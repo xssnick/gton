@@ -27,8 +27,17 @@ type proofSizeEstimator struct {
 	bytes uint64
 }
 
-func newProofSizeEstimator() *proofSizeEstimator {
-	return &proofSizeEstimator{}
+// newProofSizeEstimator opens an estimator sized for a block whose read set is
+// expected to reach expectedReadCells. The set it keeps is larger than the read
+// set — it holds every cell the record saw plus the pruned boundary of every
+// child of one — and measured over mainnet blocks it lands at 1.22-1.39x the
+// read count, so the table is asked for 1.4x and doubled for the half-full rule
+// the probe relies on. It is a capacity and nothing else: a wrong estimate costs
+// only the growth it avoided, and the set is dropped with the collation.
+func newProofSizeEstimator(expectedReadCells int) *proofSizeEstimator {
+	e := &proofSizeEstimator{}
+	e.seen.presize(expectedReadCells * 7 / 5)
+	return e
 }
 
 func (e *proofSizeEstimator) addLoadedCell(root *cell.Cell) {
@@ -131,6 +140,28 @@ func (s *proofSeenHashSet) appendHash(hash cell.Hash) {
 	}
 	s.hashes[last] = append(s.hashes[last], hash)
 	s.count++
+}
+
+// proofSeenMaxPresizedCells bounds what presize honours, so an estimate wrong by
+// orders of magnitude allocates a bounded table rather than an arbitrary one.
+const proofSeenMaxPresizedCells = 1 << 20
+
+// presize allocates the slot array for expected entries. Only the slots are
+// sized: the hash chunks above are exact by construction and have nothing to
+// gain. Growing into a block-sized table instead costs seventeen generations of
+// which sixteen are discarded.
+func (s *proofSeenHashSet) presize(expected int) {
+	if expected <= 0 || s.slots != nil {
+		return
+	}
+	if expected > proofSeenMaxPresizedCells {
+		expected = proofSeenMaxPresizedCells
+	}
+	slots := 64
+	for slots < 2*expected {
+		slots *= 2
+	}
+	s.slots = make([]uint64, slots)
 }
 
 // observe records hash and reports whether it was already present and, if so,
@@ -484,13 +515,23 @@ type blockLimitStatus struct {
 	admissionEstimate uint64
 }
 
-func newBlockLimitStatus(limits blockLimits, startLT uint64, usage *cell.ReadSet) *blockLimitStatus {
+// newBlockLimitStatus opens the limiter for a block whose storage walk is
+// expected to reach expectedCells distinct ordinary cells and expectedProofCells
+// cells outside the read set — the counts the previous build reported. Both are
+// capacities; zero simply means the tables grow as they fill, which is what the
+// first build of a chain does.
+func newBlockLimitStatus(
+	limits blockLimits,
+	startLT uint64,
+	usage *cell.ReadSet,
+	expectedCells, expectedProofCells int,
+) *blockLimitStatus {
 	return &blockLimitStatus{
 		limits:  limits,
 		startLT: startLT,
 		endLT:   startLT,
 		usage:   usage,
-		storage: cell.NewCellStorageStat(),
+		storage: cell.NewCellStorageStatSized(expectedCells, expectedProofCells),
 	}
 }
 
@@ -540,6 +581,36 @@ func (s *blockLimitStatus) classify() LoadClass {
 	class = max(class, s.limits.gas.classify(s.gas))
 	class = max(class, s.limits.ltDelta.classify(s.endLT-s.startLT))
 	return max(class, s.limits.collatedData.classify(s.collatedData))
+}
+
+// hardOverflow reports the first limit axis standing at or past its HARD
+// threshold, with the two numbers an operator needs and a flag for "none of
+// them is". It is not the admission gate — fits() answers that, and answers it
+// against the class a phase is allowed to reach — but the diagnosis for the one
+// caller that has no admission decision to make: cleanupMandatoryDrain, which
+// must dequeue what it dequeues and can only report that the result does not
+// fit.
+//
+// All four axes are checked even though a dequeue can only move two of them.
+// The drain does not own the block: it runs after the predecessor queue and
+// dispatch roots are already charged, and naming the axis that actually went
+// over is the whole point of the message.
+func (s *blockLimitStatus) hardOverflow() (string, uint64, uint64, bool) {
+	const hard = LoadHard - 1
+	if bytes := s.estimatedBytes(); bytes >= s.limits.bytes[hard] {
+		return "estimated block bytes", bytes, s.limits.bytes[hard], true
+	}
+	if s.collatedData >= s.limits.collatedData[hard] {
+		return "collated data bytes", s.collatedData, s.limits.collatedData[hard], true
+	}
+	if s.gas >= s.limits.gas[hard] {
+		return "gas", s.gas, s.limits.gas[hard], true
+	}
+	if delta := s.endLT - s.startLT; delta >= s.limits.ltDelta[hard] {
+		return "logical time delta", delta, s.limits.ltDelta[hard], true
+	}
+
+	return "", 0, 0, false
 }
 
 func (s *blockLimitStatus) fits(class LoadClass) bool {

@@ -209,14 +209,10 @@ func checkSemanticMessageOrder(processed []semanticMessageProcessing, emitted []
 }
 
 func (r *semanticReplay) verifyMasterTickTock() error {
-	specials := make([][32]byte, 0, len(r.specialAccounts))
-	for account := range r.specialAccounts {
-		specials = append(specials, account)
-	}
-	slices.SortFunc(specials, func(left, right [32]byte) int {
-		return bytes.Compare(left[:], right[:])
-	})
-	for _, account := range specials {
+	// Ascending account id, which is the order this check always imposed on
+	// itself; PrepareConfig sorts the epoch's identities once instead of every
+	// masterchain validation rebuilding the slice out of the map.
+	for _, account := range r.specials.sorted {
 		original, _, err := semanticLoadAccount(r.previous.Accounts.ShardAccounts, account)
 		if err != nil {
 			return err
@@ -248,7 +244,7 @@ func (r *semanticReplay) verifyMasterTickTock() error {
 }
 
 func (r *semanticReplay) verifyMasterAccountTickTock(account [32]byte, result *semanticAccountResult) error {
-	_, special := r.specialAccounts[account]
+	_, special := r.specials.set[account]
 	for i, transaction := range result.sequence {
 		if !transaction.tickTock {
 			continue
@@ -305,24 +301,24 @@ func (r *semanticReplay) verifyMasterSpecialMessages() error {
 	if extra == nil {
 		return fmt.Errorf("%w: masterchain block has no custom extra", ErrInvalidInput)
 	}
-	raw := tlb.BlockchainConfig{Root: r.transition.Config.execution.Root()}
+	fees := r.transition.Config.fees
 	for _, special := range [...]struct {
 		name        string
 		descriptor  *cell.Cell
 		amount      tlb.CurrencyCollection
-		destination func() ([]byte, error)
+		destination feeDestination
 	}{
 		{
 			name:        "fee recovery",
 			descriptor:  extra.Details.RecoverCreateMsg,
 			amount:      r.candidate.flow.Recovered,
-			destination: raw.GetFeeCollectorAddress,
+			destination: fees.collector,
 		},
 		{
 			name:        "mint",
 			descriptor:  extra.Details.MintMsg,
 			amount:      r.candidate.flow.Minted,
-			destination: raw.GetMinterAddress,
+			destination: fees.minter,
 		},
 	} {
 		if (special.descriptor == nil) != currencyZero(special.amount) {
@@ -331,11 +327,12 @@ func (r *semanticReplay) verifyMasterSpecialMessages() error {
 		if special.descriptor == nil {
 			continue
 		}
-		destination, err := special.destination()
-		if err != nil || len(destination) != 32 {
-			return fmt.Errorf("%w: %s destination is malformed: %v", ErrInvalidInput, special.name, err)
+		if !special.destination.ok {
+			return fmt.Errorf("%w: %s destination is malformed: %v",
+				ErrInvalidInput, special.name, special.destination.err)
 		}
-		if err = r.verifyMasterSpecialMessage(special.name, special.descriptor, special.amount, destination); err != nil {
+		destination := special.destination.addr
+		if err := r.verifyMasterSpecialMessage(special.name, special.descriptor, special.amount, destination[:]); err != nil {
 			return err
 		}
 	}
@@ -505,10 +502,13 @@ func verifyMasterSpecialEnvelope(
 }
 
 func (r *semanticReplay) verifyMasterPublicLibraries() error {
-	var previousStats tlb.ShardStateStats
-	if err := parseExact(&previousStats, r.previous.Stats); err != nil {
-		return fmt.Errorf("%w: decode previous masterchain statistics for public libraries: %v", ErrInvalidInput, err)
+	previousStats, err := r.masterPredecessorStats()
+	if err != nil {
+		return err
 	}
+	// The dictionary is shared with the structural pass now, and this function
+	// mutates it through addLibraryPublisher/removeLibraryPublisher, so the copy
+	// below is what keeps that sharing safe.
 	libraries := previousStats.Libraries
 	if libraries == nil {
 		libraries = cell.NewDict(256)

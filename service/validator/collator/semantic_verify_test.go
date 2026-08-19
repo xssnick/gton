@@ -322,14 +322,14 @@ func TestSemanticVerifierGasAccounting(t *testing.T) {
 		t.Fatalf("historical gas override accounting: used=%d err=%v", lane.normalGas, err)
 	}
 
-	replay.specialAccounts = map[[32]byte]struct{}{account: {}}
+	replay.specials = newMasterSpecials([][32]byte{account})
 	replay.specialGasLimit = 10
 	lane = &semanticAccountLane{key: account}
 	err = replay.recordTransactionGas(lane, root, transaction, result)
 	if !errors.Is(err, ErrInvalidInput) || lane.specialGas != 11 {
 		t.Fatalf("special account historical override accounting: used=%d err=%v", lane.specialGas, err)
 	}
-	delete(replay.specialAccounts, account)
+	replay.specials = masterSpecials{}
 
 	replay.candidate.block.BlockInfo.GenUtime = 1_709_164_800
 	lane = &semanticAccountLane{key: account}
@@ -615,9 +615,7 @@ func TestSemanticMasterTickTockConstraints(t *testing.T) {
 	account[0] = 0x22
 	replay := &semanticReplay{
 		candidate: &verifiedCandidate{},
-		specialAccounts: map[[32]byte]struct{}{
-			account: {},
-		},
+		specials:  newMasterSpecials([][32]byte{account}),
 	}
 	replay.candidate.block.BlockInfo.StartLt = 100
 
@@ -707,9 +705,7 @@ func TestSemanticMasterRequiresConfiguredTickTockAccountBlock(t *testing.T) {
 	replay := &semanticReplay{
 		previous: previous,
 		accounts: make(map[[32]byte]*semanticAccountResult),
-		specialAccounts: map[[32]byte]struct{}{
-			account: {},
-		},
+		specials: newMasterSpecials([][32]byte{account}),
 	}
 
 	err = replay.verifyMasterTickTock()

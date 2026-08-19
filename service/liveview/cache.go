@@ -158,6 +158,11 @@ func (s *Store) putBlockLocked(key storage.BlockRootHash, block *liveBlock, stat
 		}
 	}
 
+	// Decided before anything is merged, because it governs both the state map and
+	// the view built over it: a second materialization reachable through
+	// BlockFragments is the same defect as one reachable through BlockState.
+	retainAccepted := state != nil && s.acceptedStateWinsLocked(key, stateKey, block.acceptedOwner)
+
 	if existing := s.blocks[key]; existing != nil {
 		existingEvictable := s.liveBlockEvictableLocked(existing)
 		if block.root == nil {
@@ -169,7 +174,7 @@ func (s *Store) putBlockLocked(key storage.BlockRootHash, block *liveBlock, stat
 		block.artifactFlushed = block.artifactFlushed || existing.artifactFlushed
 		block.stateFlushed = block.stateFlushed || existing.stateFlushed
 		block.currentCachesReleased = block.currentCachesReleased || existing.currentCachesReleased
-		if block.fragments == nil {
+		if block.fragments == nil || retainAccepted {
 			block.fragments = existing.fragments
 		}
 		existingKind := liveBlockKind(existing.id)
@@ -181,7 +186,7 @@ func (s *Store) putBlockLocked(key storage.BlockRootHash, block *liveBlock, stat
 	// Publish block and state as one mutation. Refreshing after the block and
 	// again after its state makes the second refresh linearly remove the index
 	// entries that the first refresh just added.
-	if state != nil {
+	if state != nil && !retainAccepted {
 		s.states[stateKey] = *storage.CloneBlockState(state)
 	}
 	s.blocks[key] = block
@@ -508,6 +513,13 @@ func (s *Store) protectedLiveBlocksLocked() map[storage.BlockRootHash]struct{} {
 		for _, pending := range s.nonFinalPending {
 			protected[storage.BlockKey(pending.block)] = struct{}{}
 		}
+	}
+	// An accepted-state publication is the only copy of that state in the
+	// process: it exists precisely because nothing has committed it yet, so the
+	// ordinary cache limit must not evict it. Its own bound releases it — see
+	// trimAcceptedStatesLocked and cleanupAcceptedStatesLocked.
+	for key := range s.acceptedStates {
+		protected[key] = struct{}{}
 	}
 	return protected
 }

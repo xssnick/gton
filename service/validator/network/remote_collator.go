@@ -13,7 +13,7 @@ import (
 
 const remoteCollatorMaximumAnswerBytes = 1024
 
-// RemoteCollatorClient sends Delegated-v3 control queries over a Manager's
+// RemoteCollatorClient sends delegated-collation control queries over a Manager's
 // already prepared private consensus overlays.
 type RemoteCollatorClient struct {
 	manager    *Manager

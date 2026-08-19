@@ -31,26 +31,68 @@ const (
 
 	blockBroadcastCompressedV2Kind        = "tonNode.blockBroadcastCompressedV2"
 	blockCandidateBroadcastCompressedKind = "tonNode.newBlockCandidateBroadcastCompressed"
+	trustedConsensusCandidateKind         = "consensus.blockSyncCandidate"
 )
 
+// BlockBroadcastMode selects the full-node overlay routes for one publication.
+// Its bit values match fullnode::FullNode::broadcast_mode_* in the C++ node.
+type BlockBroadcastMode uint8
+
+const (
+	BlockBroadcastModePublic BlockBroadcastMode = 1 << iota
+	BlockBroadcastModeFastSync
+	BlockBroadcastModeCustom
+)
+
+const blockBroadcastModeAll = BlockBroadcastModePublic |
+	BlockBroadcastModeFastSync |
+	BlockBroadcastModeCustom
+
+func (m BlockBroadcastMode) includes(route BlockBroadcastMode) bool {
+	return m&route != 0
+}
+
+func (m BlockBroadcastMode) validate() error {
+	if m & ^blockBroadcastModeAll != 0 {
+		return fmt.Errorf("unknown block broadcast mode bits %02x", uint8(m&^blockBroadcastModeAll))
+	}
+	return nil
+}
+
 // AcceptedBlockPublication is an accepted block and its Simplex certificate.
-// Public selects the scheduled-leader full-block publication; the certificate
-// is published to every eligible finality overlay independently.
+// BlockMode and FinalityMode are independent because protocols 0 and 1 publish
+// legacy full blocks without a standalone finality broadcast. Plumtree selects
+// the public and FastSync finality transport explicitly; full blocks always use
+// the conventional FEC transport selected by their route bits.
 type AcceptedBlockPublication struct {
 	Block             DownloadedBlock
 	Signatures        *blockproof.ValidatorSignatureSet
-	Public            bool
+	BlockMode         BlockBroadcastMode
+	FinalityMode      BlockBroadcastMode
+	Plumtree          bool
 	CertificateSigner overlay.BroadcastSigner
 }
 
 // BlockCandidatePublication is the canonical block material needed to relay a
-// candidate into the node's configured block overlays.
+// candidate into the node's configured block overlays. Plumtree explicitly
+// selects the public and FastSync candidate transport. Custom candidates always
+// use conventional FEC, and a legacy candidate cannot use the public route.
 type BlockCandidatePublication struct {
 	Block             ton.BlockIDExt
 	BlockBOC          []byte
 	CatchainSeqno     uint32
 	ValidatorSetHash  uint32
+	Mode              BlockBroadcastMode
+	Plumtree          bool
 	CertificateSigner overlay.BroadcastSigner
+}
+
+// TrustedBlockCandidate is canonical block data whose consensus-overlay source
+// and candidate signature have already been authenticated. The cache worker
+// still parses the block and verifies its root and file hashes before retention.
+type TrustedBlockCandidate struct {
+	Block    ton.BlockIDExt
+	BlockBOC []byte
 }
 
 type blockPublicationKind uint8
@@ -58,12 +100,14 @@ type blockPublicationKind uint8
 const (
 	blockPublicationAccepted blockPublicationKind = iota + 1
 	blockPublicationCandidate
+	blockCacheTrustedCandidate
 )
 
 type blockPublicationRequest struct {
-	kind      blockPublicationKind
-	accepted  AcceptedBlockPublication
-	candidate BlockCandidatePublication
+	kind             blockPublicationKind
+	accepted         AcceptedBlockPublication
+	candidate        BlockCandidatePublication
+	trustedCandidate TrustedBlockCandidate
 }
 
 type blockPublicationCertificateKey struct {
@@ -167,13 +211,24 @@ func (b *BlockBroadcasts) TryPublishAccepted(publication AcceptedBlockPublicatio
 	})
 }
 
-// TryRelayCandidate transfers a candidate to the publication worker without
-// waiting. Local and private-overlay candidates use this same deduplicated
-// path. It returns false when the bounded queue is full or closed.
+// TryRelayCandidate transfers a locally generated candidate to the publication
+// worker without waiting. Received consensus candidates use TryCacheCandidate
+// instead and are not re-originated into full-node overlays. It returns false
+// when the bounded queue is full or closed.
 func (b *BlockBroadcasts) TryRelayCandidate(publication BlockCandidatePublication) bool {
 	return b.queue.Push(blockPublicationRequest{
 		kind:      blockPublicationCandidate,
 		candidate: publication,
+	})
+}
+
+// TryCacheCandidate transfers an authenticated consensus candidate to the
+// bounded cache worker without publishing it into any full-node overlay. It
+// returns false when the queue is full or closed.
+func (b *BlockBroadcasts) TryCacheCandidate(candidate TrustedBlockCandidate) bool {
+	return b.queue.Push(blockPublicationRequest{
+		kind:             blockCacheTrustedCandidate,
+		trustedCandidate: candidate,
 	})
 }
 
@@ -190,6 +245,8 @@ func blockPublicationRequestBytes(request blockPublicationRequest) int64 {
 		return size
 	case blockPublicationCandidate:
 		return overhead + int64(len(request.candidate.BlockBOC))
+	case blockCacheTrustedCandidate:
+		return overhead + int64(len(request.trustedCandidate.BlockBOC))
 	default:
 		return overhead
 	}
@@ -207,56 +264,78 @@ func (b *BlockBroadcasts) run(ctx context.Context) {
 			b.publishAccepted(request.accepted)
 		case blockPublicationCandidate:
 			b.publishCandidate(request.candidate)
+		case blockCacheTrustedCandidate:
+			b.cacheTrustedCandidate(request.trustedCandidate)
 		}
 	}
 }
 
 func (b *BlockBroadcasts) publishAccepted(publication AcceptedBlockPublication) {
+	if err := validateAcceptedBlockPublication(publication); err != nil {
+		b.logDrop(publication.Block.ID, "accepted.mode", err)
+		return
+	}
+	if publication.BlockMode == 0 && publication.FinalityMode == 0 {
+		return
+	}
+
 	block := publication.Block.ID
 	signatureSet, err := acceptedBlockBroadcastSignatureSet(publication)
 	if err != nil {
 		b.logDrop(block, "accepted", err)
 		return
 	}
-	customTargets := b.customTargets(block)
 
-	finalityPayload, finalityErr := tl.Serialize(BlockFinalityBroadcast{
-		ID:           block,
-		SignatureSet: signatureSet,
-	}, true)
-	if finalityErr != nil {
-		b.logDrop(block, "finality", fmt.Errorf("serialize finality broadcast: %w", finalityErr))
-	} else if b.node.overlayFanoutDeduper.Mark(
-		blockOverlayFanoutKey("finality", block),
-		time.Now(),
-	) {
-		b.publishFinality(
-			block,
-			finalityPayload,
-			customTargets,
-			publication.CertificateSigner,
-		)
+	var customTargets []*overlaySubscription
+	if publication.BlockMode.includes(BlockBroadcastModeCustom) ||
+		publication.FinalityMode.includes(BlockBroadcastModeCustom) {
+		customTargets = b.customTargets(block)
+	}
+	if publication.FinalityMode != 0 {
+		finalityPayload, finalityErr := tl.Serialize(BlockFinalityBroadcast{
+			ID:           block,
+			SignatureSet: signatureSet,
+		}, true)
+		if finalityErr != nil {
+			b.logDrop(block, "finality", fmt.Errorf("serialize finality broadcast: %w", finalityErr))
+		} else if b.node.overlayFanoutDeduper.Mark(
+			blockPublicationFanoutKey("finality", block),
+			time.Now(),
+		) {
+			b.publishFinality(
+				block,
+				finalityPayload,
+				publication.FinalityMode,
+				customTargets,
+				publication.Plumtree,
+				publication.CertificateSigner,
+			)
+		}
 	}
 
-	if !publication.Public && len(customTargets) == 0 {
-		return
-	}
 	now := time.Now()
-	if len(customTargets) == 0 || !b.node.overlayFanoutDeduper.Mark(
-		blockOverlayRouteFanoutKey(blockOverlayFanoutRouteCustom, "block", block),
+	customBlockTargets := customTargets
+	if !publication.BlockMode.includes(BlockBroadcastModeCustom) ||
+		len(customBlockTargets) == 0 || !b.node.overlayFanoutDeduper.Mark(
+		blockPublicationRouteFanoutKey(
+			blockOverlayFanoutRouteCustom,
+			"block",
+			block,
+			publication.Plumtree,
+		),
 		now,
 	) {
-		customTargets = nil
+		customBlockTargets = nil
 	}
 
 	var publicTarget *overlaySubscription
 	var publicCertificate any
-	if publication.Public && publication.CertificateSigner != nil {
+	if publication.BlockMode.includes(BlockBroadcastModePublic) {
 		publicTarget, err = b.node.subscriptionForBlock(block)
 		if err != nil {
 			b.logDrop(block, "block.public", err)
 			publicTarget = nil
-		} else if publicCertificate, err = b.publicationCertificate(
+		} else if publicCertificate, err = b.optionalPublicationCertificate(
 			publicTarget,
 			publication.CertificateSigner,
 			now,
@@ -264,13 +343,37 @@ func (b *BlockBroadcasts) publishAccepted(publication AcceptedBlockPublication) 
 			b.logDrop(block, "block.public.certificate", err)
 			publicTarget = nil
 		} else if !b.node.overlayFanoutDeduper.Mark(
-			blockOverlayRouteFanoutKey(blockOverlayFanoutRoutePublic, "block", block),
+			blockPublicationRouteFanoutKey(
+				blockOverlayFanoutRoutePublic,
+				"block",
+				block,
+				publication.Plumtree,
+			),
 			now,
 		) {
 			publicTarget = nil
 		}
 	}
-	if len(customTargets) == 0 && publicTarget == nil {
+
+	var fastSyncTarget *overlaySubscription
+	if publication.BlockMode.includes(BlockBroadcastModeFastSync) {
+		fastSyncTarget, err = b.fastSyncPublicationTarget(block, publication.Plumtree)
+		if err != nil {
+			b.logDrop(block, "block.fast_sync", err)
+			fastSyncTarget = nil
+		} else if fastSyncTarget != nil && !b.node.overlayFanoutDeduper.Mark(
+			blockPublicationRouteFanoutKey(
+				blockOverlayFanoutRouteFastSync,
+				"block",
+				block,
+				publication.Plumtree,
+			),
+			now,
+		) {
+			fastSyncTarget = nil
+		}
+	}
+	if len(customBlockTargets) == 0 && publicTarget == nil && fastSyncTarget == nil {
 		return
 	}
 
@@ -279,27 +382,48 @@ func (b *BlockBroadcasts) publishAccepted(publication AcceptedBlockPublication) 
 		b.logDrop(block, "block", err)
 		return
 	}
-	b.publishFullBlock(blockPayload, customTargets, publicTarget, publicCertificate)
+	b.publishFullBlock(
+		blockPayload,
+		customBlockTargets,
+		publicTarget,
+		publicCertificate,
+		fastSyncTarget,
+	)
 }
 
 func (b *BlockBroadcasts) publishCandidate(publication BlockCandidatePublication) {
+	if err := validateBlockCandidatePublication(publication); err != nil {
+		b.logDrop(publication.Block, "candidate.mode", err)
+		return
+	}
+	if publication.Mode == 0 {
+		return
+	}
+
 	payload, err := serializeBlockCandidateBroadcast(publication)
 	if err != nil {
 		b.logDrop(publication.Block, "candidate", err)
 		return
 	}
 	now := time.Now()
-	customTargets := b.customTargets(publication.Block)
-	if len(customTargets) > 0 && b.node.overlayFanoutDeduper.Mark(
-		blockOverlayRouteFanoutKey(blockOverlayFanoutRouteCustom, "candidate", publication.Block),
-		now,
-	) {
-		for _, sub := range customTargets {
-			enqueueLocalBlockFEC(sub, blockCandidateBroadcastCompressedKind, payload)
+	if publication.Mode.includes(BlockBroadcastModeCustom) {
+		customTargets := b.customTargets(publication.Block)
+		if len(customTargets) > 0 && b.node.overlayFanoutDeduper.Mark(
+			blockPublicationRouteFanoutKey(
+				blockOverlayFanoutRouteCustom,
+				"candidate",
+				publication.Block,
+				publication.Plumtree,
+			),
+			now,
+		) {
+			for _, sub := range customTargets {
+				enqueueLocalBlockFEC(sub, blockCandidateBroadcastCompressedKind, payload)
+			}
 		}
 	}
 
-	if publication.CertificateSigner != nil {
+	if publication.Mode.includes(BlockBroadcastModePublic) {
 		public, publicErr := b.node.subscriptionForBlock(publication.Block)
 		if publicErr != nil {
 			b.logDrop(publication.Block, "candidate.public", publicErr)
@@ -310,31 +434,160 @@ func (b *BlockBroadcasts) publishCandidate(publication BlockCandidatePublication
 		); certErr != nil {
 			b.logDrop(publication.Block, "candidate.public.certificate", certErr)
 		} else if b.node.overlayFanoutDeduper.Mark(
-			blockOverlayRouteFanoutKey(blockOverlayFanoutRoutePublic, "candidate", publication.Block),
+			blockPublicationRouteFanoutKey(
+				blockOverlayFanoutRoutePublic,
+				"candidate",
+				publication.Block,
+				publication.Plumtree,
+			),
 			now,
 		) {
 			b.originatePlumtreeFEC(public, blockCandidateBroadcastCompressedKind, payload, certificate)
 		}
+	}
 
-		fastSync, fastSyncErr := b.fastSyncPlumtreeTarget(publication.Block)
+	if publication.Mode.includes(BlockBroadcastModeFastSync) {
+		fastSync, fastSyncErr := b.fastSyncPublicationTarget(publication.Block, publication.Plumtree)
 		if fastSyncErr != nil {
 			b.logDrop(publication.Block, "candidate.fast_sync", fastSyncErr)
-		} else if fastSync != nil {
-			certificate, certErr := b.publicationCertificate(
-				fastSync,
-				publication.CertificateSigner,
-				now,
-			)
-			if certErr != nil {
-				b.logDrop(publication.Block, "candidate.fast_sync.certificate", certErr)
-			} else if b.node.overlayFanoutDeduper.Mark(
-				blockOverlayRouteFanoutKey(blockOverlayFanoutRouteFastSync, "candidate", publication.Block),
+			return
+		}
+		if fastSync == nil {
+			return
+		}
+
+		if !publication.Plumtree {
+			if !b.node.overlayFanoutDeduper.Mark(
+				blockPublicationRouteFanoutKey(
+					blockOverlayFanoutRouteFastSync,
+					"candidate",
+					publication.Block,
+					publication.Plumtree,
+				),
 				now,
 			) {
-				b.originatePlumtreeFEC(fastSync, blockCandidateBroadcastCompressedKind, payload, certificate)
+				return
 			}
+			enqueueLocalBlockFEC(fastSync, blockCandidateBroadcastCompressedKind, payload)
+			return
 		}
+
+		certificate, certErr := b.publicationCertificate(
+			fastSync,
+			publication.CertificateSigner,
+			now,
+		)
+		if certErr != nil {
+			b.logDrop(publication.Block, "candidate.fast_sync.certificate", certErr)
+			return
+		}
+		if !b.node.overlayFanoutDeduper.Mark(
+			blockPublicationRouteFanoutKey(
+				blockOverlayFanoutRouteFastSync,
+				"candidate",
+				publication.Block,
+				publication.Plumtree,
+			),
+			now,
+		) {
+			return
+		}
+		b.originatePlumtreeFEC(fastSync, blockCandidateBroadcastCompressedKind, payload, certificate)
 	}
+}
+
+func blockPublicationRouteFanoutKey(
+	route string,
+	class string,
+	block ton.BlockIDExt,
+	plumtree bool,
+) string {
+	if !plumtree && class == "candidate" &&
+		(route == blockOverlayFanoutRouteCustom || route == blockOverlayFanoutRouteFastSync) {
+		class = "block"
+	}
+
+	return blockPublicationFanoutKey(route+":"+class, block)
+}
+
+func blockPublicationFanoutKey(class string, block ton.BlockIDExt) string {
+	return blockOverlayFanoutKey(class, block) + ":" +
+		string(block.RootHash) + string(block.FileHash)
+}
+
+func (b *BlockBroadcasts) cacheTrustedCandidate(candidate TrustedBlockCandidate) {
+	downloaded, err := decodeRawBlockCandidateBroadcast(
+		trustedConsensusCandidateKind,
+		candidate.Block,
+		candidate.BlockBOC,
+	)
+	if err != nil {
+		b.node.log.Warn().
+			Err(err).
+			Str("block", storage.FormatBlockRef(candidate.Block)).
+			Msg("dropping trusted consensus candidate")
+		return
+	}
+
+	assembled, finalityErr := b.node.rememberBlockFinalityCandidate(downloaded)
+	b.node.rememberShardBlockCandidate(downloaded)
+	b.node.publishNonfinalDownloadedBlock(downloaded, storage.LiveBlockNonfinalCandidate)
+	if !isMasterchainBlock(downloaded.ID) {
+		b.node.observeBlockReceived(b.node.runCtx, downloaded, false)
+	}
+	if finalityErr != nil {
+		return
+	}
+
+	for i := range assembled {
+		block := assembled[i]
+		b.node.acceptBroadcastEvent(BroadcastEvent{
+			Overlay:      trustedConsensusCandidateKind,
+			Kind:         blockFinalityBroadcastKind,
+			Delivery:     DeliveryFEC,
+			Trusted:      true,
+			Block:        block.ID,
+			Downloaded:   &block,
+			SourcePeerID: block.SourcePeerID,
+			ReceivedAt:   time.Now(),
+		}, true)
+	}
+}
+
+func validateAcceptedBlockPublication(publication AcceptedBlockPublication) error {
+	if err := publication.BlockMode.validate(); err != nil {
+		return fmt.Errorf("block mode: %w", err)
+	}
+	if err := publication.FinalityMode.validate(); err != nil {
+		return fmt.Errorf("finality mode: %w", err)
+	}
+
+	plumtreeFinality := publication.FinalityMode &
+		(BlockBroadcastModePublic | BlockBroadcastModeFastSync)
+	if plumtreeFinality != 0 && !publication.Plumtree {
+		return errors.New("public and FastSync finality routes require Plumtree")
+	}
+	if plumtreeFinality != 0 && publication.CertificateSigner == nil {
+		return errors.New("Plumtree finality routes require a certificate signer")
+	}
+
+	return nil
+}
+
+func validateBlockCandidatePublication(publication BlockCandidatePublication) error {
+	if err := publication.Mode.validate(); err != nil {
+		return err
+	}
+	if publication.Mode.includes(BlockBroadcastModePublic) && !publication.Plumtree {
+		return errors.New("public candidate route requires Plumtree")
+	}
+	plumtreeRoutes := publication.Mode &
+		(BlockBroadcastModePublic | BlockBroadcastModeFastSync)
+	if publication.Plumtree && plumtreeRoutes != 0 && publication.CertificateSigner == nil {
+		return errors.New("Plumtree candidate routes require a certificate signer")
+	}
+
+	return nil
 }
 
 func acceptedBlockBroadcastSignatureSet(
@@ -471,6 +724,7 @@ func (b *BlockBroadcasts) publishFullBlock(
 	customTargets []*overlaySubscription,
 	publicTarget *overlaySubscription,
 	publicCertificate any,
+	fastSyncTarget *overlaySubscription,
 ) {
 	for _, sub := range customTargets {
 		enqueueLocalBlockFEC(sub, blockBroadcastCompressedV2Kind, payload)
@@ -483,18 +737,25 @@ func (b *BlockBroadcasts) publishFullBlock(
 			publicCertificate,
 		)
 	}
+	if fastSyncTarget != nil {
+		enqueueLocalBlockFEC(fastSyncTarget, blockBroadcastCompressedV2Kind, payload)
+	}
 }
 
 func (b *BlockBroadcasts) publishFinality(
 	block ton.BlockIDExt,
 	payload []byte,
+	mode BlockBroadcastMode,
 	customTargets []*overlaySubscription,
+	plumtree bool,
 	certificateSigner overlay.BroadcastSigner,
 ) {
-	for _, sub := range customTargets {
-		enqueueLocalBlockFEC(sub, blockFinalityBroadcastKind, payload)
+	if mode.includes(BlockBroadcastModeCustom) {
+		for _, sub := range customTargets {
+			enqueueLocalBlockFEC(sub, blockFinalityBroadcastKind, payload)
+		}
 	}
-	if certificateSigner == nil {
+	if !plumtree || mode&(BlockBroadcastModePublic|BlockBroadcastModeFastSync) == 0 {
 		return
 	}
 
@@ -503,44 +764,48 @@ func (b *BlockBroadcasts) publishFinality(
 		b.logDrop(block, "finality.id", err)
 		return
 	}
-	public, err := b.node.subscriptionForBlock(block)
-	if err != nil {
-		b.logDrop(block, "finality.public", err)
-	} else if certificate, certErr := b.publicationCertificate(
-		public,
-		certificateSigner,
-		time.Now(),
-	); certErr != nil {
-		b.logDrop(block, "finality.public.certificate", certErr)
-	} else {
-		b.originatePlumtreeSimple(
+	if mode.includes(BlockBroadcastModePublic) {
+		public, err := b.node.subscriptionForBlock(block)
+		if err != nil {
+			b.logDrop(block, "finality.public", err)
+		} else if certificate, certErr := b.publicationCertificate(
 			public,
-			blockFinalityBroadcastKind,
-			broadcastID,
-			payload,
-			certificate,
-		)
-	}
-
-	fastSync, err := b.fastSyncPlumtreeTarget(block)
-	if err != nil {
-		b.logDrop(block, "finality.fast_sync", err)
-	} else if fastSync != nil {
-		certificate, certErr := b.publicationCertificate(
-			fastSync,
 			certificateSigner,
 			time.Now(),
-		)
-		if certErr != nil {
-			b.logDrop(block, "finality.fast_sync.certificate", certErr)
+		); certErr != nil {
+			b.logDrop(block, "finality.public.certificate", certErr)
 		} else {
 			b.originatePlumtreeSimple(
-				fastSync,
+				public,
 				blockFinalityBroadcastKind,
 				broadcastID,
 				payload,
 				certificate,
 			)
+		}
+	}
+
+	if mode.includes(BlockBroadcastModeFastSync) {
+		fastSync, err := b.fastSyncPublicationTarget(block, true)
+		if err != nil {
+			b.logDrop(block, "finality.fast_sync", err)
+		} else if fastSync != nil {
+			certificate, certErr := b.publicationCertificate(
+				fastSync,
+				certificateSigner,
+				time.Now(),
+			)
+			if certErr != nil {
+				b.logDrop(block, "finality.fast_sync.certificate", certErr)
+			} else {
+				b.originatePlumtreeSimple(
+					fastSync,
+					blockFinalityBroadcastKind,
+					broadcastID,
+					payload,
+					certificate,
+				)
+			}
 		}
 	}
 }
@@ -562,19 +827,41 @@ func (b *BlockBroadcasts) customTargets(block ton.BlockIDExt) []*overlaySubscrip
 	return targets
 }
 
-func (b *BlockBroadcasts) fastSyncPlumtreeTarget(
+func (b *BlockBroadcasts) fastSyncPublicationTarget(
 	block ton.BlockIDExt,
+	plumtree bool,
 ) (*overlaySubscription, error) {
 	sub, err := b.node.fastSyncSubscriptionForBlock(block)
 	if err != nil {
 		return nil, err
 	}
 	if sub == nil || !sub.isActive() || sub.fastSync == nil ||
-		!sub.fastSync.spec.localValidator || !sub.fastSync.spec.plumtreeEnabled ||
-		sub.plumtree == nil {
+		!sub.fastSync.spec.localValidator {
 		return nil, nil
 	}
+	if sub.fastSync.spec.plumtreeEnabled != plumtree {
+		return nil, fmt.Errorf(
+			"FastSync overlay Plumtree setting is %t, publication requires %t",
+			sub.fastSync.spec.plumtreeEnabled,
+			plumtree,
+		)
+	}
+	if plumtree && sub.plumtree == nil {
+		return nil, errors.New("FastSync Plumtree runtime is unavailable")
+	}
 	return sub, nil
+}
+
+func (b *BlockBroadcasts) optionalPublicationCertificate(
+	sub *overlaySubscription,
+	signer overlay.BroadcastSigner,
+	now time.Time,
+) (any, error) {
+	if signer == nil {
+		return nil, nil
+	}
+
+	return b.publicationCertificate(sub, signer, now)
 }
 
 func enqueueLocalBlockFEC(sub *overlaySubscription, kind string, payload []byte) bool {

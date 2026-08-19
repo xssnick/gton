@@ -128,9 +128,9 @@ func (h *runnerHooks) HandleWindow(w Window) {
 	}()
 }
 
-func (h *runnerHooks) OnNotarized(CandidateID, *Certificate) {}
+func (h *runnerHooks) OnNotarized(CandidateID, VerifiedCertificate) {}
 
-func (h *runnerHooks) OnFinalized(id CandidateID, cert *Certificate) {
+func (h *runnerHooks) OnFinalized(id CandidateID, cert VerifiedCertificate) {
 	h.mu.Lock()
 	h.finalized = append(h.finalized, id)
 	h.mu.Unlock()

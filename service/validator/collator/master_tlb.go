@@ -11,18 +11,21 @@ import (
 // parseMasterStateInfo handles the inline BlockCreateStats tail explicitly.
 // tonutils-go exposes that tail with Slice.ToCell without consuming the source
 // slice, so the generic parseExact helper would report valid creator stats as
-// trailing data. Parsing BlockCreateStats exactly also rejects any real tail.
+// trailing data.
 func parseMasterStateInfo(root *cell.Cell) (tlb.McStateExtraBlockInfo, error) {
 	info, _, err := parseMasterStateInfoWithStats(root)
 	return info, err
 }
 
 // parseMasterStateInfoWithStats additionally hands back the creator statistics
-// this parse already decoded. Every consumer on the collation and validation
-// paths needs them, and re-deriving them means walking a dictionary with one
-// entry per recently active validator again — see updateBlockCreateStats and
-// verifyBlockCreateStatsUpdate, which take the decoded value for that reason.
-// The returned entries map is nil exactly when the info carries no statistics.
+// dictionary. The returned dictionary is nil exactly when the info carries no
+// statistics.
+//
+// Opening the statistics is not optional even for the callers that never read
+// them: when the flag is set, that tail is the rest of the Info cell, so its
+// header is the only thing standing between a malformed state and an accepted
+// one. It costs a tag byte and one maybe-reference — the traversal that used to
+// come with it is what moved to the passes that actually read entries.
 func parseMasterStateInfoWithStats(root *cell.Cell) (tlb.McStateExtraBlockInfo, blockCreateStats, error) {
 	if root == nil {
 		return tlb.McStateExtraBlockInfo{}, blockCreateStats{}, errors.New("cell is absent")
@@ -43,7 +46,7 @@ func parseMasterStateInfoWithStats(root *cell.Cell) (tlb.McStateExtraBlockInfo, 
 		}
 		return info, blockCreateStats{}, nil
 	}
-	stats, err := parseBlockCreateStats(info.BlockCreateStats)
+	stats, err := openBlockCreateStats(info.BlockCreateStats)
 	if err != nil {
 		return tlb.McStateExtraBlockInfo{}, blockCreateStats{}, err
 	}

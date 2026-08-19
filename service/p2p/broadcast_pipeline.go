@@ -1444,10 +1444,6 @@ func blockOverlayRouteFanoutKey(
 	class string,
 	block ton.BlockIDExt,
 ) string {
-	if route == blockOverlayFanoutRouteCustom &&
-		(class == "block" || class == "candidate") {
-		class = "block"
-	}
 	return blockOverlayFanoutKey(route+":"+class, block)
 }
 

@@ -1,11 +1,13 @@
 package groups
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
 	"math/big"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -82,6 +84,17 @@ func TestParseConfigDefaultsAndValidatorSetFallbacks(t *testing.T) {
 	}
 	if config.ActiveValidators.TotalWeight != 30 || len(config.ActiveValidators.Validators) != 2 {
 		t.Fatalf("current validator set = %+v", config.ActiveValidators)
+	}
+	fallbackID, err := PublicKeyHash(groupTestBytes(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCurrent := [][32]byte{fallbackID, groupTestBytes(70)}
+	slices.SortFunc(wantCurrent, func(left, right [32]byte) int {
+		return bytes.Compare(left[:], right[:])
+	})
+	if !slices.Equal(config.AllCurrentValidators, wantCurrent) {
+		t.Fatalf("all-current validator ADNL roster = %x, want %x", config.AllCurrentValidators, wantCurrent)
 	}
 }
 
@@ -218,6 +231,12 @@ func TestParseConfigPrefersTemporaryValidatorSets(t *testing.T) {
 	}
 	if got := config.NextValidators.Validators[0].PublicKey; got != groupTestBytes(4) {
 		t.Fatalf("next set key = %x, want temporary next", got)
+	}
+	if !slices.Equal(config.AllCurrentValidators, [][32]byte{groupTestBytes(1 + 40)}) {
+		t.Fatalf(
+			"all-current validator roster = %x, want persistent parameter 34",
+			config.AllCurrentValidators,
+		)
 	}
 
 	// The persistent overlay union is built from parameters 32, 34, and 36,
@@ -498,7 +517,7 @@ func TestParseConfig30SimplexVersions(t *testing.T) {
 	masterchain := cell.BeginCell().
 		MustStoreUInt(0x22, 8).
 		MustStoreUInt(0x55&0x1f, 5).
-		MustStoreUInt(3, 2).
+		MustStoreUInt(0, 2).
 		MustStoreBoolBit(true).
 		MustStoreUInt(4, 32).
 		MustStoreDict(nil).
@@ -506,7 +525,7 @@ func TestParseConfig30SimplexVersions(t *testing.T) {
 	shard := cell.BeginCell().
 		MustStoreUInt(0x22, 8).
 		MustStoreUInt(0x15, 5).
-		MustStoreUInt(3, 2).
+		MustStoreUInt(1, 2).
 		MustStoreBoolBit(true).
 		MustStoreUInt(9, 32).
 		MustStoreDict(noncritical).
@@ -530,12 +549,12 @@ func TestParseConfig30SimplexVersions(t *testing.T) {
 		t.Fatalf("config 30 presence = %+v", config.NewConsensus)
 	}
 	if got := config.NewConsensus.Masterchain; got.Version != 2 || got.Flags != 0x55&0x1f ||
-		got.ProtocolVersion != 3 || !got.UseQUIC || got.SlotsPerLeaderWindow != 4 {
+		got.ProtocolVersion != 0 || !got.UseQUIC || got.SlotsPerLeaderWindow != 4 {
 		t.Fatalf("masterchain simplex config = %+v", got)
 	}
 	wantParams := []NoncriticalParam{{ID: 1, Value: 42}, {ID: 250, Value: 99}}
 	gotShard := config.NewConsensus.Shard
-	if gotShard.Version != 2 || gotShard.Flags != 0x15 || gotShard.ProtocolVersion != 3 ||
+	if gotShard.Version != 2 || gotShard.Flags != 0x15 || gotShard.ProtocolVersion != 1 ||
 		!gotShard.UseQUIC || gotShard.SlotsPerLeaderWindow != 9 {
 		t.Fatalf("shard simplex v2 config = %+v", gotShard)
 	}
@@ -549,10 +568,7 @@ func TestParseConfig30SimplexVersions(t *testing.T) {
 	}
 }
 
-// The pre-Delegated-v3 #21 constructor is not parsed at all: this node only
-// joins simplex v2 with protocol version 3 or newer, so a #21 configuration
-// must be refused where it is read rather than accepted and then declined by
-// the supervisor, which left the failure to surface as an idle validator.
+// The #21 constructor is a different schema and is not interpreted as #22.
 func TestParseConfig30RejectsLegacySimplexV1(t *testing.T) {
 	legacy := cell.BeginCell().
 		MustStoreUInt(0x21, 8).
@@ -746,24 +762,40 @@ func TestSimplexProtocolCopiesEveryConfigField(t *testing.T) {
 	}
 }
 
-func TestSupportedProtocolAdmitsV2FromProtocolVersionThree(t *testing.T) {
+func TestSimplexProtocolFeatureMatrix(t *testing.T) {
 	tests := []struct {
 		version         uint8
 		protocolVersion uint8
-		want            bool
+		supported       bool
+		blockSync       bool
+		observers       bool
+		plumtree        bool
 	}{
-		{version: 2, protocolVersion: 3, want: true},
-		{version: 2, protocolVersion: 4, want: true},
-		{version: 2, protocolVersion: 2, want: false},
-		{version: 2, protocolVersion: 0, want: false},
-		{version: 1, protocolVersion: 3, want: false},
-		{version: 3, protocolVersion: 3, want: false},
+		{version: 2, protocolVersion: 0, supported: true},
+		{version: 2, protocolVersion: 1, supported: true, blockSync: true},
+		{version: 2, protocolVersion: 2, supported: true, observers: true, plumtree: true},
+		{version: 2, protocolVersion: 3, supported: true, observers: true, plumtree: true},
+		{version: 2, protocolVersion: 4},
+		{version: 1, protocolVersion: 3},
+		{version: 3, protocolVersion: 3},
 	}
 	for _, test := range tests {
 		config := SimplexConfig{Version: test.version, ProtocolVersion: test.protocolVersion}
-		if got := config.SupportedProtocol(); got != test.want {
+		if got := config.SupportedProtocol(); got != test.supported {
 			t.Fatalf("SupportedProtocol(v%d, protocol %d) = %v, want %v",
-				test.version, test.protocolVersion, got, test.want)
+				test.version, test.protocolVersion, got, test.supported)
+		}
+		if got := config.EnableBlockSync(); got != test.blockSync {
+			t.Fatalf("EnableBlockSync(v%d, protocol %d) = %v, want %v",
+				test.version, test.protocolVersion, got, test.blockSync)
+		}
+		if got := config.ObserversInPrivateOverlay(); got != test.observers {
+			t.Fatalf("ObserversInPrivateOverlay(v%d, protocol %d) = %v, want %v",
+				test.version, test.protocolVersion, got, test.observers)
+		}
+		if got := config.EnablePlumtree(); got != test.plumtree {
+			t.Fatalf("EnablePlumtree(v%d, protocol %d) = %v, want %v",
+				test.version, test.protocolVersion, got, test.plumtree)
 		}
 	}
 }

@@ -375,9 +375,15 @@ func formatSupervisorStatus(b *strings.Builder, status *SessionSupervisorStatus,
 		return
 	}
 
-	storageByID := make(map[SessionStorageID]StoredSession, len(stored))
+	// Keyed by the namespace: a running session and its own stored rows differ
+	// in the descriptor fields no namespace derivation reads whenever the
+	// consensus config has moved since the session opened, and matching on the
+	// whole descriptor would then report no durable telemetry at all.
+	storageByNamespace := make(map[sessionNamespaceKey]StoredSession, len(stored))
 	for i := range stored {
-		storageByID[stored[i].ID] = stored[i]
+		if key, err := sessionNamespaceKeyOf(stored[i].ID); err == nil {
+			storageByNamespace[key] = stored[i]
+		}
 	}
 	for i := range status.Sessions {
 		session := &status.Sessions[i]
@@ -401,7 +407,9 @@ func formatSupervisorStatus(b *strings.Builder, status *SessionSupervisorStatus,
 		if !session.RetryAt.IsZero() {
 			fmt.Fprintf(b, " retry_at=%s", formatStatusTime(session.RetryAt))
 		}
-		if durable, exists := storageByID[session.StorageID]; exists {
+		key, keyErr := sessionNamespaceKeyOf(session.StorageID)
+		durable, exists := storageByNamespace[key]
+		if keyErr == nil && exists {
 			formatStoredSessionTelemetry(b, &durable)
 		}
 		fmt.Fprintln(b)

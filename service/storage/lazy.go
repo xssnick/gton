@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -69,9 +68,11 @@ func DecodeLazyCellRecordTrusted(hash []byte, encoded []byte, loader cell.LazyCe
 	}
 
 	descriptors := uint16(record.D1)<<8 | uint16(record.D2)
+	// CreateWithLazyRefsUnsafe copies data into its slab, so record.Data — a
+	// view into encoded — needs no clone here.
 	loaded, err := cell.CreateWithLazyRefsUnsafe(
 		descriptors,
-		bytes.Clone(record.Data),
+		record.Data,
 		hashes,
 		depths,
 		refs,

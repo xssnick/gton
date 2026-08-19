@@ -40,6 +40,7 @@ func proofBackedPredecessors(
 		return PreviousBlock{}, nil, fmt.Errorf("%w: proven first predecessor state: %v", ErrInvalidInput, err)
 	}
 	first.State = state
+	first.Proven = true
 	if second == nil {
 		return first, nil, nil
 	}
@@ -52,6 +53,7 @@ func proofBackedPredecessors(
 	// lands on a copy rather than on the request the session still owns.
 	proven := *second
 	proven.State = state
+	proven.Proven = true
 
 	return first, &proven, nil
 }
@@ -77,6 +79,10 @@ func provenPredecessorStates(
 			return nil, fmt.Errorf("%w: proven predecessor %d state: %v", ErrInvalidInput, i, err)
 		}
 		proven[i].State = state
+		// Marked at the substitution, not at the consumer: from here on this
+		// entry carries a proof of what this candidate reads, which is enough to
+		// build its successor and not enough to answer as a neighbour state.
+		proven[i].Proven = true
 	}
 
 	return proven, nil
@@ -95,7 +101,7 @@ func provenPredecessorStates(
 // point: the reference validator reads them off the virtualized state too, so a
 // proof that omits one has to fail on this node as well.
 func bindProofBackedCandidateState(verified *verifiedCandidate, oldRoot *cell.Cell) error {
-	stateRoot, err := cell.ApplyMerkleUpdate(oldRoot.WithoutTrace(), verified.block.StateUpdate)
+	stateRoot, err := applyVerifiedStateUpdate(verified, oldRoot.WithoutTrace())
 	if err != nil {
 		return fmt.Errorf(
 			"%w: apply candidate state update to the proven predecessor: %v",
@@ -129,4 +135,19 @@ func bindProofBackedCandidateState(verified *verifiedCandidate, oldRoot *cell.Ce
 	verified.queue = queue
 
 	return nil
+}
+
+// applyVerifiedStateUpdate applies this candidate's transition to one parent,
+// through the capsule whenever the verdict has already been decided for it.
+//
+// The capsule is absent only where nothing validated the update on this call —
+// there is no path in this package that applies without validating first, so
+// the fallback exists for the benchmarks and for a future caller, and it is the
+// same apply either way.
+func applyVerifiedStateUpdate(verified *verifiedCandidate, from *cell.Cell) (*cell.Cell, error) {
+	if verified.stateUpdate != nil {
+		return verified.stateUpdate.ApplyTo(from)
+	}
+
+	return cell.ApplyMerkleUpdate(from, verified.block.StateUpdate)
 }

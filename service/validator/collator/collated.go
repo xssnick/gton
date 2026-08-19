@@ -350,16 +350,18 @@ func verifyFullMasterNeighborSet(
 	expected := make(map[neighborShardKey]expectedNeighbor)
 	masterKey := neighborShardKey{workchain: address.MasterchainID, shard: sharddomain.Root}
 	expected[masterKey] = expectedNeighbor{block: previous.ID, endLT: previousState.GenLT}
-	for _, top := range registry.Tops() {
-		if top.Block.SeqNo == 0 {
+	// The leaves are read directly, unordered: every registry leaf already carries
+	// the descriptor fields this needs, decoded once when the registry was parsed
+	// or applied, and a map needs no canonical order to be built. Only the
+	// descriptor re-parse is skipped — the block id is still copied here, because
+	// Tops() is not the boundary, copying is: a registry leaf's hash slices never
+	// leave the registry aliased, whichever accessor reached them.
+	for _, leaf := range registry.leaves {
+		if leaf.top.Block.SeqNo == 0 {
 			continue
 		}
-		fields, err := parseShardDescriptorFields(top.Descriptor)
-		if err != nil {
-			return fmt.Errorf("%w: decode registered neighbor descriptor: %v", ErrInvalidInput, err)
-		}
-		key := neighborShardKey{workchain: top.Block.Workchain, shard: top.Block.Shard}
-		expected[key] = expectedNeighbor{block: top.Block, endLT: fields.endLT}
+		key := neighborShardKey{workchain: leaf.top.Block.Workchain, shard: leaf.top.Block.Shard}
+		expected[key] = expectedNeighbor{block: *leaf.top.Block.Copy(), endLT: leaf.fields.endLT}
 	}
 
 	masterchain := MasterchainContext{

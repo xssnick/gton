@@ -10,11 +10,12 @@ import (
 )
 
 // A candidate the collator refuses must reach consensus as ErrCandidateRejected:
-// the session votes against it instead of treating the failure as a local fault
-// and retrying. Falling through the default branch of classifyLocalCandidateError
-// is therefore a consensus-visible regression, and it is exactly what a rewrap
-// that drops one of collator's rejection sentinels would cause. The prose of the
-// 169 distinct rejection reasons is not the invariant; the class is.
+// the session abstains from notarizing it and records a semantic rejection
+// instead of treating the failure as a local fault. Falling through the default
+// branch of classifyLocalCandidateError is therefore a consensus-visible
+// regression, and it is exactly what a rewrap that drops one of collator's
+// rejection sentinels would cause. The prose of the 169 distinct rejection
+// reasons is not the invariant; the class is.
 func TestClassifyLocalCandidateErrorRejectsCollatorRejections(t *testing.T) {
 	ctx := context.Background()
 

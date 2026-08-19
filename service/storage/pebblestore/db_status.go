@@ -14,6 +14,24 @@ type DBStatus struct {
 	Meta            *MetaDBStatus
 	CellGenerations []CellDBGenerationStatus
 	LazyCellLoads   []storage.LazyCellLoadMetric
+	// RecordCache is nil when the encoded cell record cache is disabled.
+	RecordCache *RecordCacheStatus
+}
+
+// RecordCacheStatus reports the encoded cell record cache: residency, its two
+// memory budgets (the arena the knob buys and the index derived on top), and
+// the three write-path outcomes that are not hits — inserts, declined inserts
+// (index probe budget exhausted) and salvage truncations (a rotation's 50%
+// re-append budget hit). Hits are already counted by the record_cache layer of
+// the lazy cell load metrics.
+type RecordCacheStatus struct {
+	Entries          int64
+	ResidentBytes    int64
+	CapacityBytes    int64
+	IndexBytes       int64
+	Inserts          uint64
+	Declined         uint64
+	SalvageTruncated uint64
 }
 
 type MetaDBStatus struct {
@@ -69,6 +87,18 @@ func (s *Store) DBStatus(ctx context.Context) (DBStatus, error) {
 	status := DBStatus{
 		CellGenerations: make([]CellDBGenerationStatus, 0, len(generations)),
 		LazyCellLoads:   s.lazyCellLoads.snapshot(),
+	}
+	if s.recordCache != nil {
+		stats := s.recordCache.stats()
+		status.RecordCache = &RecordCacheStatus{
+			Entries:          stats.Entries,
+			ResidentBytes:    stats.Bytes,
+			CapacityBytes:    stats.CapacityBytes,
+			IndexBytes:       stats.IndexBytes,
+			Inserts:          stats.Inserts,
+			Declined:         stats.Declined,
+			SalvageTruncated: stats.SalvageTruncated,
+		}
 	}
 	db, err := s.acquireHotDB(ctx)
 	if err != nil {

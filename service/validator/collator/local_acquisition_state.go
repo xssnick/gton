@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm"
@@ -32,13 +33,14 @@ const (
 	registeredTopWarmTimeout = 30 * time.Second
 )
 
-// LocalStateStore is the exact read surface required by local collation. The
+// LocalStateStore is the exact read surface required by local acquisition. The
 // node live store implements it directly; acquisition never reads a different
-// database or falls back to a newer chain position.
+// database, falls back to a newer chain position, or starts a download.
 type LocalStateStore interface {
 	BlockState(context.Context, ton.BlockIDExt) (*storage.BlockState, error)
 	LoadStateCellTree(context.Context, ton.BlockIDExt, []byte) (*cell.Cell, error)
 	BlockRoot(context.Context, ton.BlockIDExt) (*cell.Cell, error)
+	WaitBlockArtifacts(context.Context, ton.BlockIDExt) error
 }
 
 // LocalGroupSource publishes current and retained canonical validator-group
@@ -48,6 +50,29 @@ type LocalStateStore interface {
 type LocalGroupSource interface {
 	Snapshot() (*groups.Snapshot, error)
 	Project(*groups.Snapshot, groups.ApplyInput) (*groups.Snapshot, error)
+	WaitProject(context.Context, *groups.Snapshot, groups.ApplyInput) (*groups.Snapshot, error)
+}
+
+type acquisitionInputWait struct {
+	duration time.Duration
+}
+
+type acquisitionReadMode struct {
+	waits *acquisitionInputWait
+}
+
+var acquisitionReadImmediate acquisitionReadMode
+
+func (m acquisitionReadMode) waitsForInputs() bool {
+	return m.waits != nil
+}
+
+func (m acquisitionReadMode) waitFor(wait func() error) error {
+	started := time.Now()
+	err := wait()
+	m.waits.duration += time.Since(started)
+
+	return err
 }
 
 type localPreparedConfig struct {
@@ -63,7 +88,25 @@ type localPreparedConfig struct {
 // never invalidate a config already in use.
 const maxLocalPreparedConfigs = 4
 
+// maxLocalMasterViews bounds the non-resident masterchain views kept alongside
+// the resident one. The live working set is the resident view plus the one or
+// two immediately older ones that lagging session updates and older candidate
+// MasterRefs name. Each entry pins one masterchain state tree together with its
+// decoded extra, registry and libraries, so this cap is about resident memory
+// rather than freshness — an evicted view is only ever rebuilt.
+const maxLocalMasterViews = 4
+
+// maxLocalMasterViewLag drops cached views that fell this far behind the
+// resident one. It is kept at localBlockSourceGenerations because a validation
+// running on a view older than that would re-read its blocks from storage and
+// refresh their generation, which can evict fresher block-cache entries.
+const maxLocalMasterViewLag = localBlockSourceGenerations
+
 type localConfigCache struct {
+	// log carries the one event this cache can emit: a configuration whose parse
+	// footprint could not be captured. prepare runs once per configuration root,
+	// so it fires once per epoch rather than once per block.
+	log     zerolog.Logger
 	mu      sync.Mutex
 	entries map[cell.Hash]localPreparedConfig
 	// order is insertion order, evicted from the front. At this cap the shift
@@ -151,13 +194,107 @@ func (a *LocalAcquisition) PublishMasterchainView(
 	if a.master.view != nil && a.master.view.context.ID.SeqNo > id.SeqNo {
 		return nil
 	}
+	// The view being replaced is exactly the one lagging sessions and candidate
+	// masterchain references are about to ask for, so demoting it into the entry
+	// map is the highest-value insert there is. The map is written only here, in
+	// the same critical section that already refused to move the resident view
+	// backwards, so a publisher that lost the race can never publish into it.
+	a.master.demoteLocked(a.master.view)
 	a.master.view = view
+	a.master.sweepLocked(id.SeqNo)
 	// Registered neighbor tops only move when the masterchain view moves, so
 	// installing a view is the exact bound on cached block lifetime.
 	a.blocks.advance()
 	a.warmRegisteredTops(view)
 
 	return nil
+}
+
+// lookup returns the immutable view of id and whether it is the resident one.
+// A hit is always valid: the cache is keyed by block root hash and a block root
+// hash can never name two different states, but the full id is still compared so
+// a collision with a different seqno or file hash reads as a miss.
+//
+// The resident flag is what callers use to decide whether the group binding still
+// has to be revalidated: PublishMasterchainView bound the resident view to its
+// snapshot when it installed it, while a demoted entry can outlive the tracker's
+// history of its block.
+func (c *localMasterViewCache) lookup(id ton.BlockIDExt) (*localMasterView, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.view != nil && id.Equals(&c.view.context.ID) {
+		return c.view, true
+	}
+	key, err := blockRootKey(id)
+	if err != nil {
+		return nil, false
+	}
+	if entry := c.entries[key]; entry != nil && entry.context.ID.Equals(&id) {
+		return entry, false
+	}
+
+	return nil, false
+}
+
+// store publishes one built view. Unlike the resident install it has no side
+// effects: it never advances the block cache and never warms registered tops,
+// because those are correct exactly once per masterchain block and a cached
+// candidate view is not one.
+func (c *localMasterViewCache) store(view *localMasterView) {
+	if view == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.view != nil && view.context.ID.Equals(&c.view.context.ID) {
+		return
+	}
+	c.demoteLocked(view)
+	if c.view != nil {
+		c.sweepLocked(c.view.context.ID.SeqNo)
+	}
+}
+
+func (c *localMasterViewCache) demoteLocked(view *localMasterView) {
+	if view == nil {
+		return
+	}
+	key, err := blockRootKey(view.context.ID)
+	if err != nil {
+		return
+	}
+	if _, exists := c.entries[key]; exists {
+		return
+	}
+	if c.entries == nil {
+		c.entries = make(map[[32]byte]*localMasterView, maxLocalMasterViews)
+	}
+	c.entries[key] = view
+	c.order = append(c.order, key)
+	for len(c.order) > maxLocalMasterViews {
+		delete(c.entries, c.order[0])
+		c.order = append(c.order[:0], c.order[1:]...)
+	}
+}
+
+// sweepLocked drops views that fell too far behind the resident one. Insertion
+// order alone would keep an ancient view alive while the chain moved on.
+func (c *localMasterViewCache) sweepLocked(resident uint32) {
+	kept := c.order[:0]
+	for _, key := range c.order {
+		entry := c.entries[key]
+		if entry == nil {
+			continue
+		}
+		if entry.context.ID.SeqNo+maxLocalMasterViewLag <= resident {
+			delete(c.entries, key)
+			continue
+		}
+		kept = append(kept, key)
+	}
+	c.order = kept
 }
 
 // warmRegisteredTops reads the newly registered shard tops into the block cache
@@ -215,7 +352,7 @@ func (a *LocalAcquisition) warmRegisteredTops(view *localMasterView) {
 					if ctx.Err() != nil {
 						return
 					}
-					_, _ = a.blockSource(ctx, id)
+					_, _ = a.blockSource(ctx, id, acquisitionReadImmediate)
 				}
 			}()
 		}
@@ -327,19 +464,41 @@ func (c *localConfigCache) prepare(root *cell.Cell) (localPreparedConfig, error)
 		return prepared, nil
 	}
 
-	execution, err := tvm.PrepareBlockchainConfig(root)
-	if err != nil {
-		return localPreparedConfig{}, fmt.Errorf("%w: prepare blockchain config: %v", ErrInvalidInput, err)
+	// The capture runs here, before the entry is published, so no other goroutine
+	// can observe a Config whose footprint is still being filled in. It is also
+	// the only place it can run: parseMasterConfigEpoch is what the capture
+	// records, and master collation's own fresh branch calls that inside a live
+	// collation.
+	//
+	// It runs first because it is what materializes the configuration, and the
+	// parse below then reads cells that are already in memory. Reversed — the
+	// order this had when it was written — the parse pages the configuration in
+	// and the capture pages it in again: measured on mainnet, 5992 loads against
+	// the 2962 one pass takes. See TestPrepareConfigMaterializesBeforeParsing.
+	//
+	// This is reached inline from candidate validation, on the first block of a
+	// configuration epoch, so what it costs there is what a validator pays inside
+	// a consensus slot. What remains after the reorder is measured and small: one
+	// pass reads 2928 cells against the 2791 the parses need on their own, and
+	// the whole of prepare costs 3.16ms of CPU against 0.92ms for a parse with no
+	// capture at all. It is left here rather than moved off the path because the
+	// alternative is worse in both directions — publishing without a footprint
+	// makes master collation re-parse 0.92ms of configuration on every block, and
+	// filling one in afterwards races the readers this runs before.
+	resident, footprint := captureConfigFootprint(root)
+	if resident == nil {
+		resident = root
 	}
-	config, err := PrepareConfig(execution)
+	parsed, err := parseMasterConfigEpoch(resident)
 	if err != nil {
 		return localPreparedConfig{}, err
 	}
-	groupConfig, err := groups.ParseConfig(root)
-	if err != nil {
-		return localPreparedConfig{}, fmt.Errorf("%w: prepare validator groups config: %v", ErrInvalidInput, err)
+	parsed.config.footprint = footprint
+	if footprint == nil {
+		c.log.Warn().Hex("config", hash[:]).
+			Msg("configuration footprint was not captured, masterchain collation will re-parse the config")
 	}
-	prepared = localPreparedConfig{execution: execution, config: config, groups: groupConfig}
+	prepared = localPreparedConfig{execution: parsed.execution, config: parsed.config, groups: parsed.groups}
 
 	return c.store(hash, prepared), nil
 }
@@ -371,8 +530,9 @@ func (c *localConfigCache) store(hash cell.Hash, prepared localPreparedConfig) l
 func (a *LocalAcquisition) loadPrevious(
 	ctx context.Context,
 	id ton.BlockIDExt,
+	mode acquisitionReadMode,
 ) (PreviousBlock, tlb.ShardStateUnsplit, error) {
-	source, err := a.blockSource(ctx, id)
+	source, err := a.blockSource(ctx, id, mode)
 	if err != nil {
 		return PreviousBlock{}, tlb.ShardStateUnsplit{}, err
 	}
@@ -385,23 +545,37 @@ func (a *LocalAcquisition) loadPrevious(
 // config, which is CPU over cells already in hand, this read is storage I/O, and
 // the collation, the validation and the neighbour warm-up routinely want the
 // same neighbour at the same moment.
-func (a *LocalAcquisition) blockSource(ctx context.Context, id ton.BlockIDExt) (*localBlockSource, error) {
-	source, err := a.blocks.lookup(id)
-	if err == nil {
-		return source, nil
-	}
-	if !errors.Is(err, ErrNotFound) {
-		return nil, err
-	}
-
-	return a.blocks.loadOnce(ctx, id, func() (*localBlockSource, error) {
-		previous, state, readErr := a.readPrevious(ctx, id)
-		if readErr != nil {
-			return nil, readErr
+func (a *LocalAcquisition) blockSource(
+	ctx context.Context,
+	id ton.BlockIDExt,
+	mode acquisitionReadMode,
+) (*localBlockSource, error) {
+	for {
+		source, err := a.blocks.lookup(id)
+		if err == nil {
+			return source, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return nil, err
 		}
 
-		return &localBlockSource{previous: previous, state: state}, nil
-	})
+		source, err = a.blocks.loadOnce(ctx, id, func() (*localBlockSource, error) {
+			previous, state, readErr := a.readPrevious(ctx, id)
+			if readErr != nil {
+				return nil, readErr
+			}
+
+			return &localBlockSource{previous: previous, state: state}, nil
+		})
+		if err == nil || !mode.waitsForInputs() || !errors.Is(err, ErrAcquisitionNotReady) {
+			return source, err
+		}
+		if err = mode.waitFor(func() error {
+			return a.store.WaitBlockArtifacts(ctx, id)
+		}); err != nil {
+			return nil, acquisitionReadError("block artifacts", id, err)
+		}
+	}
 }
 
 func (a *LocalAcquisition) readPrevious(

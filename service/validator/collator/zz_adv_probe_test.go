@@ -147,6 +147,10 @@ func (l *advLazifier) root(tb testing.TB, c *cell.Cell) *cell.Cell {
 }
 
 func TestZZAdvProbeDistinctBySite(t *testing.T) {
+	// Runs in the shared-fixture parallel batch: it reads the cached mainnet
+	// workload and keeps every mutation on its own copy, holds no package-level
+	// counter and derives nothing from wall-clock timing.
+	t.Parallel()
 	req, _ := benchMainnetRequest(t, benchMainnetFiller)
 
 	lz := newAdvLazifier()

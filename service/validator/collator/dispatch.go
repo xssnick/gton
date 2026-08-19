@@ -82,6 +82,14 @@ func (c *collation) processDispatchQueue() error {
 				c.updatePeakLoad()
 				return c.registerDispatchOp(true)
 			}
+			// collator.cpp:4424-4429, which returns register_dispatch_queue_op(true)
+			// on the timeout exactly as it does on the block-full one.
+			if c.internalMsgExpired() {
+				c.blockFull = true
+				c.stats.InternalMsgTimeouts++
+				c.updatePeakLoad()
+				return c.registerDispatchOp(true)
+			}
 			if err := c.ctx.Err(); err != nil {
 				return err
 			}

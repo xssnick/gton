@@ -21,8 +21,10 @@ const (
 	// keyAcceptedProof is retired. Accepted shard proof links are no longer
 	// cached here: the shard top description reads its predecessor links from
 	// the node's own block storage and waits for them to appear. The constant
-	// stays reserved so the prefixes above keep their on-disk values.
-	keyAcceptedProof //nolint:unused // reserved prefix
+	// stays reserved so the prefixes above keep their on-disk values, and
+	// DeleteSession still sweeps it so rows an older build wrote are removed
+	// with their namespace instead of outliving the descriptor that names them.
+	keyAcceptedProof
 	keyDelegationAuthorization
 	keyValidatorKey
 )
@@ -98,6 +100,13 @@ func leaderWindowPrefix(namespace storageNamespace) []byte {
 
 func leaderWindowKey(namespace storageNamespace, startSlot uint32) []byte {
 	return binary.BigEndian.AppendUint32(leaderWindowPrefix(namespace), startSlot)
+}
+
+// acceptedProofPrefix addresses the retired kind. Nothing writes under it; only
+// the namespace sweep reads it, so a database written before it was retired is
+// cleaned up by ordinary teardown rather than needing a migration.
+func acceptedProofPrefix(namespace storageNamespace) []byte {
+	return namespacedPrefix(keyAcceptedProof, namespace)
 }
 
 func delegationAuthorizationPrefix(namespace storageNamespace) []byte {

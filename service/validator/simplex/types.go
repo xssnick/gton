@@ -40,11 +40,9 @@
 // conflicts tolerated) — and re-casts skip votes for every non-finalized slot
 // of the last announced leader window.
 //
-// Protocol version: the engine targets only the newest wire protocol
-// (protocol_version >= 3 semantics — delegated collator candidates and the
-// per-shard standstill egress split). Legacy version gates (the v1 block-sync
-// overlay, observer/plumtree switches) are intentionally absent; the config parser of a later stage must refuse older networks
-// instead of expecting downgraded behavior here.
+// Protocol version: the consensus state machine is shared by protocol versions
+// 0 through 3. Their differences are transport and topology policy owned by
+// the surrounding validator runtime, not vote or certificate semantics here.
 package simplex
 
 import (
@@ -134,6 +132,9 @@ const (
 	VoteNotarize VoteKind = iota + 1
 	VoteFinalize
 	VoteSkip
+	// VoteKindCount bounds arrays indexed by kind. The kinds start at one so
+	// the zero Vote is not a valid notarization; the unused slot is the price.
+	VoteKindCount
 )
 
 func (k VoteKind) String() string {
@@ -372,6 +373,14 @@ type Misbehavior struct {
 	Proof2 []byte
 }
 
+// CandidateRejection marks a semantic invalid-candidate verdict. Validation
+// failures without this marker are local inability to decide: this validator
+// abstains without accusing the candidate producer or counting a rejection.
+type CandidateRejection interface {
+	error
+	CandidateRejected()
+}
+
 // Hooks connects the consensus state machine to candidate validation,
 // persistence, production and outcome handling owned by the session runtime.
 //
@@ -379,8 +388,9 @@ type Misbehavior struct {
 // hand work off without blocking. Each must invoke done exactly once. With
 // Runner, done is safe to invoke from any goroutine; direct Engine users must
 // complete inline on the engine goroutine. A nil validation verdict accepts
-// the candidate. A store error is fatal because a validator must be able to
-// serve every candidate it votes to notarize.
+// the candidate, CandidateRejection rejects it semantically, and every other
+// error makes this validator abstain. A store error is fatal because a
+// validator must be able to serve every candidate it votes to notarize.
 //
 // HandleWindow and the outcome methods run on the engine goroutine and must
 // not block. Every validator and observer receives HandleWindow after the
@@ -392,8 +402,14 @@ type Hooks interface {
 	StoreCandidate(c *Candidate, done func(error))
 	HandleWindow(w Window)
 
-	OnNotarized(id CandidateID, cert *Certificate)
-	OnFinalized(id CandidateID, cert *Certificate)
+	// OnNotarized and OnFinalized deliver the certificate sealed: the quorum
+	// was verified (or, for a certificate this engine assembled from votes it
+	// verified one by one, attested — see Engine.seal) against the session id
+	// and validator roster this engine was built with. A consumer that must
+	// prove the quorum further downstream checks the binding instead of
+	// repeating the Ed25519 pass.
+	OnNotarized(id CandidateID, cert VerifiedCertificate)
+	OnFinalized(id CandidateID, cert VerifiedCertificate)
 	OnMisbehavior(validator uint32, m Misbehavior)
 	// OnFatal reports an unrecoverable session error (journal failure, own
 	// conflicting votes, quorum-level consensus violation). The engine is
@@ -418,8 +434,13 @@ type SystemClock struct{}
 
 func (SystemClock) Now() time.Time { return time.Now() }
 
-// ObserverIndex is the LocalIndex value for a non-voting observer engine.
-const ObserverIndex = -1
+const (
+	// ObserverIndex is the LocalIndex value for a non-voting observer engine.
+	ObserverIndex = -1
+	// MaxProtocolVersion is the largest value representable by the two-bit
+	// protocol_version field of the config-30 #22 constructor.
+	MaxProtocolVersion = uint8(3)
+)
 
 // maxTotalWeight is the 2^61 cap that keeps total*2 from overflowing uint64.
 const maxTotalWeight = uint64(1) << 61
@@ -450,8 +471,7 @@ type Config struct {
 	// SessionID is the validator session id; it domain-separates every
 	// signature via consensus.dataToSign.
 	SessionID [32]byte
-	// ProtocolVersion is the config-29/30 consensus protocol version. This
-	// engine implements only the current Simplex protocol (version 3+).
+	// ProtocolVersion is the config-30 consensus protocol version.
 	ProtocolVersion uint8
 	// Validators is the session validator set in canonical order; indexes
 	// into this slice are the wire validator indexes.

@@ -261,7 +261,7 @@ func (r *archiveCatchUpRun) startCheckpoint(reason string) error {
 				Msg("archive shard-client checkpoint failed")
 		}
 		if persisted != nil {
-			r.archive.checkpointTransitions.archiveCheckpointCommitted(persisted, checkpointStates.entries)
+			r.archive.currentTransitions.archiveCheckpointCommitted(persisted, checkpointStates.entries)
 		}
 		release()
 		done <- archiveCheckpointResult{

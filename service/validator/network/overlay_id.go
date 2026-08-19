@@ -44,6 +44,17 @@ func BuildConsensusOverlayIdentity(
 	return overlayIdentity(fullID)
 }
 
+// BuildBlockSyncOverlayIdentity derives the protocol-v1 candidate broadcast
+// overlay from the session ID alone.
+func BuildBlockSyncOverlayIdentity(sessionID [32]byte) (OverlayIdentity, error) {
+	fullID, err := tl.Serialize(ConsensusBlockSyncOverlayID{SessionID: sessionID[:]}, true)
+	if err != nil {
+		return OverlayIdentity{}, fmt.Errorf("validator network: serialize block-sync overlay id: %w", err)
+	}
+
+	return overlayIdentity(fullID)
+}
+
 // OverlayShortID derives the TON short ID for a serialized full overlay name.
 func OverlayShortID(fullID []byte) ([32]byte, error) {
 	if len(fullID) == 0 {

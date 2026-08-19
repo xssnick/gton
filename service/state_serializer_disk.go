@@ -95,3 +95,45 @@ func (s *StateLifecycle) prunePreviousPersistentStateBeforeSerialization(ctx con
 	}
 	return stats, nil
 }
+
+func (s *StateLifecycle) prunePersistentStatesAfterSerialization(ctx context.Context, target ton.BlockIDExt) error {
+	keepRecent := s.maintenance.persistentStateKeepRecent
+	if keepRecent == PersistentStateKeepAll {
+		return nil
+	}
+
+	stats, err := s.stateSerializer.store.PrunePersistentStateFilesToLimit(ctx, target.SeqNo, keepRecent)
+	if err != nil {
+		return fmt.Errorf("prune persistent states after serialization %s: %w", storage.FormatBlockRef(target), err)
+	}
+
+	event := s.stateSerializer.log.Debug()
+	if stats.DeletedFileRecords > 0 {
+		event = s.stateSerializer.log.Info()
+	}
+	event.
+		Str("target", storage.FormatBlockRef(target)).
+		Int("keep_recent_groups", keepRecent).
+		Int("retained_recent_groups", stats.RetainedRecentGroups).
+		Uint32("oldest_retained_master_seqno", stats.OldestRetainedMasterSeqno).
+		Uint32("deleted_master_seqno", stats.DeletedMasterSeqno).
+		Int("deleted_file_records", stats.DeletedFileRecords).
+		Int("deleted_disk_files", stats.DeletedDiskFiles).
+		Uint64("freed_bytes", stats.DeletedDiskBytes).
+		Str("freed_size", formatByteSize(stats.DeletedDiskBytes)).
+		Msg("persistent state retention completed after serialization")
+	return nil
+}
+
+func (s *StateLifecycle) enforcePersistentStateRetentionAfterSerialization(ctx context.Context, target ton.BlockIDExt, scope PersistentStateSerializationScope) {
+	if scope != PersistentStateSerializationAll {
+		return
+	}
+
+	if err := s.prunePersistentStatesAfterSerialization(ctx, target); err != nil {
+		s.log.Error().
+			Err(err).
+			Str("persistent_state", storage.FormatBlockRef(target)).
+			Msg("failed to enforce persistent state retention after serialization")
+	}
+}

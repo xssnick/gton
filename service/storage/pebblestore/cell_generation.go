@@ -500,7 +500,7 @@ func (s *Store) DropPendingCellGeneration(ctx context.Context, generation uint64
 	if !detached {
 		return nil
 	}
-	s.cellCache.deleteGeneration(generation)
+	s.forgetCachedCellGeneration(generation)
 
 	s.log.Info().
 		Uint64("cell_generation", generation).
@@ -660,7 +660,7 @@ func (s *Store) closeAndRemoveCellGeneration(ctx context.Context, generation uin
 		delete(s.cellGenerations, generation)
 	}
 	s.mu.Unlock()
-	s.cellCache.deleteGeneration(generation)
+	s.forgetCachedCellGeneration(generation)
 
 	var errs []error
 	if cells != nil {

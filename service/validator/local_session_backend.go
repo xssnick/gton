@@ -40,6 +40,17 @@ type LocalSessionNode interface {
 	LoadStateCellTree(context.Context, ton.BlockIDExt, []byte) (*cell.Cell, error)
 	LookupBlockBySeqNo(context.Context, storage.BlockSeqRef) (ton.BlockIDExt, error)
 	SubmitBlockLocally(p2p.DownloadedBlock)
+	// PublishAcceptedBlockState extends the live view with a block this session
+	// has finalized and the state it computed for it, before either reaches the
+	// node database. It is the other half of every read above: those reads go
+	// through the live view, and this is what puts into the live view the one
+	// thing it could not otherwise answer for — the state of a shard block only
+	// this node has finalized so far.
+	PublishAcceptedBlockState(storage.LiveBlockArtifacts) error
+	// BlockArtifactsSignal is the publication edge a read waits on. It replaces
+	// polling the store: the caller takes the channel before its read and blocks
+	// on it only if that read found nothing.
+	BlockArtifactsSignal() <-chan struct{}
 }
 
 // LocalSessionBackendOptions contains the shared node services and immutable
@@ -66,7 +77,12 @@ type LocalSessionBackendOptions struct {
 	ConsensusFinalized func(context.Context, ton.BlockIDExt) error
 	Publisher          BlockPublisher
 	ShardTops          *collator.ShardTopInbox
-	Logger             zerolog.Logger
+	// Metrics is the process-wide validation observer. It is optional and used
+	// here only for the predecessor-wait backstop alarm, which has no other place
+	// to report from: the wait happens inside a backend read, below every session
+	// runtime that carries an observer of its own.
+	Metrics ValidationObserver
+	Logger  zerolog.Logger
 	// CloseTimeout bounds permanent retirement because SessionBackend.Retire
 	// has no caller context. Zero uses the fixed ten-second lifecycle bound.
 	CloseTimeout time.Duration
@@ -98,29 +114,36 @@ type localValidationView struct {
 // LocalSessionBackend binds one Simplex runtime to local authenticated state,
 // validation, acceptance, and either an in-process or remote Collator.
 type LocalSessionBackend struct {
-	config           SessionConfig
-	session          collator.Session
-	activation       *collator.SessionActivation
-	node             LocalSessionNode
-	groups           collator.LocalGroupSource
-	delegations      DelegationAuthorizationStorage
-	acquisition      *collator.LocalAcquisition
-	collator         collator.Collator
-	productionMode   collator.ProductionMode
-	progress         localConsensusProgressCollator
-	self             localSelfWindowCollator
-	finalized        func(context.Context, ton.BlockIDExt) error
-	accepter         *BlockAccepter
-	log              zerolog.Logger
-	closeAfter       time.Duration
+	config         SessionConfig
+	session        collator.Session
+	activation     *collator.SessionActivation
+	node           LocalSessionNode
+	groups         collator.LocalGroupSource
+	delegations    DelegationAuthorizationStorage
+	acquisition    *collator.LocalAcquisition
+	collator       collator.Collator
+	productionMode collator.ProductionMode
+	progress       localConsensusProgressCollator
+	self           localSelfWindowCollator
+	finalized      func(context.Context, ton.BlockIDExt) error
+	accepter       *BlockAccepter
+	metrics        ValidationObserver
+	log            zerolog.Logger
+	closeAfter     time.Duration
+	// waitBackstop is chainTipWaitBackstop, overridden only by this package's
+	// own tests. A wall-clock alarm sized for the field is not something a test
+	// can wait out, and the property that needs a test — that the alarm is NOT
+	// restarted by an unrelated publication — is invisible without driving the
+	// loop across several wake-ups.
+	waitBackstop     time.Duration
 	validator        *ValidatorIdentity
 	validation       atomic.Pointer[localValidationView]
-	validationClosed atomic.Bool
 	collatorDeferred atomic.Bool
 
-	controlMu sync.Mutex
-	state     SessionState
-	update    collator.SessionUpdate
+	controlMu         sync.Mutex
+	validationChanged chan struct{}
+	state             SessionState
+	update            collator.SessionUpdate
 	// collatorUnavailable permanently disables production for this runtime
 	// attachment after the collator reports a terminal lifecycle failure.
 	// Consensus validation keeps using the authenticated session updates; only
@@ -174,21 +197,23 @@ func NewLocalSessionBackend(
 	}
 
 	backend := &LocalSessionBackend{
-		config:         options.Config,
-		session:        session,
-		node:           options.Node,
-		groups:         options.Groups,
-		delegations:    options.Delegations,
-		acquisition:    options.Acquisition,
-		collator:       options.Collator,
-		productionMode: options.ProductionMode,
-		accepter:       accepter,
-		finalized:      options.ConsensusFinalized,
-		log:            options.Logger,
-		closeAfter:     options.CloseTimeout,
-		validator:      options.Config.Identity.Validator,
-		state:          initial,
-		update:         update,
+		config:            options.Config,
+		session:           session,
+		node:              options.Node,
+		groups:            options.Groups,
+		delegations:       options.Delegations,
+		acquisition:       options.Acquisition,
+		collator:          options.Collator,
+		productionMode:    options.ProductionMode,
+		accepter:          accepter,
+		metrics:           options.Metrics,
+		finalized:         options.ConsensusFinalized,
+		log:               options.Logger,
+		closeAfter:        options.CloseTimeout,
+		validator:         options.Config.Identity.Validator,
+		validationChanged: make(chan struct{}),
+		state:             initial,
+		update:            update,
 	}
 	if backend.validator == nil {
 		return backend, nil
@@ -401,7 +426,7 @@ func (b *LocalSessionBackend) LoadChainState(
 
 	data := ChainStateData{Tips: make([]ChainTip, len(request.Blocks))}
 	for i := range request.Blocks {
-		tip, err := b.loadChainTip(ctx, request.Blocks[i])
+		tip, err := b.loadChainTip(ctx, request.Blocks[i], request.Wait)
 		if err != nil {
 			return ChainStateData{}, err
 		}
@@ -413,55 +438,81 @@ func (b *LocalSessionBackend) LoadChainState(
 
 func (b *LocalSessionBackend) ValidateCandidate(
 	ctx context.Context,
-	state *ChainState,
-	artifact *CandidateArtifact,
+	request CandidateValidationRequest,
 ) (CandidateValidation, error) {
+	state, artifact := request.Parent, request.Artifact
+	if state == nil || artifact == nil {
+		return CandidateValidation{}, errors.New("validator local backend: candidate validation request is incomplete")
+	}
 	if b.validator == nil {
 		return CandidateValidation{}, errors.New("validator local backend: observer cannot validate candidates")
 	}
-	if b.validationClosed.Load() {
-		return CandidateValidation{}, ErrLocalSessionBackendClosed
-	}
-	view := b.validation.Load()
-	if view == nil {
-		return CandidateValidation{}, fmt.Errorf("%w: collator session view is not ready", ErrBlockNotReady)
+	view, err := b.waitValidationView(ctx)
+	if err != nil {
+		return CandidateValidation{}, err
 	}
 
+	// No predecessor BOC is decoded here any more: every producer of a tip —
+	// the store loader, the applied path and the validated path — hands over the
+	// root it already parsed. A missing one is a local plumbing fault and is
+	// reported as such, because the alternative is silently skipping the block
+	// half of the collator's predecessor verification.
 	previous := make([]collator.PreviousBlock, len(state.tips))
 	for i := range state.tips {
 		tip := &state.tips[i]
-		previous[i] = collator.PreviousBlock{ID: *tip.ID.Copy(), State: tip.State}
-		if tip.ID.SeqNo == 0 {
-			continue
-		}
-
-		root, err := cell.FromBOC(tip.BlockBOC)
-		if err != nil {
+		if tip.ID.SeqNo != 0 && tip.Block == nil {
 			return CandidateValidation{}, fmt.Errorf(
-				"validator local backend: decode predecessor %d block: %w",
+				"validator local backend: predecessor %d carries no parsed block",
 				tip.ID.SeqNo,
-				err,
 			)
 		}
-		if !bytes.Equal(root.Hash(), tip.ID.RootHash) {
-			return CandidateValidation{}, errors.New("validator local backend: predecessor block root hash mismatch")
-		}
-		previous[i].Block = root
+		previous[i] = collator.PreviousBlock{ID: *tip.ID.Copy(), State: tip.State, Block: tip.Block}
 	}
 
+	// The announcement is offered on every call and taken only by the one path
+	// that needs it: a shard candidate with full collated data, whose
+	// verification runs on the candidate's own proof and so never produces a
+	// successor of the parent this node holds. There the collator calls back
+	// once it has passed every stage a lagging node retries on, and the apply
+	// over the full live parent — the one the collator must never see — overlaps
+	// the semantic replay instead of following it. That matters in exactly the
+	// case that costs disk reads: a parent reloaded from the node store after
+	// the finalized-watermark sweep released it.
+	//
+	// On every other path the collator applied the update to these very cells
+	// and hands the result back, so nothing is announced, no goroutine starts
+	// and the same tree is not walked twice.
+	pending := request.successor
 	result, err := b.acquisition.ValidateCandidate(ctx, collator.ValidationRequest{
-		Session:      view.session,
-		Update:       view.update,
-		Previous:     previous,
-		Candidate:    artifact.Candidate,
-		BlockBOC:     artifact.BlockBOC,
-		CollatedData: artifact.CollatedData,
+		Session:            view.session,
+		Update:             view.update,
+		Previous:           previous,
+		Candidate:          artifact.Candidate,
+		BlockBOC:           artifact.BlockBOC,
+		CollatedData:       artifact.CollatedData,
+		Digested:           artifact.digested,
+		AnnounceTransition: pending.announce,
 	})
 	if err != nil {
 		return CandidateValidation{}, classifyLocalCandidateError(err)
 	}
 
-	return CandidateValidation{ValidAfter: result.ValidAfter}, nil
+	next, err := state.validatedCandidateState(artifact, CandidateSuccessor{
+		BlockRoot:   result.Successor.BlockRoot,
+		StateUpdate: result.Successor.StateUpdate,
+		Prepared:    result.Successor.Prepared,
+		StateHash:   result.Successor.StateHash,
+		Live:        result.Successor.Live,
+	}, pending)
+	if err != nil {
+		// Raw, and never through classifyLocalCandidateError. The collator has
+		// already accepted this candidate; a failure to build our own successor
+		// from it is local bookkeeping, and turning it into ErrCandidateRejected
+		// would make this node vote against a block it just found valid.
+		return CandidateValidation{}, err
+	}
+
+	return CandidateValidation{ValidAfter: result.ValidAfter, State: next}, nil
 }
 
 func (b *LocalSessionBackend) AcceptBlock(ctx context.Context, acceptance BlockAcceptance) error {
@@ -488,8 +539,8 @@ func (b *LocalSessionBackend) AcceptBlock(ctx context.Context, acceptance BlockA
 	// persisted this consensus progress. Replaying it before UpdateSession
 	// reaches that durable view would address an intentionally inactive
 	// collator and make crash recovery retry forever.
-	if observeFinalized && acceptance.Certificate != nil &&
-		acceptance.Certificate.Vote.Kind == simplex.VoteFinalize {
+	if observeFinalized && !acceptance.Certificate.IsZero() &&
+		acceptance.Certificate.Vote().Kind == simplex.VoteFinalize {
 		if err := b.finalized(ctx, acceptance.Candidate.Candidate.Block); err != nil {
 			return fmt.Errorf("validator local backend: observe consensus finalization: %w", err)
 		}
@@ -785,8 +836,8 @@ func (b *LocalSessionBackend) Close() error {
 	// Teardown is synchronous here, so there is no intermediate draining state:
 	// every observer either sees an open backend or a fully closed one. Unlike
 	// collator.RemoteCollator, this backend has nothing in flight to wait for.
-	b.validationClosed.Store(true)
 	b.validation.Store(nil)
+	b.signalValidationChanged()
 	b.clearWindowRoute(0)
 	if b.releaseRoute != nil {
 		b.releaseRoute()
@@ -829,6 +880,7 @@ func (b *LocalSessionBackend) Retire() error {
 func (b *LocalSessionBackend) publishValidationView() {
 	if b.activation == nil || b.collatorDeferred.Load() || b.closed {
 		b.validation.Store(nil)
+		b.signalValidationChanged()
 		return
 	}
 	b.validation.Store(&localValidationView{
@@ -839,12 +891,156 @@ func (b *LocalSessionBackend) publishValidationView() {
 		},
 		update: b.update,
 	})
+	b.signalValidationChanged()
 }
 
-func (b *LocalSessionBackend) loadChainTip(ctx context.Context, id ton.BlockIDExt) (ChainTip, error) {
+func (b *LocalSessionBackend) signalValidationChanged() {
+	if b.validationChanged != nil {
+		close(b.validationChanged)
+	}
+	b.validationChanged = make(chan struct{})
+}
+
+func (b *LocalSessionBackend) waitValidationView(ctx context.Context) (*localValidationView, error) {
+	if view := b.validation.Load(); view != nil {
+		return view, nil
+	}
+
+	for {
+		b.controlMu.Lock()
+		if b.closed {
+			b.controlMu.Unlock()
+
+			return nil, ErrLocalSessionBackendClosed
+		}
+		view := b.validation.Load()
+		changed := b.validationChanged
+		b.controlMu.Unlock()
+
+		if view != nil {
+			return view, nil
+		}
+
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// loadChainTip reads one predecessor, waiting for it on an EDGE rather than
+// polling for it.
+//
+// What it replaces: the caller used to loop at 1 Hz around a read that failed in
+// microseconds, against a 200 ms slot rate. Nothing about that wait was paced by
+// the thing being waited for, and it was silent — no log, no metric — which is
+// how a 149 s basechain standstill was measured in the field with zero lines
+// naming its cause.
+//
+// Why the loop is HERE and not around LoadChainState: the predicate under test
+// must be the caller's own read. The store's own WaitBlockArtifacts checks the
+// state, the state cells and the block root — but a chain tip also needs the
+// block BOC, so waiting on that helper and then reading would report ready for a
+// block this read still cannot serve. Taking the signal, reading, and blocking
+// only if the read failed makes the predicate exact by construction, whatever the
+// signal happens to mean.
+//
+// Why it cannot lose a wake-up: the signal is taken BEFORE the read, and every
+// publication closes it under the same lock that installs the artifacts. A
+// publication that lands during the read wakes the wait that follows it. A signal
+// that is not about this block costs one extra read and nothing else, because
+// success is decided by the read and never by the wake-up.
+//
+// The backstop is not a poll interval. It is the alarm for the one thing this
+// structure cannot see: a publication path that makes a state readable without
+// raising a signal would otherwise turn a slow-but-correct poll into a silent
+// hang. Firing it logs at Warn and counts, then hands the not-ready error back so
+// the caller's own retry decides what to do — which is also what keeps a genuine
+// catch-up (crash replay, or a block this node did not finalize) behaving exactly
+// as it did before.
+func (b *LocalSessionBackend) loadChainTip(
+	ctx context.Context,
+	id ton.BlockIDExt,
+	wait bool,
+) (ChainTip, error) {
 	if err := storage.ValidateBlockIDHashes(id); err != nil {
 		return ChainTip{}, fmt.Errorf("validator local backend: invalid chain tip id: %w", err)
 	}
+	if !wait {
+		return b.readChainTip(ctx, id)
+	}
+
+	started := time.Now()
+	// ONE timer for the whole wait, armed before the loop. Built inside the
+	// select it would be rebuilt on every iteration, and the loop iterates on
+	// every publication in the shard — not only on a publication of the block in
+	// hand. The alarm would then require chainTipWaitBackstop of total
+	// publication SILENCE rather than that long spent waiting for this block, so
+	// on a busy node it would never fire at all and this wait would be unbounded
+	// with no backstop: exactly the silent hang the 1 Hz poll was replaced to
+	// avoid. See TestChainTipWaitBackstopIsNotRestartedByUnrelatedPublications.
+	backstop := time.NewTimer(b.chainTipWaitBackstop())
+	defer backstop.Stop()
+
+	for {
+		// Strictly before the read.
+		notify := b.node.BlockArtifactsSignal()
+
+		tip, err := b.readChainTip(ctx, id)
+		if err == nil || !errors.Is(err, ErrBlockNotReady) {
+			return tip, err
+		}
+
+		select {
+		case <-notify:
+		case <-backstop.C:
+			b.observeChainTipWaitBackstop(id, time.Since(started), err)
+
+			return ChainTip{}, err
+		case <-ctx.Done():
+			return ChainTip{}, err
+		}
+	}
+}
+
+// chainTipWaitBackstop bounds one blind wait for a predecessor. It is the same
+// order of magnitude as the reference node's own promise timeout for a block
+// state, and it is deliberately far above any interval a healthy node would wait:
+// reaching it is the alarm, not the mechanism.
+const chainTipWaitBackstop = 30 * time.Second
+
+func (b *LocalSessionBackend) chainTipWaitBackstop() time.Duration {
+	if b.waitBackstop > 0 {
+		return b.waitBackstop
+	}
+	return chainTipWaitBackstop
+}
+
+func (b *LocalSessionBackend) observeChainTipWaitBackstop(
+	id ton.BlockIDExt,
+	waited time.Duration,
+	cause error,
+) {
+	if b.metrics != nil {
+		b.metrics.AddChainTipWaitBackstop(localSessionMetricChain(b.config.Shard))
+	}
+	b.log.Warn().
+		Err(cause).
+		Str("block", storage.FormatBlockRef(id)).
+		Dur("waited", waited).
+		Msg("predecessor state did not become readable within the wait backstop")
+}
+
+func localSessionMetricChain(shard groups.ShardID) collator.MetricChain {
+	if shard.IsMasterchain() {
+		return collator.MetricChainMasterchain
+	}
+
+	return collator.MetricChainShardchain
+}
+
+func (b *LocalSessionBackend) readChainTip(ctx context.Context, id ton.BlockIDExt) (ChainTip, error) {
 	stored, err := b.node.BlockState(ctx, id)
 	if err != nil {
 		return ChainTip{}, localSessionReadError("state metadata", id, err)
@@ -885,10 +1081,14 @@ func (b *LocalSessionBackend) loadChainTip(ctx context.Context, id ton.BlockIDEx
 	if err != nil {
 		return ChainTip{}, localSessionReadError("block data", id, err)
 	}
-	fileHash := sha256.Sum256(blockBOC)
-	if !bytes.Equal(fileHash[:], id.FileHash) {
-		return ChainTip{}, errors.New("validator local backend: block file hash mismatch")
-	}
+	// The file hash of these bytes is checked once, at the boundary that has to
+	// check it for every backend rather than only for this one: newChainState
+	// binds both halves of a tip to its id — the cell by root hash, the bytes by
+	// file hash — before anything reads either. Hashing the payload here as well
+	// paid a second full sha256 of a multi-megabyte predecessor per loaded tip
+	// to reach the same rejection one step earlier. The reference loads its
+	// predecessors through BlockQ::init, which checks the root hash and nothing
+	// else (impl/block.cpp:64).
 	blockRoot, err := cell.FromBOC(blockBOC)
 	if err != nil {
 		return ChainTip{}, fmt.Errorf("validator local backend: decode block data: %w", err)
@@ -914,6 +1114,9 @@ func (b *LocalSessionBackend) loadChainTip(ctx context.Context, id ton.BlockIDEx
 		return ChainTip{}, errors.New("validator local backend: chain tip block has trailing data")
 	}
 	tip.BlockBOC = blockBOC
+	// The root was decoded and hash-checked above; keeping it is what spares
+	// every candidate validation a second decode of this same predecessor.
+	tip.Block = blockRoot
 
 	return tip, nil
 }
@@ -944,14 +1147,20 @@ func (b *LocalSessionBackend) routeCandidate(
 	if candidate.Delegation != nil {
 		return errors.New("validator local backend: self candidate carries delegated authority")
 	}
-	validatorKey := b.config.Validators[b.validator.Index].PublicKey
-	if !simplex.VerifyCandidateSignature(
-		validatorKey[:],
-		b.config.SessionID,
-		candidate.ID,
-		candidate.Signature,
-	) {
-		return errors.New("validator local backend: local candidate signature is invalid")
+	// The index, not the signature. The collator verified this signature the
+	// instant it was produced, against Session.Validators[window.Leader], and
+	// localCollatorSession builds that roster by copying b.config.Validators —
+	// so the only thing a second ed25519 verification here could establish over
+	// that one is that the leader the collator signed for is the validator this
+	// backend is, which is this comparison. Everything else it would re-derive
+	// is a value that has not left the process; C++ verifies its own candidate
+	// signature nowhere at all (window-producer.cpp:118-131).
+	//
+	// The candidate is still verified once more against the codec's roster and
+	// leader schedule in encodeForBroadcast, which is the last gate before the
+	// bytes reach the network and the one that covers the delegated route too.
+	if candidate.Leader != b.validator.Index {
+		return errors.New("validator local backend: local candidate names another leader")
 	}
 
 	return submit(ctx, &CandidateArtifact{
@@ -959,6 +1168,7 @@ func (b *LocalSessionBackend) routeCandidate(
 		BlockBOC:     artifact.BlockBOC,
 		CollatedData: artifact.CollatedData,
 		prepared:     artifact.Prepared(),
+		digested:     artifact.Digested(),
 	})
 }
 

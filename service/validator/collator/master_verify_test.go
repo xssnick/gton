@@ -175,11 +175,11 @@ func TestVerifyMasterCandidateSemanticCore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := loadMasterCandidateState(request.Config, &previous, &verified)
+	state, err := loadMasterCandidateState(request.Config, &previous, &verified, request.Groups)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = verifyMasterDeterministicTransition(request, &previous, &verified, &state); err != nil {
+	if _, err = verifyMasterDeterministicTransition(request, &previous, &verified, &state); err != nil {
 		t.Fatalf("verify semantic baseline: %v", err)
 	}
 
@@ -235,9 +235,9 @@ func TestVerifyMasterCandidateSemanticCore(t *testing.T) {
 
 	t.Run("creator stats", func(t *testing.T) {
 		changed := state
-		// The statistics are decoded once with the state info, so the mutation
-		// belongs to the decoded value rather than to the cell it came from.
-		changed.nextCreators = blockCreateStats{entries: map[[32]byte]creatorStats{}}
+		// The statistics are opened once with the state info, so the mutation
+		// belongs to the opened dictionary rather than to the cell it came from.
+		changed.nextCreators = blockCreateStatsTestStats(t, nil)
 		err := verifyMasterStateInfoTransition(
 			request,
 			&previous,

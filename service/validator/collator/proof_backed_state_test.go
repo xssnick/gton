@@ -16,7 +16,7 @@ import (
 // proof, so a node that has never applied this shard can still validate it —
 // and, the other half of the same property, cannot paper over a proof narrower
 // than the reference validator demands by reading its local tree instead.
-func TestRestoreValidationStateBuildsTheSuccessorOnTheProvenPredecessor(t *testing.T) {
+func TestPreparedValidationCandidateBuildsTheSuccessorOnTheProvenPredecessor(t *testing.T) {
 	req := benchMainnetCollatedRequest(t, 1)
 	candidate, err := testBuilder().BuildShard(t.Context(), req)
 	if err != nil {
@@ -45,24 +45,44 @@ func TestRestoreValidationStateBuildsTheSuccessorOnTheProvenPredecessor(t *testi
 		CollatedData: candidate.CollatedData,
 	}
 
-	previous, collated, block, stateRoot, err := (&LocalAcquisition{}).restoreValidationState(request, artifact)
+	prepared, err := prepareValidationCandidate(
+		t.Context(),
+		artifact,
+		req.CreatedBy,
+		request.Session.Shard.IsMasterchain(),
+		request.Previous,
+	)
 	if err != nil {
 		t.Fatalf("restore candidate state without a resident predecessor: %v", err)
 	}
-	if !collated.full {
+	if !prepared.verified.collated.full {
 		t.Fatal("fixture candidate does not carry full collated data")
 	}
-	if stateRoot.HashKeyAt(0) != candidate.State.HashKeyAt(0) {
+	if prepared.stateRoot.HashKeyAt(0) != candidate.State.HashKeyAt(0) {
 		t.Fatal("state restored from the proof differs from the collated one")
 	}
-	if previous[0].State.HashKeyAt(0) != req.Previous.State.HashKeyAt(0) {
+	if prepared.previous[0].State.HashKeyAt(0) != req.Previous.State.HashKeyAt(0) {
 		t.Fatal("proven predecessor is not the block the candidate follows")
 	}
-	if previous[0].State == narrowed.State {
+	if prepared.previous[0].State == narrowed.State {
 		t.Fatal("the narrowed resident predecessor was used after all")
 	}
-	if block.BlockInfo.SeqNo != candidate.ID.SeqNo {
-		t.Fatalf("restored block seqno = %d, want %d", block.BlockInfo.SeqNo, candidate.ID.SeqNo)
+	// The resident list survives the substitution: it is the only handle left
+	// on the trees this node actually holds.
+	if len(prepared.resident) != 1 || prepared.resident[0].State != narrowed.State {
+		t.Fatal("capsule lost the resident predecessor it was handed")
+	}
+	if prepared.verified.block.BlockInfo.SeqNo != candidate.ID.SeqNo {
+		t.Fatalf("restored block seqno = %d, want %d", prepared.verified.block.BlockInfo.SeqNo, candidate.ID.SeqNo)
+	}
+	// One parse, and it is the parse the rest of the call uses: the capsule's
+	// root is the candidate's own block cell, not a second decode of the BOC.
+	if prepared.root == nil || prepared.root.HashKeyAt(0) != cellHashKeyOf(t, candidate.ID.RootHash) {
+		t.Fatal("capsule does not carry the parsed candidate root")
+	}
+	if prepared.candidate.State != prepared.stateRoot ||
+		prepared.candidate.StateUpdate.HashKeyAt(0) != candidate.StateUpdate.HashKeyAt(0) {
+		t.Fatal("capsule candidate does not carry the successor it built")
 	}
 
 	// The control: with the capability clear there is no proof to stand in for
@@ -90,9 +110,27 @@ func TestRestoreValidationStateBuildsTheSuccessorOnTheProvenPredecessor(t *testi
 		BlockBOC:     plain.BlockBOC,
 		CollatedData: plain.CollatedData,
 	}
-	if _, _, _, _, err = (&LocalAcquisition{}).restoreValidationState(control, controlArtifact); err == nil {
+	if _, err = prepareValidationCandidate(
+		t.Context(),
+		controlArtifact,
+		plainReq.CreatedBy,
+		control.Session.Shard.IsMasterchain(),
+		control.Previous,
+	); err == nil {
 		t.Fatal("a narrowed predecessor restored a state without any proof to replace it")
 	}
+}
+
+func cellHashKeyOf(tb testing.TB, hash []byte) cell.Hash {
+	tb.Helper()
+
+	var key cell.Hash
+	if len(hash) != len(key) {
+		tb.Fatalf("block root hash is %d bytes", len(hash))
+	}
+	copy(key[:], hash)
+
+	return key
 }
 
 // Every message delivered inside the block without ever being queued costs the

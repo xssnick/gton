@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/xssnick/gton/service/validator/blockstats"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
@@ -40,6 +41,7 @@ func (s *Server) stats(ctx context.Context) (Stats, error) {
 
 	now := uint32(time.Now().Unix())
 	masterchainSeqno := current.Masterchain.Block.SeqNo
+	blockStats := s.blockStats.BlockStats()
 	stats := []OneStat{
 		{Key: "unixtime", Value: strconv.FormatUint(uint64(now), 10)},
 		{Key: "masterchainblock", Value: masterchainBlock},
@@ -52,10 +54,18 @@ func (s *Server) stats(ctx context.Context) (Stats, error) {
 		{Key: "stateserializermasterchainseqno", Value: strconv.FormatUint(uint64(masterchainSeqno), 10)},
 		{Key: "stateserializerenabled", Value: "true"},
 		{Key: "last_deleted_mc_state", Value: strconv.FormatUint(uint64(masterchainSeqno), 10)},
+		{Key: "total.collated_blocks.master", Value: formatBlockStats(blockStats.Collated.Master)},
+		{Key: "total.collated_blocks.shard", Value: formatBlockStats(blockStats.Collated.Shard)},
+		{Key: "total.validated_blocks.master", Value: formatBlockStats(blockStats.Validated.Master)},
+		{Key: "total.validated_blocks.shard", Value: formatBlockStats(blockStats.Validated.Shard)},
 		{Key: "start_time", Value: strconv.FormatInt(s.startedAt.Unix(), 10)},
 	}
 
 	return Stats{Stats: stats}, nil
+}
+
+func formatBlockStats(counter blockstats.Counter) string {
+	return "ok:" + strconv.FormatUint(counter.OK, 10) + " error:" + strconv.FormatUint(counter.Error, 10)
 }
 
 func formatBlockID(block ton.BlockIDExt) (string, error) {

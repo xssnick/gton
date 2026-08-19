@@ -13,7 +13,7 @@ import (
 // RemoteCollator implements Collator for a validator which delegates block
 // production to a standalone collator. Candidate broadcasts still arrive via
 // the validator's consensus SessionNetwork; this client owns only session
-// control and the two Delegated-v3 queries.
+// control and the two delegated-collation queries.
 type RemoteCollator struct {
 	transport RemoteCollatorTransport
 	id        [32]byte

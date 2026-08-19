@@ -169,6 +169,7 @@ func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
 			return nil, fmt.Errorf("archive window #%d did not advance shard client seqno %d", window.startSeqno, before)
 		}
 		r.current = next
+		a.currentTransitions.archiveCurrentAdvanced(r.current)
 		r.importCache.dropBefore(r.current.ShardClientSeqno + 1)
 		r.shardBlocksApplied += uint64(window.shardBlocksApplied)
 		r.shardBlocksReused += uint64(window.shardBlocksReused)

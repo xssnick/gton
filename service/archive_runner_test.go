@@ -43,6 +43,9 @@ func (archiveRunnerTransitionsStub) applyArchiveShardBlock(context.Context, ton.
 	return nil, nil
 }
 
+func (archiveRunnerTransitionsStub) archiveCurrentAdvanced(*storage.CurrentState) {
+}
+
 func (archiveRunnerTransitionsStub) archiveCheckpointCommitted(*storage.CurrentState, []storage.StateCheckpointBlock) {
 }
 

@@ -1,7 +1,9 @@
 package collator
 
 import (
+	"bytes"
 	"fmt"
+	"slices"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm"
@@ -13,7 +15,21 @@ const defaultCandidateSizeLimit = uint32(4 << 20)
 // initializes that field to 256 before unpacking the older constructor.
 const legacyDeferOutQueueSizeLimit = uint64(256)
 
-// Config contains immutable per-epoch data used by block collation.
+// Config contains immutable per-epoch data used by block collation. It is the
+// single home for everything derived from one configuration root: parsed once
+// when the epoch is prepared, shared across lanes and across blocks, never
+// mutated by a consumer.
+//
+// The caveat that decides whether a field may live here: PrepareConfig runs
+// twice in different worlds. From localConfigCache.prepare it runs on a
+// materialized, untraced root, and from deriveMasterConfigTransition's fresh
+// branch it runs on the configuration root reached through the block's accounts
+// — that one IS under the block's read set, which the Merkle update descends and
+// the collated-size estimate resolves membership against. So a field derived
+// from cells the masterchain block already reads is free, and a field whose
+// derivation reaches a cell nothing else on that path reads changes the
+// masterchain block bytes. Nothing here may be rerouted onto the traced in-state
+// configuration root for convenience.
 type Config struct {
 	execution          *tvm.PreparedBlockchainConfig
 	globalVersion      uint32
@@ -29,6 +45,73 @@ type Config struct {
 	maxBlockBytes          uint32
 	maxCollatedBytes       uint32
 	deferOutQueueSizeLimit uint64
+	// gas is the semantic gas allowance of config parameters 20/21 folded with
+	// the epoch block limits, indexed like tvm's masterchain index: 0 basechain,
+	// 1 masterchain. It is epoch data because blockLimitsAtTime rewrites only
+	// ltDelta, never gas, so the hard gas threshold does not move within an epoch.
+	gas [2]gasAccounting
+	// specials is the masterchain fundamental-contract set of parameter 31 plus
+	// the configuration contract of parameter 0.
+	specials masterSpecials
+	// fees names the destinations of the two masterchain special messages:
+	// parameter 3 (fee collector, falling back to the elector of parameter 1)
+	// and parameter 2 (minter, falling back to the configuration contract).
+	fees feeDestinations
+	// footprint is what parsing this configuration read, recorded when the
+	// configuration was prepared. Master collation replays it instead of
+	// re-parsing; a nil footprint simply means it re-parses.
+	footprint *configFootprint
+}
+
+// gasAccounting is the per-chain gas allowance a transaction may consume before
+// the semantic verifier rejects the block.
+//
+// err carries the overflow rejection instead of failing PrepareConfig, so an
+// epoch stays preparable and the rejection still happens where it happens today:
+// inside the verification of one block. Failing here would take the whole config
+// epoch down, and with it shard collation, over a masterchain-shaped defect.
+type gasAccounting struct {
+	normal  uint64
+	special uint64
+	err     error
+}
+
+// masterSpecials is the identity list of the masterchain special accounts.
+// Which of them actually execute, and at what logical time, stays per-block in
+// processMasterTickTock and verifyMasterTickTock; only the identities are epoch
+// data.
+type masterSpecials struct {
+	// ordered is parameter-31 dictionary order with the configuration contract
+	// appended last when parameter 31 does not already list it.
+	// processMasterTickTock executes in exactly this order, and the order decides
+	// logical time assignment, so it is block bytes and not a presentation
+	// detail.
+	ordered [][32]byte
+	// sorted is ordered by ascending account id, which is the order
+	// verifyMasterTickTock already imposes on itself.
+	sorted [][32]byte
+	// set is the same identities as a membership test. It is shared by every
+	// consumer of one epoch and must never be written to.
+	set map[[32]byte]struct{}
+	// err is the rejection the master paths raise today when the configuration
+	// contract address is missing or malformed. It is carried rather than
+	// returned for the same reason gasAccounting.err is.
+	err error
+}
+
+// feeDestination is one masterchain special-message recipient.
+//
+// err is the exact error the tlb accessor returned, because the master paths
+// embed it in their rejection and the wording is asserted by their tests.
+type feeDestination struct {
+	addr [32]byte
+	ok   bool
+	err  error
+}
+
+type feeDestinations struct {
+	collector feeDestination
+	minter    feeDestination
 }
 
 type workchainPolicy struct {
@@ -125,7 +208,102 @@ func PrepareConfig(execution *tvm.PreparedBlockchainConfig) (*Config, error) {
 		maxBlockBytes:          maxBlockBytes,
 		maxCollatedBytes:       maxCollatedBytes,
 		deferOutQueueSizeLimit: deferOutQueueSizeLimit,
+		gas: [2]gasAccounting{
+			deriveGasAccounting(execution, basechainLimits.limits, false),
+			deriveGasAccounting(execution, masterchainLimits.limits, true),
+		},
+		specials: deriveMasterSpecials(execution),
+		fees:     deriveFeeDestinations(raw),
 	}, nil
+}
+
+// deriveGasAccounting folds config parameter 20 or 21 into the epoch gas
+// allowance the semantic verifier charges against.
+//
+// It reads the prices off the prepared execution config, which decoded them when
+// the epoch was prepared, so this touches no cell at all.
+func deriveGasAccounting(
+	execution *tvm.PreparedBlockchainConfig,
+	limits blockLimits,
+	masterchain bool,
+) gasAccounting {
+	prices, ok := execution.GasPrices(masterchain)
+	if !ok {
+		// Unreachable through parseMasterConfigEpoch, whose strict preparation
+		// requires both params; reachable only for a caller that prepares a
+		// partial config for tooling.
+		return gasAccounting{err: fmt.Errorf("%w: %s gas prices are absent from the configuration",
+			ErrInvalidInput, chainName(masterchain))}
+	}
+	normal, err := semanticGasLimit(limits.gas[3], prices.GasLimit)
+	if err != nil {
+		return gasAccounting{err: err}
+	}
+	special, err := semanticGasLimit(limits.gas[3], prices.SpecialGasLimit)
+	if err != nil {
+		return gasAccounting{err: err}
+	}
+	return gasAccounting{normal: normal, special: special}
+}
+
+// deriveMasterSpecials resolves the masterchain special accounts once per config
+// epoch: the fundamental smart contracts of parameter 31 and the configuration
+// contract of parameter 0.
+//
+// The identities come off the prepared execution config, which walked parameter
+// 31 and read parameter 0 when the epoch was prepared, so this touches no cell.
+// That matters beyond cost: deriveMasterConfigTransition runs PrepareConfig
+// under the block's read set when the candidate installs a configuration, and a
+// parse added here that reads a cell nothing else on that path reads would change
+// the masterchain block the collator produces. Rerouting any of this onto the
+// in-state configuration root would do exactly that.
+func deriveMasterSpecials(execution *tvm.PreparedBlockchainConfig) masterSpecials {
+	if _, ok := execution.ConfigAddress(); !ok {
+		// Master-only rejection, carried so the epoch stays preparable: shard
+		// collation never asks about special accounts and must not die here.
+		return masterSpecials{err: fmt.Errorf("%w: config smart contract address is malformed", ErrInvalidInput)}
+	}
+	// Cloned rather than aliased: the backing array belongs to the prepared
+	// execution config, and nothing in this package may reach into it.
+	return newMasterSpecials(slices.Clone(execution.SpecialAccounts()))
+}
+
+// newMasterSpecials derives the three views of one identity list together.
+//
+// It is the only constructor, including for tests: a replay that could be handed
+// a set without the matching order would silently verify a masterchain block
+// against an empty tick/tock list.
+func newMasterSpecials(ordered [][32]byte) masterSpecials {
+	sorted := slices.Clone(ordered)
+	slices.SortFunc(sorted, func(left, right [32]byte) int {
+		return bytes.Compare(left[:], right[:])
+	})
+	set := make(map[[32]byte]struct{}, len(ordered))
+	for _, accountID := range ordered {
+		set[accountID] = struct{}{}
+	}
+
+	return masterSpecials{ordered: ordered, sorted: sorted, set: set}
+}
+
+// deriveFeeDestinations resolves config parameters 3 and 2 with their fallbacks.
+//
+// Unlike the two above, this does parse the configuration root — but only cells
+// validateMasterConfigData has already read on every masterchain block, since
+// parameters 0 through 3 all go through its exactBits256 check before this runs.
+// See deriveMasterSpecials for why that distinction decides block bytes.
+func deriveFeeDestinations(raw tlb.BlockchainConfig) feeDestinations {
+	return feeDestinations{
+		collector: feeDestinationOf(raw.GetFeeCollectorAddress()),
+		minter:    feeDestinationOf(raw.GetMinterAddress()),
+	}
+}
+
+func feeDestinationOf(addr []byte, err error) feeDestination {
+	if err != nil || len(addr) != 32 {
+		return feeDestination{err: err}
+	}
+	return feeDestination{addr: [32]byte(addr), ok: true}
 }
 
 func configDeferOutQueueSizeLimit(raw tlb.BlockchainConfig) (uint64, error) {

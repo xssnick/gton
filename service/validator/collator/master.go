@@ -25,6 +25,10 @@ type masterCollation struct {
 	// oldInfo, so the update pass does not walk that dictionary a second time.
 	oldCreatorStats blockCreateStats
 
+	// previousGroups is the predecessor's parsed validator config, already bound
+	// to the predecessor's config root by validateMasterSnapshot.
+	previousGroups *groups.Config
+
 	registry    *ShardRegistry
 	shardHashes *cell.Dictionary
 	shardFees   *tlb.ShardFeesAugDict
@@ -159,6 +163,7 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 	}
 
 	usage := cell.NewReadSetSized(req.Previous.State, b.readSetHint())
+	storageCells, storageProofCells := b.storageHints()
 	oldRoot := usage.Root()
 	var oldState tlb.ShardStateUnsplit
 	if err := parseExact(&oldState, oldRoot); err != nil {
@@ -270,6 +275,9 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 	if err != nil {
 		return nil, fmt.Errorf("build masterchain previous-block tuple: %w", err)
 	}
+	// Pass the traced LibDescr root itself, as the reference collator does. TVM
+	// walks only a requested library's path; an unused immutable collection stays
+	// a single predecessor boundary in the state update.
 	executionLibraries, err := masterExecutionLibraries(oldStats.Libraries)
 	if err != nil {
 		return nil, err
@@ -305,6 +313,7 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 		oldExtra:        oldExtra,
 		oldInfo:         oldInfo,
 		oldCreatorStats: oldCreatorStats,
+		previousGroups:  req.Groups.Config,
 		registry:        registry,
 		shardFees:       shardFees,
 		shardTops:       shardTops,
@@ -348,7 +357,7 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 		}},
 		dispatchSourceCount: 1,
 		blockCtx:            blockCtx,
-		limits:              newBlockLimitStatus(limits, header.StartLt, usage),
+		limits:              newBlockLimitStatus(limits, header.StartLt, usage, storageCells, storageProofCells),
 		hardLTDelta:         limits.ltDelta[3],
 		queueSize:           queueSize,
 		oldQueueSize:        queueSize,
@@ -617,20 +626,18 @@ func (m *masterCollation) initValueFlow(config *Config, stats *tlb.ShardStateSta
 		return err
 	}
 
-	raw := tlb.BlockchainConfig{Root: config.execution.Root()}
-	collector, collectorErr := raw.GetFeeCollectorAddress()
-	if collectorErr != nil || len(collector) != 32 || m.recovered.Coins.Nano().Cmp(big.NewInt(1_000_000_000)) < 0 {
+	// Both address lookups are epoch data; the two guards around them are not.
+	// The one-TON floor reads this block's recovered fees, and the minted amount
+	// below is a difference against the predecessor's global balance.
+	if !config.fees.collector.ok || m.recovered.Coins.Nano().Cmp(big.NewInt(1_000_000_000)) < 0 {
 		m.recovered = tlb.CurrencyCollection{}
 	}
-	m.minted, err = computeMinted(raw, m.oldExtra.GlobalBalance)
+	m.minted, err = computeMinted(tlb.BlockchainConfig{Root: config.execution.Root()}, m.oldExtra.GlobalBalance)
 	if err != nil {
 		return err
 	}
-	if !currencyZero(m.minted) {
-		minter, minterErr := raw.GetMinterAddress()
-		if minterErr != nil || len(minter) != 32 {
-			m.minted = tlb.CurrencyCollection{}
-		}
+	if !currencyZero(m.minted) && !config.fees.minter.ok {
+		m.minted = tlb.CurrencyCollection{}
 	}
 
 	return nil
@@ -646,6 +653,24 @@ func burnCurrency(config tlb.BurningConfig, value tlb.CurrencyCollection) (tlb.C
 	return tlb.CurrencyCollection{Coins: tlb.FromNanoTON(burned)}, nil
 }
 
+// computeMinted is the one configuration-derived value that deliberately stays
+// per-block, and the reason is not that it depends on the block — the wanted
+// amounts do not; only the delta against global does.
+//
+// The reason is the read set. deriveMasterConfigTransition runs PrepareConfig on
+// the configuration root reached through the block's own accounts, under the
+// block's read set. Every other epoch value in Config is derived from cells
+// validateMasterConfigData or PrepareBlockchainConfig has already read there.
+// The ENTRIES of parameter 7 are the exception: nothing on that path walks them,
+// because GetExtraCurrencyToMint reads only the parameter cell and the
+// dictionary root. Hoisting the LoadAll below into PrepareConfig would record
+// entry cells the reference collator never reads, and on any chain that actually
+// mints extra currencies the masterchain block bytes would change. Mainnet's
+// parameter 7 is empty, so the defect would not show up here.
+//
+// It runs on config.execution.Root(), the untraced epoch root, on both the
+// collation and the validation path. Rerouting it onto the in-state
+// configuration root would change the proof.
 func computeMinted(config tlb.BlockchainConfig, global tlb.CurrencyCollection) (tlb.CurrencyCollection, error) {
 	wanted, err := config.GetExtraCurrencyToMint()
 	if err != nil {
@@ -812,33 +837,46 @@ func (c *collation) processMasterTickTock(tock bool) error {
 }
 
 func (c *collation) processMasterSpecials() error {
-	config := tlb.BlockchainConfig{Root: c.config.execution.Root()}
+	fees := c.config.fees
 
 	if !currencyZero(c.master.recovered) {
-		collector, err := config.GetFeeCollectorAddress()
-		if err != nil || len(collector) != 32 {
+		if !fees.collector.ok {
 			return fmt.Errorf("%w: fee collector address is malformed", ErrInvalidInput)
 		}
-		c.master.recoverCreateMsg, err = c.processMasterSpecial(c.master.recovered, collector)
+		collector := fees.collector.addr
+		message, err := c.processMasterSpecial(c.master.recovered, collector[:])
 		if err != nil {
 			return fmt.Errorf("create fee recovery transaction: %w", err)
 		}
+		c.master.recoverCreateMsg = message
 	}
 
 	if !currencyZero(c.master.minted) {
-		minter, err := config.GetMinterAddress()
-		if err != nil || len(minter) != 32 {
+		if !fees.minter.ok {
 			return fmt.Errorf("%w: minter address is malformed", ErrInvalidInput)
 		}
-		c.master.mintMsg, err = c.processMasterSpecial(c.master.minted, minter)
+		minter := fees.minter.addr
+		message, err := c.processMasterSpecial(c.master.minted, minter[:])
 		if err != nil {
 			return fmt.Errorf("create mint transaction: %w", err)
 		}
+		c.master.mintMsg = message
 	}
 
 	return nil
 }
 
+// processMasterSpecial delivers one masterchain recover/mint message in-block,
+// hand-rolling the msg_import_imm$011 pair rather than routing through
+// deliverImmediate. That is not an accident of structure and must not be
+// "de-duplicated": the reference exempts exactly these two messages from the
+// processed bound, at collator.cpp:3667 `if (!is_special && ...)`, where
+// is_special is non-null only for create_special_transaction (collator.cpp:3161,
+// :3175-3178). Their created_lt is start_lt, ahead of every queue entry this
+// block can import, so advancing the bound with one would make the next import
+// fail the strict order check in advanceProcessedBound. Routing specials through
+// deliverImmediate would therefore break every masterchain block that mints or
+// recovers fees AND imports an internal message.
 func (c *collation) processMasterSpecial(amount tlb.CurrencyCollection, destination []byte) (*cell.Cell, error) {
 	zero := [32]byte{}
 	message := tlb.InternalMessage{
@@ -920,76 +958,23 @@ func (c *collation) processMasterSpecial(amount tlb.CurrencyCollection, destinat
 	return in, nil
 }
 
-// masterSpecialAccounts memoises the fundamental-contract list. Without the
-// memo the configuration-31 walk runs once per tick, once per tock and again
-// for every deferred-message special-account check.
+// masterSpecialAccounts is the fundamental-contract list of this config epoch,
+// in the order tick and tock execute. It is derived once when the configuration
+// is prepared; what stays per-block is in the caller — which of these accounts
+// is active, carries a tick/tock state init, and at which logical time.
 func (c *collation) masterSpecialAccounts() ([][32]byte, error) {
-	if c.masterSpecialAccountList != nil {
-		return c.masterSpecialAccountList, nil
+	if c.config.specials.err != nil {
+		return nil, c.config.specials.err
 	}
-	config := tlb.BlockchainConfig{Root: c.config.execution.Root()}
-	fundamental, err := config.GetFundamentalSmartContractAddresses()
-	if err != nil {
-		return nil, fmt.Errorf("%w: load fundamental smart contracts: %v", ErrInvalidInput, err)
-	}
-	if fundamental.Addresses == nil || fundamental.Addresses.GetKeySize() != 256 {
-		return nil, fmt.Errorf("%w: fundamental smart contract dictionary is malformed", ErrInvalidInput)
-	}
-	items, err := fundamental.Addresses.LoadAll()
-	if err != nil {
-		return nil, fmt.Errorf("%w: load fundamental smart contracts: %v", ErrInvalidInput, err)
-	}
-
-	addresses := make([][32]byte, 0, len(items)+1)
-	for i := range items {
-		key, loadErr := items[i].Key.LoadSlice(256)
-		if loadErr != nil || items[i].Key.BitsLeft() != 0 || items[i].Value.BitsLeft() != 0 || items[i].Value.RefsNum() != 0 {
-			return nil, fmt.Errorf("%w: fundamental smart contract entry %d is malformed", ErrInvalidInput, i)
-		}
-		var accountID [32]byte
-		copy(accountID[:], key)
-		addresses = append(addresses, accountID)
-	}
-
-	configAddress, err := config.GetConfigAddress()
-	if err != nil || len(configAddress) != 32 {
-		return nil, fmt.Errorf("%w: config smart contract address is malformed", ErrInvalidInput)
-	}
-	// Single exit: the memo must never be written on a path that skipped the
-	// config address, or a later caller would see a short list.
-	listed := false
-	for i := range addresses {
-		if bytes.Equal(addresses[i][:], configAddress) {
-			listed = true
-			break
-		}
-	}
-	if !listed {
-		var accountID [32]byte
-		copy(accountID[:], configAddress)
-		addresses = append(addresses, accountID)
-	}
-	c.masterSpecialAccountList = addresses
-
-	return addresses, nil
+	return c.config.specials.ordered, nil
 }
 
 // masterSpecialAccountIDs is the same list as a membership set.
 func (c *collation) masterSpecialAccountIDs() (map[[32]byte]struct{}, error) {
-	if c.masterSpecialAccountSet != nil {
-		return c.masterSpecialAccountSet, nil
+	if c.config.specials.err != nil {
+		return nil, c.config.specials.err
 	}
-	addresses, err := c.masterSpecialAccounts()
-	if err != nil {
-		return nil, err
-	}
-	set := make(map[[32]byte]struct{}, len(addresses))
-	for _, accountID := range addresses {
-		set[accountID] = struct{}{}
-	}
-	c.masterSpecialAccountSet = set
-
-	return set, nil
+	return c.config.specials.set, nil
 }
 
 func tickTockName(tock bool) string {

@@ -18,6 +18,7 @@ func newValidatorControlFactory(
 	options validatorControlOptions,
 	keys *keyring.Keyring,
 	localADNLID [32]byte,
+	blockStats validatorcontrol.BlockStatsReader,
 ) hooks.ExtensionFactory {
 	return func(node hooks.Node) (hooks.Extension, error) {
 		if node.Store == nil {
@@ -42,6 +43,7 @@ func newValidatorControlFactory(
 			Keys:           keys,
 			LocalADNLID:    localADNLID,
 			State:          node.Store,
+			BlockStats:     blockStats,
 			Logger:         node.Logger.With().Str("component", "validator_control").Logger(),
 		})
 		if err != nil {

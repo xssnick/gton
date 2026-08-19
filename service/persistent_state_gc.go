@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	DefaultPersistentStateKeepRecent = 2
+	DefaultPersistentStateKeepRecent = 1
 	PersistentStateKeepAll           = -1
 	persistentStateGCInterval        = 30 * time.Minute
 	persistentStateGCRetryDelay      = 5 * time.Minute

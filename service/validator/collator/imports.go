@@ -53,6 +53,15 @@ func (c *collation) processInternals() error {
 			c.blockFull = true
 			return nil
 		}
+		// collator.cpp:4141-4146: the reference stops importing at the soft
+		// boundary and sets block_full_, so the rest of the collation behaves as
+		// if a limit axis had filled — the remaining generated messages are
+		// enqueued rather than delivered — and the block still publishes.
+		if c.internalMsgExpired() {
+			c.blockFull = true
+			c.stats.InternalMsgTimeouts++
+			return nil
+		}
 		if err = c.ctx.Err(); err != nil {
 			return err
 		}
@@ -130,7 +139,7 @@ func (c *collation) importInternal(msg *msgpool.InternalMessage, records []tlb.P
 	// replaying the block has to arrive at the same bound. The queue-entry lt
 	// feeds the shard-end-lt branch of the coverage check; the canonical lt
 	// bounds the processing order.
-	if err = c.advanceProcessedBound(msg.EnqueuedLT, hash); err != nil {
+	if err = c.advanceProcessedBound("imported", msg.EnqueuedLT, hash); err != nil {
 		return err
 	}
 	descr := tlb.ProcessedMsgDescr{
@@ -327,13 +336,45 @@ func (c *collation) dequeueOwn(msg *msgpool.InternalMessage) error {
 }
 
 // advanceProcessedBound enforces the strict (lt, hash) processing order of
-// inbound internal messages.
-func (c *collation) advanceProcessedBound(lt uint64, hash [32]byte) error {
+// inbound internal messages. source names the feed -- "imported" for a queue
+// entry, "generated" for a message this block delivers in-block -- because the
+// two carry different lt provenance and the field log otherwise cannot tell
+// which one raised the error.
+//
+// EXACTLY TWO CALL SITES, and that is parity, not an omission. The reference has
+// two calls to update_last_proc_int_msg and no more:
+//
+//	collator.cpp:3956  the inbound queue import     <-> imports.go importInternal
+//	collator.cpp:3668  process_one_new_message      <-> execute.go deliverImmediate
+//
+// The second is reached only AFTER the `if (enqueue || defer) { ... return; }`
+// exit at collator.cpp:3649-3663 and is additionally gated on `!is_special`. So
+// the reference does NOT advance the bound when a generated message is ENQUEUED
+// rather than delivered, and neither do we: enqueue() writes
+// tlb.EnqueuedMsg{EnqueuedLT: item.lt} with no bound advance, matching
+// enqueue_message's own `LogicalTime enqueued_lt = msg.lt;`
+// (collator.cpp:4743, stored at :4794-4795) which likewise never touches
+// last_proc_int_msg_. The defer branch takes the same early exit on both sides,
+// and specials are routed around deliverImmediate on purpose (master.go), which
+// is the `!is_special` gate.
+//
+// The reason it cannot diverge is structural rather than incidental: the bound
+// orders messages this block PROCESSES, and an enqueued message is not processed
+// by this block at all — it runs no transaction and is assigned no transaction
+// lt. Advancing the bound on an enqueue would therefore be a divergence, not a
+// fix: it would raise the floor for later transactions on the strength of work
+// this block never did. TestProcessedBoundHasExactlyTwoCallSites pins the count,
+// because the two-call-site structure IS the invariant and nothing else in the
+// package would notice a third.
+func (c *collation) advanceProcessedBound(source string, lt uint64, hash [32]byte) error {
 	if lt == 0 {
 		return fmt.Errorf("%w: processed internal message has zero lt", ErrInvalidInput)
 	}
 	if c.lastProcLT > lt || (c.lastProcLT == lt && bytes.Compare(c.lastProcHash[:], hash[:]) >= 0) {
-		return fmt.Errorf("%w: internal message processing order violated", ErrInvalidInput)
+		// The detail is parity with collator.cpp:3500-3501, which logs both
+		// pairs at ERROR before failing with this message.
+		return fmt.Errorf("%w: internal message processing order violated: %s message (%d, %x) after message (%d, %x)",
+			ErrInvalidInput, source, lt, hash, c.lastProcLT, c.lastProcHash)
 	}
 	c.lastProcLT = lt
 	c.lastProcHash = hash
@@ -407,6 +448,17 @@ func (c *collation) updateProcessedInfo() error {
 	dict, err := tlb.ProcessedUptoDict(records)
 	if err != nil {
 		return fmt.Errorf("serialize processed info: %w", err)
+	}
+	// The bound is retained for traceProcessedQueueValidationClosure, which has
+	// to replay the validator's inbound-queue scan against the very bound this
+	// block claims. It is recorded only when the dictionary actually moved,
+	// because that is the validator's own gate: verifyProcessedInfo compares the
+	// two ProcessedInfo dictionaries and returns before the source loop when
+	// they are equal, so a bound that compaction absorbed into an existing
+	// record starts no scan and needs no proof.
+	if !equalDictionary(c.processed, dict) {
+		c.processedClaim = semanticMessageBound{lt: boundLT, hash: boundHash}
+		c.processedClaimed = true
 	}
 	c.processed = dict
 	return nil

@@ -133,6 +133,28 @@ func (c *Config) PersistentOverlayMembers() []PersistentOverlayMember {
 	return c.persistentOverlayMembers
 }
 
+func validatorADNLIDs(validators []Validator) [][32]byte {
+	ids := make([][32]byte, len(validators))
+	for i := range validators {
+		ids[i] = ValidatorADNL(validators[i])
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return bytes.Compare(ids[i][:], ids[j][:]) < 0
+	})
+
+	if len(ids) == 0 {
+		return nil
+	}
+	unique := ids[:1]
+	for i := 1; i < len(ids); i++ {
+		if ids[i] != unique[len(unique)-1] {
+			unique = append(unique, ids[i])
+		}
+	}
+
+	return unique
+}
+
 type persistentOverlayIdentity struct {
 	keyID [32]byte
 	adnl  [32]byte

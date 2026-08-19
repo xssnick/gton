@@ -21,12 +21,49 @@ const (
 var _ validator.ValidatorStorage = (*ValidatorStore)(nil)
 var _ collator.CollatorStorage = (*CollatorStore)(nil)
 
+// durabilityClass is what a write needs from the disk before its callback fires.
+//
+// The zero value is the strict one, deliberately: a write that says nothing about
+// itself is fsynced. There is no way to end up in the relaxed class by omission,
+// only by naming it — and TestDurabilityClassificationIsExplicit enumerates every
+// site that names it, so adding one is a visible edit rather than a default.
+type durabilityClass uint8
+
+const (
+	// durableCommitment is a record whose purpose is to constrain this node's
+	// future behaviour: something it has signed, voted, notarized, finalized or
+	// authorized. Losing one across a restart does not cost a resync, it lets this
+	// node produce a CONFLICTING record — a safety violation. These are fsynced,
+	// and the caller waits for the fsync, which is the whole point.
+	durableCommitment durabilityClass = iota
+	// recoverablePayload is bulk content that a restart may lose without any
+	// change in what this node is allowed to do, because the network holds it:
+	// today, exactly the candidate wire. It commits with pebble.NoSync, so its
+	// callback fires once the write is in the write-ahead log rather than after the
+	// log has been fsynced.
+	//
+	// A failed commit stays FATAL. Only the wait goes away — see the store-error
+	// handling in commitRequests and simplex/types.go:392.
+	recoverablePayload
+)
+
+func (c durabilityClass) writeOptions() *pebble.WriteOptions {
+	if c == recoverablePayload {
+		return pebble.NoSync
+	}
+
+	return pebble.Sync
+}
+
 type writeRequest struct {
 	apply func(*pebble.Batch) error
 	done  func(error)
 	// sizeHint is the approximate encoded value size. Zero marks small or
 	// unknown writes, which remain bounded by maxWriteBatch.
 	sizeHint int
+	// durability is this write's class. Left unset it is durableCommitment, so
+	// nothing becomes unsynced by accident.
+	durability durabilityClass
 }
 
 type requestError struct {
@@ -110,10 +147,16 @@ func (s *Store) Validator() *ValidatorStore {
 // Collator returns the collator persistence view owned by this physical
 // database. Only the standalone collator gets a Store of its own; the
 // validator-local collator is this view of the consensus database, so its
-// candidate writes share one queue, one writer goroutine and one synced batch
-// with every consensus write. That single queue is also the group-commit
-// mechanism: small writes ride the fsync of a large one, so separating the two
-// workloads is not free and must be measured before it is done.
+// candidate writes share one queue and one writer goroutine with every consensus
+// write. That single queue is also the group-commit mechanism: small writes ride
+// one fsync, so separating the two workloads is not free and must be measured
+// before it is done.
+//
+// The collator's candidate record is a signed MARKER, not a payload — it fences a
+// window against a second, conflicting candidate — so it is a durableCommitment and
+// shares the fsync of whatever consensus writes it batches with. The one write in
+// this database that is not fsynced is the validator's candidate wire; see
+// ValidatorStore.SaveCandidate and durabilityClass.
 func (s *Store) Collator() *CollatorStore {
 	return s.collator
 }
@@ -321,7 +364,7 @@ func (s *Store) runWriter() {
 
 					break drain
 				}
-				if !writeBatchCanAppend(batchBytes, req) {
+				if !writeBatchCanAppend(batchBytes, first.durability, req) {
 					carried = req
 					hasCarried = true
 
@@ -338,10 +381,21 @@ func (s *Store) runWriter() {
 	}
 }
 
-// writeBatchCanAppend bounds one batch by bytes. The first request of a batch
-// is appended unconditionally by the caller, so an oversized single write still
-// goes through — the cap only stops it from being joined by others.
-func writeBatchCanAppend(batchBytes int, request writeRequest) bool {
+// writeBatchCanAppend bounds one batch by bytes and by durability class. The
+// first request of a batch is appended unconditionally by the caller, so an
+// oversized single write still goes through — the cap only stops it from being
+// joined by others.
+//
+// The class check is what partitions the two commits: one batch commits with one
+// pebble.WriteOptions, so a batch may not mix a commitment with a payload. A
+// request of the other class is carried to the next batch rather than dropped or
+// downgraded, which keeps coalescing intact WITHIN each class — the group-commit
+// property the single queue exists for, where small writes ride one fsync.
+func writeBatchCanAppend(batchBytes int, class durabilityClass, request writeRequest) bool {
+	if request.durability != class {
+		return false
+	}
+
 	return batchBytes < maxWriteBatchBytes && request.sizeHint <= maxWriteBatchBytes-batchBytes
 }
 
@@ -367,8 +421,11 @@ func (s *Store) commitRequests(requests []writeRequest) {
 		break
 	}
 
+	// One batch, one durability class: writeBatchCanAppend refuses to mix them, so
+	// the first request's class is the batch's. A failed commit is fatal in either
+	// class — with NoSync only the WAIT is relaxed, never the error handling below.
 	if fatalErr == nil && !batch.Empty() {
-		fatalErr = batch.Commit(pebble.Sync)
+		fatalErr = batch.Commit(requests[0].durability.writeOptions())
 	}
 	closeErr := batch.Close()
 	if fatalErr == nil {

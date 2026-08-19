@@ -17,6 +17,7 @@ type MaintenanceStorage interface {
 
 type PersistentStateSerializationStorage interface {
 	DeletePersistentStateFile(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) error
+	PrunePersistentStateFilesToLimit(ctx context.Context, throughMasterSeqno uint32, keepRecentGroups int) (PersistentStatePruneStats, error)
 	PersistentStateSerializerState(ctx context.Context) (*PersistentStateSerializerState, error)
 	SavePersistentStateSerializerState(ctx context.Context, state *PersistentStateSerializerState) error
 	ActivePersistentStateSerialization(ctx context.Context) (*PersistentStateSerializerActive, error)

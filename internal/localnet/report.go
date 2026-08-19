@@ -178,6 +178,8 @@ func evaluateTopology(events []Event, nodes []NodeConfig) TopologyCoverage {
 	validators := make(map[string]struct{})
 	cppCandidates := make(map[string]struct{})
 	goValidated := make(map[string]struct{})
+	cppBlocks := make(map[string]struct{})
+	goValidatedBlocks := make(map[string]struct{})
 	var combined TopologyCoverage
 	for _, event := range events {
 		state := states[event.Node]
@@ -201,6 +203,16 @@ func evaluateTopology(events []Event, nodes []NodeConfig) TopologyCoverage {
 			}
 			if kind == "go" && event.Kind == "block_validated" {
 				goValidated[event.CandidateHash] = struct{}{}
+			}
+		}
+		blockID := eventBlockID(event)
+		if blockID != "" {
+			kind := nodeKind(nodes, event.Node)
+			if kind == "cpp" && event.Kind == "block_collated" {
+				cppBlocks[blockID] = struct{}{}
+			}
+			if kind == "go" && event.Kind == "block_validated" {
+				goValidatedBlocks[blockID] = struct{}{}
 			}
 		}
 	}
@@ -240,11 +252,26 @@ func evaluateTopology(events []Event, nodes []NodeConfig) TopologyCoverage {
 			break
 		}
 	}
+	if !combined.CppToGoValidated {
+		for blockID := range cppBlocks {
+			if _, exists := goValidatedBlocks[blockID]; exists {
+				combined.CppToGoValidated = true
+				break
+			}
+		}
+	}
 	topologyComplete := combined.LinearProof && combined.Split && combined.ChildrenProduced &&
 		combined.Rotation && combined.Merge && combined.AfterMergeProduced && combined.ReturnedToLinear
 	parityComplete := combined.RequiredNodeCoverage && combined.CppToGoValidated
 	combined.Complete = topologyComplete && parityComplete
 	return combined
+}
+
+func eventBlockID(event Event) string {
+	if event.BlockRootHash == "" || event.BlockFileHash == "" {
+		return ""
+	}
+	return event.BlockRootHash + ":" + event.BlockFileHash
 }
 
 func nodeKind(nodes []NodeConfig, name string) string {

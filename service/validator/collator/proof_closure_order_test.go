@@ -52,6 +52,7 @@ func TestValidationClosureReplaysEveryPart(t *testing.T) {
 		"traceAccountValidationClosure",
 		"traceOutQueueValidationClosure",
 		"traceImmediateQueueValidationClosure",
+		"traceProcessedQueueValidationClosure",
 		"traceDispatchQueueValidationClosure",
 	}
 	if got := methodCallOrder(t, "proof_closure.go", "traceValidationClosure", "c"); !slices.Equal(got, want) {

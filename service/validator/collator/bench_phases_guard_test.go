@@ -98,7 +98,9 @@ func functionCallOrder(tb testing.TB, file, fn string) []string {
 func forEachCall(tb testing.TB, file, fn string, visit func(*ast.CallExpr)) {
 	tb.Helper()
 
-	parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, 0)
+	// Anchored to the package directory, not the process cwd; see
+	// packageSourceFile.
+	parsed, err := parser.ParseFile(token.NewFileSet(), packageSourceFile(tb, file), nil, 0)
 	if err != nil {
 		tb.Fatalf("parse %s: %v", file, err)
 	}

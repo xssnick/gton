@@ -33,7 +33,7 @@ func TestVerifyMasterShardTransitionAcceptsPreV13EqualShardTime(t *testing.T) {
 	); err == nil {
 		t.Fatal("pre-v13 collator accepted a shard top generated at the masterchain block time")
 	}
-	state, err := loadMasterCandidateState(&config, &previous, &verified)
+	state, err := loadMasterCandidateState(&config, &previous, &verified, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

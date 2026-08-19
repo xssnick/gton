@@ -115,6 +115,12 @@ type semanticReplay struct {
 	accountBlocks    *tlb.ShardAccountBlocksAugDict
 	replayedAccounts *tlb.ShardAccountsAugDict
 
+	// accountBlockIndex is the structural pass's decode of every AccountBlock.
+	// It is frozen when that pass returns, so the precheck may read it from its
+	// own goroutine while the queue preparation runs, and the lanes may read it
+	// from GOMAXPROCS goroutines at once. Nothing in this replay writes it.
+	accountBlockIndex *accountBlockIndex
+
 	// precheckedAccounts holds the predecessor ShardAccounts precheckAccountUpdates
 	// already decoded out of the structural diff, so the replay does not descend
 	// the shard's whole account trie a second time for the same key. It is built
@@ -137,7 +143,11 @@ type semanticReplay struct {
 	parsedOutOrder    []cell.Hash
 	messageProcessing []semanticMessageProcessing
 
-	specialAccounts map[[32]byte]struct{}
+	// specials is the epoch's masterchain special-account identities, shared with
+	// Config.specials and with every other replay of the same config epoch. It is
+	// read-only: a write here would be a write into the shared epoch data. It
+	// stays zero on the shard path, where membership answers false.
+	specials        masterSpecials
 	blackholeBurned tlb.CurrencyCollection
 	normalGasUsed   uint64
 	specialGasUsed  uint64
@@ -187,14 +197,15 @@ func newSemanticReplay(
 	}
 
 	replay := &semanticReplay{
-		ctx:           ctx,
-		verifier:      verifier,
-		transition:    transition,
-		candidate:     candidate,
-		previous:      prepared.previous,
-		inMessages:    inMessages,
-		outMessages:   outMessages,
-		accountBlocks: candidate.accountBlocks,
+		ctx:               ctx,
+		verifier:          verifier,
+		transition:        transition,
+		candidate:         candidate,
+		previous:          prepared.previous,
+		inMessages:        inMessages,
+		outMessages:       outMessages,
+		accountBlocks:     candidate.accountBlocks,
+		accountBlockIndex: candidate.accountBlockIndex,
 		replayedAccounts: &tlb.ShardAccountsAugDict{
 			AugmentedDictionary: prepared.previous.Accounts.ShardAccounts.Copy(),
 		},
@@ -218,57 +229,31 @@ func newSemanticReplay(
 	return replay, nil
 }
 
+// prepareGasAccounting binds the epoch gas allowance and, on the masterchain,
+// the special-account set to this replay. Both are pure functions of the
+// configuration root and are derived once per config epoch by PrepareConfig; all
+// that is left here is choosing the chain and surfacing a carried rejection at
+// the site that used to raise it.
 func (r *semanticReplay) prepareGasAccounting() error {
 	masterchain := !r.candidate.block.BlockInfo.NotMaster
-	raw := tlb.BlockchainConfig{Root: r.transition.Config.execution.Root()}
-	prices, err := raw.GetGasPrices(masterchain)
-	if err != nil {
-		return fmt.Errorf("%w: load semantic gas prices: %v", ErrInvalidInput, err)
-	}
+	config := r.transition.Config
 
-	limits := r.transition.Config.basechain.limits
+	gas := config.gas[0]
 	if masterchain {
-		limits = r.transition.Config.masterchain.limits
+		gas = config.gas[1]
 	}
-	r.normalGasLimit, err = semanticGasLimit(limits.gas[3], prices.GasLimit)
-	if err != nil {
-		return err
+	if gas.err != nil {
+		return gas.err
 	}
-	r.specialGasLimit, err = semanticGasLimit(limits.gas[3], prices.SpecialGasLimit)
-	if err != nil {
-		return err
-	}
+	r.normalGasLimit = gas.normal
+	r.specialGasLimit = gas.special
 	if !masterchain {
 		return nil
 	}
-
-	r.specialAccounts = make(map[[32]byte]struct{})
-	fundamental, err := raw.GetFundamentalSmartContractAddresses()
-	if err != nil || fundamental.Addresses == nil || fundamental.Addresses.GetKeySize() != 256 {
-		return fmt.Errorf("%w: load fundamental smart contracts for gas accounting: %v", ErrInvalidInput, err)
+	if config.specials.err != nil {
+		return config.specials.err
 	}
-	items, err := fundamental.Addresses.LoadAll()
-	if err != nil {
-		return fmt.Errorf("%w: load fundamental smart contracts for gas accounting: %v", ErrInvalidInput, err)
-	}
-	for i := range items {
-		key, loadErr := items[i].Key.LoadSlice(256)
-		if loadErr != nil || items[i].Key.BitsLeft() != 0 ||
-			items[i].Value.BitsLeft() != 0 || items[i].Value.RefsNum() != 0 {
-			return fmt.Errorf("%w: fundamental smart contract entry %d is malformed", ErrInvalidInput, i)
-		}
-		var account [32]byte
-		copy(account[:], key)
-		r.specialAccounts[account] = struct{}{}
-	}
-
-	configAddress, err := raw.GetConfigAddress()
-	if err != nil || len(configAddress) != 32 {
-		return fmt.Errorf("%w: config smart contract address is malformed", ErrInvalidInput)
-	}
-	var account [32]byte
-	copy(account[:], configAddress)
-	r.specialAccounts[account] = struct{}{}
+	r.specials = config.specials
 
 	return nil
 }
@@ -306,6 +291,47 @@ func (r *semanticReplay) loadMasterSpecialTransactions() error {
 	return nil
 }
 
+// masterPredecessorStats and masterPredecessorInfo return the predecessor
+// statistics and block info of a masterchain candidate. The structural verifier
+// decodes both before it hands the transition over, and re-deriving the info
+// means opening the creator statistics tail again — so its values are reused
+// when present, exactly as precheckedAccount reuses the account updates that
+// pass already walked.
+//
+// They stay separate because their consumers are: the execution context needs
+// both, while the public library check needs only the statistics and must keep
+// working on a predecessor that carries no McStateExtra at all.
+//
+// The fallback is real: a caller that supplies a CandidateTransition without a
+// prepared structural pass still gets a correct, if slower, decode.
+func (r *semanticReplay) masterPredecessorStats() (*tlb.ShardStateStats, error) {
+	if prepared := r.transition.prepared; prepared != nil && prepared.previousStats != nil {
+		return prepared.previousStats, nil
+	}
+
+	var stats tlb.ShardStateStats
+	if err := parseExact(&stats, r.previous.Stats); err != nil {
+		return nil, fmt.Errorf("%w: decode previous masterchain statistics for replay: %v", ErrInvalidInput, err)
+	}
+	return &stats, nil
+}
+
+func (r *semanticReplay) masterPredecessorInfo() (*tlb.McStateExtraBlockInfo, error) {
+	if prepared := r.transition.prepared; prepared != nil && prepared.previousInfo != nil {
+		return prepared.previousInfo, nil
+	}
+
+	var extra tlb.McStateExtra
+	if err := parseExact(&extra, r.previous.McStateExtra); err != nil {
+		return nil, fmt.Errorf("%w: decode previous masterchain extra for replay: %v", ErrInvalidInput, err)
+	}
+	info, err := parseMasterStateInfo(extra.Info)
+	if err != nil {
+		return nil, fmt.Errorf("%w: decode previous masterchain history for replay: %v", ErrInvalidInput, err)
+	}
+	return &info, nil
+}
+
 func (r *semanticReplay) newBlockContext() (*tvm.BlockContext, error) {
 	header := &r.candidate.block.BlockInfo
 	options := tvm.BlockOptions{
@@ -321,21 +347,17 @@ func (r *semanticReplay) newBlockContext() (*tvm.BlockContext, error) {
 		options.PrevBlocks = r.transition.Masterchain.PrevBlocks
 		options.Libraries = r.transition.Masterchain.Libraries
 	} else {
-		var stats tlb.ShardStateStats
-		if err := parseExact(&stats, r.previous.Stats); err != nil {
-			return nil, fmt.Errorf("%w: decode previous masterchain statistics for replay: %v", ErrInvalidInput, err)
-		}
-		var extra tlb.McStateExtra
-		if err := parseExact(&extra, r.previous.McStateExtra); err != nil {
-			return nil, fmt.Errorf("%w: decode previous masterchain extra for replay: %v", ErrInvalidInput, err)
-		}
-		info, err := parseMasterStateInfo(extra.Info)
+		stats, err := r.masterPredecessorStats()
 		if err != nil {
-			return nil, fmt.Errorf("%w: decode previous masterchain history for replay: %v", ErrInvalidInput, err)
+			return nil, err
+		}
+		info, err := r.masterPredecessorInfo()
+		if err != nil {
+			return nil, err
 		}
 		options.PrevBlocks, err = masterPrevBlocksTuple(
 			r.transition.Previous.ID,
-			&info,
+			info,
 			r.transition.Config.globalVersion,
 		)
 		if err != nil {
@@ -360,8 +382,14 @@ func (r *semanticReplay) newBlockContext() (*tvm.BlockContext, error) {
 // the replay itself stays read-only while lanes run and every cross-account
 // effect is applied by a single goroutine in ascending account-key order.
 type semanticAccountLane struct {
-	key   [32]byte
-	block tlb.AccountBlock
+	key [32]byte
+	// entry is the structural pass's decode of this account's block, shared and
+	// immutable. Lane i owns lanes[i] and reads entries[i]; two lanes never hold
+	// the same entry, so the AccountTransactionsAugDict inside it is read by one
+	// goroutine — and even if it were not, aug-dict iteration allocates its own
+	// cursor and mutates nothing, over cells whose hashes the BOC parse already
+	// computed.
+	entry *accountBlockEntry
 	err   error
 
 	result  *semanticAccountResult
@@ -412,15 +440,24 @@ func (r *semanticReplay) precheckAccountUpdates() error {
 			return fmt.Errorf("%w: changed account key is malformed", ErrInvalidInput)
 		}
 
-		blockValue, err := r.accountBlocks.LoadValue(keyCell)
-		if err != nil {
-			return fmt.Errorf("%w: changed account %x has no AccountBlock: %v", ErrInvalidInput, key, err)
+		// The structural pass had to decode every entry to reach its transaction
+		// augmentation, so this is a binary search over what it recorded rather
+		// than a second decode. The keyed descent below runs only when the index
+		// cannot answer: a replay assembled without the structural pass, a trie
+		// whose walk was not strictly ascending, or an account the candidate
+		// changed without supplying an AccountBlock — which is the failure the
+		// message names, reported by the same LoadValue that reported it before.
+		entry, indexed := r.accountBlockIndex.find(key)
+		if !indexed {
+			var loadErr error
+			if entry, loadErr = r.loadChangedAccountBlock(keyCell); loadErr != nil {
+				return fmt.Errorf("%w: changed account %x has no AccountBlock: %v", ErrInvalidInput, key, loadErr)
+			}
 		}
-		var accountBlock tlb.AccountBlock
-		if err = loadExactSlice(&accountBlock, blockValue); err != nil {
-			return fmt.Errorf("%w: decode AccountBlock for changed account %x: %v", ErrInvalidInput, key, err)
+		if entry.exactErr != nil {
+			return fmt.Errorf("%w: decode AccountBlock for changed account %x: %v", ErrInvalidInput, key, entry.exactErr)
 		}
-		if !bytes.Equal(accountBlock.Addr, key[:]) {
+		if !bytes.Equal(entry.block.Addr, key[:]) {
 			return fmt.Errorf("%w: AccountBlock address differs from changed account %x", ErrInvalidInput, key)
 		}
 
@@ -444,10 +481,10 @@ func (r *semanticReplay) precheckAccountUpdates() error {
 			}
 		}
 
-		var accountUpdate tlb.HashUpdate
-		if err = parseExact(&accountUpdate, accountBlock.StateUpdate); err != nil {
-			return fmt.Errorf("%w: decode AccountBlock state update %x: %v", ErrInvalidInput, key, err)
+		if entry.updateErr != nil {
+			return fmt.Errorf("%w: decode AccountBlock state update %x: %v", ErrInvalidInput, key, entry.updateErr)
 		}
+		accountUpdate := &entry.update
 		if !bytes.Equal(accountUpdate.OldHash, oldAccount.Account.Hash()) {
 			return fmt.Errorf("%w: AccountBlock %x old hash differs from predecessor state", ErrInvalidInput, key)
 		}
@@ -468,6 +505,24 @@ func (r *semanticReplay) precheckAccountUpdates() error {
 	}
 
 	return nil
+}
+
+// loadChangedAccountBlock is the keyed descent precheckAccountUpdates made
+// before the structural pass started keeping its decode. It is reached only when
+// the index cannot serve a key, and it fills the same two deferred verdicts the
+// index carries so the caller reports them from one place. Both are recorded
+// rather than raised here: exactErr is reported before the address match and
+// updateErr after it, which is the order the two rejections had.
+func (r *semanticReplay) loadChangedAccountBlock(keyCell *cell.Cell) (*accountBlockEntry, error) {
+	blockValue, err := r.accountBlocks.LoadValue(keyCell)
+	if err != nil {
+		return nil, err
+	}
+	entry := &accountBlockEntry{}
+	entry.exactErr = loadExactSlice(&entry.block, blockValue)
+	entry.updateErr = parseExact(&entry.update, entry.block.StateUpdate)
+
+	return entry, nil
 }
 
 func semanticDiffAccount(valueExtra *cell.Slice) (*tlb.ShardAccount, error) {
@@ -511,49 +566,64 @@ func (r *semanticReplay) verifyAccounts() error {
 	return nil
 }
 
-// decodeAccountLanes walks the account-block dictionary once. A malformed entry
-// is recorded on its own lane and stops the walk rather than returning: keys
-// ascend, so the sequential replay would never have reached a later account
-// either, and deferring the error keeps it ranked by account key like any
-// replay failure.
+// decodeAccountLanes projects the structural pass's account-block index onto one
+// lane per entry. The projection is positional — lane i is entry i is the i-th
+// ascending account key — which is what makes mergeAccountLanes' "lowest key
+// wins" ranking mechanical rather than re-derived. A malformed entry is recorded
+// on its own lane and stops the projection rather than returning: keys ascend,
+// so the sequential replay would never have reached a later account either, and
+// deferring the error keeps it ranked by account key like any replay failure.
 func (r *semanticReplay) decodeAccountLanes() ([]semanticAccountLane, error) {
-	iterator, err := r.accountBlocks.IteratorExtra(false, false)
-	if err != nil {
-		return nil, fmt.Errorf("%w: iterate semantic account blocks: %v", ErrInvalidInput, err)
+	index := r.accountBlockIndex
+	if index == nil {
+		// Only a replay assembled without the structural verifier reaches this;
+		// the production constructor sets accountBlocks and accountBlockIndex
+		// from one verifyBlockDictionaries result, and a nil accountBlocks is
+		// already rejected above it. Rebuilding rather than failing keeps a
+		// hand-built replay's verdict the one it had — which is why the rebuild
+		// defers the structural verdicts instead of raising them: raising would
+		// replace a lane failure ranked by account key with an unranked
+		// structural rejection in different words.
+		var err error
+		if index, err = buildAccountBlockIndexDeferred(r.accountBlocks); err != nil {
+			return nil, fmt.Errorf("%w: iterate semantic account blocks: %v", ErrInvalidInput, err)
+		}
 	}
-	var lanes []semanticAccountLane
-	seen := make(map[[32]byte]struct{})
-	for iterator.Next() {
-		if err = r.ctx.Err(); err != nil {
+	// The duplicate check needs a set only when the walk was not proven strictly
+	// ascending: a strictly ascending sequence is pairwise distinct, so for a
+	// keyed index the set answers "no duplicate" for every entry and building it
+	// is N insertions for a constant.
+	var seen map[[32]byte]struct{}
+	if !index.keyed {
+		seen = make(map[[32]byte]struct{}, len(index.entries))
+	}
+	lanes := make([]semanticAccountLane, 0, len(index.entries))
+	for i := range index.entries {
+		if err := r.ctx.Err(); err != nil {
 			return nil, err
 		}
-		item := iterator.View()
-		keyBytes, keyErr := item.Key.LoadSlice(256)
-		if keyErr != nil || item.Key.BitsLeft() != 0 || item.Key.RefsNum() != 0 {
+		entry := &index.entries[i]
+		if entry.keyMalformed {
 			return nil, fmt.Errorf("%w: semantic account block key is malformed", ErrInvalidInput)
 		}
-		var lane semanticAccountLane
-		copy(lane.key[:], keyBytes)
-
-		value := item.Value
+		lane := semanticAccountLane{key: entry.key, entry: entry}
 		switch {
-		case loadExactSlice(&lane.block, &value) != nil:
+		case entry.decodeErr != nil, entry.exactErr != nil:
 			lane.err = fmt.Errorf("%w: decode semantic account block %x", ErrInvalidInput, lane.key)
-		case !bytes.Equal(lane.block.Addr, lane.key[:]):
+		case !bytes.Equal(entry.block.Addr, lane.key[:]):
 			lane.err = fmt.Errorf("%w: semantic account block %x address differs from its key", ErrInvalidInput, lane.key)
 		default:
 			if _, duplicate := seen[lane.key]; duplicate {
 				lane.err = fmt.Errorf("%w: duplicate semantic account block %x", ErrInvalidInput, lane.key)
 			}
 		}
-		seen[lane.key] = struct{}{}
+		if seen != nil {
+			seen[lane.key] = struct{}{}
+		}
 		lanes = append(lanes, lane)
 		if lane.err != nil {
 			return lanes, nil
 		}
-	}
-	if err = iterator.Err(); err != nil {
-		return nil, fmt.Errorf("%w: iterate semantic account blocks: %v", ErrInvalidInput, err)
 	}
 
 	return lanes, nil
@@ -563,7 +633,7 @@ func (r *semanticReplay) decodeAccountLanes() ([]semanticAccountLane, error) {
 // strictly larger index than the first failure, which the sequential replay
 // would not have reached either.
 func (r *semanticReplay) replayAccountLanes(lanes []semanticAccountLane) {
-	workers := min(runtime.GOMAXPROCS(0), len(lanes))
+	workers := min(8, runtime.GOMAXPROCS(0), len(lanes))
 	if workers < 2 {
 		for i := range lanes {
 			if lanes[i].err != nil {
@@ -692,7 +762,15 @@ func addAggregateGas(counter *uint64, used, limit uint64) error {
 // replayAccount replays one account block. It reads only inputs that are final
 // before the lanes start and writes exclusively through lane.
 func (r *semanticReplay) replayAccount(lane *semanticAccountLane) error {
-	key, block := lane.key, &lane.block
+	// Not a candidate check: decodeAccountLanes sets entry on every lane it
+	// produces, and nothing else feeds this. It is here because a nil dereference
+	// on the validation path takes the node down, and a rejected candidate does
+	// not.
+	if lane.entry == nil {
+		return fmt.Errorf("%w: semantic account lane %x carries no account block", ErrInvalidInput, lane.key)
+	}
+	key, entry := lane.key, lane.entry
+	block := &entry.block
 	header := &r.candidate.block.BlockInfo
 	owner := msgpool.ShardIdent{
 		Workchain: header.Shard.WorkchainID,
@@ -723,10 +801,12 @@ func (r *semanticReplay) replayAccount(lane *semanticAccountLane) error {
 		return fmt.Errorf("%w: account %x has a predecessor transaction at or after block start", ErrInvalidInput, key)
 	}
 
-	var accountUpdate tlb.HashUpdate
-	if err = parseExact(&accountUpdate, block.StateUpdate); err != nil {
-		return fmt.Errorf("%w: decode account block state update %x: %v", ErrInvalidInput, key, err)
+	// The structural pass parsed this same cell; the verdict is re-worded here
+	// because that is the message this rejection has always carried.
+	if entry.updateErr != nil {
+		return fmt.Errorf("%w: decode account block state update %x: %v", ErrInvalidInput, key, entry.updateErr)
 	}
+	accountUpdate := &entry.update
 	if !bytes.Equal(accountUpdate.OldHash, original.Account.Hash()) {
 		return fmt.Errorf("%w: account block %x old hash differs from predecessor state", ErrInvalidInput, key)
 	}
@@ -889,7 +969,7 @@ func (r *semanticReplay) recordTransactionGas(
 	if _, special := r.specialTxs[transactionRoot.HashKey()]; special {
 		return nil
 	}
-	_, specialAccount := r.specialAccounts[account]
+	_, specialAccount := r.specials.set[account]
 	if !specialAccount && semanticGasLimitOverridden(
 		r.candidate.block.BlockInfo.Shard.WorkchainID,
 		account,

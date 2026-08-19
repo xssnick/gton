@@ -132,6 +132,7 @@ type testBlockPublisher struct {
 	mu                    sync.Mutex
 	accepted              []p2p.AcceptedBlockPublication
 	candidates            []p2p.BlockCandidatePublication
+	cachedCandidates      []p2p.TrustedBlockCandidate
 	producerRegistrations int
 	activeProducers       int
 }
@@ -146,6 +147,13 @@ func (p *testBlockPublisher) TryPublishAccepted(publication p2p.AcceptedBlockPub
 func (p *testBlockPublisher) TryRelayCandidate(publication p2p.BlockCandidatePublication) bool {
 	p.mu.Lock()
 	p.candidates = append(p.candidates, publication)
+	p.mu.Unlock()
+	return true
+}
+
+func (p *testBlockPublisher) TryCacheCandidate(candidate p2p.TrustedBlockCandidate) bool {
+	p.mu.Lock()
+	p.cachedCandidates = append(p.cachedCandidates, candidate)
 	p.mu.Unlock()
 	return true
 }
@@ -174,12 +182,14 @@ func (l *testProducerLease) Close() error {
 }
 
 type testSessionReceiver struct {
-	mu         sync.Mutex
-	messages   int
-	prechecks  int
-	candidates int
-	serves     int
-	serve      func(validator.CandidateRequest) (validator.CandidateResponse, error)
+	mu          sync.Mutex
+	messages    int
+	prechecks   int
+	candidates  int
+	serves      int
+	precheckErr error
+	receiveErr  error
+	serve       func(validator.CandidateRequest) (validator.CandidateResponse, error)
 }
 
 func (r *testSessionReceiver) ReceiveConsensusMessage(simplex.PeerID, int, []byte) {
@@ -191,17 +201,23 @@ func (r *testSessionReceiver) ReceiveConsensusMessage(simplex.PeerID, int, []byt
 func (r *testSessionReceiver) PrecheckCandidateBroadcast(uint32, [32]byte, bool) error {
 	r.mu.Lock()
 	r.prechecks++
+	err := r.precheckErr
 	r.mu.Unlock()
-	return nil
+	return err
 }
 
 func (r *testSessionReceiver) ReceiveCandidate(
 	context.Context,
+	uint32,
 	[]byte,
 ) (validator.CandidateArtifact, error) {
 	r.mu.Lock()
 	r.candidates++
+	err := r.receiveErr
 	r.mu.Unlock()
+	if err != nil {
+		return validator.CandidateArtifact{}, err
+	}
 	return validator.CandidateArtifact{Candidate: simplex.Candidate{Empty: true}}, nil
 }
 
@@ -227,13 +243,17 @@ type testRelayingReceiver struct {
 }
 
 func (r *testRelayingReceiver) ReceiveCandidate(
-	context.Context,
-	[]byte,
+	_ context.Context,
+	expectedSlot uint32,
+	_ []byte,
 ) (validator.CandidateArtifact, error) {
 	r.mu.Lock()
 	r.candidates++
 	r.mu.Unlock()
-	return validator.CandidateArtifact{BlockBOC: []byte{7}}, nil
+	return validator.CandidateArtifact{
+		Candidate: simplex.Candidate{ID: simplex.CandidateID{Slot: expectedSlot}},
+		BlockBOC:  []byte{7},
+	}, nil
 }
 
 type testOverlaySigner struct {
@@ -248,151 +268,172 @@ func (s testOverlaySigner) Sign(payload []byte) ([]byte, error) {
 	return ed25519.Sign(s.key, payload), nil
 }
 
-func TestSharedSessionMultiplexesConsumersAndRetiresByRole(t *testing.T) {
-	manager, opener, validatorSpec, observerSpec := testSharedManager(t)
+func TestSessionRejectsSecondLocalRole(t *testing.T) {
+	manager, opener, validatorSpec, observerSpec := testSessionManager(t)
 	validatorEndpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	observerEndpoint, err := manager.prepare(context.Background(), observerSpec)
+	standalone, err := manager.prepare(context.Background(), observerSpec)
+	if !errors.Is(err, ErrSessionConflict) || standalone != nil {
+		t.Fatalf("second role prepare = (%T, %v), want nil conflict", standalone, err)
+	}
+	if len(manager.sessions) != 1 ||
+		manager.sessions[validatorSpec.id].endpoint(sessionKindValidator) != validatorEndpoint ||
+		manager.sessions[validatorSpec.id].endpoint(sessionKindObserver) != nil {
+		t.Fatal("second role changed the existing session")
+	}
+	if len(opener.overlays) != 1 || opener.overlays[0].closed != 0 {
+		t.Fatalf("second role changed physical overlays: opens=%d closes=%d", len(opener.overlays), opener.overlays[0].closed)
+	}
+}
+
+func TestProtocolOneRoutesConsensusAndCandidatesToSeparateOverlays(t *testing.T) {
+	manager, opener, validatorSpec, _ := testProtocolV1SharedManager(t)
+	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if validatorEndpoint == observerEndpoint {
-		t.Fatal("shared hub returned one lifecycle endpoint for both consumers")
+	if len(opener.overlays) != 2 {
+		t.Fatalf("protocol 1 opened %d overlays, want consensus and block-sync", len(opener.overlays))
 	}
-	if len(manager.sessions) != 1 || len(opener.overlays) != 2 || opener.overlays[0].closed != 1 {
-		t.Fatalf("shared open state = sessions %d overlays %d first closes %d", len(manager.sessions), len(opener.overlays), opener.overlays[0].closed)
+	consensus := opener.overlays[0]
+	blockSync := opener.overlays[1]
+	if consensus.callbacks.Message == nil || consensus.callbacks.Query == nil ||
+		consensus.callbacks.BroadcastPrecheck == nil {
+		t.Fatal("consensus overlay callbacks are incomplete")
 	}
+	if blockSync.callbacks.Message != nil || blockSync.callbacks.Query != nil ||
+		blockSync.callbacks.BroadcastPrecheck == nil {
+		t.Fatal("block-sync overlay installed consensus callbacks")
+	}
+	receiver := &testSessionReceiver{}
+	startTestEndpoint(t, endpoint, receiver)
 
-	validatorReceiver := &testSessionReceiver{serve: func(validator.CandidateRequest) (validator.CandidateResponse, error) {
-		return validator.CandidateResponse{}, validator.ErrCandidateUnavailable
-	}}
-	observerReceiver := &testSessionReceiver{}
-	startTestEndpoint(t, validatorEndpoint, validatorReceiver)
-	startTestEndpoint(t, observerEndpoint, observerReceiver)
-
-	callbacks := opener.latest().callbacks
-	callbacks.Message(context.Background(), p2p.PeerID{0x91}, tl.Raw{1, 2, 3, 4})
-	extra, err := (&simplex.BroadcastExtra{Slot: 7}).Serialize()
+	extra, err := (&simplex.BroadcastExtra{Slot: 0}).Serialize()
 	if err != nil {
 		t.Fatal(err)
 	}
 	source := firstMapKey(validatorSpec.validatorSource)
 	sourceADNL := validatorSpec.candidateADNL[source]
-	if err = callbacks.BroadcastPrecheck(context.Background(), p2p.PrivateOverlayBroadcastPrecheck{
-		Source: source, SourceADNL: sourceADNL[:], ID: [32]byte{3}, Extra: extra,
+	precheck := p2p.PrivateOverlayBroadcastPrecheck{
+		Source: source, SourceADNL: sourceADNL[:], ID: [32]byte{1}, Extra: extra,
 		Delivery: p2p.DeliveryTwoStep, SignatureChecked: true,
-	}); err != nil {
-		t.Fatal(err)
 	}
-	if disposition := callbacks.Broadcast(context.Background(), p2p.PrivateOverlayBroadcast{
-		Source: source, SourceADNL: sourceADNL[:], Payload: []byte{9}, Extra: extra,
-		Delivery: p2p.DeliveryTwoStep,
-	}); disposition != p2p.PrivateOverlayBroadcastAcceptAndRelay {
-		t.Fatalf("candidate disposition = %d", disposition)
+	if err = consensus.callbacks.BroadcastPrecheck(context.Background(), precheck); !errors.Is(err, ErrUnsupportedBroadcastMode) {
+		t.Fatalf("consensus candidate precheck = %v, want explicit protocol rejection", err)
+	}
+	if err = blockSync.callbacks.BroadcastPrecheck(context.Background(), precheck); err != nil {
+		t.Fatal(err)
 	}
 
-	request := validator.CandidateRequest{
-		SessionID: validatorSpec.id, ID: simplex.CandidateID{Slot: 8},
-		WantCandidate: true, MaximumReplyBytes: validatorSpec.maxReplyBytes,
-	}
-	requestWire, err := EncodeCandidateRequest(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	answer, err := callbacks.Query(context.Background(), p2p.PeerID{4}, tl.Raw(requestWire))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if IsRequestError(answer.(tl.Raw)) {
-		t.Fatal("observer fallback returned requestError")
-	}
-
-	assertReceiverCounts(t, validatorReceiver, 1, 1, 1, 1)
-	assertReceiverCounts(t, observerReceiver, 1, 1, 1, 1)
-	if err = manager.RetireValidatorSession(context.Background(), validatorSpec.id); err != nil {
-		t.Fatal(err)
-	}
-	if len(manager.sessions) != 1 || manager.sessions[validatorSpec.id].endpoint(sessionKindObserver) == nil {
-		t.Fatal("retiring validator closed the shared observer hub")
-	}
-	opener.latest().callbacks.Message(context.Background(), p2p.PeerID{5}, tl.Raw{1, 2, 3, 4})
-	assertReceiverCounts(t, validatorReceiver, 1, 1, 1, 1)
-	assertReceiverCounts(t, observerReceiver, 2, 1, 1, 1)
-	if err = manager.RetireSession(context.Background(), validatorSpec.id); err != nil {
-		t.Fatal(err)
-	}
-	if len(manager.sessions) != 0 || opener.latest().closed != 1 {
-		t.Fatal("last consumer did not close and remove the shared hub")
-	}
-}
-
-func TestSharedSessionUsesPerConsumerCandidateSigner(t *testing.T) {
-	manager, opener, validatorSpec, observerSpec := testSharedManager(t)
-	validatorEndpoint, err := manager.prepare(context.Background(), validatorSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	observerEndpoint, err := manager.prepare(context.Background(), observerSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	startTestEndpoint(t, validatorEndpoint, &testSessionReceiver{})
-	startTestEndpoint(t, observerEndpoint, &testSessionReceiver{})
-
-	legacyExtra, err := (&simplex.BroadcastExtra{Slot: 1}).Serialize()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = validatorEndpoint.BroadcastCandidate(context.Background(), simplex.CandidateBroadcast{
-		Data: []byte{1}, Extra: legacyExtra,
+	if err = endpoint.BroadcastCandidate(context.Background(), simplex.CandidateBroadcast{
+		Data: []byte{1}, Extra: extra,
 	}, validator.CandidateArtifact{Candidate: simplex.Candidate{Empty: true}}); err != nil {
 		t.Fatal(err)
 	}
-	handle := opener.latest()
 	waitForCondition(t, func() bool {
-		broadcasts, _ := handle.broadcastSnapshot()
+		broadcasts, _ := blockSync.broadcastSnapshot()
 		return broadcasts == 1
 	})
-	_, signer := handle.broadcastSnapshot()
-	if signer == nil || signer.PublicKey()[0] != validatorSpec.signer.PublicKey()[0] {
-		t.Fatal("validator candidate did not use the session validator signer")
+	if broadcasts, _ := consensus.broadcastSnapshot(); broadcasts != 0 {
+		t.Fatal("protocol 1 candidate was sent on the consensus overlay")
+	}
+	if _, signer := blockSync.broadcastSnapshot(); signer != nil {
+		t.Fatal("protocol 1 validator candidate did not select the node ADNL signer")
 	}
 
-	collatorKey := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
-	collatorID, err := publicKeyID(collatorKey.Public().(ed25519.PublicKey))
+	request := validator.CandidateRequest{
+		SessionID: validatorSpec.id, ID: simplex.CandidateID{Slot: 0},
+		WantCandidate: true, MaximumReplyBytes: validatorSpec.maxReplyBytes,
+	}
+	_, _ = endpoint.RequestCandidate(context.Background(), request)
+	consensus.mu.Lock()
+	consensusQueries := len(consensus.queryPeers)
+	consensus.mu.Unlock()
+	blockSync.mu.Lock()
+	blockSyncQueries := len(blockSync.queryPeers)
+	blockSync.mu.Unlock()
+	if consensusQueries != 1 || blockSyncQueries != 0 {
+		t.Fatalf("candidate request queries = consensus %d block-sync %d", consensusQueries, blockSyncQueries)
+	}
+}
+
+func TestCandidateSourceMustMatchRoundRobinLeader(t *testing.T) {
+	manager, _, spec, _ := testSessionManager(t)
+	firstSource := p2p.PeerID{0x61}
+	secondSource := p2p.PeerID{0x62}
+	firstADNL := p2p.PeerID{0x71}
+	secondADNL := p2p.PeerID{0x72}
+	spec.validatorCount = 2
+	spec.validatorKeys = append(spec.validatorKeys, [32]byte{0x63})
+	spec.slotsPerLeaderWindow = 2
+	spec.validatorSource = map[p2p.PeerID]int{firstSource: 0, secondSource: 1}
+	spec.candidateADNL = map[p2p.PeerID]p2p.PeerID{firstSource: firstADNL, secondSource: secondADNL}
+	hub := newSession(manager, spec)
+	extra, err := (&simplex.BroadcastExtra{Slot: 2}).Serialize()
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.localADNLID = collatorID
-	delegatedExtra, err := (&simplex.BroadcastExtra{
-		Slot: 2,
+
+	if _, err = hub.validateCandidateSource(firstSource, firstADNL[:], extra, true); err == nil {
+		t.Fatal("candidate from the wrong round-robin leader was accepted")
+	}
+	if _, err = hub.validateCandidateSource(secondSource, secondADNL[:], extra, true); err != nil {
+		t.Fatalf("candidate from the scheduled leader was rejected: %v", err)
+	}
+}
+
+func TestDelegatedCandidateSourceChecksLeaderAuthorizationBeforeCommit(t *testing.T) {
+	manager, _, spec, _ := testSessionManager(t)
+	collatorKey := ed25519.NewKeyFromSeed(bytesOf(0xd1, ed25519.SeedSize))
+	collatorPublic := collatorKey.Public().(ed25519.PublicKey)
+	collatorID, err := publicKeyID(collatorPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := p2p.PeerID(collatorID)
+	spec.candidateADNL[source] = source
+	hub := newSession(manager, spec)
+
+	invalidExtra, err := (&simplex.BroadcastExtra{
+		Slot: 0,
 		Delegation: &simplex.Delegation{
-			CollatorKey: collatorKey.Public().(ed25519.PublicKey),
+			CollatorKey: collatorPublic,
 			Signature:   make([]byte, ed25519.SignatureSize),
 		},
 	}).Serialize()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = observerEndpoint.BroadcastCandidate(context.Background(), simplex.CandidateBroadcast{
-		Data: []byte{2}, Extra: delegatedExtra,
-	}, validator.CandidateArtifact{Candidate: simplex.Candidate{Empty: true}}); err != nil {
+	if _, err = hub.validateCandidateSource(source, source[:], invalidExtra, false); err != nil {
+		t.Fatalf("unchecked delegation was rejected before the overlay verified its signature: %v", err)
+	}
+	if _, err = hub.validateCandidateSource(source, source[:], invalidExtra, true); err == nil {
+		t.Fatal("invalid checked delegation was accepted")
+	}
+
+	signature, err := simplex.SignDelegation(spec.signer, spec.id, 0, collatorID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	waitForCondition(t, func() bool {
-		broadcasts, _ := handle.broadcastSnapshot()
-		return broadcasts == 2
-	})
-	_, signer = handle.broadcastSnapshot()
-	if signer != nil {
-		t.Fatal("standalone collator candidate did not select the node ADNL signer")
+	validExtra, err := (&simplex.BroadcastExtra{
+		Slot: 0,
+		Delegation: &simplex.Delegation{
+			CollatorKey: collatorPublic,
+			Signature:   signature,
+		},
+	}).Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = hub.validateCandidateSource(source, source[:], validExtra, true); err != nil {
+		t.Fatalf("valid checked delegation was rejected: %v", err)
 	}
 }
 
 func TestRemoteCollatorClientDistinguishesVerdictFromDelivery(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -424,7 +465,7 @@ func TestRemoteCollatorClientDistinguishesVerdictFromDelivery(t *testing.T) {
 }
 
 func TestCandidateRelaySurvivesPrivateBroadcastFailure(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -464,7 +505,7 @@ func TestCandidateRelaySurvivesPrivateBroadcastFailure(t *testing.T) {
 }
 
 func TestAcceptedBlockPublicationResolvesValidatorCertificateSigner(t *testing.T) {
-	manager, _, validatorSpec, _ := testSharedManager(t)
+	manager, _, validatorSpec, _ := testSessionManager(t)
 	if _, err := manager.prepare(context.Background(), validatorSpec); err != nil {
 		t.Fatal(err)
 	}
@@ -484,23 +525,83 @@ func TestAcceptedBlockPublicationResolvesValidatorCertificateSigner(t *testing.T
 	) {
 		t.Fatal("accepted publication lost the validator certificate signer")
 	}
+	wantFinalityMode := p2p.BlockBroadcastModePublic |
+		p2p.BlockBroadcastModeFastSync |
+		p2p.BlockBroadcastModeCustom
+	if publisher.accepted[0].FinalityMode != wantFinalityMode ||
+		publisher.accepted[0].BlockMode != p2p.BlockBroadcastModeCustom ||
+		!publisher.accepted[0].Plumtree {
+		t.Fatalf("protocol 3 accepted publication routes = %#v", publisher.accepted[0])
+	}
+}
+
+func TestProtocolOneUsesLegacyRoutesAndCachesInboundCandidate(t *testing.T) {
+	manager, opener, validatorSpec, _ := testProtocolV1SharedManager(t)
+	endpoint, err := manager.prepare(context.Background(), validatorSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestEndpoint(t, endpoint, &testRelayingReceiver{})
+	publisher := manager.broadcasts.(*testBlockPublisher)
+	publisher.mu.Lock()
+	registrations := publisher.producerRegistrations
+	publisher.mu.Unlock()
+	if registrations != 0 {
+		t.Fatal("protocol 1 endpoint registered a Plumtree producer")
+	}
+
+	manager.PublishAcceptedBlock(validator.AcceptedBlockPublication{SessionID: validatorSpec.id})
+	publisher.mu.Lock()
+	if len(publisher.accepted) != 1 ||
+		publisher.accepted[0].BlockMode != p2p.BlockBroadcastModeCustom ||
+		publisher.accepted[0].FinalityMode != 0 || publisher.accepted[0].Plumtree ||
+		publisher.accepted[0].CertificateSigner != nil {
+		publisher.mu.Unlock()
+		t.Fatalf("protocol 1 accepted publication = %#v", publisher.accepted)
+	}
+	publisher.mu.Unlock()
+
+	extra, err := (&simplex.BroadcastExtra{Slot: 0}).Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = endpoint.BroadcastCandidate(context.Background(), simplex.CandidateBroadcast{
+		Data: []byte{1}, Extra: extra,
+	}, validator.CandidateArtifact{Candidate: simplex.Candidate{}, BlockBOC: []byte{2}}); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, func() bool {
+		publisher.mu.Lock()
+		defer publisher.mu.Unlock()
+		return len(publisher.candidates) == 1
+	})
+	publisher.mu.Lock()
+	wantCandidateMode := p2p.BlockBroadcastModeCustom | p2p.BlockBroadcastModeFastSync
+	if publisher.candidates[0].Mode != wantCandidateMode || publisher.candidates[0].Plumtree ||
+		publisher.candidates[0].CertificateSigner != nil {
+		publisher.mu.Unlock()
+		t.Fatalf("protocol 1 local candidate routes = %#v", publisher.candidates[0])
+	}
+	publisher.mu.Unlock()
+
+	receiveTestCandidate(t, opener.overlays[1].callbacks, validatorSpec, 0)
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	if len(publisher.candidates) != 1 {
+		t.Fatal("protocol 1 inbound candidate was re-originated on the public/custom relay")
+	}
+	if len(publisher.cachedCandidates) != 1 {
+		t.Fatalf("protocol 1 cached candidates = %d, want 1", len(publisher.cachedCandidates))
+	}
 }
 
 func TestReceivedCandidateRelayResolvesValidatorCertificateSigner(t *testing.T) {
-	manager, opener, validatorSpec, observerSpec := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	validatorEndpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Attaching the standalone collator consumer clears the signer in the merged
-	// effective spec, which is exactly the state that used to silence the public
-	// re-origination of every candidate received from another validator.
-	observerEndpoint, err := manager.prepare(context.Background(), observerSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
 	startTestEndpoint(t, validatorEndpoint, &testRelayingReceiver{})
-	startTestEndpoint(t, observerEndpoint, &testRelayingReceiver{})
 
 	receiveTestCandidate(t, opener.latest().callbacks, validatorSpec, 1)
 	publisher := manager.broadcasts.(*testBlockPublisher)
@@ -521,8 +622,8 @@ func TestReceivedCandidateRelayResolvesValidatorCertificateSigner(t *testing.T) 
 	}
 }
 
-func TestReceivedCandidateRelayFallsBackToEffectiveSpec(t *testing.T) {
-	manager, opener, _, observerSpec := testSharedManager(t)
+func TestReceivedCandidateRelayUsesStandaloneCollatorSpec(t *testing.T) {
+	manager, opener, _, observerSpec := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), observerSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -536,8 +637,7 @@ func TestReceivedCandidateRelayFallsBackToEffectiveSpec(t *testing.T) {
 	if len(publisher.candidates) != 1 {
 		t.Fatalf("candidate publications = %d, want 1", len(publisher.candidates))
 	}
-	// A pure standalone-collator hub has no validator contribution, so the relay
-	// keeps the effective spec and stays a plain relay without a certificate.
+	// A standalone collator relays without a validator certificate.
 	if publisher.candidates[0].CertificateSigner != nil {
 		t.Fatal("standalone collator hub relayed with a certificate signer")
 	}
@@ -569,7 +669,7 @@ func receiveTestCandidate(
 }
 
 func TestCandidateRelayDoesNotWaitForPrivateWorkerAndRetireCancels(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -667,7 +767,7 @@ func TestCandidateRelayDoesNotWaitForPrivateWorkerAndRetireCancels(t *testing.T)
 }
 
 func TestCandidatePrivateWorkersDoNotSerializeBehindOneSlowSend(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -726,7 +826,7 @@ func TestCandidatePrivateWorkersDoNotSerializeBehindOneSlowSend(t *testing.T) {
 }
 
 func TestConsensusFanoutDoesNotSerializeSlowPeers(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -756,7 +856,7 @@ func TestConsensusFanoutDoesNotSerializeSlowPeers(t *testing.T) {
 }
 
 func TestConsensusTransportIsReadyWhenStartReturns(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -802,7 +902,7 @@ func TestConsensusTransportIsReadyWhenStartReturns(t *testing.T) {
 }
 
 func TestConsensusPeerSenderDropsFailedMessageAndContinues(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -852,7 +952,7 @@ func TestConsensusPeerSenderDropsFailedMessageAndContinues(t *testing.T) {
 }
 
 func TestConsensusPeerQueueBoundsStalledFanout(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -920,7 +1020,7 @@ func TestConsensusPeerQueueBoundsStalledFanout(t *testing.T) {
 }
 
 func TestConsensusPeerWorkersStopOnRunCancellation(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -966,7 +1066,7 @@ func TestConsensusPeerWorkersStopOnRunCancellation(t *testing.T) {
 }
 
 func TestStandstillFanoutTargetsOnlyValidators(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -996,7 +1096,7 @@ func TestStandstillFanoutTargetsOnlyValidators(t *testing.T) {
 }
 
 func TestRandomFanoutTargetsRequestedPeerCount(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -1025,84 +1125,29 @@ func TestRandomFanoutTargetsRequestedPeerCount(t *testing.T) {
 	}
 }
 
-// hubHasHandle reads the installed overlay handle under the same lock the
-// session itself uses. Production never asks this question: it compares the
-// handle against a spec through handleMatches instead.
-func hubHasHandle(s *session) bool {
-	s.handleMu.RLock()
-	defer s.handleMu.RUnlock()
-	return s.handle != nil
-}
-
-func TestFailedSharedAttachRestoresExistingOverlay(t *testing.T) {
-	manager, opener, validatorSpec, observerSpec := testSharedManager(t)
-	validatorEndpoint, err := manager.prepare(context.Background(), validatorSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	opener.fail(errors.New("open failed"))
-	if _, err = manager.prepare(context.Background(), observerSpec); err == nil {
-		t.Fatal("shared attach failure was hidden")
-	}
-	hub := manager.sessions[validatorSpec.id]
-	if hub.endpoint(sessionKindValidator) != validatorEndpoint ||
-		hub.endpoint(sessionKindObserver) != nil || !hubHasHandle(hub) {
-		t.Fatal("failed attach did not restore the existing validator overlay")
-	}
-	if _, err = manager.prepare(context.Background(), observerSpec); err != nil {
-		t.Fatalf("shared attach retry: %v", err)
-	}
-}
-
-func TestFailedDetachCanRepairRemainingRoleOnRetry(t *testing.T) {
-	manager, opener, validatorSpec, observerSpec := testSharedManager(t)
-	if _, err := manager.prepare(context.Background(), validatorSpec); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := manager.prepare(context.Background(), observerSpec); err != nil {
-		t.Fatal(err)
-	}
-	opener.fail(errors.New("open failed"))
-	if err := manager.RetireValidatorSession(context.Background(), validatorSpec.id); err == nil {
-		t.Fatal("detach reopen failure was hidden")
-	}
-	hub := manager.sessions[validatorSpec.id]
-	if hub.endpoint(sessionKindValidator) != nil || hub.endpoint(sessionKindObserver) == nil || hubHasHandle(hub) {
-		t.Fatal("failed detach did not retain a retryable remaining role")
-	}
-	if err := manager.RetireValidatorSession(context.Background(), validatorSpec.id); err != nil {
-		t.Fatalf("repair on idempotent retire retry: %v", err)
-	}
-	if !hubHasHandle(hub) {
-		t.Fatal("idempotent retire retry did not repair the remaining overlay")
-	}
-}
-
-// Detach must hand the surviving contribution back UNCHANGED. mergeSessionSpecs
-// clears kind, role and signer, so folding a lone contribution through it would
-// leave the remaining role relaying candidates without a certificate signer.
-func TestDetachRestoresSurvivingContributionUnchanged(t *testing.T) {
-	manager, _, validatorSpec, observerSpec := testSharedManager(t)
-	if _, err := manager.prepare(context.Background(), validatorSpec); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := manager.prepare(context.Background(), observerSpec); err != nil {
-		t.Fatal(err)
-	}
-	hub := manager.sessions[validatorSpec.id]
-	if merged := hub.currentSpec(); merged.kind != 0 || merged.signer != nil {
-		t.Fatal("shared effective spec kept a role-scoped field")
+func TestProtocolOneBlockSyncOpenFailureClosesNewConsensusHandle(t *testing.T) {
+	manager, _, validatorSpec, _ := testProtocolV1SharedManager(t)
+	consensus := &testPrivateOverlay{}
+	opens := 0
+	manager.openOverlay = func(
+		p2p.PrivateOverlayConfig,
+		p2p.PrivateOverlayCallbacks,
+	) (privateOverlay, error) {
+		opens++
+		if opens == 2 {
+			return nil, errors.New("block-sync open failed")
+		}
+		return consensus, nil
 	}
 
-	if err := manager.RetireSession(context.Background(), observerSpec.id); err != nil {
-		t.Fatal(err)
+	if _, err := manager.prepare(context.Background(), validatorSpec); err == nil {
+		t.Fatal("partial protocol 1 open failure was hidden")
 	}
-	effective := hub.currentSpec()
-	if effective.signer == nil {
-		t.Fatal("detach dropped the surviving validator candidate signer")
-	}
-	if !effective.equal(validatorSpec) {
-		t.Fatal("detach altered the surviving validator contribution")
+	consensus.mu.Lock()
+	closed := consensus.closed
+	consensus.mu.Unlock()
+	if closed != 1 || len(manager.sessions) != 0 {
+		t.Fatalf("partial open cleanup = closes %d sessions %d", closed, len(manager.sessions))
 	}
 }
 
@@ -1110,7 +1155,7 @@ func TestDetachRestoresSurvivingContributionUnchanged(t *testing.T) {
 // candidate. Standalone collators and persistent observers are ordinary overlay
 // members, and drawing them burns a full resolve timeout on the path to voting.
 func TestCandidateRequestTargetsOnlyValidatorPeers(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSharedManager(t)
+	manager, opener, validatorSpec, _ := testSessionManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -1143,7 +1188,7 @@ func TestCandidateRequestTargetsOnlyValidatorPeers(t *testing.T) {
 
 // An overlay whose validator peers are all local or absent must still fetch.
 func TestCandidateRequestFallsBackToFullMembership(t *testing.T) {
-	_, _, validatorSpec, _ := testSharedManager(t)
+	_, _, validatorSpec, _ := testSessionManager(t)
 	validatorSpec.validatorByADNL = map[p2p.PeerID]int{}
 
 	target, ok := candidateRequestTarget(validatorSpec)
@@ -1163,7 +1208,7 @@ func TestCandidateRequestFallsBackToFullMembership(t *testing.T) {
 // Standstill drain fans one message out to every shard validator, so its target
 // selection runs per message on a roster-sized membership.
 func BenchmarkConsensusValidatorFanoutDispatch(b *testing.B) {
-	manager, _, validatorSpec, _ := testSharedManager(b)
+	manager, _, validatorSpec, _ := testSessionManager(b)
 	spec := validatorSpec
 	spec.members = []p2p.PeerID{p2p.PeerID(manager.localADNLID)}
 	spec.peers = nil
@@ -1214,7 +1259,7 @@ func BenchmarkConsensusValidatorFanoutDispatch(b *testing.B) {
 // receiveConsensusMessage is the highest-frequency callback in the package: one
 // invocation per inbound vote and per gossiped certificate from every peer.
 func BenchmarkReceiveConsensusMessage(b *testing.B) {
-	manager, _, validatorSpec, _ := testSharedManager(b)
+	manager, _, validatorSpec, _ := testSessionManager(b)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
 	if err != nil {
 		b.Fatal(err)
@@ -1235,13 +1280,15 @@ func BenchmarkReceiveConsensusMessage(b *testing.B) {
 	}
 }
 
-func testSharedManager(tb testing.TB) (*Manager, *testOverlayOpener, sessionSpec, sessionSpec) {
+func testSessionManager(tb testing.TB) (*Manager, *testOverlayOpener, sessionSpec, sessionSpec) {
 	tb.Helper()
 	local := [32]byte{0x10}
 	validatorADNL := p2p.PeerID{0x20}
 	validatorSource := p2p.PeerID{0x30}
 	remote := p2p.PeerID{0x40}
 	signerKey := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	var validatorKey [ed25519.PublicKeySize]byte
+	copy(validatorKey[:], signerKey.Public().(ed25519.PublicKey))
 	opener := &testOverlayOpener{}
 	manager := &Manager{
 		openOverlay: opener.open,
@@ -1249,21 +1296,31 @@ func testSharedManager(tb testing.TB) (*Manager, *testOverlayOpener, sessionSpec
 		localADNLID: local,
 		sessions:    make(map[[32]byte]*session),
 	}
+	authorized := map[p2p.PeerID]uint32{
+		validatorSource:   1 << 20,
+		p2p.PeerID(local): 1 << 20,
+	}
 	base := sessionSpec{
-		id:               [32]byte{1},
-		workchain:        0,
-		shard:            -1 << 63,
-		fullOverlayID:    []byte{1, 2, 3},
-		members:          []p2p.PeerID{p2p.PeerID(local), validatorADNL, remote},
-		peers:            []p2p.PeerID{validatorADNL, remote},
-		validatorByADNL:  map[p2p.PeerID]int{validatorADNL: 0},
-		validatorCount:   1,
-		catchainSeqno:    9,
-		validatorSetHash: 10,
-		maxReplyBytes:    1 << 20,
-		authorized:       map[p2p.PeerID]uint32{validatorSource: 1 << 20, p2p.PeerID(local): 1 << 20},
-		candidateADNL:    map[p2p.PeerID]p2p.PeerID{validatorSource: validatorADNL, p2p.PeerID(local): p2p.PeerID(local)},
-		validatorSource:  map[p2p.PeerID]struct{}{validatorSource: {}},
+		id:                   [32]byte{1},
+		protocolVersion:      3,
+		useQUIC:              true,
+		slotsPerLeaderWindow: 1,
+		openConsensus:        true,
+		workchain:            0,
+		shard:                -1 << 63,
+		fullOverlayID:        []byte{1, 2, 3},
+		members:              []p2p.PeerID{p2p.PeerID(local), validatorADNL, remote},
+		peers:                []p2p.PeerID{validatorADNL, remote},
+		validatorByADNL:      map[p2p.PeerID]int{validatorADNL: 0},
+		validatorKeys:        [][32]byte{validatorKey},
+		validatorCount:       1,
+		catchainSeqno:        9,
+		validatorSetHash:     10,
+		maxReplyBytes:        1 << 20,
+		consensusAuthorized:  authorized,
+		authorized:           authorized,
+		candidateADNL:        map[p2p.PeerID]p2p.PeerID{validatorSource: validatorADNL, p2p.PeerID(local): p2p.PeerID(local)},
+		validatorSource:      map[p2p.PeerID]int{validatorSource: 0},
 	}
 	validatorSpec := base
 	validatorSpec.kind = sessionKindValidator
@@ -1275,11 +1332,36 @@ func testSharedManager(tb testing.TB) (*Manager, *testOverlayOpener, sessionSpec
 	return manager, opener, validatorSpec, observerSpec
 }
 
+func testProtocolV1SharedManager(tb testing.TB) (*Manager, *testOverlayOpener, sessionSpec, sessionSpec) {
+	manager, opener, validatorSpec, _ := testSessionManager(tb)
+	validatorADNL := firstMapKey(validatorSpec.validatorByADNL)
+	localCollator := p2p.PeerID(manager.localADNLID)
+	validatorSpec.protocolVersion = 1
+	validatorSpec.blockSyncFullID = []byte{4, 5, 6}
+	validatorSpec.blockSyncMembers = validatorSpec.members
+	validatorSpec.authorized = map[p2p.PeerID]uint32{
+		validatorADNL: 1 << 20,
+		localCollator: 1 << 20,
+	}
+	validatorSpec.candidateADNL = map[p2p.PeerID]p2p.PeerID{
+		validatorADNL: validatorADNL,
+		localCollator: localCollator,
+	}
+	validatorSpec.validatorSource = map[p2p.PeerID]int{validatorADNL: 0}
+
+	observerSpec := validatorSpec
+	observerSpec.kind = sessionKindObserver
+	observerSpec.role = collator.OverlayRoleCollator
+	observerSpec.signer = nil
+
+	return manager, opener, validatorSpec, observerSpec
+}
+
 func TestValidatorEndpointOwnsPlumtreeProducerLease(t *testing.T) {
-	manager, _, validatorSpec, _ := testSharedManager(t)
+	manager, _, validatorSpec, _ := testSessionManager(t)
 	publisher := manager.broadcasts.(*testBlockPublisher)
 	hub := newSession(manager, validatorSpec)
-	hub.installInitialHandle(&testPrivateOverlay{}, validatorSpec)
+	hub.installInitialHandles(&testPrivateOverlay{}, nil, validatorSpec)
 	endpoint := hub.endpoint(sessionKindValidator)
 
 	if err := endpoint.Start(t.Context(), &testSessionReceiver{}); err != nil {
@@ -1347,7 +1429,7 @@ func assertReceiverCounts(t *testing.T, receiver *testSessionReceiver, messages,
 	}
 }
 
-func firstMapKey(values map[p2p.PeerID]struct{}) p2p.PeerID {
+func firstMapKey[V any](values map[p2p.PeerID]V) p2p.PeerID {
 	for value := range values {
 		return value
 	}

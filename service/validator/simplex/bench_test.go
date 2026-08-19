@@ -46,7 +46,7 @@ func BenchmarkVerifyCertificate(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if err := eng.verifyCertificate(cert); err != nil {
+				if _, err := eng.verifyCertificate(cert); err != nil {
 					b.Fatal(err)
 				}
 			}

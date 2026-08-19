@@ -73,7 +73,7 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 
 	original := artifacts
 	s.mu.RLock()
-	stale := s.nonfinalCoveredByCurrentLocked(block)
+	stale := s.coveredByCurrentStateLocked(block)
 	s.mu.RUnlock()
 	if stale {
 		s.deleteNonfinalWaiting(block)
@@ -98,6 +98,30 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 		}
 		s.deleteNonfinalWaitingLocked(key)
 		s.mu.Unlock()
+		return false, nil
+	}
+	if s.acceptedStateOwnsBlockLocked(key, block) {
+		// THE BLOCK IS ALREADY PUBLISHED, by this node's own acceptance, with the
+		// full state the validator computed for it. Rebuilding that state here
+		// from cell records would produce a second materialization of one block
+		// — the exact cost the accepted publication exists to avoid, since
+		// chain_state.go compares tip states by pointer — and it would pay for a
+		// decode, an apply, a cell-record encode, a view build and a prewarm to
+		// arrive at a tree already resident. So nothing is rebuilt and nothing is
+		// republished.
+		//
+		// The kind bit IS recorded, because it is the only thing this path would
+		// have contributed that the accepted publication does not: the liteserver's
+		// pending-shard-blocks listing reads it. The cell index stays empty, which
+		// costs a later non-final successor nothing — it resolves this block's
+		// predecessor state out of s.states, and that entry is the full tree.
+		pending := s.nonFinalPending[key]
+		pending.block = cloneBlockID(block)
+		pending.kind |= kind
+		s.putNonfinalPendingLocked(key, pending)
+		s.deleteNonfinalWaitingLocked(key)
+		s.mu.Unlock()
+
 		return false, nil
 	}
 	s.mu.Unlock()
@@ -226,10 +250,11 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 	pending.cells = cells
 	s.putNonfinalPendingLocked(key, pending)
 
-	published, ready := s.publishLiveBlockArtifactsPreparedLocked(prepared)
+	published, masterReady := s.publishLiveBlockArtifactsPreparedLocked(prepared)
 	s.removeNonfinalLookupIndexesLocked(block)
 	s.trimNonfinalPendingLocked()
-	if published || ready {
+	s.signalBlockArtifactsLocked()
+	if published || masterReady {
 		close(s.notify)
 		s.notify = make(chan struct{})
 	}
@@ -238,7 +263,7 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 }
 
 func (s *Store) nonfinalReadyToPrepareLocked(key storage.BlockRootHash, block ton.BlockIDExt, meta *storage.BlockMeta, original storage.LiveBlockArtifacts, kind storage.LiveBlockNonfinalKind, keepWaiting bool, validatedStateUpdate *cell.Cell) bool {
-	if s.nonfinalCoveredByCurrentLocked(block) {
+	if s.coveredByCurrentStateLocked(block) {
 		s.deleteNonfinalWaitingLocked(key)
 		return false
 	}
@@ -658,13 +683,13 @@ func (s *Store) cleanupNonfinalPendingLocked() {
 	}
 
 	for key, pending := range s.nonFinalPending {
-		if !s.nonfinalCoveredByCurrentLocked(pending.block) {
+		if !s.coveredByCurrentStateLocked(pending.block) {
 			continue
 		}
 		s.deleteNonfinalBlockLocked(key, pending.block)
 	}
 	for key, waiting := range s.nonFinalWaiting {
-		if !s.nonfinalCoveredByCurrentLocked(waiting.artifacts.Block) {
+		if !s.coveredByCurrentStateLocked(waiting.artifacts.Block) {
 			continue
 		}
 		delete(s.nonFinalWaiting, key)
@@ -691,9 +716,33 @@ func (s *Store) deleteNonfinalBlockLocked(key storage.BlockRootHash, block ton.B
 		return
 	}
 	liveKey := storage.BlockKey(block)
-	if cached := s.blocks[liveKey]; cached != nil {
-		s.deleteLiveBlockLocked(liveKey, cached, liveBlockKind(cached.id))
+	cached := s.blocks[liveKey]
+	if cached == nil {
+		return
 	}
+	// The same ownership rule dropAcceptedStateLocked applies, from the other
+	// side: a block whose live entry belongs to an accepted publication is not
+	// this cache's to delete. The non-final path can hold a listing entry for
+	// such a block without ever having published its state — see the accepted
+	// branch of publishNonfinalBlockArtifacts — and releasing the entry must
+	// release only the entry.
+	if cached.acceptedOwner {
+		return
+	}
+	s.deleteLiveBlockLocked(liveKey, cached, liveBlockKind(cached.id))
+}
+
+// acceptedStateOwnsBlockLocked reports that this node's own acceptance has
+// already published this exact block, so its state is the one materialization the
+// store holds for it.
+func (s *Store) acceptedStateOwnsBlockLocked(key storage.BlockRootHash, block ton.BlockIDExt) bool {
+	enrolled, ok := s.acceptedStates[key]
+	if !ok || !blockIDEqual(enrolled, block) {
+		return false
+	}
+	cached := s.blocks[key]
+
+	return cached != nil && cached.acceptedOwner && blockIDEqual(cached.id, block)
 }
 
 func (s *Store) deleteNonfinalPendingLocked(key storage.BlockRootHash) {
@@ -732,7 +781,11 @@ func (s *Store) dropNonfinalGapsLocked() {
 	}
 }
 
-func (s *Store) nonfinalCoveredByCurrentLocked(block ton.BlockIDExt) bool {
+// coveredByCurrentStateLocked reports whether the applied current state has
+// reached or passed this block, which is the release condition for every
+// speculative publication: the non-final cache and the accepted-state cache
+// both use it, because both exist only until the ordinary pipeline gets there.
+func (s *Store) coveredByCurrentStateLocked(block ton.BlockIDExt) bool {
 	if s.current == nil {
 		return false
 	}

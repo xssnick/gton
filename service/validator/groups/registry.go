@@ -143,10 +143,12 @@ func resolveCollatorsByValidator(state *State, config *Config) ([]CollatorRegist
 	for i := range config.persistentValidatorSets {
 		validatorCount += len(config.persistentValidatorSets[i].Validators)
 	}
-	validatorADNLs := make(map[[32]byte]struct{}, validatorCount)
+	validatorIdentities := make(map[[32]byte]struct{}, validatorCount*2)
 	for i := range config.persistentValidatorSets {
 		for j := range config.persistentValidatorSets[i].Validators {
-			validatorADNLs[ValidatorADNL(config.persistentValidatorSets[i].Validators[j])] = struct{}{}
+			validator := config.persistentValidatorSets[i].Validators[j]
+			validatorIdentities[validator.PublicKeyHash] = struct{}{}
+			validatorIdentities[ValidatorADNL(validator)] = struct{}{}
 		}
 	}
 
@@ -176,7 +178,7 @@ func resolveCollatorsByValidator(state *State, config *Config) ([]CollatorRegist
 
 			filtered := collators[:0]
 			for _, id := range collators {
-				if _, occupied := validatorADNLs[id]; !occupied {
+				if _, occupied := validatorIdentities[id]; !occupied {
 					filtered = append(filtered, id)
 				}
 			}
@@ -442,14 +444,10 @@ func ValidatorADNL(validator Validator) [32]byte {
 	return validator.PublicKeyHash
 }
 
-func persistentOverlayWithCollators(
-	validators []PersistentOverlayMember,
-	registry []CollatorRegistryEntry,
-) []PersistentOverlayMember {
-	if len(registry) == 0 {
-		return validators
-	}
-
+// AllCollatorADNLIDs flattens the current validator registry into the complete
+// sorted set of collator identities. Session-specific delegation authorization
+// remains in CollatorRegistryEntry; this wider set is transport membership.
+func AllCollatorADNLIDs(registry []CollatorRegistryEntry) [][32]byte {
 	count := 0
 	for i := range registry {
 		count += len(registry[i].CollatorADNLIDs)
@@ -467,6 +465,19 @@ func persistentOverlayWithCollators(
 			unique = append(unique, id)
 		}
 	}
+
+	return unique
+}
+
+func persistentOverlayWithCollators(
+	validators []PersistentOverlayMember,
+	registry []CollatorRegistryEntry,
+) []PersistentOverlayMember {
+	if len(registry) == 0 {
+		return validators
+	}
+
+	unique := AllCollatorADNLIDs(registry)
 
 	result := make([]PersistentOverlayMember, 0, len(validators)+len(unique))
 	validatorIndex := 0

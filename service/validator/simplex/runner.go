@@ -2,7 +2,9 @@ package simplex
 
 import (
 	"context"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,6 +27,15 @@ type Runner struct {
 	wake     chan struct{}
 	done     chan struct{}
 	stopped  bool
+
+	// snapshot is the engine's own view, republished at the end of each loop
+	// turn so an off-goroutine reader never has to enter the loop.
+	snapshot atomic.Pointer[Stats]
+	// lastSigned is the per-validator participation slice currently published.
+	// It is owned by the loop goroutine, and once published it is never written
+	// again — a change allocates a new slice, so every snapshot handed out stays
+	// valid. See publishStats.
+	lastSigned []uint32
 }
 
 // NewRunner wraps an engine that has NOT been started yet; Run starts it on
@@ -99,6 +110,7 @@ func (r *Runner) run(ctx context.Context, startup chan<- error) (resultErr error
 		}
 		if next := r.eng.NextWakeup(); !next.IsZero() && !next.After(time.Now()) {
 			r.eng.Advance()
+			r.publishStats()
 			if err := r.eng.Err(); err != nil {
 				return err
 			}
@@ -113,6 +125,7 @@ func (r *Runner) run(ctx context.Context, startup chan<- error) (resultErr error
 			return err
 		case <-timer.C:
 			r.eng.Advance()
+			r.publishStats()
 			// A timer path can fail the session just like an input can (a
 			// journal write for a timeout skip vote, a certificate built from
 			// it). Without this check NextWakeup would report "no deadline"
@@ -134,6 +147,7 @@ func (r *Runner) run(ctx context.Context, startup chan<- error) (resultErr error
 			// verifying them together is what puts the arrival burst of one
 			// vote round on all cores instead of on this goroutine alone.
 			r.eng.FlushVerify()
+			r.publishStats()
 			if more {
 				r.signal()
 			}
@@ -308,10 +322,48 @@ func (r *Runner) doWithPost(post func(func()), f func()) bool {
 
 // Stats returns a snapshot of the engine counters, taken on the loop
 // goroutine. It returns the zero value once the loop has stopped.
+//
+// It is for deterministic tests and for callers that need the exact current
+// turn. Anything that samples periodically — a metrics scrape above all — must
+// use StatsSnapshot instead: this round-trips onto the loop goroutine, so a
+// scrape taken while that goroutine is wedged would block on the very
+// condition it is being scraped to diagnose.
 func (r *Runner) Stats() Stats {
 	var s Stats
 	r.do(func() { s = r.eng.Stats() })
 	return s
+}
+
+// StatsSnapshot returns the counters published at the end of the most recent
+// loop turn, without touching the loop goroutine. Its freshness is one turn,
+// which for the timer paths is bounded by the standstill timeout.
+func (r *Runner) StatsSnapshot() Stats {
+	if stats := r.snapshot.Load(); stats != nil {
+		return *stats
+	}
+
+	return Stats{}
+}
+
+// publishStats republishes the snapshot. It runs on the loop goroutine at the
+// end of every turn, so what it costs is paid on every consensus turn there is.
+//
+// A published snapshot is immutable — a scrape may be copying the previous one
+// right now — so the turn does allocate the Stats it stores, and that is the
+// whole of what it allocates. The per-validator participation slice used to be
+// copied with it, a roster-sized allocation on every turn including the ones
+// that changed nothing about it; it is copied here only when it differs from
+// the slice already published, which is when a certificate was stored. The
+// comparison is a roster-length scan and allocates nothing, and the previously
+// published slice is never written again, so reusing it is safe for readers
+// still holding the older snapshot.
+func (r *Runner) publishStats() {
+	stats := r.eng.statsAliased()
+	if !slices.Equal(r.lastSigned, stats.LastSignedSlot) {
+		r.lastSigned = append([]uint32(nil), stats.LastSignedSlot...)
+	}
+	stats.LastSignedSlot = r.lastSigned
+	r.snapshot.Store(&stats)
 }
 
 // DebugDump renders the pool state in the canonical debug format, on the loop

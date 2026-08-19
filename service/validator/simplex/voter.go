@@ -1,6 +1,7 @@
 package simplex
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -255,8 +256,14 @@ func (e *Engine) completeValidation(id CandidateID, verdict error) {
 	}
 	slot.validationInFlight = false
 	if verdict != nil {
-		e.log.Warn().Msgf("candidate %s is rejected: %v", id, verdict)
-		e.stats.CandidatesRejected++
+		var rejection CandidateRejection
+		if errors.As(verdict, &rejection) {
+			e.log.Warn().Msgf("candidate %s is rejected: %v", id, verdict)
+			e.stats.CandidatesRejected++
+		} else {
+			e.log.Warn().Msgf("candidate %s validation abstained: %v", id, verdict)
+			e.stats.CandidatesAbstained++
+		}
 		return
 	}
 	slot.validated = true

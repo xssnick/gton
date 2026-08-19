@@ -34,6 +34,12 @@ type dbCollector struct {
 	readCells                 *prometheus.Desc
 	writtenCells              *prometheus.Desc
 	lazyCellLoads             *prometheus.Desc
+
+	recordCacheEntries          *prometheus.Desc
+	recordCacheBytes            *prometheus.Desc
+	recordCacheInserts          *prometheus.Desc
+	recordCacheDeclined         *prometheus.Desc
+	recordCacheSalvageTruncated *prometheus.Desc
 }
 
 func newDBCollector(metrics *Metrics, namespace string) prometheus.Collector {
@@ -155,6 +161,36 @@ func newDBCollector(metrics *Metrics, namespace string) prometheus.Collector {
 			[]string{"layer"},
 			nil,
 		),
+		recordCacheEntries: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "storage", "record_cache_entries"),
+			"Live entries resident in the encoded cell record cache.",
+			nil,
+			nil,
+		),
+		recordCacheBytes: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "storage", "record_cache_bytes"),
+			"Encoded cell record cache memory by kind: resident (live entry bytes), capacity (arena budget), index (derived index overhead).",
+			[]string{"kind"},
+			nil,
+		),
+		recordCacheInserts: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "storage", "record_cache_inserts_total"),
+			"Records inserted into the encoded cell record cache.",
+			nil,
+			nil,
+		),
+		recordCacheDeclined: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "storage", "record_cache_declined_inserts_total"),
+			"Record cache inserts declined because no index slot was placeable within the probe budget.",
+			nil,
+			nil,
+		),
+		recordCacheSalvageTruncated: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "storage", "record_cache_salvage_truncated_total"),
+			"Region rotations whose CLOCK salvage hit the 50% re-append budget and dropped remaining hot entries.",
+			nil,
+			nil,
+		),
 	}
 }
 
@@ -178,6 +214,11 @@ func (c *dbCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.readCells
 	ch <- c.writtenCells
 	ch <- c.lazyCellLoads
+	ch <- c.recordCacheEntries
+	ch <- c.recordCacheBytes
+	ch <- c.recordCacheInserts
+	ch <- c.recordCacheDeclined
+	ch <- c.recordCacheSalvageTruncated
 }
 
 func (c *dbCollector) Collect(ch chan<- prometheus.Metric) {
@@ -192,16 +233,38 @@ func (c *dbCollector) Collect(ch chan<- prometheus.Metric) {
 
 	ch <- prometheus.MustNewConstMetric(c.available, prometheus.GaugeValue, 1)
 	c.collectLazyCellLoads(ch, status.LazyCellLoads)
+	c.collectRecordCache(ch, status.RecordCache)
 	for _, generation := range status.CellGenerations {
 		c.collectGeneration(ch, generation)
 	}
 }
 
+// collectRecordCache exports the record cache's own series. A disabled cache
+// (nil status) exports nothing: absent series say "tier off" where zeros would
+// say "tier idle", and the record_cache LAYER of lazy_cell_loads_total is
+// seeded to zero from the canonical layer list either way.
+func (c *dbCollector) collectRecordCache(ch chan<- prometheus.Metric, status *pebblestore.RecordCacheStatus) {
+	if status == nil {
+		return
+	}
+
+	ch <- prometheus.MustNewConstMetric(c.recordCacheEntries, prometheus.GaugeValue, float64(status.Entries))
+	ch <- prometheus.MustNewConstMetric(c.recordCacheBytes, prometheus.GaugeValue, float64(status.ResidentBytes), "resident")
+	ch <- prometheus.MustNewConstMetric(c.recordCacheBytes, prometheus.GaugeValue, float64(status.CapacityBytes), "capacity")
+	ch <- prometheus.MustNewConstMetric(c.recordCacheBytes, prometheus.GaugeValue, float64(status.IndexBytes), "index")
+	ch <- prometheus.MustNewConstMetric(c.recordCacheInserts, prometheus.CounterValue, float64(status.Inserts))
+	ch <- prometheus.MustNewConstMetric(c.recordCacheDeclined, prometheus.CounterValue, float64(status.Declined))
+	ch <- prometheus.MustNewConstMetric(c.recordCacheSalvageTruncated, prometheus.CounterValue, float64(status.SalvageTruncated))
+}
+
 func (c *dbCollector) collectLazyCellLoads(ch chan<- prometheus.Metric, dbLoads []storage.LazyCellLoadMetric) {
-	counts := map[string]uint64{
-		storage.LazyCellLoadLayerStateWindow:  0,
-		storage.LazyCellLoadLayerDecodedCache: 0,
-		storage.LazyCellLoadLayerPebble:       0,
+	// Seeded from the canonical layer list so every layer is exported even at
+	// zero — a stack with a series that appears only once it is non-zero reads
+	// as a change in shape rather than a change in value, and adding a layer
+	// here cannot be forgotten.
+	counts := make(map[string]uint64, len(storage.LazyCellLoadLayers))
+	for _, layer := range storage.LazyCellLoadLayers {
+		counts[layer] = 0
 	}
 	for _, metric := range c.metrics.lazyCellLoads() {
 		if metric.Layer != "" {

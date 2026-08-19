@@ -2796,6 +2796,107 @@ func TestPruneExpiredPersistentStateFilesKeepsPendingCellGenerationOrigin(t *tes
 	assertTestPersistentStatePresent(t, store, masters[2], paths[30])
 }
 
+func TestPrunePersistentStateFilesToLimitDeletesOlderUnexpiredGroups(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	masters := []ton.BlockIDExt{
+		testArchivePruneBlock(10, 0x10),
+		testArchivePruneBlock(20, 0x20),
+		testArchivePruneBlock(30, 0x30),
+		testArchivePruneBlock(40, 0x40),
+	}
+	paths := make(map[uint32]string, len(masters))
+	for _, master := range masters {
+		saveTestPersistentStatePruneMasterMeta(t, store, master)
+		paths[master.SeqNo] = saveTestPersistentStatePruneFile(t, store, master)
+	}
+
+	stats, err := store.PrunePersistentStateFilesToLimit(ctx, masters[3].SeqNo, 2)
+	if err != nil {
+		t.Fatalf("prune persistent states to limit: %v", err)
+	}
+	if stats.DeletedFileRecords != 2 || stats.DeletedDiskFiles != 2 || stats.DeletedDiskBytes != 2 {
+		t.Fatalf("deleted = records:%d files:%d bytes:%d, want 2/2/2", stats.DeletedFileRecords, stats.DeletedDiskFiles, stats.DeletedDiskBytes)
+	}
+	if stats.RetainedRecentGroups != 2 || stats.OldestRetainedMasterSeqno != masters[2].SeqNo {
+		t.Fatalf("retained groups = %d oldest = %d, want 2 and %d", stats.RetainedRecentGroups, stats.OldestRetainedMasterSeqno, masters[2].SeqNo)
+	}
+	assertTestPersistentStatePruned(t, store, masters[0], paths[10])
+	assertTestPersistentStatePruned(t, store, masters[1], paths[20])
+	assertTestPersistentStatePresent(t, store, masters[2], paths[30])
+	assertTestPersistentStatePresent(t, store, masters[3], paths[40])
+}
+
+func TestPrunePersistentStateFilesToLimitKeepsPendingMigrationOrigin(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	masters := []ton.BlockIDExt{
+		testArchivePruneBlock(10, 0x10),
+		testArchivePruneBlock(20, 0x20),
+		testArchivePruneBlock(30, 0x30),
+		testArchivePruneBlock(40, 0x40),
+	}
+	paths := make(map[uint32]string, len(masters))
+	for _, master := range masters {
+		saveTestPersistentStatePruneMasterMeta(t, store, master)
+		paths[master.SeqNo] = saveTestPersistentStatePruneFile(t, store, master)
+	}
+	if _, err = store.BeginCellGeneration(ctx, masters[1]); err != nil {
+		t.Fatalf("begin pending cell generation: %v", err)
+	}
+
+	stats, err := store.PrunePersistentStateFilesToLimit(ctx, masters[3].SeqNo, 1)
+	if err != nil {
+		t.Fatalf("prune persistent states to limit: %v", err)
+	}
+	if stats.DeletedFileRecords != 2 || stats.DeletedDiskFiles != 2 {
+		t.Fatalf("deleted = records:%d files:%d, want 2/2", stats.DeletedFileRecords, stats.DeletedDiskFiles)
+	}
+	assertTestPersistentStatePruned(t, store, masters[0], paths[10])
+	assertTestPersistentStatePresent(t, store, masters[1], paths[20])
+	assertTestPersistentStatePruned(t, store, masters[2], paths[30])
+	assertTestPersistentStatePresent(t, store, masters[3], paths[40])
+}
+
+func TestPrunePersistentStateFilesToLimitLeavesGroupsAfterTarget(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	masters := []ton.BlockIDExt{
+		testArchivePruneBlock(10, 0x10),
+		testArchivePruneBlock(20, 0x20),
+		testArchivePruneBlock(30, 0x30),
+		testArchivePruneBlock(40, 0x40),
+	}
+	paths := make(map[uint32]string, len(masters))
+	for _, master := range masters {
+		saveTestPersistentStatePruneMasterMeta(t, store, master)
+		paths[master.SeqNo] = saveTestPersistentStatePruneFile(t, store, master)
+	}
+
+	if _, err = store.PrunePersistentStateFilesToLimit(ctx, masters[2].SeqNo, 1); err != nil {
+		t.Fatalf("prune persistent states to limit: %v", err)
+	}
+	assertTestPersistentStatePruned(t, store, masters[0], paths[10])
+	assertTestPersistentStatePruned(t, store, masters[1], paths[20])
+	assertTestPersistentStatePresent(t, store, masters[2], paths[30])
+	assertTestPersistentStatePresent(t, store, masters[3], paths[40])
+}
+
 func TestPrunePreviousPersistentStateFilesDeletesLatestOlderGroup(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {

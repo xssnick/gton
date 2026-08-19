@@ -99,7 +99,7 @@ func TestCandidateLoadIncludesActualCollatedData(t *testing.T) {
 }
 
 func TestProofSizeEstimateParticipatesInAdmission(t *testing.T) {
-	estimator := newProofSizeEstimator()
+	estimator := newProofSizeEstimator(0)
 	leaf := cell.BeginCell().MustStoreUInt(1, 8).EndCell()
 	root := cell.BeginCell().MustStoreUInt(2, 8).MustStoreRef(leaf).EndCell()
 	estimator.addLoadedCell(root)
@@ -118,7 +118,7 @@ func TestProofSizeEstimateParticipatesInAdmission(t *testing.T) {
 		gas:          loose,
 		ltDelta:      loose,
 		collatedData: limitThresholds{1, 2, 3, 4},
-	}, 1, cell.NewReadSet(nil))
+	}, 1, cell.NewReadSet(nil), 0, 0)
 	c := collation{limits: status, fullCollated: true, collatedProofEstimate: estimator}
 	c.updateCollatedEstimate()
 	if status.collatedData != estimator.size() {
@@ -132,7 +132,7 @@ func TestProofSizeEstimateParticipatesInAdmission(t *testing.T) {
 func TestProofSizeEstimatorTracksLoadedHashesSeparatelyFromReferences(t *testing.T) {
 	child := cell.BeginCell().MustStoreUInt(7, 3).EndCell()
 	root := cell.BeginCell().MustStoreRef(child).EndCell()
-	estimator := newProofSizeEstimator()
+	estimator := newProofSizeEstimator(0)
 	estimator.addLoadedCell(root)
 	loaded := estimator.loadedHashes()
 	if !loaded.loaded(root.HashKey()) {
@@ -163,7 +163,7 @@ func TestCollatedHashUsageProofKeepsStateUpdateSourceRoot(t *testing.T) {
 	// Semantic validation did not independently read the changed branch. The
 	// state update source still carries it as an ordinary non-leaf, so applying
 	// the update requires the full-collated predecessor proof to retain it too.
-	estimator := newProofSizeEstimator()
+	estimator := newProofSizeEstimator(0)
 	estimator.addLoadedCell(unchanged)
 	updateSource, err := merkleUpdateSourceShape(update)
 	if err != nil {

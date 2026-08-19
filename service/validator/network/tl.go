@@ -9,13 +9,21 @@ import (
 // consensus.overlayId constructor is already registered by tonutils-go's
 // adnl/node package and is deliberately not registered a second time here.
 const (
-	schemeConsensusOverlayID   = "consensus.overlayId session_id:int256 nodes:(vector int256) = consensus.OverlayId"
-	schemeRequestError         = "consensus.requestError = consensus.RequestError"
-	schemeCandidateAndCert     = "consensus.simplex.candidateAndCert candidate:bytes notar:bytes = consensus.simplex.CandidateAndCert"
-	schemeRequestCandidate     = "consensus.simplex.requestCandidate id:consensus.CandidateId want_candidate:Bool want_notar:Bool = consensus.simplex.CandidateAndCert"
-	schemePleaseCollatePrepare = "consensus.pleaseCollatePrepare window_start_slot:int = tonNode.Success"
-	schemePleaseCollate        = "consensus.pleaseCollate window_start_slot:int signature:bytes = tonNode.Success"
+	schemeConsensusOverlayID          = "consensus.overlayId session_id:int256 nodes:(vector int256) = consensus.OverlayId"
+	schemeConsensusBlockSyncOverlayID = "consensus.blockSyncOverlayId session_id:int256 = consensus.BlockOverlayId"
+	schemeRequestError                = "consensus.requestError = consensus.RequestError"
+	schemeCandidateAndCert            = "consensus.simplex.candidateAndCert candidate:bytes notar:bytes = consensus.simplex.CandidateAndCert"
+	schemeRequestCandidate            = "consensus.simplex.requestCandidate id:consensus.CandidateId want_candidate:Bool want_notar:Bool = consensus.simplex.CandidateAndCert"
+	schemePleaseCollatePrepare        = "consensus.pleaseCollatePrepare window_start_slot:int = tonNode.Success"
+	schemePleaseCollate               = "consensus.pleaseCollate window_start_slot:int signature:bytes = tonNode.Success"
 )
+
+// ConsensusBlockSyncOverlayID is consensus.blockSyncOverlayId. Unlike the
+// consensus overlay name, the block-sync overlay name contains no validator
+// roster and is stable for the whole session.
+type ConsensusBlockSyncOverlayID struct {
+	SessionID []byte `tl:"int256"`
+}
 
 // ConsensusSimplexCandidateAndCert is
 // consensus.simplex.candidateAndCert. An empty field means that the peer does
@@ -35,6 +43,7 @@ type ConsensusSimplexRequestCandidate struct {
 }
 
 func init() {
+	tl.Register(ConsensusBlockSyncOverlayID{}, schemeConsensusBlockSyncOverlayID)
 	tl.Register(ConsensusSimplexCandidateAndCert{}, schemeCandidateAndCert)
 	tl.Register(ConsensusSimplexRequestCandidate{}, schemeRequestCandidate)
 }

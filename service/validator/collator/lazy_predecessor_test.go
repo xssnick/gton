@@ -105,7 +105,12 @@ func TestPublishMasterchainViewAcceptsALazyResidentState(t *testing.T) {
 
 	// The store is empty, so reaching a view at all proves the published one was
 	// used — and that it decoded well enough to serve as a predecessor.
-	projected, err := acquisition.projectedMasterView(t.Context(), fixture.request.Previous.ID, time.Now())
+	projected, err := acquisition.projectedMasterView(
+		t.Context(),
+		fixture.request.Previous.ID,
+		time.Now(),
+		acquisitionReadImmediate,
+	)
 	if err != nil {
 		t.Fatalf("project the lazy resident view: %v", err)
 	}

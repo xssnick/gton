@@ -133,8 +133,10 @@ type recHooks struct {
 	windows        []Window
 	notarized      []CandidateID
 	notarizedCerts []*Certificate
+	notarizedSeals []VerifiedCertificate
 	finalized      []CandidateID
 	finalizedCerts []*Certificate
+	finalizedSeals []VerifiedCertificate
 	misbehaviors   []struct {
 		Validator uint32
 		M         Misbehavior
@@ -159,8 +161,8 @@ type acceptingHooks struct{}
 func (acceptingHooks) ValidateCandidate(_ *Candidate, done func(error)) { done(nil) }
 func (acceptingHooks) StoreCandidate(_ *Candidate, done func(error))    { done(nil) }
 func (acceptingHooks) HandleWindow(Window)                              {}
-func (acceptingHooks) OnNotarized(CandidateID, *Certificate)            {}
-func (acceptingHooks) OnFinalized(CandidateID, *Certificate)            {}
+func (acceptingHooks) OnNotarized(CandidateID, VerifiedCertificate)     {}
+func (acceptingHooks) OnFinalized(CandidateID, VerifiedCertificate)     {}
 func (acceptingHooks) OnMisbehavior(uint32, Misbehavior)                {}
 func (acceptingHooks) OnFatal(error)                                    {}
 
@@ -178,13 +180,15 @@ func (h *recHooks) StoreCandidate(c *Candidate, done func(error)) {
 	done(h.storeErr)
 }
 func (h *recHooks) HandleWindow(w Window) { h.windows = append(h.windows, w) }
-func (h *recHooks) OnNotarized(id CandidateID, cert *Certificate) {
+func (h *recHooks) OnNotarized(id CandidateID, cert VerifiedCertificate) {
 	h.notarized = append(h.notarized, id)
-	h.notarizedCerts = append(h.notarizedCerts, cert)
+	h.notarizedCerts = append(h.notarizedCerts, cert.Certificate())
+	h.notarizedSeals = append(h.notarizedSeals, cert)
 }
-func (h *recHooks) OnFinalized(id CandidateID, cert *Certificate) {
+func (h *recHooks) OnFinalized(id CandidateID, cert VerifiedCertificate) {
 	h.finalized = append(h.finalized, id)
-	h.finalizedCerts = append(h.finalizedCerts, cert)
+	h.finalizedCerts = append(h.finalizedCerts, cert.Certificate())
+	h.finalizedSeals = append(h.finalizedSeals, cert)
 }
 func (h *recHooks) OnMisbehavior(v uint32, m Misbehavior) {
 	h.misbehaviors = append(h.misbehaviors, struct {
@@ -225,6 +229,10 @@ func withParams(p Params) envOpt {
 
 func withShardPrefix(l uint32) envOpt {
 	return func(_ *testEnv, cfg *Config) { cfg.ShardPrefixLen = l }
+}
+
+func withProtocolVersion(version uint8) envOpt {
+	return func(_ *testEnv, cfg *Config) { cfg.ProtocolVersion = version }
 }
 
 func newTestEnv(t *testing.T, opts ...envOpt) *testEnv {
@@ -289,6 +297,13 @@ func (env *testEnv) completeValidation(id CandidateID, verdict error) {
 	delete(env.hooks.validationDone, id)
 	done(verdict)
 }
+
+type testCandidateRejection struct {
+	message string
+}
+
+func (e testCandidateRejection) Error() string    { return e.message }
+func (testCandidateRejection) CandidateRejected() {}
 
 func (env *testEnv) start() {
 	env.t.Helper()

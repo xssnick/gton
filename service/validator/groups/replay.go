@@ -87,6 +87,8 @@ func (t *Tracker) Bootstrap(
 		t.recordSnapshotLocked(snapshot)
 	}
 	t.snapshot.Store(result.final.Snapshot)
+	close(t.changed)
+	t.changed = make(chan struct{})
 
 	return result.final.Transitions, nil
 }
@@ -200,6 +202,7 @@ func (t *Tracker) newReplayTracker(
 		startGroupsFromSeqno: max(t.startGroupsFromSeqno, headSeqno),
 		unsafeRotations:      t.unsafeRotations,
 		initialCollators:     initial,
+		changed:              make(chan struct{}),
 	}, nil
 }
 

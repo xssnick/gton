@@ -5,6 +5,7 @@ import (
 	"errors"
 	"maps"
 	"math"
+	"math/rand"
 	"testing"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -230,12 +231,7 @@ func TestBlockCreateStatsRoundTrip(t *testing.T) {
 			masterchain: discountedCounter{lastUpdated: 77},
 		},
 	}
-	stats := blockCreateStats{entries: entries}
-
-	root, err := stats.toCell()
-	if err != nil {
-		t.Fatal(err)
-	}
+	root := blockCreateStatsTestCell(t, entries)
 	loader := root.MustBeginParse()
 	if tag := loader.MustLoadUInt(8); tag != blockCreateStatsTag {
 		t.Fatalf("tag = %x", tag)
@@ -243,21 +239,18 @@ func TestBlockCreateStatsRoundTrip(t *testing.T) {
 	if dict := loader.MustLoadDict(256); !dict.ValidateAll() || loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
 		t.Fatal("malformed serialized block creator statistics")
 	}
-	parsed, err := parseBlockCreateStats(root)
+	parsed, err := openBlockCreateStats(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !maps.Equal(parsed.entries, entries) {
-		t.Fatalf("round trip = %+v, want %+v", parsed.entries, entries)
+	if got := blockCreateStatsTestEntries(t, parsed); !maps.Equal(got, entries) {
+		t.Fatalf("round trip = %+v, want %+v", got, entries)
 	}
 
-	reversed := blockCreateStats{entries: make(map[[32]byte]creatorStats, len(entries))}
-	reversed.entries[firstKey] = entries[firstKey]
-	reversed.entries[secondKey] = entries[secondKey]
-	secondRoot, err := reversed.toCell()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reversed := make(map[[32]byte]creatorStats, len(entries))
+	reversed[firstKey] = entries[firstKey]
+	reversed[secondKey] = entries[secondKey]
+	secondRoot := blockCreateStatsTestCell(t, reversed)
 	firstBOC, err := root.ToBOCWithOptionsErr(cell.BOCSerializeOptions{WithCRC32C: true})
 	if err != nil {
 		t.Fatal(err)
@@ -271,7 +264,9 @@ func TestBlockCreateStatsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestParseBlockCreateStatsRejectsMalformed(t *testing.T) {
+// TestOpenBlockCreateStatsRejectsMalformedHeader covers what the cheap open
+// still decides on its own: the wrapper around the dictionary.
+func TestOpenBlockCreateStatsRejectsMalformedHeader(t *testing.T) {
 	zero := discountedCounter{}
 	validCreator := creatorStatsTestCell(t, creatorStatsTag, zero, zero, false)
 	validRoot := blockCreateStatsTestRoot(t, blockCreateStatsTag, validCreator)
@@ -287,34 +282,101 @@ func TestParseBlockCreateStatsRejectsMalformed(t *testing.T) {
 			name: "outer trailing data",
 			root: cell.BeginCell().MustStoreBuilder(validRoot.ToBuilder()).MustStoreBoolBit(true).EndCell(),
 		},
-		{
-			name: "wrong creator tag",
-			root: blockCreateStatsTestRoot(t, blockCreateStatsTag,
-				creatorStatsTestCell(t, 0x5, zero, zero, false)),
-		},
-		{
-			name: "creator trailing data",
-			root: blockCreateStatsTestRoot(t, blockCreateStatsTag,
-				creatorStatsTestCell(t, creatorStatsTag, zero, zero, true)),
-		},
-		{
-			name: "zero total with component",
-			root: blockCreateStatsTestRoot(t, blockCreateStatsTag,
-				creatorStatsTestCell(t, creatorStatsTag, discountedCounter{lastUpdated: 1, count2048: 1}, zero, false)),
-		},
-		{
-			name: "non-zero total without time",
-			root: blockCreateStatsTestRoot(t, blockCreateStatsTag,
-				creatorStatsTestCell(t, creatorStatsTag, zero, discountedCounter{total: 1}, false)),
-		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := parseBlockCreateStats(test.root); !errors.Is(err, ErrInvalidInput) {
+			if _, err := openBlockCreateStats(test.root); !errors.Is(err, ErrInvalidInput) {
 				t.Fatalf("error = %v, want ErrInvalidInput", err)
 			}
 		})
+	}
+}
+
+// TestVerifyBlockCreateStatsUpdateRejectsMalformedEntries pins where entry level
+// validation moved to. Opening the dictionary no longer walks it, so a malformed
+// creator entry has to be rejected by the pass that actually reads it — the diff
+// against the predecessor, which is the only place a candidate can introduce one.
+func TestVerifyBlockCreateStatsUpdateRejectsMalformedEntries(t *testing.T) {
+	zero := discountedCounter{}
+	tests := []struct {
+		name  string
+		value *cell.Cell
+	}{
+		{
+			name:  "wrong creator tag",
+			value: creatorStatsTestCell(t, 0x5, zero, zero, false),
+		},
+		{
+			name:  "creator trailing data",
+			value: creatorStatsTestCell(t, creatorStatsTag, zero, zero, true),
+		},
+		{
+			name: "zero total with component",
+			value: creatorStatsTestCell(t, creatorStatsTag,
+				discountedCounter{lastUpdated: 1, count2048: 1}, zero, false),
+		},
+		{
+			name:  "non-zero total without time",
+			value: creatorStatsTestCell(t, creatorStatsTag, zero, discountedCounter{total: 1}, false),
+		},
+	}
+
+	previous := blockCreateStatsTestStats(t, nil)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			next, err := openBlockCreateStats(blockCreateStatsTestRoot(t, blockCreateStatsTag, test.value))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = verifyBlockCreateStatsUpdate(previous, next, 1_000, nil, [32]byte{})
+			if !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("error = %v, want ErrInvalidInput", err)
+			}
+		})
+	}
+}
+
+// TestVerifyBlockCreateStatsUpdateCatchesSkippedIncrement is the converse of the
+// diff pass: an entry the candidate left untouched is skipped by hash, so the
+// explicit increment sweep is what has to notice it was required to move.
+func TestVerifyBlockCreateStatsUpdateCatchesSkippedIncrement(t *testing.T) {
+	creator := creatorStatsTestKey(0x61)
+	other := creatorStatsTestKey(0x62)
+	entry := creatorStats{
+		masterchain: discountedCounter{lastUpdated: 100, total: 3, count2048: 3 << 32, count65536: 3 << 32},
+	}
+	aggregate := creatorStats{
+		masterchain: discountedCounter{lastUpdated: 100, total: 7, count2048: 7 << 32, count65536: 7 << 32},
+		shardchain:  discountedCounter{lastUpdated: 100, total: 9, count2048: 9 << 32, count65536: 9 << 32},
+	}
+	entries := map[[32]byte]creatorStats{creator: entry, other: entry, [32]byte{}: aggregate}
+	previous := blockCreateStatsTestStats(t, entries)
+
+	// The candidate moved the aggregate but silently left the creator's own
+	// counter alone, so the diff never reports that key.
+	next := maps.Clone(entries)
+	moved := entries[[32]byte{}]
+	if err := moved.masterchain.increaseBy(1, 150); err != nil {
+		t.Fatal(err)
+	}
+	next[[32]byte{}] = moved
+	if err := verifyBlockCreateStatsUpdate(
+		previous, blockCreateStatsTestStats(t, next), 150, nil, creator,
+	); err == nil {
+		t.Fatal("a creator that skipped its own increment was accepted")
+	}
+
+	// The same candidate with the creator's counter moved as well is valid.
+	updated := entries[creator]
+	if err := updated.masterchain.increaseBy(1, 150); err != nil {
+		t.Fatal(err)
+	}
+	next[creator] = updated
+	if err := verifyBlockCreateStatsUpdate(
+		previous, blockCreateStatsTestStats(t, next), 150, nil, creator,
+	); err != nil {
+		t.Fatalf("valid update rejected: %v", err)
 	}
 }
 
@@ -330,10 +392,10 @@ func TestUpdateBlockCreateStats(t *testing.T) {
 	oldUnrelated := creatorStats{
 		masterchain: discountedCounter{lastUpdated: 800, total: 2, count2048: 2 << 32, count65536: 2 << 32},
 	}
-	previous := blockCreateStats{entries: map[[32]byte]creatorStats{
+	previous := blockCreateStatsTestStats(t, map[[32]byte]creatorStats{
 		creatorA:  oldA,
 		unrelated: oldUnrelated,
-	}}
+	})
 
 	root, err := updateBlockCreateStats(blockCreateStatsInput{
 		enabled:  true,
@@ -350,37 +412,128 @@ func TestUpdateBlockCreateStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated, err := parseBlockCreateStats(root)
+	opened, err := openBlockCreateStats(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(updated.entries) != 4 {
-		t.Fatalf("entries = %d, want creators A/B, aggregate, and unrelated", len(updated.entries))
+	updated := blockCreateStatsTestEntries(t, opened)
+	if len(updated) != 4 {
+		t.Fatalf("entries = %d, want creators A/B, aggregate, and unrelated", len(updated))
 	}
 
-	entryA := updated.entries[creatorA]
+	entryA := updated[creatorA]
 	if entryA.masterchain != oldA.masterchain || entryA.shardchain.lastUpdated != 1_000 ||
 		entryA.shardchain.total != oldA.shardchain.total+2 ||
 		entryA.shardchain.count2048 != decayDiscountedValue(oldA.shardchain.count2048, 100<<5)+2<<32 ||
 		entryA.shardchain.count65536 != decayDiscountedValue(oldA.shardchain.count65536, 100)+2<<32 {
 		t.Fatalf("creator A = %+v", entryA)
 	}
-	entryB := updated.entries[creatorB]
+	entryB := updated[creatorB]
 	wantUnit := uint64(1) << 32
 	if entryB.masterchain != (discountedCounter{lastUpdated: 1_000, total: 1, count2048: wantUnit, count65536: wantUnit}) ||
 		entryB.shardchain != (discountedCounter{lastUpdated: 1_000, total: 1, count2048: wantUnit, count65536: wantUnit}) {
 		t.Fatalf("creator B = %+v", entryB)
 	}
-	aggregate := updated.entries[[32]byte{}]
+	aggregate := updated[[32]byte{}]
 	if aggregate.masterchain.total != 1 || aggregate.shardchain.total != 3 ||
 		aggregate.masterchain.count2048 != wantUnit || aggregate.shardchain.count2048 != 3<<32 {
 		t.Fatalf("aggregate = %+v", aggregate)
 	}
-	if updated.entries[unrelated] != oldUnrelated {
+	if updated[unrelated] != oldUnrelated {
 		t.Fatal("unrelated creator statistics changed")
 	}
-	if _, exists := updated.entries[creatorC]; exists {
+	if _, exists := updated[creatorC]; exists {
 		t.Fatal("zero-count creator was inserted")
+	}
+}
+
+// TestUpdateBlockCreateStatsMatchesFullRebuild is the bit-exactness guard for
+// the incremental collation path. Mutating the predecessor dictionary in place
+// keeps its untouched subtrees, while the reference serializes every entry from
+// scratch; a canonical Hashmap is determined by its key set, so the two must
+// agree on the root hash for every shape of update — insert, modify, and a
+// predecessor whose keys share deep prefixes with the new ones.
+func TestUpdateBlockCreateStatsMatchesFullRebuild(t *testing.T) {
+	rnd := rand.New(rand.NewSource(20260814))
+
+	for round := range 200 {
+		previousEntries := map[[32]byte]creatorStats{}
+		for range rnd.Intn(40) {
+			var key [32]byte
+			rnd.Read(key[:])
+			if rnd.Intn(3) == 0 {
+				// Share a long prefix with a sibling so the update lands inside
+				// an existing edge label rather than always at the root.
+				key[0], key[1], key[2] = 0xaa, 0xbb, byte(rnd.Intn(4))
+			}
+			previousEntries[key] = creatorStats{
+				masterchain: discountedCounter{
+					lastUpdated: uint32(1_000 + rnd.Intn(500)),
+					total:       uint64(1 + rnd.Intn(50)),
+					count2048:   uint64(1+rnd.Intn(50)) << 32,
+					count65536:  uint64(1+rnd.Intn(50)) << 32,
+				},
+			}
+		}
+
+		shardCreators := map[[32]byte]uint32{}
+		existing := sortedCreatorKeys(previousEntries)
+		for i := 0; i < rnd.Intn(6) && i < len(existing); i++ {
+			shardCreators[existing[rnd.Intn(len(existing))]] = uint32(1 + rnd.Intn(4))
+		}
+		for range rnd.Intn(4) {
+			var key [32]byte
+			rnd.Read(key[:])
+			if rnd.Intn(2) == 0 {
+				key[0], key[1], key[2] = 0xaa, 0xbb, byte(rnd.Intn(8))
+			}
+			shardCreators[key] = uint32(1 + rnd.Intn(4))
+		}
+		var masterCreator [32]byte
+		if rnd.Intn(2) == 0 && len(existing) != 0 {
+			masterCreator = existing[rnd.Intn(len(existing))]
+		} else {
+			rnd.Read(masterCreator[:])
+		}
+		now := uint32(2_000 + rnd.Intn(1_000))
+
+		root, err := updateBlockCreateStats(blockCreateStatsInput{
+			enabled:            true,
+			previous:           blockCreateStatsTestStats(t, previousEntries),
+			now:                now,
+			shardBlockCreators: shardCreators,
+			masterchainCreator: masterCreator,
+		})
+		if err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+
+		// Reference: apply the same increments to a plain map and serialize the
+		// whole dictionary from nothing.
+		wantEntries := maps.Clone(previousEntries)
+		increments, err := creatorStatsIncrements(shardCreators, masterCreator)
+		if err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		for _, creator := range sortedCreatorKeys(increments) {
+			increment := increments[creator]
+			entry := wantEntries[creator]
+			if increment.masterchain != 0 {
+				if err = entry.masterchain.increaseBy(increment.masterchain, now); err != nil {
+					t.Fatalf("round %d: %v", round, err)
+				}
+			}
+			if increment.shardchain != 0 {
+				if err = entry.shardchain.increaseBy(increment.shardchain, now); err != nil {
+					t.Fatalf("round %d: %v", round, err)
+				}
+			}
+			wantEntries[creator] = entry
+		}
+
+		if got, want := root.HashKey(), blockCreateStatsTestCell(t, wantEntries).HashKey(); got != want {
+			t.Fatalf("round %d: incremental update root %x, full rebuild root %x", round, got, want)
+		}
 	}
 }
 
@@ -410,11 +563,11 @@ func TestUpdateBlockCreateStatsZeroCreatorAndOrdering(t *testing.T) {
 	if firstRoot.HashKey() != secondRoot.HashKey() {
 		t.Fatal("creator map insertion order changed output root")
 	}
-	stats, err := parseBlockCreateStats(firstRoot)
+	stats, err := openBlockCreateStats(firstRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	aggregate := stats.entries[[32]byte{}]
+	aggregate := blockCreateStatsTestEntries(t, stats)[[32]byte{}]
 	if aggregate.masterchain.total != 0 || aggregate.shardchain.total != 5 {
 		t.Fatalf("aggregate = %+v, zero creator must be ignored", aggregate)
 	}
@@ -430,16 +583,16 @@ func TestVerifyBlockCreateStatsUpdateCppTolerance(t *testing.T) {
 			count65536:  5 << 32,
 		},
 	}
-	previous := blockCreateStats{entries: map[[32]byte]creatorStats{
+	previous := blockCreateStatsTestStats(t, map[[32]byte]creatorStats{
 		creator: previousEntry,
-	}}
+	})
 	expected := previousEntry
 	if err := expected.masterchain.increaseBy(1, 150); err != nil {
 		t.Fatal(err)
 	}
 	expected.masterchain.count2048++
 	expected.masterchain.count65536--
-	next := blockCreateStats{entries: map[[32]byte]creatorStats{
+	nextEntries := map[[32]byte]creatorStats{
 		creator: expected,
 		[32]byte{}: {
 			masterchain: discountedCounter{
@@ -449,16 +602,18 @@ func TestVerifyBlockCreateStatsUpdateCppTolerance(t *testing.T) {
 				count65536:  1 << 32,
 			},
 		},
-	}}
+	}
+	next := blockCreateStatsTestStats(t, nextEntries)
 	if err := verifyBlockCreateStatsUpdate(previous, next, 150, nil, creator); err != nil {
 		t.Fatalf("+/-1 result rejected: %v", err)
 	}
 
-	invalid := blockCreateStats{entries: maps.Clone(next.entries)}
-	entry := invalid.entries[creator]
+	invalidEntries := maps.Clone(nextEntries)
+	entry := invalidEntries[creator]
 	entry.masterchain.count2048++
 	entry.masterchain.count2048++
-	invalid.entries[creator] = entry
+	invalidEntries[creator] = entry
+	invalid := blockCreateStatsTestStats(t, invalidEntries)
 	if err := verifyBlockCreateStatsUpdate(previous, invalid, 150, nil, creator); err == nil {
 		t.Fatal("discounted counter outside the +/-1 tolerance was accepted")
 	}
@@ -466,7 +621,7 @@ func TestVerifyBlockCreateStatsUpdateCppTolerance(t *testing.T) {
 
 func TestVerifyBlockCreateStatsUpdateCppPruning(t *testing.T) {
 	creator := creatorStatsTestKey(0x52)
-	previous := blockCreateStats{entries: map[[32]byte]creatorStats{
+	previous := blockCreateStatsTestStats(t, map[[32]byte]creatorStats{
 		creator: {
 			masterchain: discountedCounter{
 				lastUpdated: 1,
@@ -475,8 +630,8 @@ func TestVerifyBlockCreateStatsUpdateCppPruning(t *testing.T) {
 				count65536:  1 << 32,
 			},
 		},
-	}}
-	empty := blockCreateStats{entries: map[[32]byte]creatorStats{}}
+	})
+	empty := blockCreateStatsTestStats(t, nil)
 	if err := verifyBlockCreateStatsUpdate(previous, empty, 4_000_000, nil, [32]byte{}); err != nil {
 		t.Fatalf("stale creator pruning rejected: %v", err)
 	}
@@ -494,9 +649,9 @@ func TestUpdateBlockCreateStatsDisabled(t *testing.T) {
 	creatorB := creatorStatsTestKey(0x22)
 	root, err := updateBlockCreateStats(blockCreateStatsInput{
 		enabled: false,
-		previous: blockCreateStats{entries: map[[32]byte]creatorStats{
+		previous: blockCreateStatsTestStats(t, map[[32]byte]creatorStats{
 			creatorA: {masterchain: discountedCounter{lastUpdated: 1, total: 1}},
-		}},
+		}),
 		shardBlockCreators: map[[32]byte]uint32{
 			creatorA: math.MaxUint32,
 			creatorB: 1,
@@ -525,11 +680,11 @@ func TestUpdateBlockCreateStatsRejectsInvalidInput(t *testing.T) {
 	})
 
 	t.Run("counter overflow", func(t *testing.T) {
-		previous := blockCreateStats{entries: map[[32]byte]creatorStats{
+		previous := blockCreateStatsTestStats(t, map[[32]byte]creatorStats{
 			creatorA: {
 				masterchain: discountedCounter{lastUpdated: 1, total: math.MaxUint64},
 			},
-		}}
+		})
 		_, err := updateBlockCreateStats(blockCreateStatsInput{
 			enabled:            true,
 			previous:           previous,
@@ -574,6 +729,70 @@ func creatorStatsTestCell(
 	return builder.EndCell()
 }
 
+// blockCreateStatsTestCell serializes a whole creator dictionary from scratch.
+// Production no longer does this — it mutates the predecessor in place — so the
+// helper doubles as the independent reference the incremental update is
+// compared against.
+func blockCreateStatsTestCell(t *testing.T, entries map[[32]byte]creatorStats) *cell.Cell {
+	t.Helper()
+
+	dict := cell.NewDict(creatorStatsKeyBits)
+	for _, creator := range sortedCreatorKeys(entries) {
+		value, err := entries[creator].toCell()
+		if err != nil {
+			t.Fatalf("serialize creator %x: %v", creator, err)
+		}
+		key := cell.BeginCell().MustStoreSlice(creator[:], 256).EndCell()
+		if err = dict.Set(key, value); err != nil {
+			t.Fatalf("store creator %x: %v", creator, err)
+		}
+	}
+	builder := cell.BeginCell().MustStoreUInt(blockCreateStatsTag, 8)
+	if err := builder.StoreDict(dict); err != nil {
+		t.Fatal(err)
+	}
+	return builder.EndCell()
+}
+
+func blockCreateStatsTestStats(t *testing.T, entries map[[32]byte]creatorStats) blockCreateStats {
+	t.Helper()
+
+	stats, err := openBlockCreateStats(blockCreateStatsTestCell(t, entries))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stats
+}
+
+// blockCreateStatsTestEntries materializes a dictionary for assertions, which is
+// exactly the traversal production stopped doing.
+func blockCreateStatsTestEntries(t *testing.T, stats blockCreateStats) map[[32]byte]creatorStats {
+	t.Helper()
+
+	entries := map[[32]byte]creatorStats{}
+	if stats.dict == nil {
+		return entries
+	}
+	items, err := stats.dict.LoadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range items {
+		key, err := items[i].Key.LoadSlice(256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var creator [32]byte
+		copy(creator[:], key)
+		entry, err := loadCreatorStats(items[i].Value)
+		if err != nil {
+			t.Fatalf("creator %x: %v", creator, err)
+		}
+		entries[creator] = entry
+	}
+	return entries
+}
+
 func blockCreateStatsTestRoot(t *testing.T, tag uint64, value *cell.Cell) *cell.Cell {
 	t.Helper()
 
@@ -593,7 +812,7 @@ func blockCreateStatsTestRoot(t *testing.T, tag uint64, value *cell.Cell) *cell.
 // entry per recently active validator.
 const masterCreatorStatsBenchEntries = 300
 
-func benchBlockCreateStats(n int) blockCreateStats {
+func benchBlockCreateStatsEntries(n int) map[[32]byte]creatorStats {
 	entries := make(map[[32]byte]creatorStats, n)
 	for i := range n {
 		var key [32]byte
@@ -615,14 +834,45 @@ func benchBlockCreateStats(n int) blockCreateStats {
 			},
 		}
 	}
-	return blockCreateStats{entries: entries}
+	return entries
+}
+
+func benchBlockCreateStatsCell(tb testing.TB, n int) *cell.Cell {
+	tb.Helper()
+
+	dict := cell.NewDict(creatorStatsKeyBits)
+	entries := benchBlockCreateStatsEntries(n)
+	for _, creator := range sortedCreatorKeys(entries) {
+		value, err := entries[creator].toCell()
+		if err != nil {
+			tb.Fatal(err)
+		}
+		if err = dict.SetBuilderByBytesKey(creator[:], value.ToBuilder()); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	builder := cell.BeginCell().MustStoreUInt(blockCreateStatsTag, 8)
+	if err := builder.StoreDict(dict); err != nil {
+		tb.Fatal(err)
+	}
+	return builder.EndCell()
+}
+
+func benchBlockCreateStats(tb testing.TB, n int) blockCreateStats {
+	tb.Helper()
+
+	stats, err := openBlockCreateStats(benchBlockCreateStatsCell(tb, n))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return stats
 }
 
 // BenchmarkUpdateBlockCreateStats covers the collation-side update of a
-// realistically sized creator dictionary. The predecessor arrives decoded from
-// parseMasterStateInfoWithStats, so this path no longer walks it a second time.
+// realistically sized creator dictionary. It touches only the keys the block
+// names, so its cost is flat in the number of recently active validators.
 func BenchmarkUpdateBlockCreateStats(b *testing.B) {
-	previous := benchBlockCreateStats(masterCreatorStatsBenchEntries)
+	previous := benchBlockCreateStats(b, masterCreatorStatsBenchEntries)
 	creator := creatorStatsTestKey(0x7e)
 	b.ReportAllocs()
 	for b.Loop() {
@@ -637,16 +887,51 @@ func BenchmarkUpdateBlockCreateStats(b *testing.B) {
 	}
 }
 
-// BenchmarkParseBlockCreateStats measures one full dictionary walk — the work
-// removed once per masterchain collation and twice per masterchain validation.
-func BenchmarkParseBlockCreateStats(b *testing.B) {
-	root, err := benchBlockCreateStats(masterCreatorStatsBenchEntries).toCell()
+// BenchmarkOpenBlockCreateStats measures what decoding the statistics now costs
+// on the paths that only need the dictionary handle: the header, and nothing
+// else. It replaces a full traversal removed once per masterchain collation,
+// twice per masterchain validation and once per shard validation.
+func BenchmarkOpenBlockCreateStats(b *testing.B) {
+	root := benchBlockCreateStatsCell(b, masterCreatorStatsBenchEntries)
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := openBlockCreateStats(root); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkVerifyBlockCreateStatsUpdate measures the validation pass over a
+// realistically sized dictionary whose block touched a handful of creators.
+func BenchmarkVerifyBlockCreateStatsUpdate(b *testing.B) {
+	const shardCreators = 20
+	previous := benchBlockCreateStats(b, masterCreatorStatsBenchEntries)
+	creator := creatorStatsTestKey(0x7e)
+	creators := make(map[[32]byte]uint32, shardCreators)
+	for i := range shardCreators {
+		var key [32]byte
+		key[0] = byte(i)
+		key[2] = 0xa5
+		creators[key] = 1
+	}
+	root, err := updateBlockCreateStats(blockCreateStatsInput{
+		enabled:            true,
+		previous:           previous,
+		now:                5_000,
+		shardBlockCreators: creators,
+		masterchainCreator: creator,
+	})
 	if err != nil {
 		b.Fatal(err)
 	}
+	next, err := openBlockCreateStats(root)
+	if err != nil {
+		b.Fatal(err)
+	}
+
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := parseBlockCreateStats(root); err != nil {
+		if err := verifyBlockCreateStatsUpdate(previous, next, 5_000, creators, creator); err != nil {
 			b.Fatal(err)
 		}
 	}

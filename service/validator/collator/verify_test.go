@@ -786,6 +786,12 @@ func cloneVerificationCandidate(candidate *Candidate) *Candidate {
 	cloned.ID.FileHash = bytes.Clone(candidate.ID.FileHash)
 	cloned.BlockBOC = bytes.Clone(candidate.BlockBOC)
 	cloned.CollatedData = bytes.Clone(candidate.CollatedData)
+	// These clones exist to be tampered with and handed to VerifyShardCandidate,
+	// which is the exported entry point: a caller there assembles the Candidate
+	// itself and cannot assert that this package took its file hashes, so the
+	// clone must not inherit that claim from the build it was copied from.
+	// Dropping it is what keeps every hash-tampering case in this file honest.
+	cloned.digested = false
 	return &cloned
 }
 

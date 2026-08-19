@@ -10,6 +10,15 @@ import (
 )
 
 func (s *Store) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) error {
+	return s.publishLiveBlockArtifacts(artifacts, false)
+}
+
+// publishLiveBlockArtifacts is the one publish body. accepted marks a
+// publication this node produced itself and has not yet committed anywhere, so
+// it is additionally enrolled in the accepted-state bound — see
+// accepted_state.go for why that enrolment is mandatory rather than an
+// optimization.
+func (s *Store) publishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts, accepted bool) error {
 	prepared, err := prepareLiveBlockArtifacts(artifacts)
 	if err == nil {
 		// Structural validation of the block root and state; a block whose view
@@ -45,7 +54,18 @@ func (s *Store) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) 
 	}
 
 	s.mu.Lock()
+	// Enrolled BEFORE the publish, because publishLiveBlockArtifactsPreparedLocked
+	// trims the block cache and protectedLiveBlocksLocked is what keeps this entry
+	// out of that trim.
+	if accepted {
+		s.rememberAcceptedStateLocked(prepared.block)
+	}
+	prepared.accepted = accepted
 	published, ready := s.publishLiveBlockArtifactsPreparedLocked(prepared)
+	// Exact block/state waiters are driven by sync publications, including a
+	// non-current shard or a non-final candidate. They must not depend on the
+	// publication also advancing CurrentState or the ready masterchain seqno.
+	s.signalBlockArtifactsLocked()
 	if published || ready {
 		close(s.notify)
 		s.notify = make(chan struct{})
@@ -263,6 +283,7 @@ func (s *Store) publishLiveBlockArtifactsPreparedLocked(prepared livePreparedBlo
 		artifactFlushed: prepared.artifactFlushed || flushed.artifact,
 		stateFlushed:    prepared.stateFlushed || flushed.state,
 		fragments:       prepared.fragments,
+		acceptedOwner:   prepared.accepted,
 	}, prepared.state)
 	published := s.publishPendingCurrentLocked()
 	if s.current != nil && blockIDEqual(s.current.Masterchain.Block, prepared.block) {
@@ -271,6 +292,7 @@ func (s *Store) publishLiveBlockArtifactsPreparedLocked(prepared livePreparedBlo
 	if s.nonFinalEnabled {
 		s.cleanupNonfinalPendingLocked()
 	}
+	s.cleanupAcceptedStatesLocked()
 	s.trimBlocksLocked(liveBlockKind(prepared.block))
 	ready := s.updateReadyMasterSeqnoLocked()
 	return published, ready
@@ -290,8 +312,10 @@ func (s *Store) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 		if s.nonFinalEnabled {
 			s.cleanupNonfinalPendingLocked()
 		}
+		s.cleanupAcceptedStatesLocked()
 		s.trimBlocksLocked(liveBlockKind(block))
 		ready := s.updateReadyMasterSeqnoLocked()
+		s.signalBlockArtifactsLocked()
 		if published || ready {
 			close(s.notify)
 			s.notify = make(chan struct{})
@@ -316,6 +340,7 @@ func (s *Store) MarkLiveBlockStatesFlushed(blocks []ton.BlockIDExt) {
 	for _, block := range blocks {
 		s.markLiveBlockStateFlushedLocked(block, false)
 	}
+	s.signalBlockArtifactsLocked()
 	s.trimBlocksLocked(liveBlockMaster)
 	s.trimBlocksLocked(liveBlockShard)
 	s.mu.Unlock()
@@ -331,6 +356,7 @@ func (s *Store) MarkLiveCurrentStateFlushed(current *storage.CurrentState) {
 	s.trimBlocksLocked(liveBlockMaster)
 	s.trimBlocksLocked(liveBlockShard)
 	ready := s.updateReadyMasterSeqnoLocked()
+	s.signalBlockArtifactsLocked()
 	if published || ready {
 		close(s.notify)
 		s.notify = make(chan struct{})

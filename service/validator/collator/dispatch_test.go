@@ -440,7 +440,7 @@ func dispatchTestCollation(t *testing.T, queue *tlb.DispatchQueueAugDict, policy
 		gas:          loose,
 		ltDelta:      loose,
 		collatedData: loose,
-	}, 1_000, usage)
+	}, 1_000, usage, 0, 0)
 	oldQueue := &tlb.DispatchQueueAugDict{AugmentedDictionary: queue.Copy()}
 	c := &collation{
 		ctx:              context.Background(),

@@ -77,7 +77,7 @@ func SignCandidate(signer Signer, sessionID [32]byte, id CandidateID) ([]byte, e
 }
 
 // DelegationToSignBytes returns the boxed consensus.delegationToSign payload
-// authorized by a validator leader in Delegated v3.
+// authorized by a validator leader.
 func DelegationToSignBytes(windowStart uint32, collatorID [32]byte) []byte {
 	return mustSerialize(ConsensusDelegationToSign{
 		WindowStartSlot: int32(windowStart),
@@ -96,8 +96,8 @@ func SignDelegation(
 	return signer.Sign(DataToSign(sessionID, DelegationToSignBytes(windowStart, collatorID)))
 }
 
-// VerifyDelegationSignature verifies one Delegated-v3 leader authorization
-// without exposing TL serialization to the collator runtime.
+// VerifyDelegationSignature verifies one leader authorization without exposing
+// TL serialization to the collator runtime.
 func VerifyDelegationSignature(
 	leaderKey ed25519.PublicKey,
 	sessionID [32]byte,
@@ -127,11 +127,7 @@ func verifyDelegatedCandidate(
 	leaderKey ed25519.PublicKey,
 	sessionID [32]byte,
 	slotsPerWindow uint32,
-	protocolVersion uint8,
 ) error {
-	if protocolVersion < 3 {
-		return fmt.Errorf("simplex: delegated candidate requires protocol version 3")
-	}
 	d := c.Delegation
 	if len(d.CollatorKey) != ed25519.PublicKeySize {
 		return fmt.Errorf("simplex: delegated candidate collator key is invalid")

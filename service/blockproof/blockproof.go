@@ -414,19 +414,60 @@ func CheckPreparedMasterchainSignatures(blockID ton.BlockIDExt, blockSignatures 
 	return CheckPreparedBlockSignatures(blockID, blockSignatures, validators)
 }
 
+// CheckPreparedSignatures validates a prepared signature set in full: the
+// non-cryptographic half (see CheckPreparedSignatureWeight) and then an
+// Ed25519 verification of every listed signature.
+//
+// This is the mandatory entry point for every signature set that arrived from
+// the network — SyncCoordinator.CheckBlockBroadcastSignatures and
+// CheckBlockFinalitySignatures are the node's trust boundary with its peers and
+// nothing verified those upstream. Exactly one caller in the tree may use the
+// weaker CheckPreparedSignatureWeight instead, and only because it holds a
+// type-level proof that the same quorum was already verified; see the note
+// there.
 func CheckPreparedSignatures(blockID ton.BlockIDExt, sigSet *ValidatorSignatureSet, validators *PreparedValidatorSet) error {
-	if sigSet == nil {
-		return fmt.Errorf("block %s has no prepared validator signatures", tnstore.FormatBlockRef(blockID))
-	}
-
-	if _, err := validateSignatureWeight(sigSet, validators); err != nil {
-		return fmt.Errorf("check validator signatures for %s: %w", tnstore.FormatBlockRef(blockID), err)
+	if _, err := CheckPreparedSignatureWeight(blockID, sigSet, validators); err != nil {
+		return err
 	}
 	if err := verifySignatures(blockID, sigSet, validators); err != nil {
 		return fmt.Errorf("check validator signatures for %s: %w", tnstore.FormatBlockRef(blockID), err)
 	}
 
 	return nil
+}
+
+// CheckPreparedSignatureWeight runs everything CheckPreparedSignatures does
+// except the Ed25519 pass: roster identity (catchain seqno and validator set
+// hash), per-signature length, unknown-validator and duplicate rejection, and
+// the 2/3+1 weighted threshold. It returns the signed weight.
+//
+// None of that is cryptography, and none of it is implied by a verified
+// quorum: the seal below is expressed in validator *indices* while the wire
+// form addresses validators by node id, so this is what catches an
+// index-to-node-id mapping bug, and the threshold it proves is the one computed
+// in this package's own weight model — the model whose numbers land on the wire
+// as SigWeight in FinalitySignaturesCell.
+//
+// It exists for one caller: the Simplex block accepter
+// (service/validator.BlockAccepter), which holds a simplex.VerifiedCertificate
+// — a type-level proof that this exact quorum was already verified by the
+// consensus engine over a byte-identical signed payload. Every other caller
+// must use CheckPreparedSignatures.
+func CheckPreparedSignatureWeight(
+	blockID ton.BlockIDExt,
+	sigSet *ValidatorSignatureSet,
+	validators *PreparedValidatorSet,
+) (uint64, error) {
+	if sigSet == nil {
+		return 0, fmt.Errorf("block %s has no prepared validator signatures", tnstore.FormatBlockRef(blockID))
+	}
+
+	weight, err := validateSignatureWeight(sigSet, validators)
+	if err != nil {
+		return 0, fmt.Errorf("check validator signatures for %s: %w", tnstore.FormatBlockRef(blockID), err)
+	}
+
+	return weight, nil
 }
 
 // CheckPreparedBlockSignatures validates a serialized BlockSignatures value.
@@ -759,10 +800,20 @@ func signaturePayload(blockID ton.BlockIDExt, sigSet *ValidatorSignatureSet) ([]
 		return tl.Serialize(ton.BlockID{RootHash: blockID.RootHash, FileHash: blockID.FileHash}, true)
 	}
 
-	return buildSimplexToSignPayload(blockID, sigSet.final, sigSet.sessionID, sigSet.slot, sigSet.candidateData)
+	return SimplexSignaturePayload(blockID, sigSet.final, sigSet.sessionID, sigSet.slot, sigSet.candidateData)
 }
 
-func buildSimplexToSignPayload(blockID ton.BlockIDExt, final bool, sessionID []byte, slot int32, candidate []byte) ([]byte, error) {
+// SimplexSignaturePayload builds the exact byte string a Simplex validator
+// signature covers: the boxed notarize/finalize vote over the candidate id,
+// wrapped in consensus.dataToSign with the session id.
+//
+// It must stay byte-identical to simplex.DataToSign(sessionID,
+// simplex.VoteBytes(vote)) for the same vote — the consensus engine signs
+// through that constructor and this package verifies through this one. The
+// equality used to be enforced implicitly, because block acceptance re-verified
+// on this side every quorum the engine had already verified on that side; it is
+// now pinned explicitly by TestSimplexSignaturePayloadMatchesConsensusEngine.
+func SimplexSignaturePayload(blockID ton.BlockIDExt, final bool, sessionID []byte, slot int32, candidate []byte) ([]byte, error) {
 	if len(sessionID) != 32 {
 		return nil, fmt.Errorf("invalid simplex session id len %d", len(sessionID))
 	}

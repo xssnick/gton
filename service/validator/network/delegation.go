@@ -11,7 +11,7 @@ import (
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
-// EncodePleaseCollatePrepare serializes one Delegated-v3 availability probe.
+// EncodePleaseCollatePrepare serializes one delegated-collation availability probe.
 func EncodePleaseCollatePrepare(request simplex.ConsensusPleaseCollatePrepare) ([]byte, error) {
 	if request.WindowStartSlot < 0 {
 		return nil, errors.New("validator network: negative delegation window")
@@ -23,7 +23,7 @@ func EncodePleaseCollatePrepare(request simplex.ConsensusPleaseCollatePrepare) (
 	return wire, nil
 }
 
-// DecodePleaseCollatePrepare parses one exact Delegated-v3 availability probe.
+// DecodePleaseCollatePrepare parses one exact delegated-collation availability probe.
 func DecodePleaseCollatePrepare(wire []byte) (simplex.ConsensusPleaseCollatePrepare, error) {
 	if !IsPleaseCollatePrepare(wire) {
 		return simplex.ConsensusPleaseCollatePrepare{}, errors.New("validator network: unexpected pleaseCollatePrepare constructor")
@@ -42,12 +42,12 @@ func DecodePleaseCollatePrepare(wire []byte) (simplex.ConsensusPleaseCollatePrep
 	return request, nil
 }
 
-// IsPleaseCollatePrepare reports the Delegated-v3 probe constructor prefix.
+// IsPleaseCollatePrepare reports the delegation probe constructor prefix.
 func IsPleaseCollatePrepare(wire []byte) bool {
 	return len(wire) >= 4 && binary.LittleEndian.Uint32(wire) == idPleaseCollatePrepare
 }
 
-// EncodePleaseCollate serializes one final Delegated-v3 window delegation.
+// EncodePleaseCollate serializes one final leader-window delegation.
 func EncodePleaseCollate(request simplex.ConsensusPleaseCollate) ([]byte, error) {
 	if request.WindowStartSlot < 0 {
 		return nil, errors.New("validator network: negative delegation window")
@@ -62,7 +62,7 @@ func EncodePleaseCollate(request simplex.ConsensusPleaseCollate) ([]byte, error)
 	return wire, nil
 }
 
-// DecodePleaseCollate parses one exact final Delegated-v3 window delegation.
+// DecodePleaseCollate parses one exact final leader-window delegation.
 func DecodePleaseCollate(wire []byte) (simplex.ConsensusPleaseCollate, error) {
 	if !IsPleaseCollate(wire) {
 		return simplex.ConsensusPleaseCollate{}, errors.New("validator network: unexpected pleaseCollate constructor")
@@ -87,7 +87,7 @@ func DecodePleaseCollate(wire []byte) (simplex.ConsensusPleaseCollate, error) {
 	return request, nil
 }
 
-// IsPleaseCollate reports the final Delegated-v3 constructor prefix.
+// IsPleaseCollate reports the final delegation constructor prefix.
 func IsPleaseCollate(wire []byte) bool {
 	return len(wire) >= 4 && binary.LittleEndian.Uint32(wire) == idPleaseCollate
 }

@@ -120,14 +120,8 @@ func TestLoadDefaults(t *testing.T) {
 	if int64(decodedCellCache.Shards) != DefaultDecodedCellCacheShards {
 		t.Fatalf("unexpected decoded cell cache shards %d", decodedCellCache.Shards)
 	}
-	if decodedCellCache.BytesPerEntry != DefaultDecodedCellCacheBytesPerEntry {
-		t.Fatalf("unexpected decoded cell cache bytes per entry %d", decodedCellCache.BytesPerEntry)
-	}
-	if int64(decodedCellCache.MinEntries) != DefaultDecodedCellCacheMinEntries {
-		t.Fatalf("unexpected decoded cell cache min entries %d", decodedCellCache.MinEntries)
-	}
-	if int64(decodedCellCache.MaxEntries) != DefaultDecodedCellCacheMaxEntries {
-		t.Fatalf("unexpected decoded cell cache max entries %d", decodedCellCache.MaxEntries)
+	if int64(decodedCellCache.Entries) != DefaultDecodedCellCacheEntries {
+		t.Fatalf("unexpected decoded cell cache entries %d", decodedCellCache.Entries)
 	}
 	cellShardMemTableSize := storageOpts.CellShardMemTableSize
 	if int64(cellShardMemTableSize) != DefaultCellShardMemTable {
@@ -154,6 +148,211 @@ func TestLoadDefaults(t *testing.T) {
 	artifactFileMaxOpen := storageOpts.ArtifactFileMaxOpen
 	if int64(artifactFileMaxOpen) != DefaultArtifactFileMaxOpen {
 		t.Fatalf("unexpected artifact file max open %d", artifactFileMaxOpen)
+	}
+}
+
+// Load parses with DisallowUnknownFields, so a config.json written by any
+// earlier build — every one of which carried all three byte knobs — must still
+// open. This is the whole reason the fields are kept as no-ops rather than
+// deleted: deleting them would have made existing nodes refuse to start.
+func TestLoadAcceptsDeprecatedDecodedCellCacheByteKnobs(t *testing.T) {
+	path := writeTestConfig(t, `{
+	  "storage": {
+	    "cell_total_cache_size": 17179869184,
+	    "decoded_cell_cache_enabled": true,
+	    "decoded_cell_cache_shards": 64,
+	    "decoded_cell_cache_bytes_per_entry": 16384,
+	    "decoded_cell_cache_min_entries": 65536,
+	    "decoded_cell_cache_max_entries": 1048576
+	  }
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config with deprecated knobs: %v", err)
+	}
+	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("runtime options: %v", err)
+	}
+
+	// cell_total_cache_size keeps its meaning: it is the pebble block cache.
+	if runtimeOpts.Node.Storage.CellTotalCacheSize != 16<<30 {
+		t.Fatalf("pebble cell cache size = %d, want %d",
+			runtimeOpts.Node.Storage.CellTotalCacheSize, int64(16<<30))
+	}
+
+	// The dead knobs size nothing. In particular min_entries = 65536 must NOT
+	// clamp anything: it is a floor from a derivation that no longer happens,
+	// and honouring it would override any smaller value an operator sets today.
+	decoded := runtimeOpts.Node.Storage.DecodedCellCache
+	if int64(decoded.Entries) != DefaultDecodedCellCacheEntries {
+		t.Fatalf("entries = %d, want %d", decoded.Entries, DefaultDecodedCellCacheEntries)
+	}
+
+	// And nothing is warned about, because these are exactly the values the node
+	// itself wrote. Every deployment on earth carries them, so a warning here
+	// would fire for all of them and would say something untrue: that a setting
+	// somebody chose has stopped working. The warning is for a choice, and this
+	// config records no choice.
+	if dead := DeprecatedDecodedCellCacheFields(cfg.Storage); len(dead) != 0 {
+		t.Fatalf("the node's own stock values are reported as deprecated: %v", dead)
+	}
+}
+
+// The same three knobs, at values no released build ever wrote. Somebody typed
+// these, they no longer do anything, and that is the case the warning exists
+// for.
+func TestDeprecatedDecodedCellCacheKnobsWarnWhenTunedByHand(t *testing.T) {
+	path := writeTestConfig(t, `{
+	  "storage": {
+	    "decoded_cell_cache_bytes_per_entry": 4096,
+	    "decoded_cell_cache_min_entries": 131072,
+	    "decoded_cell_cache_max_entries": 4194304
+	  }
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config with hand-tuned dead knobs: %v", err)
+	}
+	dead := DeprecatedDecodedCellCacheFields(cfg.Storage)
+	if len(dead) != 3 {
+		t.Fatalf("deprecated fields reported = %v, want all three byte knobs", dead)
+	}
+}
+
+// The decoded cache is bounded in entries because its cost is GC mark work over
+// roughly ten live objects per entry, paid on every collection. When the
+// derivation that used to size it was removed, the clamp that bounded the
+// derivation went with it and the knob was left open at the top — so a config
+// could put back exactly the object count the resize removed.
+func TestDecodedCellCacheEntriesAreBoundedAbove(t *testing.T) {
+	for _, field := range []string{"decoded_cell_cache_entries", "service_decoded_cell_cache_entries"} {
+		path := writeTestConfig(t, `{"storage": {"`+field+`": 8388608}}`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("load config with an oversized %s: %v", field, err)
+		}
+		if _, err = cfg.RuntimeOptions(gton.DefaultNodeOptions()); err == nil {
+			t.Fatalf("storage.%s accepted 8 Mi entries, %d times the ceiling",
+				field, 8<<20/MaxDecodedCellCacheEntries)
+		}
+	}
+
+	// The ceiling itself is usable.
+	path := writeTestConfig(t, `{"storage": {"decoded_cell_cache_entries": 1048576}}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("the ceiling itself was rejected: %v", err)
+	}
+	if int64(opts.Node.Storage.DecodedCellCache.Entries) != MaxDecodedCellCacheEntries {
+		t.Fatalf("entries at the ceiling = %d, want %d",
+			opts.Node.Storage.DecodedCellCache.Entries, MaxDecodedCellCacheEntries)
+	}
+}
+
+// A config written by the two-cache build carries the service/operation pair.
+// DisallowUnknownFields means both names must still parse, and — the part that
+// matters to an operator who tuned it — the service value must still be applied
+// rather than silently reverting to the default.
+func TestLoadHonoursTheRenamedServiceEntriesKnob(t *testing.T) {
+	path := writeTestConfig(t, `{
+	  "storage": {
+	    "decoded_cell_cache_enabled": true,
+	    "decoded_cell_cache_shards": 64,
+	    "service_decoded_cell_cache_entries": 4096,
+	    "operation_decoded_cell_cache_entries": 1024
+	  }
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config written by the two-cache build: %v", err)
+	}
+	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("runtime options: %v", err)
+	}
+
+	if got := runtimeOpts.Node.Storage.DecodedCellCache.Entries; got != 4096 {
+		t.Fatalf("entries = %d, want the operator's 4096 carried over from the old name", got)
+	}
+
+	// The old name is reported as renamed-but-honoured, not as dead.
+	renamed := RenamedDecodedCellCacheFields(cfg.Storage)
+	if renamed["storage.service_decoded_cell_cache_entries"] != "storage.decoded_cell_cache_entries" {
+		t.Fatalf("renamed fields = %v, want the service knob mapped to the new name", renamed)
+	}
+	// The operation knob really is dead: there is no second cache to size, and
+	// folding its value into the single one would misstate the operator's intent.
+	dead := DeprecatedDecodedCellCacheFields(cfg.Storage)
+	if len(dead) != 1 || dead[0] != "storage.operation_decoded_cell_cache_entries" {
+		t.Fatalf("deprecated fields = %v, want only the operation knob", dead)
+	}
+}
+
+// When both names are present the current one wins and the old one is reported
+// as ignored rather than honoured, so the two messages can never both be true.
+func TestLoadPrefersTheCurrentEntriesKnobOverTheAlias(t *testing.T) {
+	path := writeTestConfig(t, `{
+	  "storage": {
+	    "decoded_cell_cache_entries": 8192,
+	    "service_decoded_cell_cache_entries": 4096
+	  }
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("runtime options: %v", err)
+	}
+
+	if got := runtimeOpts.Node.Storage.DecodedCellCache.Entries; got != 8192 {
+		t.Fatalf("entries = %d, want the current knob's 8192", got)
+	}
+	if renamed := RenamedDecodedCellCacheFields(cfg.Storage); len(renamed) != 0 {
+		t.Fatalf("renamed fields = %v, want none: the alias is ignored, not honoured", renamed)
+	}
+	dead := DeprecatedDecodedCellCacheFields(cfg.Storage)
+	if len(dead) != 1 || dead[0] != "storage.service_decoded_cell_cache_entries" {
+		t.Fatalf("deprecated fields = %v, want the shadowed alias", dead)
+	}
+}
+
+// An operator who sets the current knob gets exactly what they asked for, and
+// nothing is reported.
+func TestLoadExplicitDecodedCellCacheEntries(t *testing.T) {
+	path := writeTestConfig(t, `{
+	  "storage": {
+	    "decoded_cell_cache_entries": 4096
+	  }
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("runtime options: %v", err)
+	}
+
+	if got := runtimeOpts.Node.Storage.DecodedCellCache.Entries; got != 4096 {
+		t.Fatalf("entries = %d, want 4096", got)
+	}
+	if len(DeprecatedDecodedCellCacheFields(cfg.Storage)) != 0 {
+		t.Fatal("a config using only the current knob should report nothing deprecated")
+	}
+	if len(RenamedDecodedCellCacheFields(cfg.Storage)) != 0 {
+		t.Fatal("a config using only the current knob should report nothing renamed")
 	}
 }
 
@@ -463,9 +662,7 @@ func TestStorageOptions(t *testing.T) {
 			"cell_total_cache_size": 8589934592,
 			"decoded_cell_cache_enabled": false,
 			"decoded_cell_cache_shards": 16,
-			"decoded_cell_cache_bytes_per_entry": 8192,
-			"decoded_cell_cache_min_entries": 1000,
-			"decoded_cell_cache_max_entries": 2000,
+			"decoded_cell_cache_entries": 2000,
 			"cell_shard_memtable_size": 1073741824,
 			"cell_memtable_stop_writes_threshold": 3,
 			"large_boc_shard_read_workers": 8,
@@ -497,14 +694,8 @@ func TestStorageOptions(t *testing.T) {
 	if decodedCellCache.Shards != 16 {
 		t.Fatalf("unexpected decoded cell cache shards %d", decodedCellCache.Shards)
 	}
-	if decodedCellCache.BytesPerEntry != 8192 {
-		t.Fatalf("unexpected decoded cell cache bytes per entry %d", decodedCellCache.BytesPerEntry)
-	}
-	if decodedCellCache.MinEntries != 1000 {
-		t.Fatalf("unexpected decoded cell cache min entries %d", decodedCellCache.MinEntries)
-	}
-	if decodedCellCache.MaxEntries != 2000 {
-		t.Fatalf("unexpected decoded cell cache max entries %d", decodedCellCache.MaxEntries)
+	if decodedCellCache.Entries != 2000 {
+		t.Fatalf("unexpected decoded cell cache entries %d", decodedCellCache.Entries)
 	}
 	if storageOpts.CellShardMemTableSize != 1<<30 {
 		t.Fatalf("unexpected cell shard memtable size %d", storageOpts.CellShardMemTableSize)
@@ -529,6 +720,64 @@ func TestStorageOptions(t *testing.T) {
 	}
 }
 
+// The record cache knob's three meanings, pinned separately because a JSON
+// int64 usually cannot carry all of them: ABSENT takes the 4 GiB default (an
+// existing config from before the knob gets the tier on upgrade), an explicit
+// value is honoured, and an explicit ZERO is the off switch rather than "give
+// me the default".
+func TestCellRecordCacheBytesKnob(t *testing.T) {
+	absent := writeTestConfig(t, `{"storage": {"dir": "data/node"}}`)
+	cfg, err := Load(absent)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	storageOpts, err := storageOptionsFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("storage options: %v", err)
+	}
+	if storageOpts.CellRecordCacheBytes != DefaultCellRecordCacheBytes {
+		t.Fatalf("absent knob = %d, want the %d default", storageOpts.CellRecordCacheBytes, DefaultCellRecordCacheBytes)
+	}
+
+	explicit := writeTestConfig(t, `{"storage": {"dir": "data/node", "cell_record_cache_bytes": 1073741824}}`)
+	if cfg, err = Load(explicit); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if storageOpts, err = storageOptionsFromConfig(cfg); err != nil {
+		t.Fatalf("storage options: %v", err)
+	}
+	if storageOpts.CellRecordCacheBytes != 1<<30 {
+		t.Fatalf("explicit knob = %d, want 1 GiB", storageOpts.CellRecordCacheBytes)
+	}
+
+	disabled := writeTestConfig(t, `{"storage": {"dir": "data/node", "cell_record_cache_bytes": 0}}`)
+	if cfg, err = Load(disabled); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if storageOpts, err = storageOptionsFromConfig(cfg); err != nil {
+		t.Fatalf("storage options: %v", err)
+	}
+	if storageOpts.CellRecordCacheBytes != 0 {
+		t.Fatalf("explicit zero = %d, want 0 (disabled)", storageOpts.CellRecordCacheBytes)
+	}
+
+	negative := writeTestConfig(t, `{"storage": {"dir": "data/node", "cell_record_cache_bytes": -1}}`)
+	if cfg, err = Load(negative); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if _, err = storageOptionsFromConfig(cfg); err == nil {
+		t.Fatal("negative record cache bytes should be rejected")
+	}
+
+	absurd := writeTestConfig(t, `{"storage": {"dir": "data/node", "cell_record_cache_bytes": 1099511627777}}`)
+	if cfg, err = Load(absurd); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if _, err = storageOptionsFromConfig(cfg); err == nil {
+		t.Fatal("a >1 TiB record cache budget should be rejected as a typo")
+	}
+}
+
 func TestDecodedCellCacheOptionsRejectInvalidValues(t *testing.T) {
 	tests := []struct {
 		name string
@@ -538,6 +787,22 @@ func TestDecodedCellCacheOptionsRejectInvalidValues(t *testing.T) {
 			name: "negative shards",
 			cfg:  Config{Storage: Storage{DecodedCellCacheShards: -1}},
 		},
+		{
+			name: "negative entries",
+			cfg:  Config{Storage: Storage{DecodedCellCacheEntries: -1}},
+		},
+		// The renamed alias and the dead operation knob are range-checked too,
+		// so a negative left in an old config is reported rather than skipped.
+		{
+			name: "negative service entries alias",
+			cfg:  Config{Storage: Storage{ServiceDecodedCellCacheEntries: -1}},
+		},
+		{
+			name: "negative operation entries",
+			cfg:  Config{Storage: Storage{OperationDecodedCellCacheEntries: -1}},
+		},
+		// The deprecated knobs no longer size anything, but a negative value is
+		// still reported rather than quietly ignored.
 		{
 			name: "negative bytes per entry",
 			cfg:  Config{Storage: Storage{DecodedCellCacheBytesPerEntry: -1}},
@@ -549,10 +814,6 @@ func TestDecodedCellCacheOptionsRejectInvalidValues(t *testing.T) {
 		{
 			name: "negative max entries",
 			cfg:  Config{Storage: Storage{DecodedCellCacheMaxEntries: -1}},
-		},
-		{
-			name: "min over max",
-			cfg:  Config{Storage: Storage{DecodedCellCacheMinEntries: 20, DecodedCellCacheMaxEntries: 10}},
 		},
 	}
 
@@ -781,14 +1042,23 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.Storage.DecodedCellCacheShards != DefaultDecodedCellCacheShards {
 		t.Fatalf("unexpected decoded cell cache shards %d", cfg.Storage.DecodedCellCacheShards)
 	}
-	if cfg.Storage.DecodedCellCacheBytesPerEntry != DefaultDecodedCellCacheBytesPerEntry {
-		t.Fatalf("unexpected decoded cell cache bytes per entry %d", cfg.Storage.DecodedCellCacheBytesPerEntry)
+	if cfg.Storage.DecodedCellCacheEntries != DefaultDecodedCellCacheEntries {
+		t.Fatalf("unexpected decoded cell cache entries %d", cfg.Storage.DecodedCellCacheEntries)
 	}
-	if cfg.Storage.DecodedCellCacheMinEntries != DefaultDecodedCellCacheMinEntries {
-		t.Fatalf("unexpected decoded cell cache min entries %d", cfg.Storage.DecodedCellCacheMinEntries)
+	// A generated config must not carry the old names at all, so a fresh node
+	// never emits a knob it would then have to warn about.
+	if cfg.Storage.ServiceDecodedCellCacheEntries != 0 {
+		t.Fatalf("generated config carries the renamed service knob: %d", cfg.Storage.ServiceDecodedCellCacheEntries)
 	}
-	if cfg.Storage.DecodedCellCacheMaxEntries != DefaultDecodedCellCacheMaxEntries {
-		t.Fatalf("unexpected decoded cell cache max entries %d", cfg.Storage.DecodedCellCacheMaxEntries)
+	if cfg.Storage.OperationDecodedCellCacheEntries != 0 {
+		t.Fatalf("generated config carries the dead operation knob: %d", cfg.Storage.OperationDecodedCellCacheEntries)
+	}
+	if len(RenamedDecodedCellCacheFields(cfg.Storage)) != 0 {
+		t.Fatalf("generated config carries renamed knobs: %v", RenamedDecodedCellCacheFields(cfg.Storage))
+	}
+	// A freshly generated config carries none of the dead knobs.
+	if len(DeprecatedDecodedCellCacheFields(cfg.Storage)) != 0 {
+		t.Fatalf("generated config carries deprecated knobs: %v", DeprecatedDecodedCellCacheFields(cfg.Storage))
 	}
 	if cfg.Storage.LargeBOCShardReadWorkers != DefaultLargeBOCShardReadWorkers {
 		t.Fatalf("unexpected large boc shard read workers %d", cfg.Storage.LargeBOCShardReadWorkers)

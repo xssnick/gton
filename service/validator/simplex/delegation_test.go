@@ -2,6 +2,7 @@ package simplex
 
 import (
 	"crypto/ed25519"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -60,20 +61,24 @@ func TestDelegatedCandidateAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env := newTestEnv(t, withLocal(1))
-	env.start()
+	for protocolVersion := uint8(0); protocolVersion <= MaxProtocolVersion; protocolVersion++ {
+		t.Run(fmt.Sprintf("protocol_%d", protocolVersion), func(t *testing.T) {
+			env := newTestEnv(t, withLocal(1), withProtocolVersion(protocolVersion))
+			env.start()
 
-	cand := env.makeCandidate(0, Genesis(), 0x51)
-	env.delegate(cand, collatorPub, collatorPriv)
+			cand := env.makeCandidate(0, Genesis(), 0x51)
+			env.delegate(cand, collatorPub, collatorPriv)
 
-	if err = env.eng.SubmitCandidate(cand); err != nil {
-		t.Fatalf("delegated candidate rejected: %v", err)
-	}
-	if len(env.hooks.validations) != 1 || env.hooks.validations[0].ID != cand.ID {
-		t.Fatal("delegated candidate must reach validation")
-	}
-	if env.hooks.validations[0].Delegation == nil {
-		t.Fatal("delegation must survive ingestion")
+			if submitErr := env.eng.SubmitCandidate(cand); submitErr != nil {
+				t.Fatalf("delegated candidate rejected: %v", submitErr)
+			}
+			if len(env.hooks.validations) != 1 || env.hooks.validations[0].ID != cand.ID {
+				t.Fatal("delegated candidate must reach validation")
+			}
+			if env.hooks.validations[0].Delegation == nil {
+				t.Fatal("delegation must survive ingestion")
+			}
+		})
 	}
 }
 

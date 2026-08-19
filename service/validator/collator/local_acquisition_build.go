@@ -8,6 +8,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -390,7 +391,7 @@ func (a *LocalAcquisition) resolveBlock(
 		}
 		return candidate.block, candidate.storageStats, nil
 	}
-	previous, _, err := a.loadPrevious(ctx, id)
+	previous, _, err := a.loadPrevious(ctx, id, acquisitionReadImmediate)
 	if err != nil {
 		return PreviousBlock{}, nil, err
 	}
@@ -477,7 +478,7 @@ func (a *LocalAcquisition) RestoreCandidate(
 	if err != nil {
 		return err
 	}
-	root, block, state, err := restoreCandidateState(artifact, chain.previous)
+	blockRoot, stateRoot, block, state, err := restoreCandidateState(artifact, chain.previous)
 	if err != nil {
 		return err
 	}
@@ -489,11 +490,34 @@ func (a *LocalAcquisition) RestoreCandidate(
 		ID:          cloneBlockID(artifact.Candidate.Block),
 		CreatedBy:   request.Session.Validators[request.Leader].PublicKey,
 		BlockBOC:    artifact.BlockBOC,
-		State:       root,
+		State:       stateRoot,
 		StateUpdate: block.StateUpdate,
 		Stats:       Stats{OutQueueSize: queueSize},
 	}
-	return a.commitCandidateLocked(ctx, managed, request, built, artifact)
+	// The restore has already parsed this block and applied its update over this
+	// exact chain; the commit used to do both a second time. verifyPredecessor
+	// still runs, because a restored candidate is a from-disk tree and that check
+	// is the only thing binding it.
+	derived := PreviousBlock{
+		ID:           cloneBlockID(built.ID),
+		Block:        blockRoot,
+		State:        stateRoot,
+		OutQueueSize: uint64Pointer(queueSize),
+	}
+	if _, err = verifyPredecessor("candidate", &derived); err != nil {
+		return err
+	}
+	ready := &readyCommit{
+		chain: chain,
+		derivation: commitDerivation{
+			root:     blockRoot,
+			state:    stateRoot,
+			startLT:  block.BlockInfo.StartLt,
+			genUTime: state.GenUTime,
+		},
+	}
+
+	return a.commitDerivedCandidateLocked(ctx, managed, request, built, artifact, ready)
 }
 
 func (a *LocalAcquisition) restoreFinalizedCandidateAnchor(
@@ -578,12 +602,38 @@ func finalizedAnchorPrevious(anchor *FinalizedAnchorState, id ton.BlockIDExt) (P
 	return previous, nil
 }
 
+// commitCandidateLocked records one produced or restored candidate as the
+// state a later build extends. It is the only writer of managed.candidates and
+// managed.blocks for a non-empty candidate.
+//
+// The block's derivation — a parsed root, the successor state, the header's
+// start logical time and the state's generation time — reaches it one of two
+// ways. Our own builder already holds all four when it returns, and hands them
+// over in the candidate's capsule; anything else replays the bytes. Which one
+// happens is decided by the type: only finish() can create a capsule. See
+// candidate_built_commit.go and deriveCommitLocked.
 func (a *LocalAcquisition) commitCandidateLocked(
 	ctx context.Context,
 	managed *localAcquisitionSession,
 	request BuildRequest,
 	built *Candidate,
 	artifact CandidateArtifact,
+) error {
+	return a.commitDerivedCandidateLocked(ctx, managed, request, built, artifact, nil)
+}
+
+// commitDerivedCandidateLocked is commitCandidateLocked with the derivation
+// optionally already in hand. RestoreCandidate needs that: it parses the block
+// and applies the update to check the restored artifact before it gets here, and
+// passing the result through is what keeps the restore path from doing both
+// twice.
+func (a *LocalAcquisition) commitDerivedCandidateLocked(
+	ctx context.Context,
+	managed *localAcquisitionSession,
+	request BuildRequest,
+	built *Candidate,
+	artifact CandidateArtifact,
+	ready *readyCommit,
 ) error {
 	if artifact.SessionID != request.Session.ID || artifact.Candidate.ID.Slot != request.Slot ||
 		artifact.Candidate.Parent != request.Parent {
@@ -608,37 +658,135 @@ func (a *LocalAcquisition) commitCandidateLocked(
 		!bytes.Equal(built.BlockBOC, artifact.BlockBOC) {
 		return ErrCandidateConflict
 	}
+
+	var (
+		chain      localResolvedChain
+		derivation commitDerivation
+		err        error
+	)
+	if ready != nil {
+		chain, derivation = ready.chain, ready.derivation
+	} else {
+		if chain, err = a.resolveChain(ctx, managed, request); err != nil {
+			return err
+		}
+		if derivation, err = a.deriveCommitLocked(built, chain.previous); err != nil {
+			return err
+		}
+	}
+
+	return a.recordCandidateLocked(ctx, managed, request, built, artifact, chain, derivation)
+}
+
+// readyCommit carries a derivation its caller already produced, together with
+// the chain it was produced against. The two travel as one because a derivation
+// is only meaningful for the predecessors it was applied over.
+type readyCommit struct {
+	chain      localResolvedChain
+	derivation commitDerivation
+}
+
+// deriveCommitLocked prefers the derivation our own builder already performed
+// and falls back to replaying the serialized bytes.
+//
+// Removing the replay from the self path removes, per produced block: a full
+// eager parse of the block BOC, a second application of the Merkle update over
+// the predecessor, and verifyPredecessor's re-parse of both the block and the
+// state. The reference does strictly less than what remains — ChainState::apply
+// (chain-state.cpp:116) deserializes the candidate lazily, unpacks it, applies
+// the update, and checks nothing at all about the predecessor it applied over,
+// on its own candidate as well as on foreign ones.
+//
+// What the removed checks covered is either impossible by construction here or
+// caught where the value is next used: the ID was built from the same header the
+// block was serialized from, the accounts were prefix-checked as they were
+// written, and the next build re-parses the state it receives. The single clause
+// whose failure would have been silent — a published state that is not the
+// target its own update names — is asserted in finish(), in O(1), where the two
+// hashes are already computed.
+func (a *LocalAcquisition) deriveCommitLocked(
+	built *Candidate,
+	previous []PreviousBlock,
+) (commitDerivation, error) {
+	if derivation, bound := built.built.bind(built.ID, built.State, previous); bound {
+		return derivation, nil
+	}
+	if built.built != nil {
+		// A capsule that does not bind means the chain being committed is not the
+		// chain the block was built over. Replay still produces the right answer —
+		// or the right rejection — but this is never expected on the self path and
+		// a silent fallback would cost the whole saving with nothing to show.
+		a.builtBindMisses.Add(1)
+		a.log.Warn().
+			Uint32("seqno", built.ID.SeqNo).
+			Int("predecessors", len(previous)).
+			Msg("built candidate capsule does not bind its commit chain; replaying the block")
+	}
+
+	return deriveCommitByReplay(built, previous)
+}
+
+// deriveCommitByReplay is the derivation for a block this node did not build:
+// one restored from the durable candidate store, one delivered by a foreign
+// Pipeline, or one whose capsule did not bind. Here the parse is genuine work
+// and verifyPredecessor is the only binding there is, so both stay.
+func deriveCommitByReplay(built *Candidate, previous []PreviousBlock) (commitDerivation, error) {
 	root, block, err := parseCandidateBlock(built.ID, built.BlockBOC)
 	if err != nil {
-		return err
+		return commitDerivation{}, err
 	}
 	if block.StateUpdate.HashKeyAt(0) != built.StateUpdate.HashKeyAt(0) {
-		return ErrCandidateConflict
+		return commitDerivation{}, ErrCandidateConflict
 	}
-	chain, err := a.resolveChain(ctx, managed, request)
+	stateRoot, candidateState, _, err := applyCandidateStateUpdate(previous, block.StateUpdate)
 	if err != nil {
-		return err
-	}
-	stateRoot, candidateState, err := applyCandidateStateUpdate(chain.previous, block.StateUpdate)
-	if err != nil {
-		return err
+		return commitDerivation{}, err
 	}
 	if stateRoot.HashKeyAt(0) != built.State.HashKeyAt(0) {
-		return ErrCandidateConflict
+		return commitDerivation{}, ErrCandidateConflict
 	}
-	previous := PreviousBlock{
+	derived := PreviousBlock{
 		ID:           cloneBlockID(built.ID),
 		Block:        root,
 		State:        stateRoot,
 		OutQueueSize: uint64Pointer(built.Stats.OutQueueSize),
 	}
-	if _, err = verifyPredecessor("candidate", &previous); err != nil {
-		return err
+	if _, err = verifyPredecessor("candidate", &derived); err != nil {
+		return commitDerivation{}, err
+	}
+
+	return commitDerivation{
+		root:     root,
+		state:    stateRoot,
+		startLT:  block.BlockInfo.StartLt,
+		genUTime: candidateState.GenUTime,
+	}, nil
+}
+
+// recordCandidateLocked installs one derived candidate: the predecessor view a
+// later build extends, the masterchain view it is anchored to, the queue tip and
+// base, and the message-pool delta. Both derivations end here, so the fast and
+// the replayed path cannot drift apart in what they record.
+func (a *LocalAcquisition) recordCandidateLocked(
+	ctx context.Context,
+	managed *localAcquisitionSession,
+	request BuildRequest,
+	built *Candidate,
+	artifact CandidateArtifact,
+	chain localResolvedChain,
+	derivation commitDerivation,
+) error {
+	previous := PreviousBlock{
+		ID:           cloneBlockID(built.ID),
+		Block:        derivation.root,
+		State:        derivation.state,
+		OutQueueSize: uint64Pointer(built.Stats.OutQueueSize),
 	}
 	state := localCandidateState{
 		block:        previous,
 		storageStats: built.StorageStats,
 	}
+	var err error
 	if request.Session.Shard.IsMasterchain() {
 		base := chain.master
 		if base == nil {
@@ -648,7 +796,7 @@ func (a *LocalAcquisition) commitCandidateLocked(
 			ctx,
 			base,
 			previous,
-			time.Unix(int64(candidateState.GenUTime), 0),
+			time.Unix(int64(derivation.genUTime), 0),
 		)
 		if err != nil {
 			return err
@@ -677,8 +825,8 @@ func (a *LocalAcquisition) commitCandidateLocked(
 	delta, err := managed.branch.DeltaFromBlockRoot(
 		source,
 		msgpool.SourceRef{Seqno: built.ID.SeqNo, RootHash: queueID},
-		root,
-		block.BlockInfo.StartLt,
+		derivation.root,
+		derivation.startLT,
 	)
 	if err != nil {
 		return fmt.Errorf("derive candidate message delta: %w", err)
@@ -750,26 +898,28 @@ func clonePreviousBlocks(previous []PreviousBlock) []PreviousBlock {
 	return cloned
 }
 
+// restoreCandidateState replays one stored candidate: it parses the block and
+// applies the block's update over the resolved predecessors. Both roots are
+// returned, because the commit that follows needs the block root as well and
+// re-deriving it would be a second parse of bytes this one just walked.
 func restoreCandidateState(
 	artifact CandidateArtifact,
 	previous []PreviousBlock,
-) (*cell.Cell, tlb.Block, tlb.ShardStateUnsplit, error) {
-	// Only the header and the state update are needed here; the block root is
-	// re-derived by the callers that actually hold on to it.
-	_, block, err := parseCandidateBlock(artifact.Candidate.Block, artifact.BlockBOC)
+) (*cell.Cell, *cell.Cell, tlb.Block, tlb.ShardStateUnsplit, error) {
+	blockRoot, block, err := parseCandidateBlock(artifact.Candidate.Block, artifact.BlockBOC)
 	if err != nil {
-		return nil, tlb.Block{}, tlb.ShardStateUnsplit{}, err
+		return nil, nil, tlb.Block{}, tlb.ShardStateUnsplit{}, err
 	}
-	stateRoot, state, err := applyCandidateStateUpdate(previous, block.StateUpdate)
+	stateRoot, state, _, err := applyCandidateStateUpdate(previous, block.StateUpdate)
 	if err != nil {
-		return nil, tlb.Block{}, tlb.ShardStateUnsplit{}, err
+		return nil, nil, tlb.Block{}, tlb.ShardStateUnsplit{}, err
 	}
 	if state.Seqno != artifact.Candidate.Block.SeqNo ||
 		state.ShardIdent.WorkchainID != artifact.Candidate.Block.Workchain ||
 		int64(state.ShardIdent.GetShardID()) != artifact.Candidate.Block.Shard {
-		return nil, tlb.Block{}, tlb.ShardStateUnsplit{}, fmt.Errorf("%w: recovered state differs from candidate ID", ErrInvalidInput)
+		return nil, nil, tlb.Block{}, tlb.ShardStateUnsplit{}, fmt.Errorf("%w: recovered state differs from candidate ID", ErrInvalidInput)
 	}
-	return stateRoot, block, state, nil
+	return blockRoot, stateRoot, block, state, nil
 }
 
 // applyCandidateStateUpdate derives a live successor tree from the exact
@@ -778,36 +928,41 @@ func restoreCandidateState(
 // (notably the masterchain config dictionary). Applying the update here keeps
 // those immutable branches attached to their storage-backed loader, just as
 // ordinary block application does.
+// Its third result is the single root the update was applied to — the sole
+// predecessor state, or the merged root built over two — so a caller that needs
+// to say which tree this successor belongs to can name it without rebuilding
+// the merge.
 func applyCandidateStateUpdate(
 	previous []PreviousBlock,
 	update *cell.Cell,
-) (*cell.Cell, tlb.ShardStateUnsplit, error) {
+) (*cell.Cell, tlb.ShardStateUnsplit, cell.Hash, error) {
+	var none cell.Hash
 	var oldRoot *cell.Cell
 	var err error
 	switch len(previous) {
 	case 1:
 		oldRoot = previous[0].State
 	case 2:
-		oldRoot, err = mechanicalSplitState(previous[0].State, previous[1].State)
-		if err != nil {
-			return nil, tlb.ShardStateUnsplit{}, fmt.Errorf("%w: combine predecessor states: %v", ErrInvalidInput, err)
+		if oldRoot, err = mechanicalSplitState(previous[0].State, previous[1].State); err != nil {
+			return nil, tlb.ShardStateUnsplit{}, none, fmt.Errorf("%w: combine predecessor states: %v", ErrInvalidInput, err)
 		}
 	default:
-		return nil, tlb.ShardStateUnsplit{}, fmt.Errorf("%w: invalid predecessor count", ErrInvalidInput)
+		return nil, tlb.ShardStateUnsplit{}, none, fmt.Errorf("%w: invalid predecessor count", ErrInvalidInput)
 	}
 	stateRoot, err := cell.ApplyMerkleUpdate(oldRoot.WithoutTrace(), update)
 	if err != nil {
-		return nil, tlb.ShardStateUnsplit{}, fmt.Errorf("%w: apply state update: %v", ErrInvalidInput, err)
+		return nil, tlb.ShardStateUnsplit{}, none, fmt.Errorf("%w: apply state update: %v", ErrInvalidInput, err)
 	}
 	var state tlb.ShardStateUnsplit
 	if err = parseExact(&state, stateRoot); err != nil {
-		return nil, tlb.ShardStateUnsplit{}, fmt.Errorf("%w: decode updated state: %v", ErrInvalidInput, err)
+		return nil, tlb.ShardStateUnsplit{}, none, fmt.Errorf("%w: decode updated state: %v", ErrInvalidInput, err)
 	}
 
-	return stateRoot, state, nil
+	return stateRoot, state, oldRoot.HashKeyAt(0), nil
 }
 
 func parseCandidateBlock(id ton.BlockIDExt, boc []byte) (*cell.Cell, tlb.Block, error) {
+	candidateBlockParses.Add(1)
 	root, err := cell.FromBOC(boc)
 	if err != nil {
 		return nil, tlb.Block{}, fmt.Errorf("%w: decode candidate BOC: %v", ErrInvalidInput, err)
@@ -944,22 +1099,42 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 
 		input, err := a.AcquireMaster(ctx, request)
 		if err != nil {
-			a.observeCollationStage(chain, CollationStageAcquireInputs, assembly)
+			a.observeCollationStage(chain, CollationStageAcquireInputs, time.Since(assembly))
 
 			return nil, err
 		}
-		a.observeCollationStage(chain, CollationStageAcquireInputs, assembly)
+		a.observeCollationStage(chain, CollationStageAcquireInputs, time.Since(assembly))
+		// From assembly, the instant this build started, and not from a reading
+		// taken now. C++ sets queue_cleanup_timeout_ in the Collator constructor
+		// (collator.cpp:85-97), before start_up issues one query; this branch has
+		// no external wait, so the budget is a quarter of the soft deadline, and
+		// measured from here that quarter would be taken over a remainder the
+		// state loads above have already eaten — a window that shrinks with this
+		// node's disk latency and reaches zero when acquisition reaches the soft
+		// deadline. See TestQueueCleanupBudgetDoesNotDependOnAcquisitionLatency.
+		input.QueueCleanupUntil = queueCleanupUntil(
+			assembly,
+			request.BuildSoftDeadline,
+			request.ExternalWaitUntil,
+		)
+		input.InternalMsgUntil = internalMsgUntil(
+			assembly,
+			request.BuildSoftDeadline,
+			request.ExternalWaitUntil,
+		)
 
 		started := time.Now()
-		candidate, buildErr := a.builder.buildMasterWithReadyExternals(
+		candidate, external, buildErr := a.builder.buildMasterWithReadyExternals(
 			ctx,
 			input,
 			stream,
 			request.ExternalProcessUntil,
 			a.externalLimit,
 		)
-		a.observeCollationStage(chain, CollationStageCore, started)
-		a.logCoreCollation(request, started, candidate, buildErr)
+		elapsed := time.Since(started)
+		a.observeCandidateAssembly(chain, elapsed, external.wait)
+		a.logCandidateAssembly(request, elapsed, external, candidate, buildErr)
+		a.reportCollationAlarms(chain, request, candidate, buildErr)
 		return candidate, buildErr
 	}
 
@@ -971,14 +1146,31 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 
 	input, err := a.AcquireShard(ctx, request)
 	if err != nil {
-		a.observeCollationStage(chain, CollationStageAcquireInputs, assembly)
+		a.observeCollationStage(chain, CollationStageAcquireInputs, time.Since(assembly))
 
 		return nil, err
 	}
-	a.observeCollationStage(chain, CollationStageAcquireInputs, assembly)
+	a.observeCollationStage(chain, CollationStageAcquireInputs, time.Since(assembly))
+	// The budget is derived here rather than inside the collation so that the
+	// deterministic entry points — BuildShard, restore, every test — keep a zero
+	// instant and an inert budget, and from assembly rather than from a fresh
+	// reading for the reason the masterchain branch above spells out. On this
+	// branch the external wait pins the budget to an absolute instant anyway, so
+	// the two readings agree; taking the same one keeps that an accident of the
+	// parameters instead of a second rule.
+	input.QueueCleanupUntil = queueCleanupUntil(
+		assembly,
+		request.BuildSoftDeadline,
+		request.ExternalWaitUntil,
+	)
+	input.InternalMsgUntil = internalMsgUntil(
+		assembly,
+		request.BuildSoftDeadline,
+		request.ExternalWaitUntil,
+	)
 
 	started := time.Now()
-	candidate, buildErr := a.builder.buildShardWithReadyExternals(
+	candidate, external, buildErr := a.builder.buildShardWithReadyExternals(
 		ctx,
 		input,
 		stream,
@@ -987,15 +1179,17 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 		a.externalLimit,
 		assembly,
 	)
-	a.observeCollationStage(chain, CollationStageCore, started)
-	a.logCoreCollation(request, started, candidate, buildErr)
+	elapsed := time.Since(started)
+	a.observeCandidateAssembly(chain, elapsed, external.wait)
+	a.logCandidateAssembly(request, elapsed, external, candidate, buildErr)
+	a.reportCollationAlarms(chain, request, candidate, buildErr)
 	return candidate, buildErr
 }
 
 func (a *LocalAcquisition) observeCollationStage(
 	chain MetricChain,
 	stage CollationStage,
-	started time.Time,
+	duration time.Duration,
 ) {
 	if a.collationObserver == nil {
 		return
@@ -1004,13 +1198,23 @@ func (a *LocalAcquisition) observeCollationStage(
 	a.collationObserver.ObserveCollationStage(CollationStageObservation{
 		Chain:    chain,
 		Stage:    stage,
-		Duration: time.Since(started),
+		Duration: duration,
 	})
 }
 
-func (a *LocalAcquisition) logCoreCollation(
+func (a *LocalAcquisition) observeCandidateAssembly(
+	chain MetricChain,
+	duration time.Duration,
+	externalWait time.Duration,
+) {
+	a.observeCollationStage(chain, CollationStageAssembleCandidate, duration-externalWait)
+	a.observeCollationStage(chain, CollationStageWaitExternalMessages, externalWait)
+}
+
+func (a *LocalAcquisition) logCandidateAssembly(
 	request BuildRequest,
-	started time.Time,
+	duration time.Duration,
+	external readyExternalStats,
 	candidate *Candidate,
 	buildErr error,
 ) {
@@ -1025,15 +1229,148 @@ func (a *LocalAcquisition) logCoreCollation(
 		Int64("shard", request.Session.Shard.Shard).
 		Uint32("slot", request.Slot).
 		Uint32("leader", request.Leader).
-		Float64("collation_core_ms", float64(time.Since(started))/float64(time.Millisecond)).
-		Float64("external_wait_ms", candidateExternalWaitMS(candidate)).
-		Uint32("external_batches", candidateExternalBatches(candidate)).
-		Str("external_stop", candidateExternalStop(candidate)).
+		Float64("build_ms", float64(duration)/float64(time.Millisecond)).
+		Float64("assemble_candidate_ms", float64(duration-external.wait)/float64(time.Millisecond)).
+		Float64("wait_external_messages_ms", float64(external.wait)/float64(time.Millisecond)).
+		Uint32("external_batches", external.batches).
+		Uint32("build_attempts", external.attempts).
+		Str("external_stop", external.stop.String()).
+		Str("external_phase", externalFailurePhase(external, buildErr)).
 		Int("block_bytes", candidateBytes(candidate)).
 		Int("collated_bytes", candidateCollatedBytes(candidate)).
 		Str("overload_reason", candidateOverloadReason(candidate)).
-		Err(buildErr).
-		Msg("collation_core_measure_done")
+		Uint32("queue_cleaned", candidateQueueCleaned(candidate)).
+		Str("queue_cleanup_stop", candidateQueueCleanupStop(candidate)).
+		Str("processed_scan_trace_error", candidateProcessedScanTraceError(candidate)).
+		Err(buildErr)
+	logExternalShape(event, external)
+	event.Msg("candidate assembly finished")
+}
+
+// externalFailurePhase is the field the previous investigation needed and did
+// not have. external_stop is only meaningful on a SUCCESSFUL attempt — the
+// reason it read "unknown" on all 71 order-violation events is that it was
+// assigned after the wave loop — so on a failure this reports which phase the
+// attempt died in instead, and on a success it reports nothing, leaving
+// external_stop as the answer.
+func externalFailurePhase(external readyExternalStats, buildErr error) string {
+	if buildErr == nil {
+		return ""
+	}
+	if external.failedAt == "" {
+		// Reached only if the error came from outside the wave loop, e.g. the
+		// size-limit retry gave up. Naming that is still better than "unknown".
+		return "outside_wave_loop"
+	}
+	return external.failedAt
+}
+
+// logExternalShape adds the counters that used to die with the nil candidate.
+// block_bytes and collated_bytes are zero on every failure because they are read
+// off the candidate, which is why no field record said how many externals had
+// been pre-admitted or how far the internal import had got — the two facts that
+// would have distinguished the field's external_batches==1 events from an
+// unreachable path on sight.
+func logExternalShape(event *zerolog.Event, external readyExternalStats) {
+	if !external.shape.valid {
+		return
+	}
+	shape := external.shape
+	event.
+		Int("externals_pre_admitted", shape.preAdmitted).
+		Uint32("internals_imported", shape.internalsImported).
+		Uint32("immediate_delivered", shape.immediateDelivered).
+		Uint32("enqueued_messages", shape.enqueuedMessages).
+		Uint64("start_lt", shape.startLT).
+		Uint64("last_processed_lt", shape.lastProcLT)
+}
+
+// candidateQueueCleaned and candidateQueueCleanupStop mirror the two
+// observability points the reference collator emits around cleanup
+// (stats_.msg_queue_cleaned and its two "completed only partially" warnings).
+// A wall-clock budget that fires silently is a budget nobody will ever tune.
+func candidateQueueCleaned(candidate *Candidate) uint32 {
+	if candidate == nil {
+		return 0
+	}
+	return candidate.Stats.QueueCleaned
+}
+
+func candidateQueueCleanupStop(candidate *Candidate) string {
+	if candidate == nil {
+		return CleanupStopExhausted.String()
+	}
+	return candidate.Stats.QueueCleanupStop.String()
+}
+
+// candidateProcessedScanTraceError surfaces the one failure this collator
+// deliberately swallows. Without it the operator sees a block that every peer
+// rejects for a pruned-branch error and nothing that says why the proof was
+// short in the first place.
+func candidateProcessedScanTraceError(candidate *Candidate) string {
+	if candidate == nil {
+		return ""
+	}
+	return candidate.Stats.ProcessedScanTraceError
+}
+
+// reportCollationAlarms raises the two producer faults that a debug log line
+// cannot carry, because in both cases the node needs an operator and neither
+// shows up in any other series.
+//
+// A short collated proof rides on a build that SUCCEEDED: the block is signed,
+// broadcast and counted as a candidate like any other, and the only trace of
+// the defect is a field on a Debug event this node most likely does not emit.
+// What the network sees is every peer rejecting the block with "augmented dict
+// has special cells in tree structure", which names a cell and not a cause.
+//
+// A mandatory-dequeue overflow is the opposite shape: no block at all, and one
+// failed build among all the other reasons builds fail, indistinguishable in
+// builds_total{result="error"} from a cancelled slot or a bad input.
+//
+// Both are logged at Error and both move a counter, so a node in either state
+// can be found from :8085 without reading anyone else's logs. See
+// gton_collator_alarms_total in METRICS.md.
+func (a *LocalAcquisition) reportCollationAlarms(
+	chain MetricChain,
+	request BuildRequest,
+	candidate *Candidate,
+	buildErr error,
+) {
+	if reason := candidateProcessedScanTraceError(candidate); reason != "" {
+		a.observeCollationAlarm(chain, CollationAlarmShortCollatedProof)
+		if event := a.log.Error(); event != nil {
+			event.
+				Str("reason", reason).
+				Hex("session_id", request.Session.ID[:]).
+				Int32("workchain", request.Session.Shard.Workchain).
+				Int64("shard", request.Session.Shard.Shard).
+				Uint32("slot", request.Slot).
+				Msg("collated proof does not cover the predecessor queue scan a validator will make; " +
+					"the block was produced and will very likely be rejected as a pruned branch")
+		}
+	}
+	if !errors.Is(buildErr, ErrMandatoryDequeueOverflow) {
+		return
+	}
+	a.observeCollationAlarm(chain, CollationAlarmMandatoryDequeueOverflow)
+	if event := a.log.Error(); event != nil {
+		event.
+			Err(buildErr).
+			Hex("session_id", request.Session.ID[:]).
+			Int32("workchain", request.Session.Shard.Workchain).
+			Int64("shard", request.Session.Shard.Shard).
+			Uint32("slot", request.Slot).
+			Msg("collation lost the slot: the predecessor's already-processed own-shard queue entries " +
+				"do not fit one block, and the dequeue they require cannot be truncated")
+	}
+}
+
+func (a *LocalAcquisition) observeCollationAlarm(chain MetricChain, alarm CollationAlarm) {
+	if a.collationObserver == nil {
+		return
+	}
+	a.collationObserver.ObserveCollationAlarm(chain, alarm)
 }
 
 // candidateOverloadReason separates a shard that split because a block-limit
@@ -1045,25 +1382,4 @@ func candidateOverloadReason(candidate *Candidate) string {
 		return OverloadNone.String()
 	}
 	return candidate.Stats.OverloadReason.String()
-}
-
-func candidateExternalWaitMS(candidate *Candidate) float64 {
-	if candidate == nil {
-		return 0
-	}
-	return float64(candidate.Stats.ExternalWait) / float64(time.Millisecond)
-}
-
-func candidateExternalBatches(candidate *Candidate) uint32 {
-	if candidate == nil {
-		return 0
-	}
-	return candidate.Stats.ExternalBatches
-}
-
-func candidateExternalStop(candidate *Candidate) string {
-	if candidate == nil {
-		return ExternalStopUnknown.String()
-	}
-	return candidate.Stats.ExternalStop.String()
 }

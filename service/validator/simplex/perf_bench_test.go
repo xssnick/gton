@@ -144,7 +144,7 @@ type runnerPipelineHooks struct {
 	finalized chan uint32
 }
 
-func (h *runnerPipelineHooks) OnFinalized(id CandidateID, _ *Certificate) {
+func (h *runnerPipelineHooks) OnFinalized(id CandidateID, _ VerifiedCertificate) {
 	h.finalized <- id.Slot
 }
 

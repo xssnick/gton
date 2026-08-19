@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/service/blockproof"
 	sharddomain "github.com/xssnick/gton/service/shard"
+	tnstore "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
@@ -53,6 +54,156 @@ func TestBlockBroadcastsQueueClosesWithNode(t *testing.T) {
 
 	if node.BlockBroadcasts().TryRelayCandidate(BlockCandidatePublication{BlockBOC: []byte{1}}) {
 		t.Fatal("candidate was queued after Node stopped")
+	}
+}
+
+func TestBlockBroadcastsTrustedCandidateQueueIsBoundedAndTransfersOwnership(t *testing.T) {
+	node := newTestNode(t)
+	broadcasts := node.BlockBroadcasts()
+	broadcasts.queue = newBoundedQueue(1, 1<<20, blockPublicationRequestBytes)
+
+	owned := []byte{1, 2, 3, 4}
+	if !broadcasts.TryCacheCandidate(TrustedBlockCandidate{BlockBOC: owned}) {
+		t.Fatal("trusted candidate was not queued")
+	}
+	if broadcasts.TryCacheCandidate(TrustedBlockCandidate{BlockBOC: []byte{5}}) {
+		t.Fatal("trusted candidate was queued above the item bound")
+	}
+
+	request, ok := broadcasts.queue.TryPop()
+	if !ok || request.kind != blockCacheTrustedCandidate {
+		t.Fatalf("trusted candidate request = %+v, ok=%v", request, ok)
+	}
+	if len(request.trustedCandidate.BlockBOC) == 0 ||
+		&request.trustedCandidate.BlockBOC[0] != &owned[0] {
+		t.Fatal("successful enqueue copied instead of taking ownership of the trusted candidate BOC")
+	}
+}
+
+func TestBlockBroadcastsCachesTrustedCandidateWithoutPublishing(t *testing.T) {
+	node := newPrivateOverlayTestNode(t)
+	_, peer := blockPublicationTestCustomOverlay(t, node, "trusted-candidate")
+	candidate := testBlockFinalityCandidate(t, 410)
+
+	node.BlockBroadcasts().cacheTrustedCandidate(TrustedBlockCandidate{
+		Block:    candidate.ID,
+		BlockBOC: candidate.BlockBOC,
+	})
+
+	key := tnstore.BlockKey(candidate.ID)
+	node.blockFinalityCache.mu.Lock()
+	finalityCandidate := node.blockFinalityCache.candidates[key]
+	node.blockFinalityCache.mu.Unlock()
+	if finalityCandidate == nil {
+		t.Fatal("trusted candidate is missing from the finality cache")
+	}
+
+	node.shardCandidateCache.mu.Lock()
+	_, shardCandidateFound := node.shardCandidateCache.candidates[key]
+	node.shardCandidateCache.mu.Unlock()
+	if !shardCandidateFound {
+		t.Fatal("trusted candidate is missing from the shard candidate cache")
+	}
+	if _, ok := node.eventQueue.TryPop(); ok {
+		t.Fatal("candidate without finality produced a signed block event")
+	}
+	if _, _, ok := peer.rebroadcastQueueSnapshots(); ok {
+		t.Fatal("trusted candidate was re-originated into a full-node overlay")
+	}
+}
+
+func TestBlockBroadcastsRejectsInvalidTrustedCandidate(t *testing.T) {
+	node := newTestNode(t)
+	candidate := testBlockFinalityCandidate(t, 411)
+	corruptBOC := bytes.Clone(candidate.BlockBOC)
+	corruptBOC[len(corruptBOC)-1] ^= 0xff
+
+	node.BlockBroadcasts().cacheTrustedCandidate(TrustedBlockCandidate{
+		Block:    candidate.ID,
+		BlockBOC: corruptBOC,
+	})
+
+	key := tnstore.BlockKey(candidate.ID)
+	node.blockFinalityCache.mu.Lock()
+	finalityCandidate := node.blockFinalityCache.candidates[key]
+	node.blockFinalityCache.mu.Unlock()
+	if finalityCandidate != nil {
+		t.Fatal("invalid trusted candidate entered the finality cache")
+	}
+
+	node.shardCandidateCache.mu.Lock()
+	_, shardCandidateFound := node.shardCandidateCache.candidates[key]
+	node.shardCandidateCache.mu.Unlock()
+	if shardCandidateFound {
+		t.Fatal("invalid trusted candidate entered the shard candidate cache")
+	}
+}
+
+func TestBlockBroadcastsTrustedCandidateDeliversAssembledFinality(t *testing.T) {
+	node := newPrivateOverlayTestNode(t)
+	_, peer := blockPublicationTestCustomOverlay(t, node, "trusted-finality")
+	candidate := testBlockFinalityCandidate(t, 412)
+	finality := testShardBlockFinality(candidate.ID)
+	if blocks, err := node.blockFinalityCache.StoreFinality(finality, time.Now()); err != nil || len(blocks) != 0 {
+		t.Fatalf("prime finality cache: blocks=%d err=%v", len(blocks), err)
+	}
+
+	node.BlockBroadcasts().cacheTrustedCandidate(TrustedBlockCandidate{
+		Block:    candidate.ID,
+		BlockBOC: candidate.BlockBOC,
+	})
+
+	event, ok := node.eventQueue.TryPop()
+	if !ok {
+		t.Fatal("assembled trusted candidate did not produce a block event")
+	}
+	if !event.Trusted || event.Kind != blockFinalityBroadcastKind ||
+		event.Downloaded == nil || !event.Block.Equals(&candidate.ID) {
+		t.Fatalf("assembled trusted candidate event = %+v", event)
+	}
+	if event.SourcePeerID != finality.sourcePeerID {
+		t.Fatalf("assembled trusted candidate source = %s, want %s", event.SourcePeerID, finality.sourcePeerID)
+	}
+	if !node.shardBroadcastCache.HasBlock(candidate.ID) {
+		t.Fatal("assembled trusted candidate did not enter the signed block cache")
+	}
+	if _, _, ok = peer.rebroadcastQueueSnapshots(); ok {
+		t.Fatal("assembled trusted candidate was re-originated into a full-node overlay")
+	}
+}
+
+func TestBlockBroadcastPublicationModesAreExplicit(t *testing.T) {
+	if err := validateBlockCandidatePublication(BlockCandidatePublication{
+		Mode: BlockBroadcastMode(1 << 7),
+	}); err == nil {
+		t.Fatal("candidate accepted an unknown route bit")
+	}
+	if err := validateBlockCandidatePublication(BlockCandidatePublication{
+		Mode: BlockBroadcastModePublic,
+	}); err == nil {
+		t.Fatal("public candidate accepted legacy FEC transport")
+	}
+	if err := validateBlockCandidatePublication(BlockCandidatePublication{
+		Mode:     BlockBroadcastModePublic,
+		Plumtree: true,
+	}); err == nil {
+		t.Fatal("Plumtree candidate accepted a missing certificate signer")
+	}
+	if err := validateAcceptedBlockPublication(AcceptedBlockPublication{
+		FinalityMode: BlockBroadcastModePublic,
+	}); err == nil {
+		t.Fatal("public finality accepted legacy FEC transport")
+	}
+	if err := validateAcceptedBlockPublication(AcceptedBlockPublication{
+		FinalityMode: BlockBroadcastModePublic,
+		Plumtree:     true,
+	}); err == nil {
+		t.Fatal("Plumtree finality accepted a missing certificate signer")
+	}
+	if err := validateBlockCandidatePublication(BlockCandidatePublication{
+		Mode: BlockBroadcastModeCustom | BlockBroadcastModeFastSync,
+	}); err != nil {
+		t.Fatalf("legacy candidate routes require an unnecessary signer: %v", err)
 	}
 }
 
@@ -233,7 +384,6 @@ func TestBlockBroadcastsAcceptedCustomModes(t *testing.T) {
 		node := newPrivateOverlayTestNode(t)
 		sub, peer := blockPublicationTestCustomOverlay(t, node, "notarized")
 		publication := blockPublicationTestAccepted(t, false)
-		publication.Public = false
 
 		node.BlockBroadcasts().publishAccepted(publication)
 		queue := blockPublicationTestLegacyFECQueue(t, sub, peer)
@@ -257,7 +407,6 @@ func TestBlockBroadcastsAcceptedCustomModes(t *testing.T) {
 		node := newPrivateOverlayTestNode(t)
 		sub, peer := blockPublicationTestCustomOverlay(t, node, "final")
 		publication := blockPublicationTestAccepted(t, true)
-		publication.Public = false
 
 		node.BlockBroadcasts().publishAccepted(publication)
 		queue := blockPublicationTestLegacyFECQueue(t, sub, peer)
@@ -278,6 +427,23 @@ func TestBlockBroadcastsAcceptedCustomModes(t *testing.T) {
 	})
 }
 
+func TestBlockBroadcastsAcceptedWithoutFinalityPublishesOnlyBlock(t *testing.T) {
+	node := newPrivateOverlayTestNode(t)
+	sub, peer := blockPublicationTestCustomOverlay(t, node, "without-finality")
+	publication := blockPublicationTestAccepted(t, true)
+	publication.FinalityMode = 0
+
+	node.BlockBroadcasts().publishAccepted(publication)
+	queue := blockPublicationTestLegacyFECQueue(t, sub, peer)
+	request, ok := queue.TryPop()
+	if !ok || request.kind != blockBroadcastCompressedV2Kind {
+		t.Fatalf("custom block request = %+v, ok=%v", request, ok)
+	}
+	if _, ok = queue.TryPop(); ok {
+		t.Fatal("finality was published while disabled")
+	}
+}
+
 func TestBlockBroadcastsCandidateCustomPathIsDeduplicated(t *testing.T) {
 	node := newPrivateOverlayTestNode(t)
 	sub, peer := blockPublicationTestCustomOverlay(t, node, "candidate")
@@ -288,6 +454,7 @@ func TestBlockBroadcastsCandidateCustomPathIsDeduplicated(t *testing.T) {
 		BlockBOC:         blockBOC,
 		CatchainSeqno:    11,
 		ValidatorSetHash: 12,
+		Mode:             BlockBroadcastModeCustom,
 	}
 
 	node.BlockBroadcasts().publishCandidate(publication)
@@ -302,6 +469,62 @@ func TestBlockBroadcastsCandidateCustomPathIsDeduplicated(t *testing.T) {
 	}
 	if _, ok = queue.TryPop(); ok {
 		t.Fatal("duplicate candidate was enqueued twice")
+	}
+}
+
+func TestBlockBroadcastsLegacyFastSyncCandidateAndBlockShareDedupe(t *testing.T) {
+	for _, candidateFirst := range []bool{true, false} {
+		name := "block first"
+		if candidateFirst {
+			name = "candidate first"
+		}
+		t.Run(name, func(t *testing.T) {
+			node := newPrivateOverlayTestNode(t)
+			root := blockPublicationTestRoot()
+			blockBOC := serializeCompressedBlockRoot(root)
+			block := blockPublicationTestID(root, blockBOC)
+			sub, peer := blockPublicationTestLegacyFastSyncOverlay(t, node, block, name)
+			candidate := BlockCandidatePublication{
+				Block:            block,
+				BlockBOC:         blockBOC,
+				CatchainSeqno:    11,
+				ValidatorSetHash: 12,
+				Mode:             BlockBroadcastModeFastSync,
+			}
+			accepted := blockPublicationTestAcceptedForBlock(t, block, root, blockBOC, false)
+			accepted.BlockMode = BlockBroadcastModeFastSync
+			accepted.FinalityMode = 0
+
+			if candidateFirst {
+				node.BlockBroadcasts().publishCandidate(candidate)
+				node.BlockBroadcasts().publishAccepted(accepted)
+			} else {
+				node.BlockBroadcasts().publishAccepted(accepted)
+				node.BlockBroadcasts().publishCandidate(candidate)
+			}
+
+			queue := blockPublicationTestLegacyFECQueue(t, sub, peer)
+			request, ok := queue.TryPop()
+			if !ok {
+				t.Fatal("legacy FastSync publication is missing")
+			}
+			expectedKind := blockBroadcastCompressedV2Kind
+			if candidateFirst {
+				expectedKind = blockCandidateBroadcastCompressedKind
+			}
+			if request.kind != expectedKind {
+				t.Fatalf("legacy FastSync publication kind = %q, want %q", request.kind, expectedKind)
+			}
+			if delivery := sub.rebroadcastDelivery(request); delivery != DeliveryFEC {
+				t.Fatalf("legacy FastSync delivery = %s, want FEC", delivery)
+			}
+			if request.certificate != nil {
+				t.Fatalf("legacy FastSync certificate = %T, want nil", request.certificate)
+			}
+			if _, ok = queue.TryPop(); ok {
+				t.Fatal("legacy FastSync candidate and full block were both published")
+			}
+		})
 	}
 }
 
@@ -322,9 +545,9 @@ func TestBlockBroadcastsCustomCandidateAndFullBlockShareDedupe(t *testing.T) {
 				BlockBOC:         blockBOC,
 				CatchainSeqno:    11,
 				ValidatorSetHash: 12,
+				Mode:             BlockBroadcastModeCustom,
 			}
 			accepted := blockPublicationTestAcceptedForBlock(t, block, root, blockBOC, false)
-			accepted.Public = false
 
 			if candidateFirst {
 				node.BlockBroadcasts().publishCandidate(candidate)
@@ -358,6 +581,41 @@ func TestBlockBroadcastsCustomCandidateAndFullBlockShareDedupe(t *testing.T) {
 	}
 }
 
+func TestBlockBroadcastsPlumtreeCustomCandidateAndBlockStayDistinct(t *testing.T) {
+	node := newPrivateOverlayTestNode(t)
+	sub, peer := blockPublicationTestCustomOverlay(t, node, "plumtree-distinct")
+	root := blockPublicationTestRoot()
+	blockBOC := serializeCompressedBlockRoot(root)
+	block := blockPublicationTestID(root, blockBOC)
+	candidate := BlockCandidatePublication{
+		Block:            block,
+		BlockBOC:         blockBOC,
+		CatchainSeqno:    11,
+		ValidatorSetHash: 12,
+		Mode:             BlockBroadcastModeCustom,
+		Plumtree:         true,
+	}
+	accepted := blockPublicationTestAcceptedForBlock(t, block, root, blockBOC, false)
+	accepted.FinalityMode = 0
+	accepted.Plumtree = true
+
+	node.BlockBroadcasts().publishCandidate(candidate)
+	node.BlockBroadcasts().publishAccepted(accepted)
+
+	queue := blockPublicationTestLegacyFECQueue(t, sub, peer)
+	first, ok := queue.TryPop()
+	if !ok || first.kind != blockCandidateBroadcastCompressedKind {
+		t.Fatalf("Plumtree custom candidate = %+v, ok=%v", first, ok)
+	}
+	second, ok := queue.TryPop()
+	if !ok || second.kind != blockBroadcastCompressedV2Kind {
+		t.Fatalf("Plumtree custom full block = %+v, ok=%v", second, ok)
+	}
+	if _, ok = queue.TryPop(); ok {
+		t.Fatal("Plumtree custom publication produced an unexpected third request")
+	}
+}
+
 func TestBlockBroadcastsCandidateFirstSkipsUnroutableFullBlockCompression(t *testing.T) {
 	node := newPrivateOverlayTestNode(t)
 	var logs bytes.Buffer
@@ -372,11 +630,11 @@ func TestBlockBroadcastsCandidateFirstSkipsUnroutableFullBlockCompression(t *tes
 		BlockBOC:         blockBOC,
 		CatchainSeqno:    11,
 		ValidatorSetHash: 12,
+		Mode:             BlockBroadcastModeCustom,
 	})
 	logs.Reset()
 
 	accepted := blockPublicationTestAcceptedForBlock(t, block, root, blockBOC, false)
-	accepted.Public = false
 	accepted.Block.Block = nil
 	node.BlockBroadcasts().publishAccepted(accepted)
 	if strings.Contains(logs.String(), "accepted block root is nil") {
@@ -384,35 +642,50 @@ func TestBlockBroadcastsCandidateFirstSkipsUnroutableFullBlockCompression(t *tes
 	}
 }
 
-func TestBlockOverlayFanoutDedupeIsRouteScoped(t *testing.T) {
+func TestBlockPublicationFanoutDedupeIsLegacyAndRouteScoped(t *testing.T) {
 	block := testBlockID(0, topShard, 17)
-	customCandidate := blockOverlayRouteFanoutKey(
-		blockOverlayFanoutRouteCustom,
-		"candidate",
-		block,
-	)
-	customFull := blockOverlayRouteFanoutKey(
+	routes := []struct {
+		name  string
+		route string
+	}{
+		{name: "custom", route: blockOverlayFanoutRouteCustom},
+		{name: "FastSync", route: blockOverlayFanoutRouteFastSync},
+	}
+	legacyKeys := make([]string, 0, len(routes))
+	for _, tt := range routes {
+		t.Run(tt.name, func(t *testing.T) {
+			legacyCandidate := blockPublicationRouteFanoutKey(tt.route, "candidate", block, false)
+			legacyBlock := blockPublicationRouteFanoutKey(tt.route, "block", block, false)
+			if legacyCandidate != legacyBlock {
+				t.Fatalf("legacy candidate key %q differs from block key %q", legacyCandidate, legacyBlock)
+			}
+			if genericBlock := blockOverlayRouteFanoutKey(tt.route, "block", block); legacyBlock == genericBlock {
+				t.Fatalf("publication key %q lost the full block hashes", legacyBlock)
+			}
+
+			plumtreeCandidate := blockPublicationRouteFanoutKey(tt.route, "candidate", block, true)
+			plumtreeBlock := blockPublicationRouteFanoutKey(tt.route, "block", block, true)
+			if plumtreeCandidate == plumtreeBlock {
+				t.Fatalf("Plumtree candidate and block share key %q", plumtreeCandidate)
+			}
+		})
+
+		legacyKeys = append(legacyKeys, blockPublicationRouteFanoutKey(tt.route, "block", block, false))
+	}
+	fork := block
+	fork.RootHash = bytes.Repeat([]byte{0xf1}, sha256.Size)
+	if blockPublicationRouteFanoutKey(
 		blockOverlayFanoutRouteCustom,
 		"block",
-		block,
-	)
-	if customCandidate != customFull {
-		t.Fatalf("custom candidate key %q differs from full-block key %q", customCandidate, customFull)
+		fork,
+		false,
+	) == legacyKeys[0] {
+		t.Fatal("publication dedupe merged competing blocks at one chain position")
 	}
-
-	keys := []string{
-		blockOverlayRouteFanoutKey(blockOverlayFanoutRoutePublic, "candidate", block),
-		blockOverlayRouteFanoutKey(blockOverlayFanoutRoutePublic, "block", block),
-		blockOverlayRouteFanoutKey(blockOverlayFanoutRouteFastSync, "candidate", block),
-		blockOverlayRouteFanoutKey(blockOverlayFanoutRouteFastSync, "block", block),
-	}
-	for i, key := range keys {
-		if key == customFull {
-			t.Fatalf("route key %q shares custom key", key)
-		}
+	for i, key := range legacyKeys {
 		for j := 0; j < i; j++ {
-			if key == keys[j] {
-				t.Fatalf("route keys %q and %q unexpectedly match", key, keys[j])
+			if key == legacyKeys[j] {
+				t.Fatalf("legacy route keys %q and %q unexpectedly match", key, legacyKeys[j])
 			}
 		}
 	}
@@ -425,7 +698,8 @@ func TestBlockBroadcastsFullBlockUsesPublicOnlyWhenSelected(t *testing.T) {
 	publication.CertificateSigner = privateOverlayTestSigner{
 		key: ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x61}, ed25519.SeedSize)),
 	}
-	publication.Public = false
+	publication.BlockMode = 0
+	publication.FinalityMode = 0
 
 	publicSub, err := node.subscriptionForBlock(publication.Block.ID)
 	if err != nil {
@@ -445,16 +719,16 @@ func TestBlockBroadcastsFullBlockUsesPublicOnlyWhenSelected(t *testing.T) {
 
 	node.BlockBroadcasts().publishAccepted(publication)
 	if _, _, ok := peer.rebroadcastQueueSnapshots(); ok {
-		t.Fatal("Public=false created a public full-block queue")
+		t.Fatal("zero block mode created a public full-block queue")
 	}
 
-	publication.Public = true
+	publication.BlockMode = BlockBroadcastModePublic
 	node.BlockBroadcasts().publishAccepted(publication)
 	peer.rebroadcastMx.Lock()
 	queue := peer.localRebroadcastQueue
 	peer.rebroadcastMx.Unlock()
 	if queue == nil {
-		t.Fatal("Public=true did not create a public full-block queue")
+		t.Fatal("public block mode did not create a public full-block queue")
 	}
 	request, ok := queue.TryPop()
 	if !ok || request.kind != blockBroadcastCompressedV2Kind {
@@ -470,6 +744,77 @@ func TestBlockBroadcastsFullBlockUsesPublicOnlyWhenSelected(t *testing.T) {
 	result, err := certificate.Check(node.localID[:], publicSub.spec.ShortID, 1, true)
 	if err != nil || result != overlay.CertCheckResultTrusted {
 		t.Fatalf("public full-block certificate check = %d, err=%v", result, err)
+	}
+}
+
+func TestBlockBroadcastsLegacyPublicFullBlockDoesNotRequireSigner(t *testing.T) {
+	node := newPrivateOverlayTestNode(t)
+	node.zeroStateFileHash = make([]byte, sha256.Size)
+	publication := blockPublicationTestAccepted(t, false)
+	publication.BlockMode = BlockBroadcastModePublic
+	publication.FinalityMode = 0
+
+	publicSub, err := node.subscriptionForBlock(publication.Block.ID)
+	if err != nil {
+		t.Fatalf("create public publication overlay: %v", err)
+	}
+	peer := &overlayPeer{
+		id:          testPeerID("block-publication-legacy-public-peer"),
+		fixedMember: true,
+		alive:       true,
+	}
+	publicSub.mx.Lock()
+	publicSub.peers[peer.id] = peer
+	testOverlaySubscription(publicSub)
+	publicSub.mx.Unlock()
+	publicSub.broadcastTargets.Store(nil)
+
+	node.BlockBroadcasts().publishAccepted(publication)
+	queue := blockPublicationTestLegacyFECQueue(t, publicSub, peer)
+	request, ok := queue.TryPop()
+	if !ok || request.kind != blockBroadcastCompressedV2Kind {
+		t.Fatalf("legacy public full-block request = %+v, ok=%v", request, ok)
+	}
+	if request.certificate != nil {
+		t.Fatalf("legacy public full-block certificate = %T, want nil", request.certificate)
+	}
+}
+
+func TestBlockBroadcastsCandidateSignerDoesNotInferRoutes(t *testing.T) {
+	node := newPrivateOverlayTestNode(t)
+	node.zeroStateFileHash = make([]byte, sha256.Size)
+	customSub, customPeer := blockPublicationTestCustomOverlay(t, node, "explicit-candidate-routes")
+	root := blockPublicationTestRoot()
+	blockBOC := serializeCompressedBlockRoot(root)
+	block := blockPublicationTestID(root, blockBOC)
+	publicSub, err := node.subscriptionForBlock(block)
+	if err != nil {
+		t.Fatalf("create public publication overlay: %v", err)
+	}
+	fastSyncSub := blockPublicationTestFastSyncOverlay(t, node, block)
+
+	node.BlockBroadcasts().publishCandidate(BlockCandidatePublication{
+		Block:            block,
+		BlockBOC:         blockBOC,
+		CatchainSeqno:    11,
+		ValidatorSetHash: 12,
+		Mode:             BlockBroadcastModeCustom,
+		Plumtree:         true,
+		CertificateSigner: privateOverlayTestSigner{
+			key: ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x63}, ed25519.SeedSize)),
+		},
+	})
+
+	queue := blockPublicationTestLegacyFECQueue(t, customSub, customPeer)
+	request, ok := queue.TryPop()
+	if !ok || request.kind != blockCandidateBroadcastCompressedKind {
+		t.Fatalf("explicit custom candidate request = %+v, ok=%v", request, ok)
+	}
+	if got := plumtreeFECStateCount(publicSub); got != 0 {
+		t.Fatalf("candidate signer inferred public route: states=%d", got)
+	}
+	if got := plumtreeFECStateCount(fastSyncSub); got != 0 {
+		t.Fatalf("candidate signer inferred FastSync route: states=%d", got)
 	}
 }
 
@@ -499,6 +844,8 @@ func TestBlockBroadcastsPlumtreeModes(t *testing.T) {
 		BlockBOC:          blockBOC,
 		CatchainSeqno:     11,
 		ValidatorSetHash:  12,
+		Mode:              blockBroadcastModeAll,
+		Plumtree:          true,
 		CertificateSigner: certificateSigner,
 	}
 	node.BlockBroadcasts().publishCandidate(candidate)
@@ -512,7 +859,8 @@ func TestBlockBroadcastsPlumtreeModes(t *testing.T) {
 	requirePublicationCertificate(t, fastSyncSub, node.localID, issuerID)
 
 	accepted := blockPublicationTestAcceptedForBlock(t, block, root, blockBOC, false)
-	accepted.Public = false
+	accepted.FinalityMode = blockBroadcastModeAll
+	accepted.Plumtree = true
 	accepted.CertificateSigner = certificateSigner
 	node.BlockBroadcasts().publishAccepted(accepted)
 	finalityID, err := finalityPlumtreeBroadcastID(block)
@@ -527,6 +875,110 @@ func TestBlockBroadcastsPlumtreeModes(t *testing.T) {
 	}
 	if got := plumtreeFECStateCount(fastSyncSub); got != 1 {
 		t.Fatalf("accepted full block entered FastSync FEC: states=%d, want candidate-only 1", got)
+	}
+}
+
+func TestBlockBroadcastsPublicCandidateForksUseFullBlockID(t *testing.T) {
+	node := newPrivateOverlayTestNode(t)
+	node.zeroStateFileHash = make([]byte, sha256.Size)
+	certificateSigner := privateOverlayTestSigner{
+		key: ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x64}, ed25519.SeedSize)),
+	}
+	issuerID, err := peerIDFromED25519PublicKey(certificateSigner.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{issuerID}))
+
+	firstRoot := blockPublicationTestRoot()
+	secondRoot := cell.BeginCell().MustStoreUInt(1, 1).MustStoreRef(firstRoot).EndCell()
+	firstBOC := serializeCompressedBlockRoot(firstRoot)
+	secondBOC := serializeCompressedBlockRoot(secondRoot)
+	firstBlock := blockPublicationTestID(firstRoot, firstBOC)
+	secondBlock := blockPublicationTestID(secondRoot, secondBOC)
+	if firstBlock.Workchain != secondBlock.Workchain ||
+		firstBlock.Shard != secondBlock.Shard || firstBlock.SeqNo != secondBlock.SeqNo {
+		t.Fatal("candidate forks do not share one chain position")
+	}
+
+	publicSub, err := node.subscriptionForBlock(firstBlock)
+	if err != nil {
+		t.Fatalf("create public publication overlay: %v", err)
+	}
+	for _, candidate := range []BlockCandidatePublication{
+		{
+			Block:             firstBlock,
+			BlockBOC:          firstBOC,
+			CatchainSeqno:     11,
+			ValidatorSetHash:  12,
+			Mode:              BlockBroadcastModePublic,
+			Plumtree:          true,
+			CertificateSigner: certificateSigner,
+		},
+		{
+			Block:             secondBlock,
+			BlockBOC:          secondBOC,
+			CatchainSeqno:     11,
+			ValidatorSetHash:  12,
+			Mode:              BlockBroadcastModePublic,
+			Plumtree:          true,
+			CertificateSigner: certificateSigner,
+		},
+	} {
+		node.BlockBroadcasts().publishCandidate(candidate)
+	}
+
+	if got := plumtreeFECStateCount(publicSub); got != 2 {
+		t.Fatalf("public candidate fork Plumtree FEC states = %d, want 2", got)
+	}
+}
+
+func TestBlockBroadcastsFinalityForksUseFullBlockID(t *testing.T) {
+	node := newPrivateOverlayTestNode(t)
+	node.zeroStateFileHash = make([]byte, sha256.Size)
+	certificateSigner := privateOverlayTestSigner{
+		key: ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x65}, ed25519.SeedSize)),
+	}
+	issuerID, err := peerIDFromED25519PublicKey(certificateSigner.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{issuerID}))
+
+	firstRoot := blockPublicationTestRoot()
+	secondRoot := cell.BeginCell().MustStoreUInt(1, 1).MustStoreRef(firstRoot).EndCell()
+	firstBOC := serializeCompressedBlockRoot(firstRoot)
+	secondBOC := serializeCompressedBlockRoot(secondRoot)
+	firstBlock := blockPublicationTestID(firstRoot, firstBOC)
+	secondBlock := blockPublicationTestID(secondRoot, secondBOC)
+	if firstBlock.Workchain != secondBlock.Workchain ||
+		firstBlock.Shard != secondBlock.Shard || firstBlock.SeqNo != secondBlock.SeqNo {
+		t.Fatal("finality forks do not share one chain position")
+	}
+
+	publicSub, err := node.subscriptionForBlock(firstBlock)
+	if err != nil {
+		t.Fatalf("create public publication overlay: %v", err)
+	}
+	for _, accepted := range []AcceptedBlockPublication{
+		blockPublicationTestAcceptedForBlock(t, firstBlock, firstRoot, firstBOC, true),
+		blockPublicationTestAcceptedForBlock(t, secondBlock, secondRoot, secondBOC, true),
+	} {
+		accepted.BlockMode = 0
+		accepted.FinalityMode = BlockBroadcastModePublic
+		accepted.Plumtree = true
+		accepted.CertificateSigner = certificateSigner
+		node.BlockBroadcasts().publishAccepted(accepted)
+	}
+
+	for _, block := range []ton.BlockIDExt{firstBlock, secondBlock} {
+		finalityID, err := finalityPlumtreeBroadcastID(block)
+		if err != nil {
+			t.Fatalf("build finality id: %v", err)
+		}
+		if !plumtreeHasSimpleState(publicSub, finalityID) {
+			t.Fatalf("public finality fork %x Plumtree state is missing", block.RootHash)
+		}
 	}
 }
 
@@ -579,7 +1031,6 @@ func requirePublicationCertificate(
 func TestBlockBroadcastsSkipsUnroutableFullBlockCompression(t *testing.T) {
 	node := newTestNode(t)
 	publication := blockPublicationTestAccepted(t, false)
-	publication.Public = false
 	publication.Block.Block = nil
 
 	node.BlockBroadcasts().publishAccepted(publication)
@@ -637,8 +1088,9 @@ func blockPublicationTestAcceptedForBlock(
 			BlockBOC: blockBOC,
 			ProofBOC: cell.BeginCell().MustStoreUInt(0x77, 8).EndCell().ToBOC(),
 		},
-		Signatures: signatures,
-		Public:     true,
+		Signatures:   signatures,
+		BlockMode:    BlockBroadcastModeCustom,
+		FinalityMode: BlockBroadcastModeCustom,
 	}
 }
 
@@ -690,16 +1142,69 @@ func blockPublicationTestLegacyFECQueue(
 	twoStepQueue := sub.twoStepQueue
 	sub.mx.Unlock()
 	if twoStepQueue != nil {
-		t.Fatal("BlockBroadcasts routed custom legacy FEC through two-step")
+		if request, ok := twoStepQueue.TryPop(); ok {
+			t.Fatalf("BlockBroadcasts routed legacy FEC through two-step: %+v", request)
+		}
 	}
 
 	peer.rebroadcastMx.Lock()
 	queue := peer.localRebroadcastQueue
 	peer.rebroadcastMx.Unlock()
 	if queue == nil {
-		t.Fatal("custom legacy FEC queue is missing")
+		t.Fatal("legacy FEC queue is missing")
 	}
 	return queue
+}
+
+func blockPublicationTestLegacyFastSyncOverlay(
+	t *testing.T,
+	node *Node,
+	block ton.BlockIDExt,
+	name string,
+) (*overlaySubscription, *overlayPeer) {
+	t.Helper()
+
+	node.zeroStateFileHash = make([]byte, sha256.Size)
+	remoteID := testPeerID("block-publication-fast-sync-peer-" + name)
+	roster := NewFastSyncValidatorRoster(nil, []FastSyncValidator{
+		fastSyncOverlayTestValidator(0x31, node.localID),
+		fastSyncOverlayTestValidator(0x32, remoteID),
+	}, nil)
+	if err := node.SetFastSyncOverlays(FastSyncState{
+		Roster: roster,
+		Shards: []FastSyncShard{{
+			Workchain: block.Workchain,
+			Shard:     block.Shard,
+		}},
+	}); err != nil {
+		t.Fatalf("create legacy FastSync publication overlay: %v", err)
+	}
+	sub, err := node.fastSyncSubscriptionForBlock(block)
+	if err != nil {
+		t.Fatalf("resolve legacy FastSync publication overlay: %v", err)
+	}
+	if sub == nil {
+		t.Fatal("legacy FastSync publication overlay is missing")
+	}
+	if sub.plumtree != nil {
+		t.Fatal("legacy FastSync publication overlay has a Plumtree runtime")
+	}
+
+	peer := &overlayPeer{
+		id:          remoteID,
+		fixedMember: true,
+		alive:       true,
+	}
+	sub.mx.Lock()
+	sub.peers[remoteID] = peer
+	testOverlaySubscription(sub)
+	sub.mx.Unlock()
+	sub.broadcastTargets.Store(&broadcastTargetsSnapshot{
+		builtAt:    time.Now(),
+		generation: sub.broadcastTargetsGen.Load(),
+		peers:      []*overlayPeer{peer},
+	})
+	return sub, peer
 }
 
 func blockPublicationTestFastSyncOverlay(

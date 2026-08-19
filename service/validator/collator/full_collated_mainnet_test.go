@@ -30,6 +30,10 @@ import (
 // stopped containing multi-transaction storage-stat accounts would pass while
 // proving nothing.
 func TestFullCollatedMainnetCandidateVerifies(t *testing.T) {
+	// Runs in the shared-fixture parallel batch: it reads the cached mainnet
+	// workload and keeps every mutation on its own copy, holds no package-level
+	// counter and derives nothing from wall-clock timing.
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		repeat int

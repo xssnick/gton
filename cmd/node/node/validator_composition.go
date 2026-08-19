@@ -9,9 +9,11 @@ import (
 
 	standalone "github.com/xssnick/gton/extensions/collator"
 	"github.com/xssnick/gton/service/hooks"
+	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/gton/service/validator"
+	"github.com/xssnick/gton/service/validator/blockstats"
 	core "github.com/xssnick/gton/service/validator/collator"
 	"github.com/xssnick/gton/service/validator/keyring"
 	validatornet "github.com/xssnick/gton/service/validator/network"
@@ -31,9 +33,75 @@ type validatorNetwork interface {
 	RetireValidatorSession(context.Context, [32]byte) error
 }
 
+// localSessionNode is the consensus seam onto the node.
+//
+// The field stays an interface so the seam's own pass-through property can be
+// tested against a store that counts and returns fixed cells; what the seam is
+// given in production is decided one level up, by consensusLiveView, which is
+// where the identity of the store is asserted.
 type localSessionNode struct {
 	store   hooks.Store
 	network hooks.Network
+}
+
+// localCollatorStateStore is the collator's read surface, built on the same seam
+// the validator uses.
+//
+// It exists to make "collation and validation read state through one seam" true
+// by construction rather than by coincidence. The collator was once handed
+// node.Store directly while the validator went through localSessionNode; the two
+// happened to agree, and would have kept agreeing right up until anything was
+// added to the seam. What they must agree on is not a cache but a POINTER:
+// ChainState.validatedCandidateState compares tip states by identity, so two
+// materializations of one parent cost a silent full re-apply per candidate. One
+// seam is the only structural guarantee of that.
+//
+// The collator additionally needs two reads hooks.Store does not carry, which is
+// why it takes core.LocalStateStore separately rather than being handed a plain
+// hooks.Store. Both are straight pass-throughs and deliberately untouched:
+// blocks are stored as whole BOCs and never enter the decoded cell cache, so
+// there is nothing to decide for them.
+type localCollatorStateStore struct {
+	localSessionNode
+	artifacts core.LocalStateStore
+}
+
+// consensusLiveView is the composition-level half of the read rule: the store
+// behind the consensus seam IS the live view, named as the concrete type.
+//
+// The package graph test in service/validator proves neither consensus package can
+// REACH the node's meta DB and celldb, and the compile-time block beside it proves
+// the live view satisfies everything the seam asks for. Neither closes this hole: a
+// *pebblestore.Store satisfies the same method set, so it could be handed in here
+// through the hooks.Store interface with both of those still green — and every read
+// the consensus path makes would then go straight to the store, waiting for commits
+// the live view exists to make unnecessary, and returning a SECOND materialization
+// of each parent because a store read decodes fresh cells.
+//
+// So the assertion is here, where the store is chosen, and it is the identity of
+// the type rather than its shape. Both consensus compositions go through it, so
+// there is one answer to "which store does consensus read".
+func consensusLiveView(role string, store hooks.Store) (*liveview.Store, error) {
+	live, ok := store.(*liveview.Store)
+	if !ok {
+		return nil, fmt.Errorf(
+			"%s composition: node store is %T and not the live view: collation and validation "+
+				"read state only through the live view, and a store that merely satisfies the same "+
+				"methods would read committed state and hand out a second materialization of every parent",
+			role,
+			store,
+		)
+	}
+
+	return live, nil
+}
+
+func (s localCollatorStateStore) BlockRoot(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
+	return s.artifacts.BlockRoot(ctx, block)
+}
+
+func (s localCollatorStateStore) WaitBlockArtifacts(ctx context.Context, block ton.BlockIDExt) error {
+	return s.artifacts.WaitBlockArtifacts(ctx, block)
 }
 
 const validatorSessionRetireTimeout = 10 * time.Second
@@ -93,6 +161,34 @@ func prepareValidatorSessionNetwork(
 	return network.PrepareValidatorSession(ctx, config)
 }
 
+func prepareBlockSyncObserverSession(
+	ctx context.Context,
+	network validatorNetwork,
+	config validator.SessionConfig,
+	sessionNetwork validator.SessionNetwork,
+) (validator.SessionRuntime, error) {
+	session, err := validator.PrepareBlockSyncObserverRuntime(
+		ctx,
+		config,
+		sessionNetwork,
+		config.CandidateLimits,
+	)
+	if err != nil {
+		retireErr := retireValidatorSession(network, config.SessionID)
+
+		return nil, errors.Join(
+			fmt.Errorf("validator composition: prepare block-sync observer runtime: %w", err),
+			retireErr,
+		)
+	}
+
+	return &validatorSessionRuntime{
+		SessionRuntime: session,
+		network:        network,
+		sessionID:      config.SessionID,
+	}, nil
+}
+
 func (n localSessionNode) BlockData(ctx context.Context, block ton.BlockIDExt) ([]byte, error) {
 	return n.store.BlockData(ctx, block)
 }
@@ -112,6 +208,24 @@ func (n localSessionNode) BlockState(
 	return n.store.BlockState(ctx, block)
 }
 
+// LoadStateCellTree is the single seam through which BOTH collation and
+// validation read state: the collator reaches it through its LocalStateStore
+// (localCollatorStateStore embeds this type) and the validator through its local
+// session backend, and neither has any other route to the state tree.
+//
+// Routing them together is not an optimization, it is required.
+// ChainState.validatedCandidateState compares tip states by POINTER, so if the
+// two ever received different materializations of the same parent, the
+// live-successor carry-back would stop matching and every candidate would cost a
+// full re-apply — silently, with no error and no metric. That is why this is a
+// pass-through and must stay one: anything that transforms, copies or rebuilds
+// the returned tree here breaks per-call stability and therefore the identity.
+// TestCollatorAndValidatorShareOneParentMaterialization pins it.
+//
+// There is nothing to route. There is one decoded cell cache behind this call
+// for every consumer, and even when there were two, this seam did not choose
+// between them: both callers only reach the storage decode when the live view
+// has no resident state, and it essentially always does.
 func (n localSessionNode) LoadStateCellTree(
 	ctx context.Context,
 	block ton.BlockIDExt,
@@ -129,6 +243,20 @@ func (n localSessionNode) LookupBlockBySeqNo(
 
 func (n localSessionNode) SubmitBlockLocally(block p2p.DownloadedBlock) {
 	n.network.SubmitBlockLocally(block)
+}
+
+// PublishAcceptedBlockState is the write counterpart of the read seam above, and
+// a pass-through for the same reason: the state it publishes is installed BY
+// REFERENCE, so the block's own producer, the collator and the validator all read
+// back the one materialization that chain_state.go's pointer comparison needs.
+// Anything that copied or rebuilt the state here would turn every subsequent
+// candidate into a full re-apply, silently.
+func (n localSessionNode) PublishAcceptedBlockState(artifacts storage.LiveBlockArtifacts) error {
+	return n.store.PublishAcceptedBlockState(artifacts)
+}
+
+func (n localSessionNode) BlockArtifactsSignal() <-chan struct{} {
+	return n.store.BlockArtifactsSignal()
 }
 
 type localValidatorComposition struct {
@@ -235,7 +363,7 @@ type validatorStackComposition struct {
 
 // newValidatorStackFactory creates the one process-wide transport manager and
 // then builds role extensions around it. Start is forward and Close is reverse:
-// the standalone observer installs Delegated-v3 handlers before validator
+// the standalone observer installs delegated-collation handlers before validator
 // sessions attach, while validator endpoints retire before the shared manager.
 func newValidatorStackFactory(composition validatorStackComposition) hooks.ExtensionFactory {
 	return func(node hooks.Node) (hooks.Extension, error) {
@@ -287,6 +415,7 @@ func newValidatorStackFactory(composition validatorStackComposition) hooks.Exten
 				closeErr,
 			)
 		}
+		blockStats := blockstats.New()
 		var validationObserver validator.ValidationObserver
 		if composition.localValidator != nil {
 			validationMetrics, metricsErr := validator.NewPrometheusValidationMetrics(registry)
@@ -298,7 +427,7 @@ func newValidatorStackFactory(composition validatorStackComposition) hooks.Exten
 					closeErr,
 				)
 			}
-			validationObserver = validationMetrics.Observer()
+			validationObserver = validator.NewBlockStatsObserver(blockStats, validationMetrics.Observer())
 		}
 
 		factories := hooks.ExtensionComposer{
@@ -308,7 +437,7 @@ func newValidatorStackFactory(composition validatorStackComposition) hooks.Exten
 			factories = append(factories, newStandaloneCollatorFactory(
 				*composition.standaloneCollator,
 				manager,
-				collatorMetrics.Observer(core.MetricsModeStandalone),
+				core.NewBlockStatsObserver(blockStats, collatorMetrics.Observer(core.MetricsModeStandalone)),
 			))
 		}
 		if composition.localValidator != nil {
@@ -324,12 +453,13 @@ func newValidatorStackFactory(composition validatorStackComposition) hooks.Exten
 				composition.localValidator.control,
 				composition.localValidator.keys,
 				composition.localADNLID,
+				blockStats,
 			))
 			factories = append(factories, newLocalValidatorFactory(
 				*composition.localValidator,
 				manager,
 				validationObserver,
-				collatorMetrics.Observer(core.MetricsModeValidator),
+				core.NewBlockStatsObserver(blockStats, collatorMetrics.Observer(core.MetricsModeValidator)),
 				newRemoteCollator,
 			))
 		}
@@ -379,6 +509,15 @@ func newLocalValidatorFactory(
 		if node.Store == nil || node.Network == nil || node.TVM == nil {
 			return nil, errors.New("validator composition: node store, network, and TVM are required")
 		}
+		store, err := consensusLiveView("validator", node.Store)
+		if err != nil {
+			return nil, err
+		}
+		localNode := localSessionNode{store: store, network: node.Network}
+		// Collation reads state through the same seam as validation. Sharing the
+		// seam is what guarantees the two receive the SAME materialization of a
+		// parent, which chain_state.go's live-successor carry-back requires.
+		collatorStore := localCollatorStateStore{localSessionNode: localNode, artifacts: store}
 
 		shardTops, err := core.NewShardTopInbox(core.ShardTopInboxOptions{})
 		if err != nil {
@@ -389,7 +528,7 @@ func newLocalValidatorFactory(
 			Logger:             node.Logger.With().Str("component", "validator").Logger(),
 			CollationObserver:  collationObserver,
 			ValidationObserver: validationObserver,
-			Store:              node.Store,
+			Store:              collatorStore,
 			Groups:             composition.runtime.Groups,
 			Messages:           composition.runtime.Messages,
 			ShardTops:          shardTops,
@@ -415,7 +554,6 @@ func newLocalValidatorFactory(
 			return nil, fmt.Errorf("validator composition: create local collator: %w", err)
 		}
 
-		localNode := localSessionNode{store: node.Store, network: node.Network}
 		log := node.Logger.With().Str("component", "validator").Logger()
 		prepare := func(
 			ctx context.Context,
@@ -443,6 +581,10 @@ func newLocalValidatorFactory(
 					retireErr,
 				)
 			}
+			if config.Identity.Validator == nil && config.Protocol.Version == 2 &&
+				config.Protocol.ProtocolVersion == 1 {
+				return prepareBlockSyncObserverSession(ctx, network, config, sessionNetwork)
+			}
 			production, prepareErr := prepareSessionProduction(
 				ctx,
 				config,
@@ -468,6 +610,7 @@ func newLocalValidatorFactory(
 				CandidateRouter: production.candidateRouter,
 				Publisher:       network,
 				ShardTops:       shardTops,
+				Metrics:         validationObserver,
 				Logger:          log,
 			})
 			if prepareErr != nil {
@@ -510,6 +653,7 @@ func newLocalValidatorFactory(
 		options.ShardTops = shardTops
 		options.PrepareSession = prepare
 		options.ObserverADNLIDs = [][32]byte{network.LocalADNLID()}
+		options.Metrics = validationObserver
 
 		return validator.New(options)(node)
 	}
@@ -534,6 +678,12 @@ func newStandaloneCollatorFactory(
 		if node.Store == nil || node.Network == nil || node.TVM == nil {
 			return nil, errors.New("collator composition: node store, network, and TVM are required")
 		}
+		store, err := consensusLiveView("collator", node.Store)
+		if err != nil {
+			return nil, err
+		}
+		localNode := localSessionNode{store: store, network: node.Network}
+		collatorStore := localCollatorStateStore{localSessionNode: localNode, artifacts: store}
 
 		shardTops, err := core.NewShardTopInbox(core.ShardTopInboxOptions{})
 		if err != nil {
@@ -543,7 +693,7 @@ func newStandaloneCollatorFactory(
 			Builder:           core.NewBuilder(node.TVM, core.SupportedSoftware()),
 			Logger:            node.Logger.With().Str("component", "collator").Logger(),
 			CollationObserver: collationObserver,
-			Store:             node.Store,
+			Store:             collatorStore,
 			Groups:            composition.runtime.Groups,
 			Messages:          composition.runtime.Messages,
 			ShardTops:         shardTops,
@@ -553,7 +703,6 @@ func newStandaloneCollatorFactory(
 			return nil, fmt.Errorf("collator composition: create local acquisition: %w", err)
 		}
 
-		localNode := localSessionNode{store: node.Store, network: node.Network}
 		log := node.Logger.With().Str("component", "collator").Logger()
 		observer, err := validator.NewConsensusObserver(validator.ConsensusObserverOptions{
 			Network:   network,

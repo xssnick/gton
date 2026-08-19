@@ -149,7 +149,12 @@ func (p *localShardTopProvider) ShardTopReady(ctx context.Context, block ton.Blo
 	if p.views[key] != nil {
 		return true, nil
 	}
-	view, err := p.acquisition.loadNeighborView(ctx, block, masterNeedsCollatedProofs(p.master))
+	view, err := p.acquisition.loadNeighborView(
+		ctx,
+		block,
+		masterNeedsCollatedProofs(p.master),
+		acquisitionReadImmediate,
+	)
 	if errors.Is(err, ErrAcquisitionNotReady) {
 		return false, nil
 	}
@@ -187,7 +192,16 @@ func (a *LocalAcquisition) acquireShardMessages(
 	}
 
 	views := make(map[msgpool.ShardIdent]*localNeighborView, len(expected))
-	neighbors, err := a.loadExpectedNeighbors(ctx, master, expected, previous, views, nil, masterNeedsCollatedProofs(master))
+	neighbors, err := a.loadExpectedNeighbors(
+		ctx,
+		master,
+		expected,
+		previous,
+		views,
+		nil,
+		masterNeedsCollatedProofs(master),
+		acquisitionReadImmediate,
+	)
 	if err != nil {
 		return localAcquiredMessages{}, err
 	}
@@ -200,7 +214,15 @@ func (a *LocalAcquisition) acquireShardMessages(
 	if err != nil {
 		return localAcquiredMessages{}, err
 	}
-	endLT, err := a.historicalShardEndLT(ctx, master, previous, neighbors, nil, nil)
+	endLT, err := a.historicalShardEndLT(
+		ctx,
+		master,
+		previous,
+		neighbors,
+		nil,
+		nil,
+		acquisitionReadImmediate,
+	)
 	if err != nil {
 		return localAcquiredMessages{}, err
 	}
@@ -254,10 +276,11 @@ func prepareShardNeighborQueues(
 	return nil
 }
 
-// effectiveShardMessageViews mirrors C++ add_trivial_neighbor case 4. The
-// masterchain can keep both child descriptors after the first merged block;
-// their state proofs remain neighbor artifacts, but inbound messages must come
-// from the newer merged predecessor queue.
+// effectiveShardMessageViews mirrors the single-predecessor cases of C++
+// add_trivial_neighbor. Registered states remain neighbor proof artifacts, but
+// the inbound view for our own shard must come from the exact predecessor. The
+// masterchain can additionally keep both child descriptors after the first
+// merged block; those message views are replaced by the merged predecessor.
 func effectiveShardMessageViews(
 	target msgpool.ShardIdent,
 	previous []PreviousBlock,
@@ -274,13 +297,14 @@ func effectiveShardMessageViews(
 			children++
 		}
 	}
-	if children != 2 {
+	_, hasRegisteredTarget := registered[target]
+	if !hasRegisteredTarget && children != 2 {
 		return registered
 	}
 
-	effective := make(map[msgpool.ShardIdent]*localNeighborView, len(registered)-1)
+	effective := make(map[msgpool.ShardIdent]*localNeighborView, len(registered)+1)
 	for source, view := range registered {
-		if source.Workchain == target.Workchain &&
+		if children == 2 && source.Workchain == target.Workchain &&
 			sharddomain.IsDirectChild(int64(target.Shard), int64(source.Shard)) {
 			continue
 		}
@@ -334,7 +358,16 @@ func (a *LocalAcquisition) acquireMasterMessages(
 		}
 		views[blockShardIdent(tops[index].Block)] = view
 	}
-	neighbors, err := a.loadExpectedNeighbors(ctx, master, expected, previous, views, nil, masterNeedsCollatedProofs(master))
+	neighbors, err := a.loadExpectedNeighbors(
+		ctx,
+		master,
+		expected,
+		previous,
+		views,
+		nil,
+		masterNeedsCollatedProofs(master),
+		acquisitionReadImmediate,
+	)
 	if err != nil {
 		return localAcquiredMessages{}, err
 	}
@@ -359,7 +392,15 @@ func (a *LocalAcquisition) acquireMasterMessages(
 		return localAcquiredMessages{}, err
 	}
 	cut := mergeLocalCuts(committed, localRuns)
-	endLT, err := a.historicalShardEndLT(ctx, master, previous, neighbors, nil, registry)
+	endLT, err := a.historicalShardEndLT(
+		ctx,
+		master,
+		previous,
+		neighbors,
+		nil,
+		registry,
+		acquisitionReadImmediate,
+	)
 	if err != nil {
 		return localAcquiredMessages{}, err
 	}
@@ -386,6 +427,7 @@ func (a *LocalAcquisition) loadExpectedNeighbors(
 	views map[msgpool.ShardIdent]*localNeighborView,
 	collated *verifiedCollatedData,
 	needProofs bool,
+	mode acquisitionReadMode,
 ) ([]Neighbor, error) {
 	keys := make([]neighborShardKey, 0, len(expected))
 	for key := range expected {
@@ -403,7 +445,7 @@ func (a *LocalAcquisition) loadExpectedNeighbors(
 	// the sum of those latencies into the longest of them; the loop then joins
 	// whatever is still in flight through the block cache and is otherwise
 	// untouched, so the order it verifies and fails in is unchanged.
-	a.warmNeighborSources(ctx, keys, expected, views, collated)
+	a.warmNeighborSources(ctx, keys, expected, previous, views, collated)
 
 	neighbors := make([]Neighbor, 0, len(keys))
 	for _, key := range keys {
@@ -449,38 +491,57 @@ func (a *LocalAcquisition) loadExpectedNeighbors(
 			if err != nil {
 				return nil, fmt.Errorf("%w: load collated neighbor state for block %d: %v", ErrInvalidInput, id.SeqNo, err)
 			}
-			view, err = localViewFromPrevious(PreviousBlock{ID: id, State: state}, false, false)
+			view, err = localViewFromPrevious(PreviousBlock{ID: id, State: state, Proven: true}, false, false)
 			if err != nil {
 				return nil, fmt.Errorf("decode collated neighbor %d: %w", id.SeqNo, err)
 			}
 		}
-		// Prefer the node's canonical full state when the exact block has already
-		// been accepted. A session predecessor received with a candidate may be a
-		// narrow Merkle proof: it is sufficient to continue that candidate chain,
-		// but can omit the outbound queue needed when the same block is selected as
-		// a neighbor. A genuinely speculative predecessor is not in the node store
-		// yet and falls through to the supplied state below.
+		// A shard is its own neighbor, so the session's own predecessor is in the
+		// expected set — and it is already in memory, exactly as the node store
+		// would hand it back. Prefer it: reading the same block back out of
+		// storage costs a block read, a state read and a second full decode of a
+		// tree we are holding.
+		//
+		// The one state that must not be taken here is a predecessor re-pointed
+		// at the candidate's own collated proof, which covers what that
+		// candidate's replay reads and stops at a pruned boundary anywhere else;
+		// asking it for an outbound queue would reject a valid candidate.
+		// Proven says so at the entry itself, so this branch is safe on its own
+		// terms rather than by an argument about which caller reaches it. Every
+		// other supplied predecessor is a full live tree — the validator applies
+		// each accepted candidate to its own full parent, and collation carries
+		// the state it just built — so it is decoded as a resident state, the
+		// same treatment loadNeighborView gives the stored copy.
+		//
+		// It is deliberately never traced, whatever needProofs says. A view
+		// taken here answers for a block in previous, and previous is exactly
+		// the pair BuildFullCollatedProofs skips (ShardRequest.Previous and
+		// Previous2 are that same pair): the predecessor state travels in the
+		// candidate's own proof of its parent, not as a neighbour proof. A
+		// builder here would therefore produce a proof that is discarded, after
+		// traceInternalCut had walked the whole predecessor outbound queue to
+		// fill it — measured at about a thousand extra cell loads per shard
+		// collation on mainnet, spent on nothing.
+		if view == nil {
+			if supplied := suppliedNeighborState(previous, id); supplied != nil {
+				var err error
+				view, err = localViewFromPrevious(*supplied, true, false)
+				if err != nil {
+					return nil, fmt.Errorf("decode supplied neighbor %d: %w", id.SeqNo, err)
+				}
+			}
+		}
+		// Everything else comes from the node's canonical state: a neighbor
+		// shard we do not collate, and a proven predecessor whose full tree this
+		// node may still hold.
 		if view == nil && a.store != nil {
-			stored, err := a.loadNeighborView(ctx, id, needProofs)
+			stored, err := a.loadNeighborView(ctx, id, needProofs, mode)
 			switch {
 			case err == nil:
 				view = stored
 			case errors.Is(err, ErrAcquisitionNotReady):
 			default:
 				return nil, err
-			}
-		}
-		for i := range previous {
-			if view != nil {
-				break
-			}
-			if previous[i].ID.Equals(&id) {
-				var err error
-				view, err = localViewFromPrevious(previous[i], false, false)
-				if err != nil {
-					return nil, fmt.Errorf("decode supplied neighbor %d: %w", id.SeqNo, err)
-				}
-				break
 			}
 		}
 		if view == nil {
@@ -505,32 +566,16 @@ func (a *LocalAcquisition) loadExpectedNeighbors(
 // nothing here can widen a proof: the block cache holds the untraced read, and
 // every traced view is rebuilt per collation from the state root it caches.
 //
-// The skipped cases mirror the loop's own preference order exactly: the
-// masterchain neighbour is served from the master view, an entry already in
-// views is reused, and full collated data is the authenticated neighbour state
-// that makes the resident read unnecessary.
+// Which sources it warms is decided by pendingWarmSources.
 func (a *LocalAcquisition) warmNeighborSources(
 	ctx context.Context,
 	keys []neighborShardKey,
 	expected map[neighborShardKey]ton.BlockIDExt,
+	previous []PreviousBlock,
 	views map[msgpool.ShardIdent]*localNeighborView,
 	collated *verifiedCollatedData,
 ) {
-	if a.store == nil || (collated != nil && collated.full) {
-		return
-	}
-
-	pending := make([]ton.BlockIDExt, 0, len(keys))
-	for _, key := range keys {
-		id := expected[key]
-		if id.Workchain == masterchainWorkchainID {
-			continue
-		}
-		if cached := views[blockShardIdent(id)]; cached != nil && cached.previous.ID.Equals(&id) {
-			continue
-		}
-		pending = append(pending, id)
-	}
+	pending := a.pendingWarmSources(keys, expected, previous, views, collated)
 	// One neighbour is the loop's own read; there is nothing to overlap it with.
 	if len(pending) < 2 {
 		return
@@ -547,18 +592,80 @@ func (a *LocalAcquisition) warmNeighborSources(
 				if ctx.Err() != nil {
 					return
 				}
-				_, _ = a.blockSource(ctx, id)
+				_, _ = a.blockSource(ctx, id, acquisitionReadImmediate)
 			}
 		}()
 	}
+}
+
+// pendingWarmSources selects the neighbour blocks warmNeighborSources will read
+// ahead of the resolution loop, in the loop's own order.
+//
+// The skipped cases mirror the loop's preference order exactly: the masterchain
+// neighbour is served from the master view, an entry already in views is reused,
+// full collated data is the authenticated neighbour state that makes the
+// resident read unnecessary, and a supplied predecessor that is not proven is
+// the same tree the store would return. Warming a source the loop prefers
+// something else for is not merely wasted work: it is precisely the storage read
+// the preference exists to remove.
+//
+// It is a separate function so that this selection — the half of the preference
+// that runs on goroutines nobody joins, and is therefore invisible to a test
+// that watches a store counter — can be asserted directly and deterministically.
+func (a *LocalAcquisition) pendingWarmSources(
+	keys []neighborShardKey,
+	expected map[neighborShardKey]ton.BlockIDExt,
+	previous []PreviousBlock,
+	views map[msgpool.ShardIdent]*localNeighborView,
+	collated *verifiedCollatedData,
+) []ton.BlockIDExt {
+	if a.store == nil || (collated != nil && collated.full) {
+		return nil
+	}
+
+	pending := make([]ton.BlockIDExt, 0, len(keys))
+	for _, key := range keys {
+		id := expected[key]
+		if id.Workchain == masterchainWorkchainID {
+			continue
+		}
+		if cached := views[blockShardIdent(id)]; cached != nil && cached.previous.ID.Equals(&id) {
+			continue
+		}
+		if suppliedNeighborState(previous, id) != nil {
+			continue
+		}
+		pending = append(pending, id)
+	}
+
+	return pending
+}
+
+// suppliedNeighborState returns the session predecessor that can answer for
+// block id as a neighbour, or nil when none can. Both the resolution loop and
+// its warm-up call it, which is what keeps the warm-up from starting the very
+// storage read the loop is about to prefer a memory-resident state over.
+//
+// A proven entry is deliberately invisible here: its state is the candidate's
+// own Merkle proof, complete for that candidate's replay and pruned everywhere
+// else, so the neighbour view has to come from the node store instead.
+func suppliedNeighborState(previous []PreviousBlock, id ton.BlockIDExt) *PreviousBlock {
+	for i := range previous {
+		if !previous[i].Proven && previous[i].ID.Equals(&id) {
+			return &previous[i]
+		}
+	}
+
+	return nil
 }
 
 func (a *LocalAcquisition) loadNeighborView(
 	ctx context.Context,
 	id ton.BlockIDExt,
 	trace bool,
+	mode acquisitionReadMode,
 ) (*localNeighborView, error) {
-	previous, _, err := a.loadPrevious(ctx, id)
+	previous, _, err := a.loadPrevious(ctx, id, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -1069,6 +1176,7 @@ func (a *LocalAcquisition) historicalShardEndLT(
 	neighbors []Neighbor,
 	collated *verifiedCollatedData,
 	nextRegistry *ShardRegistry,
+	mode acquisitionReadMode,
 ) (tlb.ShardEndLTFunc, error) {
 	seqnos := map[uint32]struct{}{current.context.ID.SeqNo: {}}
 	nextSeqno := current.context.ID.SeqNo + 1
@@ -1115,6 +1223,7 @@ func (a *LocalAcquisition) historicalShardEndLT(
 				return nil, fmt.Errorf("load collated predecessor %d state: %w", predecessor.ID.SeqNo, err)
 			}
 			predecessor.State = state
+			predecessor.Proven = true
 		}
 		view, err := localViewFromPrevious(predecessor, false, false)
 		if err != nil {
@@ -1148,7 +1257,7 @@ func (a *LocalAcquisition) historicalShardEndLT(
 		if err != nil {
 			return nil, err
 		}
-		source, err := a.blockSource(ctx, id)
+		source, err := a.blockSource(ctx, id, mode)
 		if err != nil {
 			return nil, err
 		}

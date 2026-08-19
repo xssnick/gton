@@ -8,6 +8,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
+	"github.com/xssnick/gton/service/validator/blockstats"
 	"github.com/xssnick/tonutils-go/tvm"
 )
 
@@ -29,13 +30,17 @@ func TestPrometheusCollationObserverExportsBoundedMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observer := metrics.Observer(MetricsModeStandalone)
+	blockStats := blockstats.New()
+	observer := NewBlockStatsObserver(blockStats, metrics.Observer(MetricsModeStandalone))
 	observer.AddCollationBuildInflight(MetricChainShardchain, 1)
 	observer.ObserveCollationBuild(CollationBuildObservation{
 		Chain: MetricChainShardchain, Result: CollationResultSuccess, Duration: 25 * time.Millisecond,
 	})
 	observer.ObserveCollationStage(CollationStageObservation{
-		Chain: MetricChainShardchain, Stage: CollationStageCore, Duration: 20 * time.Millisecond,
+		Chain: MetricChainShardchain, Stage: CollationStageAssembleCandidate, Duration: 20 * time.Millisecond,
+	})
+	observer.ObserveCollationStage(CollationStageObservation{
+		Chain: MetricChainShardchain, Stage: CollationStageWaitExternalMessages, Duration: 5 * time.Millisecond,
 	})
 	observer.ObserveCollationCandidate(CandidateObservation{
 		Chain: MetricChainShardchain,
@@ -61,6 +66,11 @@ func TestPrometheusCollationObserverExportsBoundedMetrics(t *testing.T) {
 		DeadlineActionWait,
 	)
 	observer.ObserveCollationRetry(MetricChainShardchain, ProductionRetryNotReady)
+	// Both producer alarms, because both are conditions no other series carries:
+	// a short collated proof rides on a SUCCESSFUL build and a mandatory-dequeue
+	// overflow is one error among all the reasons a build can fail.
+	observer.ObserveCollationAlarm(MetricChainShardchain, CollationAlarmShortCollatedProof)
+	observer.ObserveCollationAlarm(MetricChainShardchain, CollationAlarmMandatoryDequeueOverflow)
 	observer.AddCollationWindowInflight(MetricChainShardchain, 1)
 	observer.ObserveCollationWindow(WindowObservation{
 		Chain: MetricChainShardchain, Result: CollationResultSuccess, Duration: time.Second,
@@ -82,6 +92,7 @@ func TestPrometheusCollationObserverExportsBoundedMetrics(t *testing.T) {
 		"gton_collator_candidate_production_duration_seconds",
 		"gton_collator_deadline_events_total",
 		"gton_collator_retries_total",
+		"gton_collator_alarms_total",
 		"gton_collator_windows_total",
 	} {
 		if byName[name] == nil {
@@ -92,6 +103,90 @@ func TestPrometheusCollationObserverExportsBoundedMetrics(t *testing.T) {
 		"mode": "standalone", "chain": "shardchain", "result": "success",
 	}) {
 		t.Fatal("successful standalone shardchain build labels were not exported")
+	}
+	for _, alarm := range []string{"short_collated_proof", "mandatory_dequeue_overflow"} {
+		if !metricFamilyHasLabels(byName["gton_collator_alarms_total"], map[string]string{
+			"mode": "standalone", "chain": "shardchain", "alarm": alarm,
+		}) {
+			t.Fatalf("alarm %s was not exported; a node shipping short proofs or losing every slot "+
+				"would be invisible on :8085", alarm)
+		}
+	}
+	if !metricFamilyHasLabels(byName["gton_collator_stage_duration_seconds"], map[string]string{
+		"mode": "standalone", "chain": "shardchain", "stage": "assemble_candidate",
+	}) {
+		t.Fatal("candidate assembly stage was not exported")
+	}
+	if !metricFamilyHasLabels(byName["gton_collator_stage_duration_seconds"], map[string]string{
+		"mode": "standalone", "chain": "shardchain", "stage": "wait_external_messages",
+	}) {
+		t.Fatal("external-message wait stage was not exported")
+	}
+	if byName["gton_collator_external_wait_duration_seconds"] != nil {
+		t.Fatal("external wait was exported outside the exclusive stage histogram")
+	}
+	if got := blockStats.BlockStats().Collated.Shard.OK; got != 1 {
+		t.Fatalf("shard collation blocks = %d, want 1", got)
+	}
+}
+
+func TestBlockStatsCollationObserverCountsTerminalBuilds(t *testing.T) {
+	stats := blockstats.New()
+	observer := NewBlockStatsObserver(stats, nil)
+
+	observer.ObserveCollationRetry(MetricChainMasterchain, ProductionRetryNotReady)
+	observer.ObserveCandidateProduction(CandidateProductionObservation{
+		Chain: MetricChainMasterchain, Kind: CandidateKindBlock, Result: CollationResultSuccess,
+	})
+	observer.ObserveCollationBuild(CollationBuildObservation{
+		Chain: MetricChainMasterchain, Result: CollationResultSuccess,
+	})
+	observer.ObserveCollationBuild(CollationBuildObservation{
+		Chain: MetricChainShardchain, Result: CollationResultError,
+	})
+	observer.ObserveCollationBuild(CollationBuildObservation{
+		Chain: MetricChainShardchain, Result: CollationResultCanceled,
+	})
+	observer.ObserveCollationBuild(CollationBuildObservation{
+		Chain: MetricChainShardchain, Result: CollationResultDeadline,
+	})
+
+	got := stats.BlockStats()
+	if got.Collated.Master.OK != 1 || got.Collated.Master.Error != 0 ||
+		got.Collated.Shard.OK != 0 || got.Collated.Shard.Error != 3 {
+		t.Fatalf("collation counters = %#v", got.Collated)
+	}
+}
+
+func TestCandidateAssemblyMetricsExcludeExternalWait(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := NewPrometheusMetrics(collatorMetricsTestRegistry{registry: registry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisition := LocalAcquisition{collationObserver: metrics.Observer(MetricsModeValidator)}
+	acquisition.observeCandidateAssembly(MetricChainShardchain, 2*time.Second, time.Second)
+
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := make(map[string]*dto.MetricFamily, len(families))
+	for _, family := range families {
+		byName[family.GetName()] = family
+	}
+
+	for _, stage := range []string{"assemble_candidate", "wait_external_messages"} {
+		sum, found := histogramSumWithLabels(
+			byName["gton_collator_stage_duration_seconds"],
+			map[string]string{"mode": "validator", "chain": "shardchain", "stage": stage},
+		)
+		if !found {
+			t.Fatalf("stage %q was not exported", stage)
+		}
+		if sum != 1 {
+			t.Fatalf("stage %q duration = %v seconds, want 1", stage, sum)
+		}
 	}
 }
 
@@ -118,7 +213,7 @@ func BenchmarkCollationMetricsDisabledStageBoundary(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		started := service.metricStageStarted()
-		service.observeMetricStage(MetricChainShardchain, CollationStageCore, started)
+		service.observeMetricStage(MetricChainShardchain, CollationStageAssembleCandidate, started)
 	}
 }
 
@@ -130,7 +225,7 @@ func BenchmarkCollationMetricsEnabledObservation(b *testing.B) {
 	}
 	observer := metrics.Observer(MetricsModeValidator)
 	observation := CollationStageObservation{
-		Chain: MetricChainShardchain, Stage: CollationStageCore, Duration: 10 * time.Millisecond,
+		Chain: MetricChainShardchain, Stage: CollationStageAssembleCandidate, Duration: 10 * time.Millisecond,
 	}
 
 	b.ReportAllocs()

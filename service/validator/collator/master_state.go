@@ -188,10 +188,11 @@ func (c *collation) buildMasterStateAndBlockParts() (blockParts, error) {
 	}
 	// One pass produces both the update and the shared, trace-free state; see
 	// buildShardStateAndBlockParts for why the published root comes from here.
-	stateUpdate, stateRoot, err := c.usage.CreateMerkleUpdateApplied(stateRoot)
+	stateUpdate, stateRoot, memoCells, err := c.usage.CreateMerkleUpdateAppliedSized(stateRoot, c.builder.updateMemoHint())
 	if err != nil {
 		return blockParts{}, fmt.Errorf("create masterchain state update: %w", err)
 	}
+	c.updateMemoCells = memoCells
 
 	inMessages, err := c.inMessages.ToCell()
 	if err != nil {
@@ -315,9 +316,24 @@ func (c *collation) buildMasterValueFlow() (valueFlowParts, error) {
 }
 
 func (c *collation) deriveMasterConfig() error {
+	// This runs under the block's read set, which decides the Merkle update and
+	// answers the collated-size estimate's membership questions. The three parses
+	// read roughly 2700 cells below the configuration parameters that nothing
+	// else on this path touches — validator entries, fundamental-smc entries,
+	// storage price rows — so skipping them is sound only while the prepared
+	// configuration's footprint replays exactly what they read.
+	// TestDeriveMasterConfigTransitionReuseMatchesFreshParse and
+	// TestMasterConfigFootprintMutationsAreDetected are the guards; both compare
+	// the record and not the produced bytes, for the reason configFootprint
+	// documents.
 	transition, err := deriveMasterConfigTransition(
 		c.accounts,
 		&c.master.oldExtra,
+		masterConfigPredecessor{
+			config: c.config,
+			groups: c.master.previousGroups,
+			usage:  c.usage,
+		},
 	)
 	if err != nil {
 		return err
@@ -337,9 +353,31 @@ type masterConfigTransition struct {
 	keyBlock bool
 }
 
+// masterConfigPredecessor is the predecessor's prepared configuration, plus the
+// read set on the collation path. Reuse is decided and replayed in one place:
+// the footprint describes the parses the gate skips, so it must never be
+// recorded when the gate does not fire.
+type masterConfigPredecessor struct {
+	config *Config
+	groups *groups.Config
+	usage  *cell.ReadSet // nil on the verification path, which records nothing
+}
+
+// deriveMasterConfigTransition resolves the configuration the candidate
+// installs, from the configuration contract's own account.
+//
+// The predecessor's already prepared configuration is used only when the
+// resulting configuration is the very same root at the very same address.
+// Preparing a configuration means building the execution config, the collator
+// config and the validator group config, which together are the bulk of this
+// function's cost and are pure functions of the root — the reference collator
+// likewise reuses its parsed config and only re-validates the raw data every
+// block. Either half may be absent, in which case everything is derived from
+// scratch.
 func deriveMasterConfigTransition(
 	accounts *tlb.ShardAccountsAugDict,
 	oldExtra *tlb.McStateExtra,
+	previous masterConfigPredecessor,
 ) (masterConfigTransition, error) {
 	currentAddr := oldExtra.ConfigParams.ConfigAddr
 	oldRoot := oldExtra.ConfigParams.Config.Params.AsCell()
@@ -366,18 +404,37 @@ func deriveMasterConfigTransition(
 		}
 	}
 
-	prepared, err := tvm.PrepareBlockchainConfig(root)
-	if err != nil {
-		return masterConfigTransition{}, fmt.Errorf("%w: prepare resulting blockchain config: %v", ErrInvalidInput, err)
+	// The gate is deliberately narrow: same root cell and same contract address.
+	// It matches important_config_parameters_changed, which is itself a plain
+	// root comparison, and the address term is what keeps a configuration moved
+	// to a new contract with identical contents a key block. Widening it to
+	// "important parameters unchanged" would diverge from the reference.
+	//
+	// The raw validation above is NOT part of the gate and always runs, exactly
+	// as block::valid_config_data does on every masterchain block.
+	//
+	// A recorder without a usable footprint is the last term, and it is the whole
+	// safety argument: the reads the skipped parses would have taken are replayed
+	// here, at the exact position they would have happened, or the parses run.
+	nextConfig, nextGroups := previous.config, previous.groups
+	reuse := previous.config != nil && previous.groups != nil &&
+		previous.config.execution != nil &&
+		bytes.Equal(currentAddr, nextAddr) &&
+		root.HashKey() == oldRoot.HashKey() &&
+		previous.config.execution.Root().HashKey() == oldRoot.HashKey() &&
+		(previous.usage == nil || previous.config.footprint.covers(root))
+	if reuse {
+		previous.config.footprint.replay(previous.usage)
+	} else {
+		parsed, parseErr := parseMasterConfigEpoch(root)
+		if parseErr != nil {
+			return masterConfigTransition{}, parseErr
+		}
+		nextConfig, nextGroups = parsed.config, parsed.groups
 	}
-	nextConfig, err := PrepareConfig(prepared)
-	if err != nil {
-		return masterConfigTransition{}, err
-	}
-	nextGroups, err := groups.ParseConfig(root)
-	if err != nil {
-		return masterConfigTransition{}, fmt.Errorf("%w: parse resulting validator config: %v", ErrInvalidInput, err)
-	}
+	// Asserted on both branches: a reused config was already checked when it was
+	// prepared, and keeping the check here means the invariant holds for every
+	// value this function returns rather than only for freshly parsed ones.
 	if nextGroups.Catchain.MasterchainLifetime == 0 || nextGroups.Catchain.ShardLifetime == 0 {
 		return masterConfigTransition{}, fmt.Errorf("%w: resulting catchain lifetime is zero", ErrInvalidInput)
 	}

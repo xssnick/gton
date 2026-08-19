@@ -114,7 +114,7 @@ func (v *semanticQueueValidation) applyDispatchChanges() error {
 		if err != nil || !v.target.ContainsPrefix(envelope.source) {
 			return fmt.Errorf("%w: new deferred message %x source is outside this shard", ErrInvalidInput, hash)
 		}
-		if _, special := v.replay.specialAccounts[accountID]; special {
+		if _, special := v.replay.specials.set[accountID]; special {
 			return fmt.Errorf("%w: special masterchain account %x defers an outbound message", ErrInvalidInput, accountID)
 		}
 		change, err := v.dispatchChange(changes, accountID)

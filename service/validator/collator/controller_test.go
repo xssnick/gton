@@ -3,6 +3,7 @@ package collator
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -405,8 +406,9 @@ func controllerTestSnapshot(local [32]byte) *groups.Snapshot {
 				Masterchain: consensus,
 				Shard:       consensus,
 			},
-			MaxBlockSize:        1 << 20,
-			MaxCollatedDataSize: 2 << 20,
+			MaxBlockSize:         1 << 20,
+			MaxCollatedDataSize:  2 << 20,
+			AllCurrentValidators: [][32]byte{validator.ADNL},
 		},
 		Active: []groups.Session{{
 			ID:               [32]byte{0x21},
@@ -484,7 +486,8 @@ func TestProjectCollatorSessionsUsesChainRegistryRoles(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := projected[snapshot.Active[0].ID]
-	if base.overlay.Role != OverlayRoleObserver || len(base.overlay.CollatorsByValidator) != 0 {
+	if base.overlay.Role != OverlayRoleCollator || len(base.overlay.CollatorsByValidator) != 0 ||
+		!slices.Equal(base.overlay.AllCollators, [][32]byte{local}) {
 		t.Fatalf("non-roster registration projection = %+v", base.overlay)
 	}
 
@@ -495,12 +498,31 @@ func TestProjectCollatorSessionsUsesChainRegistryRoles(t *testing.T) {
 	base = projected[snapshot.Active[0].ID]
 	if base.overlay.Role != OverlayRoleCollator ||
 		base.overlay.BroadcastMode != CandidateBroadcastPrivateOverlay ||
-		!base.overlay.ObserversInPrivateOverlay || len(base.overlay.CollatorsByValidator) != 1 {
+		!base.overlay.ObserversInPrivateOverlay || len(base.overlay.CollatorsByValidator) != 1 ||
+		!slices.Equal(base.overlay.AllCollators, [][32]byte{local}) ||
+		!slices.Equal(base.overlay.AllCurrentValidators, snapshot.Config.AllCurrentValidators) {
 		t.Fatalf("roster registration projection = %+v", base.overlay)
 	}
 }
 
-func TestProjectCollatorSessionsSkipsUnsupportedObserverGroup(t *testing.T) {
+func TestProjectCollatorSessionsGivesGroupValidatorADNLPrecedence(t *testing.T) {
+	snapshot := controllerTestSnapshot([32]byte{0x31})
+	validatorADNL := snapshot.Active[0].Validators[0].ADNL
+	snapshot.CollatorsByValidator = []groups.CollatorRegistryEntry{{
+		ValidatorKeyID:  snapshot.Active[0].Validators[0].PublicKeyHash,
+		CollatorADNLIDs: [][32]byte{validatorADNL},
+	}}
+
+	projected, err := projectCollatorSessions(snapshot, sessionProjectionPolicy{localADNLID: validatorADNL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projected) != 0 {
+		t.Fatalf("validator ADNL projected %d standalone collator sessions", len(projected))
+	}
+}
+
+func TestProjectCollatorSessionsSkipsUnavailableObserverIdentity(t *testing.T) {
 	legacy := &groups.SimplexConfig{
 		Version:              1,
 		SlotsPerLeaderWindow: 2,
@@ -511,6 +533,11 @@ func TestProjectCollatorSessionsSkipsUnsupportedObserverGroup(t *testing.T) {
 	}{
 		{name: "absent"},
 		{name: "legacy", consensus: legacy},
+		{name: "protocol zero", consensus: &groups.SimplexConfig{
+			Version:              2,
+			ProtocolVersion:      0,
+			SlotsPerLeaderWindow: 2,
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			local := [32]byte{0x31}
@@ -554,9 +581,9 @@ func TestProjectCollatorSessionsRejectsUnsupportedDelegatedGroup(t *testing.T) {
 			ProtocolVersion:      3,
 			SlotsPerLeaderWindow: 2,
 		}},
-		{name: "old protocol", consensus: &groups.SimplexConfig{
+		{name: "unrepresentable protocol", consensus: &groups.SimplexConfig{
 			Version:              2,
-			ProtocolVersion:      2,
+			ProtocolVersion:      simplex.MaxProtocolVersion + 1,
 			SlotsPerLeaderWindow: 2,
 		}},
 	} {
@@ -568,6 +595,69 @@ func TestProjectCollatorSessionsRejectsUnsupportedDelegatedGroup(t *testing.T) {
 			_, err := projectCollatorSessions(snapshot, sessionProjectionPolicy{localADNLID: local})
 			if err == nil {
 				t.Fatal("unsupported delegated session was accepted")
+			}
+		})
+	}
+}
+
+func TestProjectCollatorSessionsProtocolRoleMatrix(t *testing.T) {
+	local := [32]byte{0x31}
+	for _, test := range []struct {
+		name             string
+		protocolVersion  uint8
+		masterchain      bool
+		wantProjected    bool
+		wantRole         OverlayRole
+		wantBroadcast    CandidateBroadcastMode
+		wantPrivatePeers bool
+	}{
+		{name: "protocol zero collator omitted", protocolVersion: 0},
+		{name: "protocol one collator block sync", protocolVersion: 1, wantProjected: true,
+			wantRole: OverlayRoleCollator, wantBroadcast: CandidateBroadcastBlockSyncOverlay},
+		{name: "protocol two collator private", protocolVersion: 2, wantProjected: true,
+			wantRole: OverlayRoleCollator, wantBroadcast: CandidateBroadcastPrivateOverlay, wantPrivatePeers: true},
+		{name: "protocol three collator private", protocolVersion: 3, wantProjected: true,
+			wantRole: OverlayRoleCollator, wantBroadcast: CandidateBroadcastPrivateOverlay, wantPrivatePeers: true},
+		{name: "protocol zero observer omitted", protocolVersion: 0, masterchain: true},
+		{name: "protocol one block sync observer", protocolVersion: 1, masterchain: true, wantProjected: true,
+			wantRole: OverlayRoleObserver, wantBroadcast: CandidateBroadcastBlockSyncOverlay},
+		{name: "protocol two private observer", protocolVersion: 2, masterchain: true, wantProjected: true,
+			wantRole: OverlayRoleObserver, wantBroadcast: CandidateBroadcastPrivateOverlay, wantPrivatePeers: true},
+		{name: "protocol three private observer", protocolVersion: 3, masterchain: true, wantProjected: true,
+			wantRole: OverlayRoleObserver, wantBroadcast: CandidateBroadcastPrivateOverlay, wantPrivatePeers: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := controllerTestSnapshot(local)
+			consensus := &groups.SimplexConfig{
+				Version:              2,
+				ProtocolVersion:      test.protocolVersion,
+				SlotsPerLeaderWindow: 2,
+			}
+			group := snapshot.Active[0]
+			if test.masterchain {
+				group.Shard = groups.ShardID{Workchain: -1, Shard: -1 << 63}
+				group.Genesis = []ton.BlockIDExt{runtimeTestBlockID(-1, -1<<63, 19)}
+				snapshot.Config.NewConsensus.Masterchain = consensus
+			} else {
+				snapshot.Config.NewConsensus.Shard = consensus
+			}
+			snapshot.Active = []groups.Session{group}
+
+			projected, err := projectCollatorSessions(snapshot, sessionProjectionPolicy{localADNLID: local})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, exists := projected[group.ID]
+			if exists != test.wantProjected {
+				t.Fatalf("projected = %v, want %v", exists, test.wantProjected)
+			}
+			if !exists {
+				return
+			}
+			if got.overlay.Role != test.wantRole || got.overlay.BroadcastMode != test.wantBroadcast ||
+				got.overlay.ObserversInPrivateOverlay != test.wantPrivatePeers ||
+				!slices.Equal(got.overlay.AllCollators, [][32]byte{local}) {
+				t.Fatalf("protocol projection = %+v", got.overlay)
 			}
 		})
 	}

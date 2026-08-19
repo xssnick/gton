@@ -55,16 +55,27 @@ type CandidateArtifact struct {
 	// from the roots it serializes, and an artifact reaching this package from
 	// an extension-supplied Pipeline therefore cannot carry one.
 	prepared *simplex.PreparedCandidate
+
+	// digested records that Candidate.Block.FileHash and
+	// Candidate.CollatedFileHash are the sha256 of BlockBOC and CollatedData.
+	// It is set only where that is how those two values came to exist — the
+	// decoder derives both from the payload it decompressed, the local producer
+	// takes both inside the build that serialized it — so it travels with the
+	// bytes rather than being asserted about them.
+	//
+	// Unexported for the same reason prepared is: an artifact reaching this
+	// package from anywhere but those two producers cannot claim it, and the
+	// validator it is handed to then re-derives the digest itself.
+	digested bool
 }
 
 type candidateCodec struct {
-	sessionID       [32]byte
-	shard           groups.ShardID
-	validators      []simplex.Validator
-	schedule        simplex.LeaderSchedule
-	protocolVersion uint8
-	slotsPerWindow  uint32
-	limits          CandidateLimits
+	sessionID      [32]byte
+	shard          groups.ShardID
+	validators     []simplex.Validator
+	schedule       simplex.LeaderSchedule
+	slotsPerWindow uint32
+	limits         CandidateLimits
 }
 
 func newCandidateCodec(config SessionConfig, limits CandidateLimits) (*candidateCodec, error) {
@@ -74,9 +85,10 @@ func newCandidateCodec(config SessionConfig, limits CandidateLimits) (*candidate
 	if len(config.Validators) == 0 {
 		return nil, errors.New("validator runtime: empty validator set")
 	}
-	if config.Protocol.ProtocolVersion < 3 {
+	if config.Protocol.Version != 2 || config.Protocol.ProtocolVersion > simplex.MaxProtocolVersion {
 		return nil, fmt.Errorf(
-			"validator runtime: protocol version %d is unsupported, require 3 or newer",
+			"validator runtime: unsupported simplex version %d protocol %d",
+			config.Protocol.Version,
 			config.Protocol.ProtocolVersion,
 		)
 	}
@@ -101,9 +113,8 @@ func newCandidateCodec(config SessionConfig, limits CandidateLimits) (*candidate
 			SlotsPerLeaderWindow: config.Protocol.SlotsPerLeaderWindow,
 			Validators:           uint32(len(validators)),
 		},
-		protocolVersion: config.Protocol.ProtocolVersion,
-		slotsPerWindow:  config.Protocol.SlotsPerLeaderWindow,
-		limits:          limits,
+		slotsPerWindow: config.Protocol.SlotsPerLeaderWindow,
+		limits:         limits,
 	}, nil
 }
 
@@ -262,6 +273,13 @@ func (c *candidateCodec) decodeBlock(
 		BlockBOC:     payload.blockBOC,
 		CollatedData: payload.collatedData,
 		prepared:     payload.prepared,
+		// block.FileHash and candidate.CollatedFileHash immediately above are
+		// payload.fileHash and payload.collatedFileHash, which decodePayload
+		// took of these exact two buffers. The candidate id the signature covers
+		// is computed from them here, so the digests are not merely consistent
+		// with the payload — they are the only thing that made this candidate
+		// identifiable at all.
+		digested: true,
 	}, nil
 }
 
@@ -415,6 +433,7 @@ func (c *candidateCodec) finishPayload(
 			roots[1:],
 			result.fileHash,
 			result.collatedFileHash,
+			simplex.PayloadCellHint(blockBOC, collatedData),
 		)
 		if err != nil {
 			return decodedCandidatePayload{}, err
@@ -443,9 +462,6 @@ func (c *candidateCodec) verifyCandidate(candidate *simplex.Candidate) error {
 		}
 
 		return nil
-	}
-	if c.protocolVersion < 3 {
-		return errors.New("validator runtime: delegated candidate requires protocol version 3")
 	}
 	delegation := candidate.Delegation
 	if len(delegation.CollatorKey) != ed25519.PublicKeySize {

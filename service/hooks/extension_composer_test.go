@@ -219,7 +219,7 @@ func TestExtensionComposerRetriesCloseBeforeLowerDependencies(t *testing.T) {
 	lower := &recordingLifecycleExtension{recordingExtension: &recordingExtension{name: "a", calls: &calls}}
 	retrying := &recordingLifecycleExtension{
 		recordingExtension: &recordingExtension{name: "b", calls: &calls},
-		closeErrs:         []error{errComposerTest, nil},
+		closeErrs:          []error{errComposerTest, nil},
 	}
 	upper := &recordingLifecycleExtension{recordingExtension: &recordingExtension{name: "c", calls: &calls}}
 	extension := &composedExtension{extensions: []Extension{lower, retrying, upper}}

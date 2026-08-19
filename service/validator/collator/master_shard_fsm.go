@@ -185,10 +185,10 @@ func postprocessMasterShardRegistry(input masterShardRegistryPostprocessInput) e
 		staged[key] = leaf
 	}
 
-	if _, err := buildShardHashesDictionary(staged); err != nil {
-		return fmt.Errorf("%w: serialize postprocessed shard registry: %v", ErrInvalidInput, err)
-	}
-
+	// The key set is untouched here — every write above replaces a leaf that
+	// already existed — so the partition this would validate is the one Apply and
+	// activateMasterShardWorkchains already validated, and Build re-derives the
+	// dictionary from these very leaves on the next statement of the only caller.
 	input.registry.leaves = staged
 	return nil
 }

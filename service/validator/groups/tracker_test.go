@@ -2,6 +2,7 @@ package groups
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -77,6 +78,85 @@ func TestSnapshotBeforeFirstApplyReturnsNotFound(t *testing.T) {
 	_, err = tracker.Snapshot()
 	if !errors.Is(err, ErrNoSnapshot) {
 		t.Fatalf("Snapshot error = %v, want ErrNoSnapshot", err)
+	}
+}
+
+func TestTrackerWaitProjectResumesWhenExactStateIsApplied(t *testing.T) {
+	current := buildTestValidatorSet(t, []testValidatorWire{{
+		index: 0, key: groupTestBytes(1), weight: 10,
+	}}, true, 10)
+	configRoot := buildTestConfig(t, map[uint32]*cell.Cell{
+		configParamCurrentValidators: current,
+	})
+	shard := ShardID{Workchain: 0, Shard: masterchainShard}
+	first := buildStateFixture(t, stateFixtureOptions{
+		Seqno:            100,
+		GenUTime:         1_700_000_000,
+		CatchainSeqno:    44,
+		RotatedAllShards: true,
+		ConfigRoot:       configRoot,
+		ShardHashes: testShardHashes(t, testBinTreeLeaf(
+			testParsedShardDescription(t, shard, 17, 91, tlb.FutureSplitMergeNone{}),
+		)),
+	})
+	second := buildStateFixture(t, stateFixtureOptions{
+		Seqno:         101,
+		GenUTime:      1_700_000_001,
+		CatchainSeqno: 44,
+		ConfigRoot:    configRoot,
+		ShardHashes: testShardHashes(t, testBinTreeLeaf(
+			testParsedShardDescription(t, shard, 18, 91, tlb.FutureSplitMergeNone{}),
+		)),
+	})
+	tracker, err := NewTracker(TrackerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tracker.Apply(ApplyInput{
+		Block: first.Block,
+		Root:  first.Root,
+		AsOf:  time.Unix(1_700_000_000, 0),
+	}); err != nil {
+		t.Fatalf("apply ready base: %v", err)
+	}
+	input := ApplyInput{
+		Block: second.Block,
+		Root:  second.Root,
+		AsOf:  time.Unix(1_700_000_001, 0),
+	}
+
+	result := make(chan *Snapshot, 1)
+	failure := make(chan error, 1)
+	go func() {
+		snapshot, waitErr := tracker.WaitProject(context.Background(), nil, input)
+		if waitErr != nil {
+			failure <- waitErr
+			return
+		}
+		result <- snapshot
+	}()
+
+	select {
+	case snapshot := <-result:
+		t.Fatalf("wait returned speculative snapshot before Apply: %+v", snapshot)
+	case err = <-failure:
+		t.Fatalf("wait failed before Apply: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	applied, err := tracker.Apply(input)
+	if err != nil {
+		t.Fatalf("apply exact state: %v", err)
+	}
+	select {
+	case snapshot := <-result:
+		if snapshot != applied.Snapshot || !snapshot.Ready {
+			t.Fatal("wait did not return the exact applied snapshot")
+		}
+	case err = <-failure:
+		t.Fatalf("wait after Apply: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("wait did not resume after exact Apply")
 	}
 }
 

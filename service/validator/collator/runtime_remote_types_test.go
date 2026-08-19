@@ -12,7 +12,7 @@ import (
 
 func TestRemoteHandlersSeparateAuthenticatedQueryFromWirePayload(t *testing.T) {
 	if fields := reflect.TypeOf(RemoteHandlers{}).NumField(); fields != 2 {
-		t.Fatalf("RemoteHandlers has %d fields, want only the two Delegated-v3 query handlers", fields)
+		t.Fatalf("RemoteHandlers has %d fields, want only the two delegated-collation query handlers", fields)
 	}
 
 	auth := AuthenticatedQuery{SessionID: [32]byte{1}, SourceADNL: [32]byte{2}}
@@ -66,6 +66,8 @@ func TestOverlaySessionCarriesReferenceMembershipAndLimits(t *testing.T) {
 			ValidatorKeyID:  [32]byte{2},
 			CollatorADNLIDs: [][32]byte{{3}, {4}},
 		}},
+		AllCollators:              [][32]byte{{7}, {8}},
+		AllCurrentValidators:      [][32]byte{{9}, {10}},
 		AllOverlayNodes:           [][32]byte{{5}, {6}},
 		MaxBlockSize:              1 << 20,
 		MaxCollatedDataSize:       2 << 20,
@@ -74,9 +76,21 @@ func TestOverlaySessionCarriesReferenceMembershipAndLimits(t *testing.T) {
 	}
 
 	if session.Session.ID[0] != 1 || session.CollatorsByValidator[0].ValidatorKeyID[0] != 2 ||
-		len(session.CollatorsByValidator[0].CollatorADNLIDs) != 2 || len(session.AllOverlayNodes) != 2 ||
+		len(session.CollatorsByValidator[0].CollatorADNLIDs) != 2 || len(session.AllCollators) != 2 ||
+		len(session.AllCurrentValidators) != 2 ||
+		len(session.AllOverlayNodes) != 2 ||
 		session.MaxBlockSize == 0 || session.MaxCollatedDataSize == 0 ||
 		session.BroadcastMode != CandidateBroadcastBlockSyncOverlay || !session.ObserversInPrivateOverlay {
 		t.Fatalf("overlay session lost a required network input: %+v", session)
+	}
+	changed := session
+	changed.AllCollators = [][32]byte{{7}, {9}}
+	if session.Equal(changed) {
+		t.Fatal("overlay equality ignored the all-collator transport roster")
+	}
+	changed = session
+	changed.AllCurrentValidators = [][32]byte{{9}, {11}}
+	if session.Equal(changed) {
+		t.Fatal("overlay equality ignored the current-validator intermediate roster")
 	}
 }

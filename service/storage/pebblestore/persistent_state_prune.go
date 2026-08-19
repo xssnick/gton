@@ -91,6 +91,64 @@ func (s *Store) pendingCellGenerationMigrationOriginSeqno() (uint32, error) {
 	return s.pendingCellMigration.origin.SeqNo, nil
 }
 
+func (s *Store) PrunePersistentStateFilesToLimit(ctx context.Context, throughMasterSeqno uint32, keepRecentGroups int) (storage.PersistentStatePruneStats, error) {
+	stats := storage.PersistentStatePruneStats{}
+	if throughMasterSeqno == 0 || keepRecentGroups <= 0 {
+		return stats, nil
+	}
+
+	files, err := s.persistentStateFileSnapshot(ctx)
+	if err != nil {
+		return stats, err
+	}
+	stats.ScannedFiles = len(files)
+	if len(files) == 0 {
+		return stats, nil
+	}
+
+	sortPersistentStatePruneFiles(files)
+	end := sort.Search(len(files), func(i int) bool {
+		return files[i].master.SeqNo > throughMasterSeqno
+	})
+	files = files[:end]
+	if len(files) == 0 {
+		return stats, nil
+	}
+
+	retained := persistentStatePruneRetainedGroups(files, keepRecentGroups)
+	pendingMigrationSeqno, pendingMigrationErr := s.pendingCellGenerationMigrationOriginSeqno()
+	if pendingMigrationErr != nil && !errors.Is(pendingMigrationErr, storage.ErrNotFound) {
+		return stats, pendingMigrationErr
+	}
+	hasPendingMigration := pendingMigrationErr == nil
+	stats.RetainedRecentGroups = len(retained)
+	stats.OldestRetainedMasterSeqno = oldestRetainedPersistentStateSeqno(retained)
+
+	deletes := make([]persistentStatePruneFile, 0)
+	for _, file := range files {
+		select {
+		case <-ctx.Done():
+			return stats, ctx.Err()
+		default:
+		}
+
+		if _, ok := retained[file.master.SeqNo]; ok {
+			continue
+		}
+		if hasPendingMigration && file.master.SeqNo == pendingMigrationSeqno {
+			continue
+		}
+
+		deletes = append(deletes, file)
+		trackDeletedPersistentStateMasterSeqno(&stats, file.master.SeqNo)
+	}
+
+	if err = s.deletePersistentStatePruneFiles(ctx, &stats, deletes); err != nil {
+		return stats, err
+	}
+	return stats, nil
+}
+
 func (s *Store) PrunePreviousPersistentStateFiles(ctx context.Context, beforeMasterSeqno uint32) (storage.PersistentStatePruneStats, error) {
 	stats := storage.PersistentStatePruneStats{}
 	if beforeMasterSeqno == 0 {

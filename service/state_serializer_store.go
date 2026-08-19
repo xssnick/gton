@@ -18,6 +18,7 @@ type stateSerializerStore interface {
 	BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error)
 	NextKeyBlockMetas(ctx context.Context, after uint32, limit int) ([]*storage.BlockMeta, error)
 	ThrottleCellCompactions() func()
+	PrunePersistentStateFilesToLimit(ctx context.Context, throughMasterSeqno uint32, keepRecentGroups int) (storage.PersistentStatePruneStats, error)
 	PrunePreviousPersistentStateFiles(ctx context.Context, beforeMasterSeqno uint32) (storage.PersistentStatePruneStats, error)
 
 	PersistentStateSize(ctx context.Context, block ton.BlockIDExt, masterchainBlock ton.BlockIDExt, effectiveShard int64) (int64, error)

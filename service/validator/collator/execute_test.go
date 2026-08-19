@@ -17,7 +17,14 @@ import (
 // uninitialised account cell, a last-transaction hash that is not exactly 32
 // bytes) only occur in traffic.
 func TestShardAccountCellMatchesReflection(t *testing.T) {
-	req := benchMainnetCollatedRequest(t, 1)
+	// The bare fixture, not the collated one. This walks 64 real accounts out of
+	// the predecessor state and compares two renderings of each; it collates
+	// nothing, reads no masterchain state and never looks at the account
+	// dictionary's size, so a minted predecessor, a group snapshot and 100,000
+	// synthetic filler contracts were fixture shape it did not exercise. The
+	// property is unchanged — the dropped accounts are all externalAcceptCode
+	// clones, and the ones that can diverge are exactly the real ones this keeps.
+	req, _ := benchMainnetRequest(t, 0)
 	previous := loadPreviousShardState(t, req)
 
 	const sample = 64

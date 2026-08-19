@@ -1584,9 +1584,13 @@ func TestBlockOverlayFanoutKeyIsPerRouteClassAndChainPosition(t *testing.T) {
 	if got := blockOverlayRouteFanoutKey(blockOverlayFanoutRouteFastSync, "block", block); got == key {
 		t.Fatalf("FastSync route shares the public route key %q", key)
 	}
-	if candidate := blockOverlayRouteFanoutKey(blockOverlayFanoutRouteCustom, "candidate", block); candidate !=
+	if candidate := blockOverlayRouteFanoutKey(blockOverlayFanoutRouteCustom, "candidate", block); candidate ==
 		blockOverlayRouteFanoutKey(blockOverlayFanoutRouteCustom, "block", block) {
-		t.Fatalf("custom candidate and full-block keys differ: %q", candidate)
+		t.Fatalf("generic custom candidate and full-block keys match: %q", candidate)
+	}
+	if candidate := blockOverlayRouteFanoutKey(blockOverlayFanoutRouteFastSync, "candidate", block); candidate ==
+		blockOverlayRouteFanoutKey(blockOverlayFanoutRouteFastSync, "block", block) {
+		t.Fatalf("generic FastSync candidate and full-block keys match: %q", candidate)
 	}
 
 	next := block

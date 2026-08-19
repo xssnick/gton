@@ -10,7 +10,7 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-// TestCollationConstructorIDsGolden pins the Delegated-v3 protocol ids.
+// TestCollationConstructorIDsGolden pins the delegation protocol ids.
 func TestCollationConstructorIDsGolden(t *testing.T) {
 	golden := map[string]uint32{
 		"delegationToSign":     0x1ff5c190,

@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -74,13 +75,38 @@ type LocalAcquisition struct {
 	master  localMasterViewCache
 	blocks  localBlockCache
 
+	// builtBindMisses counts commits of a candidate this node built whose
+	// derivation capsule did not bind the chain being committed, and which
+	// therefore fell back to replaying the block. It is expected to stay at zero;
+	// a non-zero value means every produced block is paying for a full parse and a
+	// second Merkle apply again.
+	builtBindMisses atomic.Int64
+
 	mu       sync.RWMutex
 	sessions map[[32]byte]*localAcquisitionSession
 }
 
+// localMasterViewCache holds the resident masterchain view plus a small set of
+// recently demoted ones.
+//
+// The resident slot alone is not enough. A session update pins the masterchain
+// block it was issued for, and a shard candidate pins the one its MasterRef
+// names; both routinely lag the newest applied block by the time validation
+// runs, so every candidate would otherwise rebuild the whole view — state extra,
+// shard registry, masterchain history tuple and libraries — from scratch.
+//
+// The two are kept in one struct so a lookup takes one lock and reads the
+// resident slot first, and so the entry map can only ever be written by the same
+// critical section that installs a resident view.
 type localMasterViewCache struct {
 	mu   sync.RWMutex
 	view *localMasterView
+	// entries is keyed by block root hash. Views are immutable, so an entry is
+	// only ever evicted, never invalidated.
+	entries map[[32]byte]*localMasterView
+	// order is insertion order, evicted from the front, exactly as
+	// localConfigCache does at the same cap.
+	order [][32]byte
 }
 
 type localAcquisitionSession struct {
@@ -165,7 +191,7 @@ func NewLocalAcquisition(options LocalAcquisitionOptions) (*LocalAcquisition, er
 		externalLimit:       options.ExternalLimit,
 		maxExternalAttempts: options.MaxExternalAttempts,
 		dispatch:            dispatch,
-		configs:             localConfigCache{entries: make(map[cell.Hash]localPreparedConfig)},
+		configs:             localConfigCache{log: options.Logger, entries: make(map[cell.Hash]localPreparedConfig)},
 		blocks:              localBlockCache{entries: make(map[[32]byte]*localBlockSource)},
 		sessions:            make(map[[32]byte]*localAcquisitionSession),
 	}, nil
@@ -409,7 +435,12 @@ func (a *LocalAcquisition) stageMaster(
 
 		return installed.context.Groups, installed, nil
 	}
-	master, err := a.projectedMasterView(ctx, update.MasterchainBlock, time.Now())
+	master, err := a.projectedMasterView(
+		ctx,
+		update.MasterchainBlock,
+		time.Now(),
+		acquisitionReadImmediate,
+	)
 	if err != nil {
 		return nil, nil, err
 	}

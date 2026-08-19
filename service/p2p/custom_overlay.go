@@ -69,15 +69,34 @@ func (s *overlaySubscription) twoStepCandidates(sourcePeerID PeerID) []*overlayP
 	return peers
 }
 
+func (s *overlaySubscription) twoStepIntermediateCandidates() []*overlayPeer {
+	candidates := s.broadcastTargetsSnapshot().peers
+	if !s.spec.isPrivateOverlay() {
+		return candidates
+	}
+
+	peers := make([]*overlayPeer, 0, len(candidates))
+	for _, peer := range candidates {
+		if _, intermediate := s.spec.PrivateTwoStepIntermediateIDs[peer.id]; intermediate {
+			peers = append(peers, peer)
+		}
+	}
+
+	return peers
+}
+
 func (s *overlaySubscription) resolveTwoStepPeerSet(
 	ctx context.Context,
 	sourcePeerID PeerID,
 ) (overlay.StaticBroadcastPeerSet, []overlay.BroadcastTwoStepPeerError) {
-	candidates := s.twoStepCandidates(sourcePeerID)
+	candidates := s.twoStepIntermediateCandidates()
 	peers := make(overlay.StaticBroadcastPeerSet, 0, len(candidates))
 	var failed []overlay.BroadcastTwoStepPeerError
 
 	for _, peer := range candidates {
+		if peer.id == sourcePeerID {
+			continue
+		}
 		if s.spec.UseQUIC {
 			_, err := peer.dialQUIC(ctx)
 			if err != nil {

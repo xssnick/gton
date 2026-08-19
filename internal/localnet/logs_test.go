@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -265,9 +266,9 @@ func TestParseColoredLifecycleAndCPPEvents(t *testing.T) {
 		t.Fatalf("lifecycle = %+v, parsed=%t", event, ok)
 	}
 
-	cpp := "Published event CandidateGenerated {candidate=Candidate{id={17, AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=, ?}, parent=null, block=BlockCandidate{id=(0,4000000000000000,9):AAAA:BBBB}}}"
+	cpp := "Published event CandidateGenerated {candidate=Candidate{id={17, AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=, ?}, parent=null, block=BlockCandidate{id=(0,4000000000000000,9):AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB}}}"
 	event, ok = parseLogLine(NodeConfig{Name: "cpp", Kind: "cpp"}, []byte(cpp))
-	if !ok || event.Kind != "block_collated" || event.CandidateHash != "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" || event.Seqno != 9 {
+	if !ok || event.Kind != "block_collated" || event.CandidateHash != "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" || event.Seqno != 9 || event.BlockRootHash != strings.Repeat("a", 64) || event.BlockFileHash != strings.Repeat("b", 64) {
 		t.Fatalf("C++ candidate = %+v, parsed=%t", event, ok)
 	}
 

@@ -106,8 +106,6 @@ type collation struct {
 	lastDispatchEmitted          map[[32]byte]uint64
 	unprocessedDeferred          map[[32]byte]uint32
 	haveUnprocessedDispatchQueue bool
-	masterSpecialAccountList     [][32]byte
-	masterSpecialAccountSet      map[[32]byte]struct{}
 
 	// lastProcLT and lastProcHash track the newest processed inbound internal
 	// message (queue imports and immediate deliveries) for the ProcessedUpto
@@ -116,6 +114,13 @@ type collation struct {
 	lastProcLT   uint64
 	lastProcHash [32]byte
 	blockFull    bool
+	// processedClaim is the (lt, hash) bound updateProcessedInfo wrote into the
+	// candidate's ProcessedInfo, and processedClaimed says the dictionary moved
+	// because of it. Only the validation-closure replay reads them: the scan a
+	// validator runs over the predecessor outbound queue is bounded by exactly
+	// this pair, so the proof has to be widened to exactly this pair.
+	processedClaim   semanticMessageBound
+	processedClaimed bool
 	// processedRecords caches the parsed parent ProcessedInfo entries; both
 	// constructors seed it from the parse they already do for processedMinMC.
 	// updateProcessedInfo hands the slice to InsertProcessedUpto and
@@ -143,6 +148,11 @@ type collation struct {
 	// it nil and size() answers zero for it.
 	collatedProofEstimate *proofSizeEstimator
 	collatedFixedEstimate uint64
+	// updateMemoCells is how many cells the state update's destination walk
+	// memoised, carried from where the update is built to finish(), which is
+	// where the builder's hints are updated — a build that never produced a
+	// candidate must not resize the next one.
+	updateMemoCells int
 
 	// pace carries the wall-clock spans the split decision consults. Only the
 	// live schedule installs one; a zero value disables the heuristic, which is
@@ -290,10 +300,11 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 	if err != nil {
 		return nil, err
 	}
+	storageCells, storageProofCells := b.storageHints()
 	fullCollated := req.Masterchain.Config.capabilities&capFullCollatedData != 0
 	var collatedProofEstimate *proofSizeEstimator
 	if fullCollated {
-		collatedProofEstimate = newProofSizeEstimator()
+		collatedProofEstimate = newProofSizeEstimator(b.readSetHint())
 		usage.SetRecordCallback(collatedProofEstimate.addLoadedCell)
 	}
 	predecessor, err := preparePredecessor(req, usage)
@@ -425,7 +436,7 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 		dispatchSources:     predecessor.dispatchSources,
 		dispatchSourceCount: predecessor.dispatchSourceCount,
 		blockCtx:            blockCtx,
-		limits:              newBlockLimitStatus(limits, header.StartLt, usage),
+		limits:              newBlockLimitStatus(limits, header.StartLt, usage, storageCells, storageProofCells),
 		hardLTDelta:         hardLTDelta,
 		queueSize:           queueSize,
 		oldQueueSize:        queueSize,
@@ -798,6 +809,20 @@ func (c *collation) finish() (*Candidate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("serialize block: %w", err)
 	}
+	// The published state must be the target the update names. Everything else
+	// verifyPredecessor used to restate about our own block is either impossible
+	// by construction here or re-checked where the value is next used; this one
+	// clause is the only failure that would be silent, and it is the worst kind:
+	// a successor tree nobody else can reach, which forks this node from itself
+	// rather than getting the block rejected. Two cached-hash reads and a 32-byte
+	// compare.
+	target, err := parts.stateUpdate.PeekRef(1)
+	if err != nil {
+		return nil, fmt.Errorf("load produced state update target: %w", err)
+	}
+	if target.HashKeyAt(0) != parts.state.HashKeyAt(0) {
+		return nil, fmt.Errorf("produced state differs from the update it was built with")
+	}
 	if err = c.ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -823,6 +848,20 @@ func (c *collation) finish() (*Candidate, error) {
 		collatedData, collatedRoots, collatedErr = c.serializeCollatedData(parts.stateUpdate)
 	}()
 	boc, err := c.serializeBlockBOC(blockRoot, cellHint)
+	// Hashed before the join, not after. The block bytes are final the moment
+	// serializeBlockBOC returns and the digest is a pure function of them, so
+	// this millisecond of sha256 runs alongside a collated branch that is still
+	// working instead of being added to the serial tail once it has finished.
+	// Same bytes, same hash, earlier moment.
+	//
+	// The serialization error is checked first — hashing a nil buffer would
+	// digest emptiness and hide it — but the wait still happens on every path,
+	// so a failed block branch cannot leave the collated goroutine running past
+	// finish() and into whatever the caller does next.
+	var fileHash [sha256.Size]byte
+	if err == nil {
+		fileHash = sha256.Sum256(boc)
+	}
 	wg.Wait()
 	if err != nil {
 		return nil, err
@@ -832,7 +871,6 @@ func (c *collation) finish() (*Candidate, error) {
 	}
 	c.limits.collatedData = uint64(len(collatedData))
 	collatedFileHash := sha256.Sum256(collatedData)
-	fileHash := sha256.Sum256(boc)
 	rootHash := blockRoot.HashKey()
 
 	// The broadcast payload is a third serialization of these same roots, and
@@ -841,17 +879,44 @@ func (c *collation) finish() (*Candidate, error) {
 	// instead of running after all of them. The roots are final by now, and BOC
 	// serialization never parses a cell, so this walk cannot disturb the two
 	// that just finished or the commit that reads the state.
+	//
+	// The two BOCs it will hold the union of are both finished by now, so the
+	// hint that sizes its dedup structures is an upper bound taken off their
+	// headers rather than an estimate carried over from anywhere.
 	prepared := simplex.PrepareCandidateAsync(
 		parts.header.SeqNo,
 		blockRoot,
 		collatedRoots,
 		fileHash,
 		collatedFileHash,
+		simplex.PayloadCellHint(boc, collatedData),
 	)
 
 	// Recorded only for a build that produced a candidate, so a run abandoned
-	// part-way cannot shrink the next recorder to the size it stopped at.
-	c.builder.observeReadSetSize(c.usage.Size())
+	// part-way cannot shrink the next recorder to the size it stopped at. These
+	// are integers describing the scratch structures this build filled — nothing
+	// that holds a cell crosses from one collation to the next.
+	storageCells, storageProofCells := c.limits.storage.CellCounts()
+	c.builder.observeBuildSizes(
+		c.usage.Size(),
+		int(storageCells),
+		int(storageProofCells),
+		c.updateMemoCells,
+	)
+
+	// The record has produced everything it exists for — the state update, the
+	// collated proofs and the size estimates — and the collation is over. Closing
+	// it here matters because the block this build is about to hand back embeds
+	// cells that were read out of the predecessor and still carry this recorder's
+	// trace: a handful in the inbound descriptors, envelopes reimported from our
+	// own out-queue. Retaining that block would otherwise retain the whole record
+	// — the predecessor tree and a six-figure table — for as long as the candidate
+	// lives, and every later descent through one of those cells would both record
+	// into a set nobody reads again and hand out a wrapped copy instead of the
+	// shared cell. Nothing here or after reads the record: BOC serialization never
+	// parses a cell, so the broadcast payload still being compressed in the
+	// background cannot reach it.
+	c.usage.Seal()
 
 	c.stats.EndLT = c.maxLT
 	c.stats.OutQueueSize = c.queueSize
@@ -876,7 +941,35 @@ func (c *collation) finish() (*Candidate, error) {
 		Externals:        c.externals,
 		Stats:            c.stats,
 		prepared:         prepared,
+		// ID.FileHash and CollatedFileHash above are fileHash and
+		// collatedFileHash, taken from these very buffers a few statements ago.
+		// signArtifact used to re-derive both to compare them against
+		// themselves; C++'s window-producer accepts the collator's hashes as
+		// they come out of collator.cpp:6445-6450 and hashes nothing.
+		digested: true,
+		// The commit that follows re-derived all of this from BlockBOC: a full
+		// eager parse of the block, a second apply of the update over the
+		// predecessor, and a re-validation of a predecessor this very build read.
+		// The reference does strictly less at the same point — ChainState::apply
+		// deserializes lazily and applies, and checks nothing about the parent.
+		built: newBuiltCandidate(
+			blockRoot,
+			parts.header.StartLt,
+			parts.header.GenUtime,
+			c.builtPredecessors()...,
+		),
 	}, nil
+}
+
+// builtPredecessors names the predecessor states this collation's Merkle update
+// was built over, in the order openPredecessorReadSet combined them.
+func (c *collation) builtPredecessors() []*PreviousBlock {
+	previous := make([]*PreviousBlock, 0, 2)
+	for i := range c.previousCount() {
+		previous = append(previous, c.previousAt(i))
+	}
+
+	return previous
 }
 
 func (c *collation) serializeBlockBOC(blockRoot *cell.Cell, cellHint int) ([]byte, error) {
@@ -987,9 +1080,21 @@ func (c *collation) buildCollatedRoots(consensusExtra, stateUpdate *cell.Cell) (
 		if err != nil {
 			return nil, fmt.Errorf("collect state update source shape: %w", err)
 		}
-		previousStateProof, err := c.oldRoot.WithoutTrace().CreateHashUsageProof(func(hash cell.Hash) bool {
+		// The read set is handed in as the resolver because it holds the loaded
+		// form of everything this walk keeps that the collation already touched;
+		// without it a lazy predecessor is paged in a second time to build a proof
+		// over cells that are already in memory. The selection is still the hash
+		// predicate above, so the proof bytes do not depend on it.
+		// The read set's size is handed over as the memo capacity. It is the only
+		// figure available on this goroutine that bounds the walk — the proof
+		// keeps the cells the record saw, plus the boundaries under them — and on
+		// a mainnet block it is a third over, where reaching the same table by
+		// doubling from sixteen entries allocates nearly three times what the
+		// table ends up holding and discards the rest. Capacity only: the hash
+		// predicate above is what decides the bytes.
+		previousStateProof, err := c.oldRoot.WithoutTrace().CreateHashUsageProofResolvedSized(func(hash cell.Hash) bool {
 			return loaded.loaded(hash) || updateSource.loaded(hash)
-		})
+		}, c.usage.RecordedCell, c.usage.Size())
 		if err != nil {
 			return nil, fmt.Errorf("build previous state proof: %w", err)
 		}

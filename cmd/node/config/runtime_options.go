@@ -128,6 +128,10 @@ func storageOptionsFromConfig(cfg Config) (gton.StorageOptions, error) {
 	if err != nil {
 		return gton.StorageOptions{}, err
 	}
+	cellRecordCacheBytes, err := cellRecordCacheBytesFromConfig(cfg.Storage)
+	if err != nil {
+		return gton.StorageOptions{}, err
+	}
 	cellShardMemTableSize, err := intConfigValue("storage.cell_shard_memtable_size", cfg.Storage.CellShardMemTableSize, DefaultCellShardMemTable)
 	if err != nil {
 		return gton.StorageOptions{}, err
@@ -157,6 +161,7 @@ func storageOptionsFromConfig(cfg Config) (gton.StorageOptions, error) {
 		Dir:                              strings.TrimSpace(cfg.Storage.Dir),
 		CellTotalCacheSize:               cellTotalCacheSize,
 		DecodedCellCache:                 decodedCellCacheOpts,
+		CellRecordCacheBytes:             cellRecordCacheBytes,
 		CellShardMemTableSize:            cellShardMemTableSize,
 		CellMemTableStopWritesThreshold:  cellMemTableStopWritesThreshold,
 		LargeBOCShardReadWorkers:         largeBOCShardReadWorkers,
@@ -165,6 +170,22 @@ func storageOptionsFromConfig(cfg Config) (gton.StorageOptions, error) {
 		StateSerializeOnePass:            cfg.Storage.StateSerializeOnePass,
 		ArtifactFileMaxOpen:              artifactFileMaxOpen,
 	}, nil
+}
+
+// cellRecordCacheBytesFromConfig validates the record cache budget. It is NOT
+// run through intConfigValue on purpose: there zero means "take the default",
+// here zero is the OFF switch (the default rides in via defaultConfig's
+// prefill), so zero must pass through untouched. A positive dust value is
+// clamped up to a workable ring by pebblestore, not here — the store logs the
+// effective figure it built.
+func cellRecordCacheBytesFromConfig(cfg Storage) (int64, error) {
+	if cfg.CellRecordCacheBytes < 0 {
+		return 0, fmt.Errorf("storage.cell_record_cache_bytes cannot be negative; use 0 to disable the record cache")
+	}
+	if cfg.CellRecordCacheBytes > MaxCellRecordCacheBytes {
+		return 0, fmt.Errorf("storage.cell_record_cache_bytes cannot exceed %d bytes (1 TiB): the record cache arena is off-GC memory with nothing else pushing back on a typo", MaxCellRecordCacheBytes)
+	}
+	return cfg.CellRecordCacheBytes, nil
 }
 
 func persistentStateKeepRecentFromConfig(value int64) (int, error) {
@@ -232,13 +253,104 @@ func cellTotalCacheSizeFromConfig(cfg Storage) (int64, error) {
 	return cfg.CellTotalCacheSize, nil
 }
 
-func decodedCellCacheOptionsFromConfig(cfg Storage) (gton.DecodedCellCacheOptions, error) {
-	opts := gton.DecodedCellCacheOptions{
-		Enabled:       cfg.DecodedCellCacheEnabled,
-		BytesPerEntry: cfg.DecodedCellCacheBytesPerEntry,
+// DeprecatedDecodedCellCacheFields lists the storage knobs that are still
+// accepted on disk but no longer affect anything. Callers report them so an
+// operator who tuned one is told it is dead rather than left guessing.
+//
+// storage.service_decoded_cell_cache_entries is NOT in this list when it is the
+// only entry count set: it is honoured as the former name of
+// storage.decoded_cell_cache_entries. It appears here only when the current name
+// is also set, in which case the current name wins and the old one really is
+// ignored. See RenamedDecodedCellCacheFields for the honoured-but-renamed case.
+//
+// A field holding exactly the value the node's own earlier releases wrote is
+// also not in this list. Those three keys were emitted into every generated
+// config.json with the defaults below, so nobody chose them; warning about them
+// would fire on every existing deployment on upgrade and would mean the
+// opposite of what the message says — it would tell an operator that something
+// they never set has stopped doing something they never asked for, and it would
+// bury the case the warning exists for. Any other value at those keys was typed
+// by a person and is still reported.
+func DeprecatedDecodedCellCacheFields(cfg Storage) []string {
+	var dead []string
+	if cfg.ServiceDecodedCellCacheEntries != 0 && cfg.DecodedCellCacheEntries != 0 {
+		dead = append(dead, "storage.service_decoded_cell_cache_entries")
 	}
-	if cfg.DecodedCellCacheShards < 0 {
-		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_shards cannot be negative")
+	if cfg.OperationDecodedCellCacheEntries != 0 {
+		dead = append(dead, "storage.operation_decoded_cell_cache_entries")
+	}
+	if tunedByHand(cfg.DecodedCellCacheBytesPerEntry, formerDecodedCellCacheBytesPerEntry) {
+		dead = append(dead, "storage.decoded_cell_cache_bytes_per_entry")
+	}
+	if tunedByHand(cfg.DecodedCellCacheMinEntries, formerDecodedCellCacheMinEntries) {
+		dead = append(dead, "storage.decoded_cell_cache_min_entries")
+	}
+	if tunedByHand(cfg.DecodedCellCacheMaxEntries, formerDecodedCellCacheMaxEntries) {
+		dead = append(dead, "storage.decoded_cell_cache_max_entries")
+	}
+	return dead
+}
+
+// The stock values every released version of this node wrote into a generated
+// config.json for the three knobs that sized the derivation. They are recorded
+// here and nowhere else: nothing reads them, and their only purpose is to tell
+// a value the node emitted apart from one an operator chose.
+const (
+	formerDecodedCellCacheBytesPerEntry = int64(16 << 10)
+	formerDecodedCellCacheMinEntries    = int64(64 << 10)
+	formerDecodedCellCacheMaxEntries    = int64(1 << 20)
+)
+
+func tunedByHand(value, stock int64) bool { return value != 0 && value != stock }
+
+// RenamedDecodedCellCacheFields lists knobs whose value IS being used but under
+// an old name, so startup can tell the operator to rename them rather than
+// warning that they do nothing. A field is never in both this list and
+// DeprecatedDecodedCellCacheFields.
+func RenamedDecodedCellCacheFields(cfg Storage) map[string]string {
+	renamed := map[string]string{}
+	if cfg.ServiceDecodedCellCacheEntries != 0 && cfg.DecodedCellCacheEntries == 0 {
+		renamed["storage.service_decoded_cell_cache_entries"] = "storage.decoded_cell_cache_entries"
+	}
+	if len(renamed) == 0 {
+		return nil
+	}
+	return renamed
+}
+
+func decodedCellCacheOptionsFromConfig(cfg Storage) (gton.DecodedCellCacheOptions, error) {
+	opts := gton.DecodedCellCacheOptions{Enabled: cfg.DecodedCellCacheEnabled}
+
+	shards, err := intConfigValue("storage.decoded_cell_cache_shards", cfg.DecodedCellCacheShards, DefaultDecodedCellCacheShards)
+	if err != nil {
+		return gton.DecodedCellCacheOptions{}, err
+	}
+
+	// The alias is range-checked whether or not it is the value that wins, so a
+	// negative left over from an old config is still reported rather than
+	// silently skipped.
+	if cfg.ServiceDecodedCellCacheEntries < 0 {
+		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.service_decoded_cell_cache_entries cannot be negative")
+	}
+	entriesField, entriesValue := "storage.decoded_cell_cache_entries", cfg.DecodedCellCacheEntries
+	if entriesValue == 0 && cfg.ServiceDecodedCellCacheEntries != 0 {
+		entriesField, entriesValue = "storage.service_decoded_cell_cache_entries", cfg.ServiceDecodedCellCacheEntries
+	}
+	if entriesValue > MaxDecodedCellCacheEntries {
+		return gton.DecodedCellCacheOptions{}, fmt.Errorf(
+			"%s cannot exceed %d entries: the decoded cache is bounded in entries because its cost "+
+				"is GC mark work over roughly ten live objects each, paid on every collection",
+			entriesField, MaxDecodedCellCacheEntries)
+	}
+	entries, err := intConfigValue(entriesField, entriesValue, DefaultDecodedCellCacheEntries)
+	if err != nil {
+		return gton.DecodedCellCacheOptions{}, err
+	}
+
+	// The deprecated knobs no longer size anything, but a negative value is
+	// still a mistake worth reporting rather than silently ignoring.
+	if cfg.OperationDecodedCellCacheEntries < 0 {
+		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.operation_decoded_cell_cache_entries cannot be negative")
 	}
 	if cfg.DecodedCellCacheBytesPerEntry < 0 {
 		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_bytes_per_entry cannot be negative")
@@ -249,34 +361,9 @@ func decodedCellCacheOptionsFromConfig(cfg Storage) (gton.DecodedCellCacheOption
 	if cfg.DecodedCellCacheMaxEntries < 0 {
 		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_max_entries cannot be negative")
 	}
-	if cfg.DecodedCellCacheMinEntries > int64(int(^uint(0)>>1)) {
-		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries is too large")
-	}
-	if cfg.DecodedCellCacheMaxEntries > int64(int(^uint(0)>>1)) {
-		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_max_entries is too large")
-	}
-	if cfg.DecodedCellCacheShards > int64(int(^uint(0)>>1)) {
-		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_shards is too large")
-	}
 
-	opts.Shards = int(cfg.DecodedCellCacheShards)
-	opts.MinEntries = int(cfg.DecodedCellCacheMinEntries)
-	opts.MaxEntries = int(cfg.DecodedCellCacheMaxEntries)
-	if opts.Shards == 0 {
-		opts.Shards = int(DefaultDecodedCellCacheShards)
-	}
-	if opts.BytesPerEntry == 0 {
-		opts.BytesPerEntry = DefaultDecodedCellCacheBytesPerEntry
-	}
-	if opts.MinEntries == 0 {
-		opts.MinEntries = int(DefaultDecodedCellCacheMinEntries)
-	}
-	if opts.MaxEntries == 0 {
-		opts.MaxEntries = int(DefaultDecodedCellCacheMaxEntries)
-	}
-	if opts.MinEntries > opts.MaxEntries {
-		return gton.DecodedCellCacheOptions{}, fmt.Errorf("storage.decoded_cell_cache_min_entries cannot exceed storage.decoded_cell_cache_max_entries")
-	}
+	opts.Shards = shards
+	opts.Entries = entries
 	return opts, nil
 }
 

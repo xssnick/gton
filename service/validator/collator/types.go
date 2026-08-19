@@ -22,6 +22,12 @@ var (
 	ErrUnsupported          = errors.New("collator: unsupported block")
 	ErrSizeLimit            = errors.New("collator: candidate size limit exceeded")
 	ErrCollatedRootNotFound = errors.New("collator: collated proof root not found")
+	// ErrMandatoryDequeueOverflow ends a collation whose predecessor left more
+	// already-processed own-shard queue entries than one block can dequeue. It
+	// is deliberately not an ErrSizeLimit: that one is answered by admitting
+	// less, and this drain is not admission — there is nothing optional in it to
+	// give up. See cleanupMandatoryDrain.
+	ErrMandatoryDequeueOverflow = errors.New("collator: mandatory own-shard dequeue exceeds the block limits")
 )
 
 type PreviousBlock struct {
@@ -35,6 +41,16 @@ type PreviousBlock struct {
 	// OutQueueSize is storage-verified metadata required for a non-empty queue
 	// when State does not store it.
 	OutQueueSize *uint64
+	// Proven marks State as a Merkle proof taken from the candidate's own
+	// collated data rather than a full live tree. It is set exactly where that
+	// substitution happens — proofBackedPredecessors and provenPredecessorStates
+	// — and read where a full tree is required for something other than
+	// continuing this candidate: a proof covers what the candidate's replay
+	// reads and may stop at a pruned boundary anywhere else, so a proven state
+	// must never be taken as a neighbour source (see loadExpectedNeighbors).
+	// The field is process-local: PreviousBlock is not serialized, so nothing on
+	// the wire can claim a narrow state is full.
+	Proven bool
 }
 
 // MasterchainContext contains data verified against the state identified by ID.
@@ -222,6 +238,18 @@ type ShardRequest struct {
 	// record may cover a message generated outside that record's shard,
 	// without it the coverage check cannot decide those messages.
 	NeighborShardEndLT tlb.ShardEndLTFunc
+	// QueueCleanupUntil is the wall-clock instant out-queue cleanup stops at,
+	// the port of C++ Collator::queue_cleanup_timeout_. Zero disables the
+	// budget, which is what every deterministic entry point wants: BuildShard,
+	// restore requests and the whole test surface leave it zero and reproduce
+	// the pre-budget candidate byte for byte. Derive it with queueCleanupUntil.
+	QueueCleanupUntil time.Time
+	// InternalMsgUntil is the wall-clock instant the three internal message
+	// phases — inbound internals, dispatch queue, generated messages — stop
+	// admitting work at, the port of C++ Collator::internal_msg_timeout_. Zero
+	// disables the budget under the same convention QueueCleanupUntil uses.
+	// Derive it with internalMsgUntil.
+	InternalMsgUntil time.Time
 }
 
 // MasterRequest contains the previous masterchain state and the deterministic
@@ -248,6 +276,14 @@ type MasterRequest struct {
 	// state proofs when capFullCollatedData is active. The masterchain
 	// predecessor state is already authenticated by Previous.
 	FullCollatedProofs FullCollatedProofProvider
+	// QueueCleanupUntil bounds out-queue cleanup exactly as the shardchain
+	// field does. Masterchain builds carry no external wait, so the derivation
+	// gives them a quarter of the remaining soft budget.
+	QueueCleanupUntil time.Time
+	// InternalMsgUntil bounds the internal message phases exactly as the
+	// shardchain field does; with no external wait the derivation gives the
+	// masterchain half of the remaining soft budget.
+	InternalMsgUntil time.Time
 
 	ShardTops []ShardTop
 }
@@ -302,6 +338,12 @@ type preparedCandidateTransition struct {
 	candidate     *verifiedCandidate
 	previous      *tlb.ShardStateUnsplit
 	minimumBurned tlb.CurrencyCollection
+	// previousStats and previousInfo are the predecessor statistics and block
+	// info the masterchain structural pass already decoded. They are nil on the
+	// shard path and whenever the caller did not run that pass, so consumers
+	// must go through masterPredecessorState and keep their own fallback.
+	previousStats *tlb.ShardStateStats
+	previousInfo  *tlb.McStateExtraBlockInfo
 }
 
 // ShardVerificationRequest contains the authenticated context and semantic
@@ -340,6 +382,25 @@ type MasterVerificationRequest struct {
 	NeighborShardEndLT tlb.ShardEndLTFunc
 	Semantics          CandidateTransitionVerifier
 	Candidate          *Candidate
+	// previousState is the state verifyPredecessor already returned for this
+	// exact Previous value while the acquisition pipeline resolved the
+	// masterchain view around it. It is only ever the result of that same call,
+	// so supplying it removes a duplicate decode and accounts-prefix walk
+	// without removing a check. Entry points that did not run it leave it nil
+	// and verification performs the call itself.
+	previousState *acquiredPredecessorState
+}
+
+// acquiredPredecessorState is a predecessor state parse together with the exact
+// root it was parsed from. The root is what makes the plumbing assertion on the
+// receiving side a real one: a state carries no identity of its own — two
+// forks at the same sequence number in the same shard produce states that agree
+// on every field the verifier could compare — while the tree it came from is
+// the very cell the rest of verification runs against, and can be compared to
+// it by pointer.
+type acquiredPredecessorState struct {
+	root  *cell.Cell
+	state tlb.ShardStateUnsplit
 }
 
 // internalsIncomplete reports whether the inbound window is not fully
@@ -364,6 +425,14 @@ type collationRequest struct {
 	neighbors           []Neighbor
 	neighborShardEndLT  tlb.ShardEndLTFunc
 	fullCollatedProofs  FullCollatedProofProvider
+	// queueCleanupUntil bounds out-queue cleanup in wall-clock time. Zero
+	// leaves the budget inert, which is what every deterministic entry point
+	// relies on; see queueCleanupUntil for the derivation.
+	queueCleanupUntil time.Time
+	// internalMsgUntil bounds the inbound-internal, dispatch-queue and
+	// generated-message phases in wall-clock time. Zero leaves the budget
+	// inert; see internalMsgUntil for the derivation.
+	internalMsgUntil time.Time
 }
 
 func shardCollationRequest(req ShardRequest) collationRequest {
@@ -381,6 +450,8 @@ func shardCollationRequest(req ShardRequest) collationRequest {
 		neighbors:           req.Neighbors,
 		neighborShardEndLT:  req.NeighborShardEndLT,
 		fullCollatedProofs:  req.FullCollatedProofs,
+		queueCleanupUntil:   req.QueueCleanupUntil,
+		internalMsgUntil:    req.InternalMsgUntil,
 	}
 }
 
@@ -398,6 +469,8 @@ func masterCollationRequest(req MasterRequest) collationRequest {
 		neighbors:           req.Neighbors,
 		neighborShardEndLT:  req.NeighborShardEndLT,
 		fullCollatedProofs:  req.FullCollatedProofs,
+		queueCleanupUntil:   req.QueueCleanupUntil,
+		internalMsgUntil:    req.InternalMsgUntil,
 	}
 }
 
@@ -460,8 +533,54 @@ type Stats struct {
 	GasUsed              uint64
 	EndLT                uint64
 	OutQueueSize         uint64
-	Load                 LoadClass
-	OverloadReason       OverloadReason
+	QueueCleaned         uint32
+	QueueCleanupStop     CleanupStopReason
+	// InternalMsgTimeouts counts the internal phases that stopped admitting work
+	// because the ported internal_msg_timeout_ had passed rather than because a
+	// limit axis filled. Non-zero means the block was truncated by wall clock,
+	// which is a legal published block on both sides but the only signal that it
+	// happened.
+	InternalMsgTimeouts uint32
+	Load                LoadClass
+	OverloadReason      OverloadReason
+
+	// ProcessedScanTraceError is empty on every healthy block. It is set when
+	// traceProcessedQueueValidationClosure could not finish replaying the
+	// validator's predecessor-queue scan, which leaves the collated proof short
+	// of what a proof-backed validator will open. The block still ships — see
+	// that function for why refusing to ship is worse — but it is very likely
+	// to be rejected, and this carries the real reason, which the rejection
+	// itself will not.
+	ProcessedScanTraceError string
+}
+
+// CleanupStopReason records why out-queue cleanup stopped. It is local
+// observability state, not block data: a partially cleaned ordinary block is
+// legal on both sides (see queueCleanupUntil), so nothing downstream can tell
+// these apart from the block alone. C++ carries the same information as two
+// LOG(WARNING) lines and stats_.msg_queue_cleaned.
+type CleanupStopReason uint8
+
+const (
+	// CleanupStopExhausted is the normal end: every neighbor's frontier ran out
+	// of entries or hit its first undelivered message.
+	CleanupStopExhausted CleanupStopReason = iota
+	CleanupStopBlockFull
+	CleanupStopBudget
+	cleanupStopReasonCount
+)
+
+func (r CleanupStopReason) String() string {
+	switch r {
+	case CleanupStopExhausted:
+		return "exhausted"
+	case CleanupStopBlockFull:
+		return "block_full"
+	case CleanupStopBudget:
+		return "budget"
+	default:
+		return "unknown"
+	}
 }
 
 // OverloadReason records why a collation set the overload bit that eventually
@@ -544,6 +663,30 @@ type Candidate struct {
 	// canonical build path; a Pipeline that returns a Candidate of its own
 	// leaves it nil and its candidate is serialized from the BOCs as before.
 	prepared *simplex.PreparedCandidate
+
+	// built is the derivation finish() already performed for this block: its
+	// parsed root, the header's start logical time, the successor state's
+	// generation time and the predecessor states the update was built over.
+	// The field is unexported so that only the canonical build path can claim
+	// it — a Pipeline implemented outside this package returns a Candidate with
+	// no capsule, and its block is committed by replaying the bytes, which is
+	// genuine work there. See candidate_built_commit.go.
+	built *builtCandidate
+
+	// digested records that ID.FileHash and CollatedFileHash are the digests
+	// finish() computed from these very BlockBOC and CollatedData buffers, in
+	// the same composite literal that carries them. Nothing between there and
+	// the signature touches either slice, so re-deriving the two digests to
+	// compare them with themselves is a megabyte of sha256 that can only fail
+	// on local memory corruption.
+	//
+	// It is separate from built, which may legitimately be nil for a build whose
+	// predecessor list a capsule cannot describe, and it is unexported for the
+	// same reason built is: a Pipeline supplied from outside this package
+	// returns a Candidate whose hashes this process did not compute, and there
+	// the comparison is the only thing standing between a mis-serialized block
+	// and a signature over an ID nobody else will reproduce.
+	digested bool
 }
 
 // Builder carries no state a candidate depends on and may build independent
@@ -559,6 +702,25 @@ type Builder struct {
 	// magnitude, and a wrong estimate only costs the growth it failed to avoid,
 	// so this is a hint and nothing reads it for anything else.
 	readSetCells atomic.Int64
+
+	// The three below are the same idea for the other scratch structures a build
+	// fills, and they are separate counters because the read count does not
+	// predict any of them. Measured over four mainnet block shapes the storage
+	// walk's populations were 0.57-0.85 of the read set and the update memo's was
+	// 0.27-0.50 of it, so the read hint sizes them anywhere from a fifth to three
+	// times over — and over-sizing here is megabytes per block, since a slot in
+	// these tables drags 40 to 56 bytes of entry with it. Each population is
+	// steady from block to block in its own right, which is what makes the
+	// previous build the right ruler for it.
+	//
+	// CAPACITY ONLY — these are integers, deliberately. Nothing that holds cells
+	// may be carried from one build to the next: the proof arena hands out
+	// interior pointers that become cells of the produced block and of the
+	// collated data a background goroutine is still serializing, so a reused
+	// buffer aliases one block's proof into the next one's.
+	storageCells      atomic.Int64
+	storageProofCells atomic.Int64
+	updateMemoCells   atomic.Int64
 }
 
 // NewBuilder creates a candidate builder backed by a prepared TVM instance.
@@ -570,6 +732,59 @@ func (b *Builder) readSetHint() int {
 	return int(b.readSetCells.Load())
 }
 
-func (b *Builder) observeReadSetSize(cells int) {
-	b.readSetCells.Store(int64(cells))
+// storageHints sizes the next build's storage stat: how many distinct ordinary
+// cells it walked and how many cells its proofs held outside the read set.
+func (b *Builder) storageHints() (cells, proofCells int) {
+	return int(b.storageCells.Load()), int(b.storageProofCells.Load())
+}
+
+// updateMemoMaxPresizedCells bounds what the memo hint asks for, so a figure
+// wrong by orders of magnitude sizes a bounded table rather than an arbitrary
+// one — the same ceiling readSetMaxPresizedCells, storageSeenMaxPresizedCells
+// and proofSeenMaxPresizedCells carry for their own structures.
+//
+// What it protects against is specific to this hint. The walk it sizes used to
+// be sized from rs.Size(), the count of cells the build in front of it had just
+// read: an over-estimate, but one that could not exceed the block being built.
+// The hint replaces that bound with a number carried over from the previous
+// build, and one builder serves collations whose shapes differ by an order of
+// magnitude — a masterchain build's memo sizing the next shard build's. This is
+// what stops that from becoming an allocation nothing in the current block
+// justifies.
+const updateMemoMaxPresizedCells = 1 << 20
+
+// updateMemoHint sizes the memo the next state update's destination walk fills.
+// An eighth is added because the walk grows its entry array by doubling, so
+// landing just under costs a copy of everything memoised so far, while landing
+// an eighth over costs an eighth of one array.
+func (b *Builder) updateMemoHint() int {
+	if b == nil {
+		return 0
+	}
+	cells := int(b.updateMemoCells.Load())
+	if cells > updateMemoMaxPresizedCells {
+		cells = updateMemoMaxPresizedCells
+	}
+	hint := cells + cells/8
+	if hint > updateMemoMaxPresizedCells {
+		hint = updateMemoMaxPresizedCells
+	}
+	return hint
+}
+
+// observeBuildSizes records what a finished build measured, for the next one to
+// size against. Only a build that produced a candidate reports, so a run
+// abandoned part-way cannot shrink the next recorder to the size it stopped at.
+//
+// All four are written unconditionally, because they are one observation of one
+// build rather than four running maxima. A build that legitimately reports zero
+// for a field is reporting that the structure behind it was not filled, and the
+// next build is better sized from that than from a figure left behind by a build
+// two ago: a zero costs the ordinary lazy growth, which is what every one of
+// these structures did before there were hints at all.
+func (b *Builder) observeBuildSizes(readSetCells, storageCells, storageProofCells, updateMemoCells int) {
+	b.readSetCells.Store(int64(readSetCells))
+	b.storageCells.Store(int64(storageCells))
+	b.storageProofCells.Store(int64(storageProofCells))
+	b.updateMemoCells.Store(int64(updateMemoCells))
 }

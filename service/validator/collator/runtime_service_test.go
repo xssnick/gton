@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/xssnick/gton/service/validator/blockstats"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 
@@ -5692,4 +5694,174 @@ func TestCtxMutexContract(t *testing.T) {
 		}
 	}()
 	mutex.Unlock()
+}
+
+// syncLogBuffer is a zerolog sink the test goroutine can read while the
+// producer goroutine is still writing: a producer keeps running after it emits
+// its candidate, and the line these tests are about is written on the way out.
+type syncLogBuffer struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.data = append(b.data, p...)
+
+	return len(p), nil
+}
+
+func (b *syncLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return string(b.data)
+}
+
+// awaitLogLine waits for one message to appear in the buffer and returns the
+// whole log.
+func awaitLogLine(t *testing.T, buffer *syncLogBuffer, message string) string {
+	t.Helper()
+
+	deadline := time.After(3 * time.Second)
+	for {
+		if output := buffer.String(); strings.Contains(output, message) {
+			return output
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("log line %q never appeared; log=%q", message, buffer.String())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// A local input that has not arrived yet is not a collation failure. The window
+// producer retries on a 0/5/10/20/20 ms schedule, so one waiting window used to
+// emit a burst of identical "block collation failed" lines — 27,027 of 27,103
+// such lines in five hours on the test network, against 48 genuine ones — and
+// the same error mapped onto the error result of the build counter, which is
+// what made a 0.18% failure rate read as 39%.
+func TestRuntimeDoesNotLogNotReadyRetriesAsCollationFailures(t *testing.T) {
+	emitted := make(chan CandidateArtifact, 1)
+	pipeline := &runtimeTestPipeline{}
+	var attempts atomic.Int32
+	pipeline.build = func(_ context.Context, request BuildRequest) (*Candidate, error) {
+		if attempts.Add(1) <= 3 {
+			return nil, fmt.Errorf("%w: exact neighbor state for block 371 is unavailable", ErrAcquisitionNotReady)
+		}
+
+		return runtimeBuiltCandidate(request), nil
+	}
+	fixture := newRuntimeFixture(t, 1, 1, pipeline, nil, func(_ context.Context, artifact CandidateArtifact) error {
+		emitted <- artifact
+
+		return nil
+	})
+	defer fixture.close(t)
+
+	output := &syncLogBuffer{}
+	fixture.service.log = zerolog.New(output).Level(zerolog.DebugLevel)
+	session, update := fixture.session(83, 1, 4, time.Now())
+	fixture.prepare(t, session, update)
+	if err := fixture.service.CommitDelegation(context.Background(), fixture.request(t, session, 4)); err != nil {
+		t.Fatal(err)
+	}
+	runtimeAwaitArtifact(t, emitted)
+	// The window summary is written as the producer leaves the window, after
+	// the candidate it finally built has already been emitted.
+	log := awaitLogLine(t, output, "collation window waited for inputs")
+
+	messages := map[string]int{}
+	var waits []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(log), "\n") {
+		if line == "" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("decode producer log: %v; line=%q", err, line)
+		}
+		message, _ := event["message"].(string)
+		messages[message]++
+		if message == "collation window waited for inputs" {
+			waits = append(waits, event)
+		}
+	}
+
+	if got := messages["block collation failed"]; got != 0 {
+		t.Fatalf("not-ready retries emitted %d collation failure lines; log=%s", got, log)
+	}
+	if len(waits) != 1 {
+		t.Fatalf("input waits logged = %d, want exactly one summary per window; log=%s", len(waits), log)
+	}
+	if got := waits[0]["attempts"]; got != float64(3) {
+		t.Fatalf("input wait attempts = %v, want the 3 retries; event=%v", got, waits[0])
+	}
+	if _, exists := waits[0]["waited"]; !exists {
+		t.Fatalf("input wait has no waited duration: %v", waits[0])
+	}
+}
+
+// A genuine build failure is a defect and stays visible, at a level that is
+// affordable now that the retries are gone: 48 lines in five hours rather than
+// 27,103.
+func TestRuntimeLogsGenuineCollationFailureAtWarn(t *testing.T) {
+	pipeline := &runtimeTestPipeline{}
+	buildErr := errors.New("outbound queue is absent")
+	pipeline.build = func(context.Context, BuildRequest) (*Candidate, error) {
+		return nil, buildErr
+	}
+	fixture := newRuntimeFixture(t, 1, 1, pipeline, nil, nil)
+	defer fixture.close(t)
+
+	output := &syncLogBuffer{}
+	fixture.service.log = zerolog.New(output).Level(zerolog.WarnLevel)
+	session, update := fixture.session(84, 1, 4, time.Now())
+	fixture.prepare(t, session, update)
+	if err := fixture.service.CommitDelegation(context.Background(), fixture.request(t, session, 4)); err != nil {
+		t.Fatal(err)
+	}
+
+	log := awaitLogLine(t, output, "block collation failed")
+	line := strings.SplitN(strings.TrimSpace(log), "\n", 2)[0]
+	var event map[string]any
+	if err := json.Unmarshal([]byte(line), &event); err != nil {
+		t.Fatalf("decode failure log: %v; line=%q", err, line)
+	}
+	if event["level"] != "warn" {
+		t.Fatalf("collation failure level = %v, want warn; event=%v", event["level"], event)
+	}
+}
+
+// The build counter must not call a retried wait an error either: that is the
+// half of the defect a log change alone would leave in place.
+func TestCollationResultSeparatesNotReadyFromError(t *testing.T) {
+	wrapped := fmt.Errorf("%w: exact neighbor state for block 371 is unavailable", ErrAcquisitionNotReady)
+	if got := collationResult(wrapped); got != CollationResultNotReady {
+		t.Fatalf("not-ready build result = %d, want CollationResultNotReady (%d)", got, CollationResultNotReady)
+	}
+	if got := collationResult(errors.New("outbound queue is absent")); got != CollationResultError {
+		t.Fatalf("genuine build result = %d, want CollationResultError", got)
+	}
+
+	// validator-engine's two-valued counter must not see it at all: the attempt
+	// that eventually runs is the one it should count.
+	stats := blockstats.New()
+	observer := &blockStatsObserver{stats: stats}
+	observer.ObserveCollationBuild(CollationBuildObservation{
+		Chain:  MetricChainShardchain,
+		Result: CollationResultNotReady,
+	})
+	if collated := stats.BlockStats().Collated.Shard; collated != (blockstats.Counter{}) {
+		t.Fatalf("not-ready builds recorded validator-engine collations %+v, want none", collated)
+	}
+	observer.ObserveCollationBuild(CollationBuildObservation{
+		Chain:  MetricChainShardchain,
+		Result: CollationResultError,
+	})
+	if collated := stats.BlockStats().Collated.Shard; collated.Error != 1 {
+		t.Fatalf("genuine build failures recorded %+v, want one error", collated)
+	}
 }

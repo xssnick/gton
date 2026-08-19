@@ -142,7 +142,7 @@ func TestRemoteCollatorMapsDelegatedV3Requests(t *testing.T) {
 		t.Fatal(err)
 	}
 	if transport.record.Session.ID != ([32]byte{}) {
-		t.Fatal("remote lifecycle unexpectedly reached Delegated-v3 transport")
+		t.Fatal("remote lifecycle unexpectedly reached delegated-collation transport")
 	}
 	loaded, err := client.Session(ctx, session.ID)
 	if err != nil {
@@ -196,7 +196,7 @@ func TestRemoteCollatorMapsDelegatedV3Requests(t *testing.T) {
 		t.Fatal(err)
 	}
 	if transport.retired != ([32]byte{}) {
-		t.Fatal("remote retirement unexpectedly reached Delegated-v3 transport")
+		t.Fatal("remote retirement unexpectedly reached delegated-collation transport")
 	}
 	if err = client.UpdateSession(ctx, update); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("update retired session = %v, want %v", err, ErrNotFound)

@@ -63,9 +63,16 @@ type MetricsOptions struct {
 }
 
 type StorageOptions struct {
-	Dir                              string
-	CellTotalCacheSize               int64
-	DecodedCellCache                 DecodedCellCacheOptions
+	Dir                string
+	CellTotalCacheSize int64
+	DecodedCellCache   DecodedCellCacheOptions
+	// CellRecordCacheBytes budgets the encoded cell record cache in BYTES: the
+	// tier between the decoded cell cache and pebble, holding raw celldb
+	// records pre-decode in region rings allocated outside the GC under cgo.
+	// Bytes rather than entries because this tier has no per-object GC cost;
+	// the derived index adds ~22-25% on top. Zero disables the tier — callers
+	// that want the default must pass it explicitly (the config layer does).
+	CellRecordCacheBytes             int64
 	CellShardMemTableSize            int
 	CellMemTableStopWritesThreshold  int
 	LargeBOCShardReadWorkers         int
@@ -75,12 +82,28 @@ type StorageOptions struct {
 	ArtifactFileMaxOpen              int
 }
 
+// DecodedCellCacheOptions sizes the decoded cell cache, in ENTRIES.
+//
+// There is ONE such cache, shared by every consumer that decodes a cell out of
+// celldb: the lightserver, proof building, the archive importer, sync and
+// download, collation and validation. It is deliberately not per-consumer.
+// Collation and validation must receive the same *cell.Cell for a given parent —
+// the validator's live-successor carry-back compares tip states by pointer — and
+// two caches cannot both supply one object.
+//
+// Entries, not bytes, because each entry is a live Go object graph (~9.9 live
+// objects, ~820 B measured) that every GC mark cycle has to scan: mark cost
+// tracks object count, so an entry cap bounds the cost directly and a byte
+// budget does not. This is also why the default is small. Bulk capacity belongs
+// in the off-heap tiers — StorageOptions.CellTotalCacheSize is pebble's block
+// cache, and below it the OS page cache — where a resident byte costs nothing to
+// mark. The two knobs are independent and have different cost models; raising
+// CellTotalCacheSize does not and must not move this one.
 type DecodedCellCacheOptions struct {
-	Enabled       bool
-	Shards        int
-	BytesPerEntry int64
-	MinEntries    int
-	MaxEntries    int
+	Enabled bool
+	Shards  int
+	// Entries sizes the cache. Zero takes the default.
+	Entries int
 }
 
 // NodeOptions configures RunNode.
@@ -234,9 +257,8 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 		Int64("cell_total_cache_size", cellTotalCacheSize).
 		Bool("decoded_cell_cache_enabled", decodedCellCacheOpts.Enabled).
 		Int("decoded_cell_cache_shards", decodedCellCacheOpts.Shards).
-		Int64("decoded_cell_cache_bytes_per_entry", decodedCellCacheOpts.BytesPerEntry).
-		Int("decoded_cell_cache_min_entries", decodedCellCacheOpts.MinEntries).
-		Int("decoded_cell_cache_max_entries", decodedCellCacheOpts.MaxEntries).
+		Int("decoded_cell_cache_entries_requested", decodedCellCacheOpts.Entries).
+		Int64("cell_record_cache_bytes", storageOpts.CellRecordCacheBytes).
 		Int("cell_shard_memtable_size", cellShardMemTableSize).
 		Int("cell_memtable_stop_writes_threshold", cellMemTableStopWritesThreshold).
 		Int("large_boc_shard_read_workers", largeBOCShardReadWorkers).
@@ -244,14 +266,15 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 		Int("artifact_file_max_open", artifactFileMaxOpen).
 		Msg("opening storage")
 	store, err := pebblestore.Open(pebblestore.Options{
-		Dir:                             storageDir,
-		Logger:                          &baseLogger,
-		CellCacheSize:                   cellTotalCacheSize,
-		DisableDecodedCellCache:         !decodedCellCacheOpts.Enabled,
-		DecodedCellCacheShards:          decodedCellCacheOpts.Shards,
-		DecodedCellCacheBytesPerEntry:   decodedCellCacheOpts.BytesPerEntry,
-		DecodedCellCacheMinEntries:      decodedCellCacheOpts.MinEntries,
-		DecodedCellCacheMaxEntries:      decodedCellCacheOpts.MaxEntries,
+		Dir:                     storageDir,
+		Logger:                  &baseLogger,
+		CellCacheSize:           cellTotalCacheSize,
+		DisableDecodedCellCache: !decodedCellCacheOpts.Enabled,
+		DecodedCellCacheShards:  decodedCellCacheOpts.Shards,
+
+		DecodedCellCacheEntries: decodedCellCacheOpts.Entries,
+		CellRecordCacheBytes:    storageOpts.CellRecordCacheBytes,
+
 		CellShardMemTableSize:           cellShardMemTableSize,
 		CellMemTableStopWritesThreshold: cellMemTableStopWritesThreshold,
 		LargeBOCShardReadWorkers:        largeBOCShardReadWorkers,

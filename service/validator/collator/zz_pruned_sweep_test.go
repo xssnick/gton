@@ -24,7 +24,7 @@ var (
 
 func TestMain(m *testing.M) {
 	if os.Getenv("PRUNED_SWEEP") == "" {
-		os.Exit(m.Run())
+		os.Exit(runPackageTests(m))
 	}
 
 	cell.SetPrunedParseDetector(func(*cell.Cell) {
@@ -50,7 +50,7 @@ func TestMain(m *testing.M) {
 		zzPrunedMu.Unlock()
 	})
 
-	code := m.Run()
+	code := runPackageTests(m)
 
 	zzPrunedMu.Lock()
 	keys := make([]string, 0, len(zzPrunedSites))

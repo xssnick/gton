@@ -80,20 +80,27 @@ func (j *runtimeStartupOrderJournal) Bootstrap() (*simplex.BootstrapState, error
 type runtimeTestStorage struct {
 	mu sync.Mutex
 
-	candidates  map[SessionStorageID]map[simplex.CandidateID]CandidateRecord
-	delegations map[SessionStorageID]map[uint32]DelegationAuthorization
+	// Keyed by the namespace, as the real store keys its rows: a descriptor
+	// carries two fields no namespace derivation reads, so a double keyed by the
+	// whole SessionStorageID would answer "not found" for rows the store would
+	// have found.
+	candidates  map[validatorTestNamespace]map[simplex.CandidateID]CandidateRecord
+	delegations map[validatorTestNamespace]map[uint32]DelegationAuthorization
 	saves       int
 	loads       int
 	finalized   []simplex.CandidateID
 	windows     []LeaderWindowRecord
 	saveHook    func(SessionStorageID, CandidateRecord, func(error))
 	windowHook  func(SessionStorageID, LeaderWindowRecord, func(error))
+	// loadHook runs inside every candidate read, after it has been counted, so a
+	// test can hold reads open and observe how many of them overlap.
+	loadHook func()
 }
 
 func newRuntimeTestStorage() *runtimeTestStorage {
 	return &runtimeTestStorage{
-		candidates:  make(map[SessionStorageID]map[simplex.CandidateID]CandidateRecord),
-		delegations: make(map[SessionStorageID]map[uint32]DelegationAuthorization),
+		candidates:  make(map[validatorTestNamespace]map[simplex.CandidateID]CandidateRecord),
+		delegations: make(map[validatorTestNamespace]map[uint32]DelegationAuthorization),
 	}
 }
 
@@ -114,12 +121,16 @@ func (s *runtimeTestStorage) SaveCandidate(
 	s.saves++
 	hook := s.saveHook
 	if hook == nil {
-		byID := s.candidates[session]
+		namespace := validatorTestNamespaceOf(session)
+		byID := s.candidates[namespace]
 		if byID == nil {
 			byID = make(map[simplex.CandidateID]CandidateRecord)
-			s.candidates[session] = byID
+			s.candidates[namespace] = byID
 		}
 		record.Wire = bytes.Clone(record.Wire)
+		// Candidates are content-addressed durably, so the stored identity is
+		// derived here exactly once and handed back by Candidate.
+		record.ContentHash = sha256.Sum256(record.Wire)
 		byID[record.ID] = record
 	}
 	s.mu.Unlock()
@@ -142,7 +153,14 @@ func (s *runtimeTestStorage) Candidate(
 
 	s.mu.Lock()
 	s.loads++
-	record, exists := s.candidates[session][id]
+	hook := s.loadHook
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+
+	s.mu.Lock()
+	record, exists := s.candidates[validatorTestNamespaceOf(session)][id]
 	s.mu.Unlock()
 	if !exists {
 		return CandidateRecord{}, corestorage.ErrNotFound
@@ -203,10 +221,11 @@ func (s *runtimeTestStorage) SaveDelegationAuthorization(
 	done func(error),
 ) {
 	s.mu.Lock()
-	byStart := s.delegations[session]
+	namespace := validatorTestNamespaceOf(session)
+	byStart := s.delegations[namespace]
 	if byStart == nil {
 		byStart = make(map[uint32]DelegationAuthorization)
-		s.delegations[session] = byStart
+		s.delegations[namespace] = byStart
 	}
 	stored, exists := byStart[authorization.StartSlot]
 	if exists && (stored.Collator != authorization.Collator ||
@@ -231,7 +250,7 @@ func (s *runtimeTestStorage) DelegationAuthorization(
 		return DelegationAuthorization{}, err
 	}
 	s.mu.Lock()
-	authorization, exists := s.delegations[session][start]
+	authorization, exists := s.delegations[validatorTestNamespaceOf(session)][start]
 	s.mu.Unlock()
 	if !exists {
 		return DelegationAuthorization{}, corestorage.ErrNotFound
@@ -269,6 +288,8 @@ type runtimeTestBackend struct {
 	progress   func(context.Context, sessionConsensusProgress) error
 	load       func(context.Context, ChainStateRequest) (ChainStateData, error)
 	validation func(context.Context, *ChainState, *CandidateArtifact) (CandidateValidation, error)
+	// requests observes the internal parent-bound successor handle.
+	requests   func(CandidateValidationRequest)
 	acceptance func(context.Context, BlockAcceptance) error
 }
 
@@ -306,7 +327,8 @@ func (b *runtimeTestBackend) LoadChainState(
 	for i := range request.Blocks {
 		tips[i] = ChainTip{ID: request.Blocks[i], State: b.stateRoot}
 		if request.Blocks[i].SeqNo != 0 {
-			tips[i].BlockBOC = []byte{0x01}
+			tips[i].BlockBOC = testTipBOCFor(request.Blocks[i])
+			tips[i].Block = testTipBlockFor(request.Blocks[i])
 		}
 	}
 
@@ -315,14 +337,16 @@ func (b *runtimeTestBackend) LoadChainState(
 
 func (b *runtimeTestBackend) ValidateCandidate(
 	ctx context.Context,
-	state *ChainState,
-	artifact *CandidateArtifact,
+	request CandidateValidationRequest,
 ) (CandidateValidation, error) {
+	if b.requests != nil {
+		b.requests(request)
+	}
 	if b.validation != nil {
-		return b.validation(ctx, state, artifact)
+		return b.validation(ctx, request.Parent, request.Artifact)
 	}
 
-	return CandidateValidation{}, nil
+	return testCandidateValidation(request.Parent, request.Artifact)
 }
 
 func (b *runtimeTestBackend) AcceptBlock(ctx context.Context, acceptance BlockAcceptance) error {
@@ -588,8 +612,19 @@ func TestMasterchainRecoveryFinalizationsAreVerifiedAndOrdered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0] != first || got[1] != second {
+	if len(got) != 2 || got[0].Certificate() != first || got[1].Certificate() != second {
 		t.Fatalf("recovery finalizations are not in slot order: %+v", got)
+	}
+	// The replay set is sealed, and sealed against this session and roster:
+	// block acceptance drops its own Ed25519 pass on the strength of that.
+	binding, err := simplex.NewCertificateBinding(config.SessionID, validators)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range got {
+		if err = binding.Check(got[i]); err != nil {
+			t.Fatalf("recovery finalization %d is not sealed for this session: %v", i, err)
+		}
 	}
 
 	conflict := runtimeTestCertificate(
@@ -659,6 +694,29 @@ func runtimeTestCertificate(
 			),
 		}},
 	}
+}
+
+// runtimeTestSeal builds a genuinely verified certificate. simplex.VerifiedCertificate
+// has no populated literal form outside its own package by design, so tests
+// take exactly the route production takes: sign, then verify.
+func runtimeTestSeal(
+	t testing.TB,
+	config SessionConfig,
+	privateKey ed25519.PrivateKey,
+	vote simplex.Vote,
+) simplex.VerifiedCertificate {
+	t.Helper()
+
+	verified, err := simplex.VerifyCertificate(
+		config.SessionID,
+		runtimeValidators(config.Validators),
+		runtimeTestCertificate(t, config.SessionID, privateKey, vote),
+	)
+	if err != nil {
+		t.Fatalf("verify test certificate: %v", err)
+	}
+
+	return verified
 }
 
 func runtimeTestState() SessionState {
@@ -1425,7 +1483,12 @@ func TestSessionRuntimeWaitsForExactFinalizedStateWithoutStopping(t *testing.T) 
 
 		tips := make([]ChainTip, len(request.Blocks))
 		for i := range request.Blocks {
-			tips[i] = ChainTip{ID: request.Blocks[i], State: backend.stateRoot, BlockBOC: []byte{0x01}}
+			tips[i] = ChainTip{
+				ID:       request.Blocks[i],
+				State:    backend.stateRoot,
+				BlockBOC: testTipBOCFor(request.Blocks[i]),
+				Block:    testTipBlockFor(request.Blocks[i]),
+			}
 		}
 
 		return ChainStateData{Tips: tips}, nil
@@ -1479,8 +1542,8 @@ func TestSessionRuntimeSkipsWindowBehindLocallyFinalizedState(t *testing.T) {
 	state := runtimeTestState()
 	ahead := runtimeTestStart().Genesis[0]
 	ahead.SeqNo++
-	ahead.RootHash = bytes.Repeat([]byte{0xa1}, 32)
-	ahead.FileHash = bytes.Repeat([]byte{0xa2}, 32)
+	ahead.RootHash = testTipRootHash(0xa1)
+	ahead.FileHash = testTipFileHash(0xa1)
 	state.FinalizedBlock = &ahead
 	if err := runtime.Update(context.Background(), state); err != nil {
 		t.Fatal(err)
@@ -1549,14 +1612,14 @@ func TestSessionRuntimeFinalizationReleasesResolvedStates(t *testing.T) {
 		t.Fatal("network did not start")
 	}
 
-	slot := uint32(4 * stateCacheRetainedSlots)
+	slot := 4 * runtime.states.stateRetainedSlots()
 	artifact := runtimeOrdinaryArtifact(t, runtime.config, privateKey, slot, simplex.Genesis())
 	if err := runtime.candidates.stage(artifact, []byte{0x01}); err != nil {
 		t.Fatal(err)
 	}
 	runtime.candidates.observeNotarization(
 		artifact.Candidate.ID,
-		&simplex.Certificate{Vote: simplex.NotarizeVote(artifact.Candidate.ID)},
+		runtimeTestSeal(t, runtime.config, privateKey, simplex.NotarizeVote(artifact.Candidate.ID)),
 	)
 
 	stale := simplex.Parent(simplex.CandidateID{Slot: 0, Hash: [32]byte{0xc0}})
@@ -1568,7 +1631,7 @@ func TestSessionRuntimeFinalizationReleasesResolvedStates(t *testing.T) {
 
 	runtime.OnFinalized(
 		artifact.Candidate.ID,
-		&simplex.Certificate{Vote: simplex.FinalizeVote(artifact.Candidate.ID)},
+		runtimeTestSeal(t, runtime.config, privateKey, simplex.FinalizeVote(artifact.Candidate.ID)),
 	)
 	select {
 	case <-accepted:
@@ -1588,6 +1651,146 @@ func TestSessionRuntimeFinalizationReleasesResolvedStates(t *testing.T) {
 	}
 	if err := <-runResult; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSessionRuntimeFinalizationReleasesCandidatePayloads(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	network := newRuntimeTestNetwork()
+	backend := newRuntimeTestBackend()
+	accepted := make(chan struct{}, 1)
+	backend.acceptance = func(context.Context, BlockAcceptance) error {
+		accepted <- struct{}{}
+
+		return nil
+	}
+	runtime, privateKey := prepareRuntimeTest(t, 0x58, storage, network, backend)
+
+	runResult := make(chan error, 1)
+	go func() { runResult <- runtime.Run(context.Background(), runtimeTestStart()) }()
+	select {
+	case <-network.started:
+	case <-time.After(time.Second):
+		t.Fatal("network did not start")
+	}
+
+	superseded := runtimeOrdinaryArtifact(t, runtime.config, privateKey, 0, simplex.Genesis())
+	if err := runtime.candidates.stage(superseded, []byte{0x01}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.candidates.store(context.Background(), superseded.Candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	slot := uint32(4 * candidateCacheRetainedSlots)
+	artifact := runtimeOrdinaryArtifact(t, runtime.config, privateKey, slot, simplex.Genesis())
+	if err := runtime.candidates.stage(artifact, []byte{0x02}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.candidates.observeNotarization(
+		artifact.Candidate.ID,
+		runtimeTestSeal(t, runtime.config, privateKey, simplex.NotarizeVote(artifact.Candidate.ID)),
+	)
+	runtime.OnFinalized(
+		artifact.Candidate.ID,
+		runtimeTestSeal(t, runtime.config, privateKey, simplex.FinalizeVote(artifact.Candidate.ID)),
+	)
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("finalized block was not handed to acceptance")
+	}
+
+	runtime.candidates.mu.Lock()
+	released := runtime.candidates.entries[superseded.Candidate.ID]
+	finalized := runtime.candidates.entries[artifact.Candidate.ID]
+	runtime.candidates.mu.Unlock()
+	if released.candidate != nil || released.wire != nil {
+		t.Fatal("finalization did not release the candidate payload below its watermark")
+	}
+	if !released.durable || !released.hasWireHash {
+		t.Fatalf("released candidate lost its durable identity: %+v", released)
+	}
+	if finalized.candidate != artifact {
+		t.Fatal("the candidate being finalized was released with its ancestors")
+	}
+
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-runResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSessionRuntimeValidatesCandidateAfterPayloadRelease(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	runtime, privateKey := prepareRuntimeTest(
+		t,
+		0x59,
+		storage,
+		newRuntimeTestNetwork(),
+		newRuntimeTestBackend(),
+	)
+	defer runtime.Close()
+	if err := runtime.states.start(context.Background(), runtimeTestStart()); err != nil {
+		t.Fatal(err)
+	}
+
+	const slot = uint32(6)
+	artifact := runtimeOrdinaryArtifact(t, runtime.config, privateKey, slot, simplex.Genesis())
+	wire, _, err := runtime.codec.encodeForBroadcast(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = runtime.candidates.stage(artifact, wire); err != nil {
+		t.Fatal(err)
+	}
+	if err = runtime.candidates.store(context.Background(), artifact.Candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	runtime.candidates.notifyFinalized(slot+candidateCacheRetainedSlots+1, retentionFloorNone)
+
+	if err = runtime.validateCandidate(context.Background(), &artifact.Candidate); err != nil {
+		t.Fatalf("validation after the candidate payload was released: %v", err)
+	}
+	if storage.loadCount() != 1 {
+		t.Fatalf("candidate reloads = %d, want exactly one", storage.loadCount())
+	}
+}
+
+// Readiness waits belong inside the one validation query. If an implementation
+// still reports not-ready to the runtime, that query has ended and Simplex
+// abstains; the runtime must not restart all semantic stages itself.
+func TestSessionRuntimeDoesNotRetryNotReadyValidation(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	backend := newRuntimeTestBackend()
+	attempts := 0
+	backend.validation = func(
+		_ context.Context,
+		_ *ChainState,
+		_ *CandidateArtifact,
+	) (CandidateValidation, error) {
+		attempts++
+
+		return CandidateValidation{}, ErrBlockNotReady
+	}
+	runtime, privateKey := prepareRuntimeTest(t, 0x5a, storage, newRuntimeTestNetwork(), backend)
+	defer runtime.Close()
+	if err := runtime.states.start(context.Background(), runtimeTestStart()); err != nil {
+		t.Fatal(err)
+	}
+	artifact := runtimeOrdinaryArtifact(t, runtime.config, privateKey, 0, simplex.Genesis())
+	if err := runtime.candidates.stage(artifact, []byte{0x01}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runtime.validateCandidate(context.Background(), &artifact.Candidate)
+	if !errors.Is(err, ErrBlockNotReady) {
+		t.Fatalf("validation error = %v, want ErrBlockNotReady", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("validation attempts = %d, want exactly one", attempts)
 	}
 }
 
@@ -1616,11 +1819,11 @@ func TestSessionRuntimeAcceptanceFailureDoesNotStopConsensus(t *testing.T) {
 	}
 	runtime.candidates.observeNotarization(
 		artifact.Candidate.ID,
-		&simplex.Certificate{Vote: simplex.NotarizeVote(artifact.Candidate.ID)},
+		runtimeTestSeal(t, runtime.config, privateKey, simplex.NotarizeVote(artifact.Candidate.ID)),
 	)
 	runtime.OnFinalized(
 		artifact.Candidate.ID,
-		&simplex.Certificate{Vote: simplex.FinalizeVote(artifact.Candidate.ID)},
+		runtimeTestSeal(t, runtime.config, privateKey, simplex.FinalizeVote(artifact.Candidate.ID)),
 	)
 	select {
 	case <-accepted:
@@ -2075,11 +2278,14 @@ func TestSessionRuntimeValidationWaitsForBackendValidAfter(t *testing.T) {
 	network := newRuntimeTestNetwork()
 	backend := newRuntimeTestBackend()
 	backend.validation = func(
-		context.Context,
-		*ChainState,
-		*CandidateArtifact,
+		_ context.Context,
+		state *ChainState,
+		artifact *CandidateArtifact,
 	) (CandidateValidation, error) {
-		return CandidateValidation{ValidAfter: time.Now().Add(35 * time.Millisecond)}, nil
+		return CandidateValidation{
+			ValidAfter: time.Now().Add(35 * time.Millisecond),
+			State:      testValidatedCandidateState(t, state, artifact),
+		}, nil
 	}
 	runtime, privateKey := prepareRuntimeTest(t, 0x52, storage, network, backend)
 	if err := runtime.states.start(context.Background(), runtimeTestStart()); err != nil {
@@ -2099,6 +2305,114 @@ func TestSessionRuntimeValidationWaitsForBackendValidAfter(t *testing.T) {
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSessionRuntimePublishesValidatedStateBeforeFinalization(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	backend := newRuntimeTestBackend()
+	var ordinaryLoads int
+	backend.load = func(_ context.Context, request ChainStateRequest) (ChainStateData, error) {
+		block := request.Blocks[0]
+		if block.SeqNo != 0 {
+			ordinaryLoads++
+
+			return ChainStateData{}, ErrBlockNotReady
+		}
+
+		return ChainStateData{Tips: []ChainTip{{ID: block, State: backend.stateRoot}}}, nil
+	}
+	runtime, privateKey := prepareRuntimeTest(t, 0x53, storage, newRuntimeTestNetwork(), backend)
+	defer runtime.Close()
+	if err := runtime.states.start(context.Background(), runtimeTestStart()); err != nil {
+		t.Fatal(err)
+	}
+	artifact := runtimeOrdinaryArtifact(t, runtime.config, privateKey, 0, simplex.Genesis())
+	if err := runtime.candidates.stage(artifact, []byte{0x01}); err != nil {
+		t.Fatal(err)
+	}
+	certificate := runtimeTestSeal(t, runtime.config, privateKey, simplex.NotarizeVote(artifact.Candidate.ID))
+	runtime.candidates.observeNotarization(artifact.Candidate.ID, certificate)
+	if err := runtime.validateCandidate(context.Background(), &artifact.Candidate); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.states.finalize(
+		context.Background(),
+		artifact.Candidate.ID,
+		runtimeTestSeal(t, runtime.config, privateKey, simplex.FinalizeVote(artifact.Candidate.ID)),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	resolved, err := runtime.states.resolve(ctx, simplex.Parent(artifact.Candidate.ID))
+	if err != nil {
+		t.Fatalf("resolve validated parent from live view: %v", err)
+	}
+	block, err := resolved.State.NormalBlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameBlockID(block, artifact.Candidate.Block) {
+		t.Fatalf("resolved block = %+v, want %+v", block, artifact.Candidate.Block)
+	}
+	if ordinaryLoads != 0 {
+		t.Fatalf("validated parent loaded from ordinary store %d times, want 0", ordinaryLoads)
+	}
+}
+
+func TestSessionRuntimeValidatedStateCompletesInflightStoreLookup(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	backend := newRuntimeTestBackend()
+	storeLookup := make(chan struct{}, 1)
+	backend.load = func(_ context.Context, request ChainStateRequest) (ChainStateData, error) {
+		block := request.Blocks[0]
+		if block.SeqNo != 0 {
+			storeLookup <- struct{}{}
+
+			return ChainStateData{}, ErrBlockNotReady
+		}
+
+		return ChainStateData{Tips: []ChainTip{{ID: block, State: backend.stateRoot}}}, nil
+	}
+	runtime, privateKey := prepareRuntimeTest(t, 0x54, storage, newRuntimeTestNetwork(), backend)
+	defer runtime.Close()
+	if err := runtime.states.start(context.Background(), runtimeTestStart()); err != nil {
+		t.Fatal(err)
+	}
+	artifact := runtimeOrdinaryArtifact(t, runtime.config, privateKey, 0, simplex.Genesis())
+	if err := runtime.candidates.stage(artifact, []byte{0x01}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.candidates.observeNotarization(
+		artifact.Candidate.ID,
+		runtimeTestSeal(t, runtime.config, privateKey, simplex.NotarizeVote(artifact.Candidate.ID)),
+	)
+	runtime.states.mu.Lock()
+	runtime.states.finalized[artifact.Candidate.ID] = &finalizedState{isDone: true}
+	runtime.states.mu.Unlock()
+
+	resolved := make(chan error, 1)
+	go func() {
+		_, err := runtime.states.resolve(context.Background(), simplex.Parent(artifact.Candidate.ID))
+		resolved <- err
+	}()
+	select {
+	case <-storeLookup:
+	case <-time.After(time.Second):
+		t.Fatal("finalized parent store lookup did not start")
+	}
+	if err := runtime.validateCandidate(context.Background(), &artifact.Candidate); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-resolved:
+		if err != nil {
+			t.Fatalf("in-flight parent resolution: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("validated live state did not complete the in-flight store lookup")
 	}
 }
 
@@ -2164,8 +2478,8 @@ func TestSessionRuntimeLogsCompletedEmptyCandidateValidation(t *testing.T) {
 		Workchain: runtime.config.Shard.Workchain,
 		Shard:     runtime.config.Shard.Shard,
 		SeqNo:     17,
-		RootHash:  bytes.Repeat([]byte{0x61}, 32),
-		FileHash:  bytes.Repeat([]byte{0x62}, 32),
+		RootHash:  testTipRootHash(0x61),
+		FileHash:  testTipFileHash(0x61),
 	}
 	stateRoot := cell.BeginCell().MustStoreUInt(0x63, 8).EndCell()
 	parentID := simplex.CandidateID{Slot: 4, Hash: [32]byte{0x64}}
@@ -2218,11 +2532,18 @@ func TestSessionRuntimeValidationErrorAbstainsWithoutStopping(t *testing.T) {
 	network := newRuntimeTestNetwork()
 	backend := newRuntimeTestBackend()
 	validationErr := errors.New("local candidate validation failed")
+	var validationDeadline time.Time
 	backend.validation = func(
-		context.Context,
-		*ChainState,
-		*CandidateArtifact,
+		ctx context.Context,
+		_ *ChainState,
+		_ *CandidateArtifact,
 	) (CandidateValidation, error) {
+		var ok bool
+		validationDeadline, ok = ctx.Deadline()
+		if !ok {
+			return CandidateValidation{}, errors.New("candidate validation has no deadline")
+		}
+
 		return CandidateValidation{}, validationErr
 	}
 	runtime, privateKey := prepareRuntimeTest(t, 0x54, storage, network, backend)
@@ -2238,6 +2559,15 @@ func TestSessionRuntimeValidationErrorAbstainsWithoutStopping(t *testing.T) {
 		t.Fatal("network did not start")
 	}
 
+	// Run the session at the test network's own pacing: 200 ms slots with the
+	// four slots per leader window runtimeTestConfig sets. That is the exact
+	// configuration a window-derived deadline collapsed to 6.4 s on.
+	fast := runtimeTestState()
+	fast.Params.TargetRate = 200 * time.Millisecond
+	if err := runtime.Update(context.Background(), fast); err != nil {
+		t.Fatalf("update to the fast slot rate: %v", err)
+	}
+
 	artifact := runtimeOrdinaryArtifact(t, runtime.config, privateKey, 0, simplex.Genesis())
 	if err := runtime.candidates.stage(artifact, []byte{0x01}); err != nil {
 		t.Fatal(err)
@@ -2251,6 +2581,13 @@ func TestSessionRuntimeValidationErrorAbstainsWithoutStopping(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("candidate validation did not complete")
+	}
+	// The deadline is the flat wall-clock constant and nothing about this
+	// session's pacing enters it.
+	remaining := time.Until(validationDeadline)
+	if remaining < candidateValidationTimeout-time.Second || remaining > candidateValidationTimeout {
+		t.Fatalf("candidate validation deadline remaining = %v, want about %v",
+			remaining, candidateValidationTimeout)
 	}
 
 	select {
@@ -2282,8 +2619,8 @@ func TestSessionRuntimeValidatesOnNotarizedMasterchainParentState(t *testing.T) 
 		Workchain: -1,
 		Shard:     math.MinInt64,
 		SeqNo:     164,
-		RootHash:  bytes.Repeat([]byte{0xa1}, 32),
-		FileHash:  bytes.Repeat([]byte{0xa2}, 32),
+		RootHash:  testTipRootHash(0xa1),
+		FileHash:  testTipFileHash(0xa1),
 	}
 	initial := runtimeTestState()
 	initial.FinalizedBlock = &applied
@@ -2304,8 +2641,8 @@ func TestSessionRuntimeValidatesOnNotarizedMasterchainParentState(t *testing.T) 
 		Workchain: -1,
 		Shard:     math.MinInt64,
 		SeqNo:     applied.SeqNo + 1,
-		RootHash:  bytes.Repeat([]byte{0xb2}, 32),
-		FileHash:  bytes.Repeat([]byte{0xb3}, 32),
+		RootHash:  testTipRootHash(0xb2),
+		FileHash:  testTipFileHash(0xb2),
 	}
 	root := cell.BeginCell().MustStoreUInt(0xb4, 8).EndCell()
 	resolved := ResolvedState{State: &ChainState{
@@ -2321,7 +2658,11 @@ func TestSessionRuntimeValidatesOnNotarizedMasterchainParentState(t *testing.T) 
 	if err = runtime.candidates.stage(artifact, []byte{0x01}); err != nil {
 		t.Fatal(err)
 	}
-	backend.validation = func(_ context.Context, state *ChainState, _ *CandidateArtifact) (CandidateValidation, error) {
+	backend.validation = func(
+		_ context.Context,
+		state *ChainState,
+		artifact *CandidateArtifact,
+	) (CandidateValidation, error) {
 		block, blockErr := state.NormalBlock()
 		if blockErr != nil {
 			return CandidateValidation{}, blockErr
@@ -2330,7 +2671,9 @@ func TestSessionRuntimeValidatesOnNotarizedMasterchainParentState(t *testing.T) 
 			t.Fatalf("validation parent = %+v, want speculative %+v", block, speculative)
 		}
 
-		return CandidateValidation{}, nil
+		return CandidateValidation{
+			State: testValidatedCandidateState(t, state, artifact),
+		}, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -2432,7 +2775,23 @@ func runtimeOrdinaryArtifact(
 ) *CandidateArtifact {
 	t.Helper()
 
-	blockRoot := cell.BeginCell().MustStoreUInt(0x71, 8).EndCell()
+	return runtimeBlockArtifact(t, config, privateKey, slot, parent, 1, 0x71)
+}
+
+func runtimeBlockArtifact(
+	t testing.TB,
+	config SessionConfig,
+	privateKey ed25519.PrivateKey,
+	slot uint32,
+	parent simplex.ParentID,
+	seqNo uint32,
+	tag uint64,
+) *CandidateArtifact {
+	t.Helper()
+
+	// A backend asked for this block as a chain tip has to hand its parsed root
+	// back on ChainTip.Block, so the root has to be findable by its hash.
+	blockRoot := cell.BeginCell().MustStoreUInt(tag, 8).EndCell()
 	blockBOC, err := blockRoot.ToBOCWithOptionsErr(cell.BOCSerializeOptions{
 		WithCRC32C:    true,
 		WithIndex:     true,
@@ -2454,6 +2813,9 @@ func runtimeOrdinaryArtifact(
 	if err != nil {
 		t.Fatal(err)
 	}
+	// These exact bytes are what the id's file hash names, so a backend serving
+	// this block as a chain tip has to serve them and not a re-serialization.
+	registerTestTipBlockBOC(blockRoot, blockBOC)
 	fileHash := sha256.Sum256(blockBOC)
 	candidate := simplex.Candidate{
 		Parent: parent,
@@ -2461,7 +2823,7 @@ func runtimeOrdinaryArtifact(
 		Block: ton.BlockIDExt{
 			Workchain: config.Shard.Workchain,
 			Shard:     config.Shard.Shard,
-			SeqNo:     1,
+			SeqNo:     seqNo,
 			RootHash:  blockRoot.Hash(),
 			FileHash:  fileHash[:],
 		},
@@ -2481,31 +2843,199 @@ func runtimeOrdinaryArtifact(
 		Candidate:    candidate,
 		BlockBOC:     blockBOC,
 		CollatedData: collatedData,
+		// Both file hashes above were taken from these two buffers, which is
+		// exactly how both real producers of an artifact get them: the codec
+		// derives them from the payload it decompressed, the builder from the
+		// buffers it just serialized. A fixture that stood for a produced
+		// candidate but withheld the claim would exercise the fallback rather
+		// than the path production takes.
+		digested: true,
 	}
 }
 
-// A validator that waits on local state casts no vote. That is ordinary for a
-// moment and a problem after one, and the difference has to be visible without
-// turning on debug logging.
-func TestCandidateNotReadyWaitEscalatesOutOfDebug(t *testing.T) {
-	cases := []struct {
-		name   string
-		waited time.Duration
-		want   zerolog.Level
-	}{
-		{name: "first attempt", waited: 0, want: zerolog.DebugLevel},
-		{name: "just inside the grace", waited: candidateNotReadyWarnAfter - time.Nanosecond, want: zerolog.DebugLevel},
-		{name: "at the threshold", waited: candidateNotReadyWarnAfter, want: zerolog.WarnLevel},
-		{name: "long stall", waited: time.Minute, want: zerolog.WarnLevel},
+// TestLeaderWindowSubmitterDoesNotWaitForTheDurableWrite pins the producer's
+// half of the store split: the record is submitted to storage synchronously —
+// the save call has already happened when Submit returns — but the fsync is not
+// waited for. The wait belongs to the voter, which joins the same write before
+// it notarizes (simplex/hardening_test.go TestStoreOverlapsValidation), and the
+// reference detaches it here exactly the same way.
+func TestLeaderWindowSubmitterDoesNotWaitForTheDurableWrite(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	network := newRuntimeTestNetwork()
+	backend := newRuntimeTestBackend()
+	callbacks := make(chan func(error), 1)
+	storage.saveHook = func(_ SessionStorageID, _ CandidateRecord, done func(error)) {
+		callbacks <- done
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := candidateNotReadyLevel(tc.waited); got != tc.want {
-				t.Fatalf("level after %v = %v, want %v", tc.waited, got, tc.want)
-			}
-		})
+	runtime, privateKey := prepareRuntimeTest(t, 0x57, storage, network, backend)
+
+	runResult := make(chan error, 1)
+	go func() { runResult <- runtime.Run(context.Background(), runtimeTestStart()) }()
+	<-network.started
+	var window LeaderWindow
+	select {
+	case window = <-backend.windows:
+	case <-time.After(time.Second):
+		t.Fatal("leader window was not delivered")
 	}
-	if candidateNotReadyWarnAfter < candidateNotReadyRetryInterval {
-		t.Fatal("the grace period is shorter than one retry, so no attempt is ever logged at debug")
+	artifact := runtimeOrdinaryArtifact(t, runtime.config, privateKey, window.Window.StartSlot, window.Window.Base)
+
+	submitted := make(chan error, 1)
+	go func() { submitted <- window.Submit(context.Background(), artifact) }()
+	select {
+	case err := <-submitted:
+		if err != nil {
+			t.Fatalf("submit candidate: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the producer is still waiting for the durable write")
+	}
+	// The submission itself stayed on the producer's goroutine and kept its
+	// place in the durable FIFO: the write is outstanding, not deferred.
+	if storage.saveCount() != 1 {
+		t.Fatalf("candidate saves = %d, want 1", storage.saveCount())
+	}
+	var done func(error)
+	select {
+	case done = <-callbacks:
+	default:
+		t.Fatal("the candidate write was never submitted")
+	}
+
+	// A peer asking while the write is outstanding is answered from the staged
+	// payload, which is why staging must not move.
+	response, err := runtime.ServeCandidate(context.Background(), simplex.PeerID{0x91}, CandidateRequest{
+		SessionID:     runtime.config.SessionID,
+		ID:            artifact.Candidate.ID,
+		WantCandidate: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.CandidateWire) == 0 {
+		t.Fatal("candidate was not servable while its durable write was outstanding")
+	}
+
+	done(nil)
+	if err = runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-runResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLeaderWindowSubmitterSurvivesDurableWriteFailure covers the runtime that
+// has no voter to report the write to — the standalone and delegated collator
+// composition builds its session as an observer, so this producer store is the
+// only durable write of its own candidate wire there is. Its failure is logged
+// rather than returned: the bytes were already broadcast, the collator marker
+// that binds this slot to this candidate is already durable, and retrying the
+// window does not repair a disk. That is the reference behaviour, which detaches
+// this store outright.
+func TestLeaderWindowSubmitterSurvivesDurableWriteFailure(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	network := newRuntimeTestNetwork()
+	backend := newRuntimeTestBackend()
+	saveErr := errors.New("no space left on device")
+	storage.saveHook = func(_ SessionStorageID, _ CandidateRecord, done func(error)) {
+		done(saveErr)
+	}
+	config, privateKey := runtimeTestConfig(0x58, &runtimeTestJournal{})
+	if config.Identity.Validator != nil {
+		t.Fatal("this test needs the observer composition, which has no voter")
+	}
+	var logOutput bytes.Buffer
+	logger := zerolog.New(&logOutput)
+	session, err := PrepareSessionRuntime(context.Background(), config, runtimeTestState(), RuntimeOptions{
+		Storage: storage,
+		Network: network,
+		Backend: backend,
+		Limits:  CandidateLimits{MaxBlockBytes: 1 << 20, MaxCollatedDataBytes: 1 << 20},
+		Logger:  &logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := session.(*sessionRuntime)
+
+	runResult := make(chan error, 1)
+	go func() { runResult <- runtime.Run(context.Background(), runtimeTestStart()) }()
+	<-network.started
+	var window LeaderWindow
+	select {
+	case window = <-backend.windows:
+	case <-time.After(time.Second):
+		t.Fatal("leader window was not delivered")
+	}
+	artifact := runtimeOrdinaryArtifact(t, runtime.config, privateKey, window.Window.StartSlot, window.Window.Base)
+	if err = window.Submit(context.Background(), artifact); err != nil {
+		t.Fatalf("a failed durable write stopped the producer: %v", err)
+	}
+	if storage.saveCount() != 1 {
+		t.Fatalf("candidate saves = %d, want 1", storage.saveCount())
+	}
+	if !strings.Contains(logOutput.String(), saveErr.Error()) {
+		t.Fatalf("the failed candidate write was not logged: %s", logOutput.String())
+	}
+
+	if err = runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-runResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The retention gauges have to describe now, not the last finalization. A
+// session that has stopped finalizing keeps accepting candidates and keeps
+// walking a lineage per leader window, so both numbers move while it is stuck —
+// and a projection refreshed only by OnFinalized holds its pre-standstill
+// values for exactly the interval the gauges were added to explain.
+func TestConsensusStatsReportRetentionWithoutAFinalization(t *testing.T) {
+	runtime, privateKey := prepareRuntimeTest(
+		t, 0x73, newRuntimeTestStorage(), newRuntimeTestNetwork(), newRuntimeTestBackend())
+	defer runtime.Close()
+
+	if stats := runtime.ConsensusStats(); stats.Retention.RetainedPayloads != 0 ||
+		stats.Retention.AnchorKnown {
+		t.Fatalf("a session that has done nothing reports %+v", stats.Retention)
+	}
+
+	parent := simplex.Genesis()
+	var bytesStaged int64
+	for slot := range uint32(3) {
+		artifact := runtimeBlockArtifact(t, runtime.config, privateKey, slot, parent, slot+1, uint64(slot))
+		wire, _, err := runtime.candidates.codec.encodeForBroadcast(artifact)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = runtime.candidates.stage(artifact, wire); err != nil {
+			t.Fatal(err)
+		}
+		bytesStaged += candidatePayloadBytes(artifact, wire)
+		parent = simplex.Parent(artifact.Candidate.ID)
+	}
+	// A leader window walked back to slot 5 while the session was not
+	// finalizing, which is what a stalled session spends its time doing.
+	runtime.states.mu.Lock()
+	runtime.states.noteLineageFloorLocked(5)
+	runtime.states.mu.Unlock()
+
+	stats := runtime.ConsensusStats()
+	if stats.Retention.RetainedPayloads != 3 {
+		t.Fatalf("retained payloads = %d, want the 3 staged without a finalization",
+			stats.Retention.RetainedPayloads)
+	}
+	if stats.Retention.RetainedBytes != bytesStaged {
+		t.Fatalf("retained bytes = %d, want %d", stats.Retention.RetainedBytes, bytesStaged)
+	}
+	if !stats.Retention.AnchorKnown || stats.Retention.AnchorSlot != 5 {
+		t.Fatalf("lineage anchor = %d (known=%v), want 5",
+			stats.Retention.AnchorSlot, stats.Retention.AnchorKnown)
+	}
+	if stats.Retention.BudgetBytes != retentionFloorCapBytes {
+		t.Fatalf("retention budget = %d, want the shard budget %d",
+			stats.Retention.BudgetBytes, retentionFloorCapBytes)
 	}
 }

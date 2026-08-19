@@ -19,10 +19,10 @@ import (
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
-// ConsensusObserverNetwork owns the process-wide Delegated-v3 endpoint and
-// every private-overlay session used by a standalone collator. PrepareSession
-// creates an inactive overlay exactly once and returns its session-scoped
-// consensus/candidate transport. Run is started later by SessionRuntime.
+// ConsensusObserverNetwork owns the process-wide delegated-collation endpoint
+// and every session transport used by a standalone collator or observer.
+// PrepareSession creates an inactive overlay exactly once and returns its
+// session-scoped transport. Run is started later by the session runtime.
 // Implementations must make UpdateSession, RetireSession, and Close
 // idempotent and must join their receiver goroutines before returning from
 // Close or from the SessionNetwork.Run call cancelled by retirement.
@@ -72,10 +72,10 @@ const (
 	observerSessionRetired
 )
 
-// ConsensusObserver runs one non-voting Simplex Pool per selected group. It
-// is the sole owner of the low-level network lifecycle and never accepts a
-// trusted externally supplied window: every progress event is derived by its
-// local Pool from authenticated votes and certificates.
+// ConsensusObserver owns the projected non-validator session lifecycles. A
+// protocol-1 plain observer is block-sync-only; other projected roles run a
+// non-voting Simplex Pool whose progress is derived from authenticated votes
+// and certificates.
 type ConsensusObserver struct {
 	network      ConsensusObserverNetwork
 	storage      ValidatorStorage
@@ -108,7 +108,7 @@ type observerSession struct {
 	state            SessionState
 	limits           CandidateLimits
 	network          SessionNetwork
-	runtime          *sessionRuntime
+	runtime          observerSessionRuntime
 	activation       *collator.SessionActivation
 	phase            observerSessionPhase
 	terminal         error
@@ -120,6 +120,13 @@ type observerSession struct {
 	overlayRetired bool
 	storageDeleted bool
 	progressWG     sync.WaitGroup
+}
+
+type observerSessionRuntime interface {
+	SessionRuntime
+	runWithStartup(context.Context, SessionStart, chan<- error) error
+	publishCandidate(context.Context, *CandidateArtifact) error
+	fail(error)
 }
 
 type observerRuntimeInput struct {
@@ -607,10 +614,19 @@ func (o *ConsensusObserver) BroadcastCandidate(
 		return collator.ErrCandidateConflict
 	}
 
+	// A delegated candidate is built by this very process — the collator↔validator
+	// link carries only pleaseCollatePrepare/pleaseCollate, never the candidate —
+	// so its payload was already compressed from the roots it was built from,
+	// exactly as on the self route in LocalSessionBackend.routeCandidate. Dropping
+	// the capsule here made the standalone collator compress every payload twice
+	// per slot and throw the first one away, then reach the second by parsing both
+	// BOCs back into cells and re-serializing them to prove they were canonical.
 	return session.runtime.publishCandidate(ctx, &CandidateArtifact{
 		Candidate:    artifact.Candidate,
 		BlockBOC:     artifact.BlockBOC,
 		CollatedData: artifact.CollatedData,
+		prepared:     artifact.Prepared(),
+		digested:     artifact.Digested(),
 	})
 }
 
@@ -901,8 +917,18 @@ func (o *ConsensusObserver) removeSession(id [32]byte, session *observerSession)
 func (o *ConsensusObserver) prepareRuntime(
 	ctx context.Context,
 	session *observerSession,
-) (*sessionRuntime, error) {
+) (observerSessionRuntime, error) {
 	config := session.config
+	if config.Protocol.ProtocolVersion == 1 &&
+		session.descriptor.Overlay.Role == collator.OverlayRoleObserver {
+		runtime, err := PrepareBlockSyncObserverRuntime(ctx, config, session.network, session.limits)
+		if err != nil {
+			return nil, fmt.Errorf("validator consensus observer: prepare block-sync runtime: %w", err)
+		}
+
+		return runtime, nil
+	}
+
 	config.Journal = o.storage.Journal(config.StorageID, len(config.Validators))
 	backend, err := NewLocalSessionBackend(ctx, LocalSessionBackendOptions{
 		Config:  config,
@@ -950,11 +976,41 @@ func (o *ConsensusObserver) runtimeInput(
 	if session.ID == ([32]byte{}) || descriptor.Update.SessionID != session.ID {
 		return observerRuntimeInput{}, errors.New("validator consensus observer: session id mismatch")
 	}
-	if session.ConsensusVersion != 2 || session.ProtocolVersion < 3 {
+	if session.ConsensusVersion != 2 || session.ProtocolVersion > simplex.MaxProtocolVersion {
 		return observerRuntimeInput{}, fmt.Errorf(
 			"validator consensus observer: unsupported simplex version %d protocol %d",
 			session.ConsensusVersion,
 			session.ProtocolVersion,
+		)
+	}
+	if overlay.Role != collator.OverlayRoleObserver && overlay.Role != collator.OverlayRoleCollator {
+		return observerRuntimeInput{}, errors.New("validator consensus observer: invalid overlay role")
+	}
+	if !session.Shard.IsMasterchain() {
+		registered := slices.Contains(overlay.AllCollators, o.localADNLID)
+		if registered != (overlay.Role == collator.OverlayRoleCollator) {
+			return observerRuntimeInput{}, errors.New(
+				"validator consensus observer: non-masterchain role differs from global collator registration",
+			)
+		}
+	}
+	if session.ProtocolVersion == 0 {
+		return observerRuntimeInput{}, errors.New(
+			"validator consensus observer: protocol version 0 has no non-validator identity",
+		)
+	}
+	expectedBroadcastMode := collator.CandidateBroadcastPrivateOverlay
+	if session.ProtocolVersion == 1 {
+		expectedBroadcastMode = collator.CandidateBroadcastBlockSyncOverlay
+	}
+	if overlay.BroadcastMode != expectedBroadcastMode {
+		return observerRuntimeInput{}, errors.New(
+			"validator consensus observer: candidate broadcast mode differs from protocol",
+		)
+	}
+	if overlay.ObserversInPrivateOverlay != (session.ProtocolVersion >= 2) {
+		return observerRuntimeInput{}, errors.New(
+			"validator consensus observer: private-overlay observer policy differs from protocol",
 		)
 	}
 	if len(session.Validators) == 0 || len(overlay.AllOverlayNodes) == 0 {
@@ -1005,7 +1061,9 @@ func (o *ConsensusObserver) runtimeInput(
 		ValidatorSetHash:     session.ValidatorSetHash,
 		Validators:           validators,
 		OverlayMembers:       overlay.AllOverlayNodes,
+		AllCurrentValidators: overlay.AllCurrentValidators,
 		CollatorsByValidator: overlay.CollatorsByValidator,
+		AllCollators:         overlay.AllCollators,
 		ShardPrefixLen:       shardPrefixLen,
 		Protocol:             protocol,
 		CandidateLimits:      limits,
@@ -1129,7 +1187,7 @@ func (o *ConsensusObserver) deliverFinalization(
 func (o *ConsensusObserver) flushProgress(
 	ctx context.Context,
 	session *observerSession,
-	runtime *sessionRuntime,
+	runtime observerSessionRuntime,
 	progress collator.ConsensusProgress,
 ) {
 	defer o.workersWG.Done()
@@ -1143,7 +1201,7 @@ func (o *ConsensusObserver) flushProgress(
 func (o *ConsensusObserver) flushFinalizations(
 	ctx context.Context,
 	session *observerSession,
-	runtime *sessionRuntime,
+	runtime observerSessionRuntime,
 	finalizations []collator.ConsensusFinalization,
 ) {
 	defer o.workersWG.Done()
@@ -1166,7 +1224,7 @@ func (o *ConsensusObserver) flushFinalizations(
 // that into a deadlock bounded only by the caller's deadline.
 func (o *ConsensusObserver) watchRuntime(
 	session *observerSession,
-	runtime *sessionRuntime,
+	runtime observerSessionRuntime,
 	runCancel context.CancelFunc,
 	returned <-chan error,
 	done chan<- struct{},

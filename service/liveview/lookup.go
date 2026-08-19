@@ -22,24 +22,61 @@ func (s *Store) BlockState(ctx context.Context, block ton.BlockIDExt) (*storage.
 	return s.backing.BlockState(ctx, block)
 }
 
+// LoadStateCellTree answers from the live view when the state is resident and
+// from the backing otherwise. Every consumer takes this one path — the
+// lightserver as much as collation and validation.
+//
+// The resident branch is the branch that is taken for collation and validation:
+// the live view holds every applied state as BlockState.Cell, so a predecessor
+// read essentially never reaches the backing. What comes back is an
+// already-decoded tree, returned AS ITSELF, and that matters twice over:
+//
+//   - Pointer identity. ChainState.validatedCandidateState compares tip states
+//     by pointer; handing out a copy, or a rebuilt tree, silently turns every
+//     live-successor carry-back into a full re-apply.
+//   - Loader inheritance. A resident tree's unresolved tips carry the loader
+//     that decoded them, so a subtree entered below a live root resolves through
+//     whatever produced that root and cannot be redirected from here.
+//     Redirecting it would mean rebuilding the tree, which is precisely the work
+//     residency exists to avoid.
+//
+// Both are pinned by TestLiveStoreResidentStateTipsKeepTheirOwnLoader. The
+// second is also the fact that defeated an attempt to give collation its own
+// decoded cell cache: the routing decision is taken once, at the first cold
+// decode, and a resident tip is past it.
 func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error) {
-	state, err := s.cachedBlockState(block)
-	if err == nil && state.Cell != nil {
-		if len(rootHash) > 0 && !bytes.Equal(state.StateRootHash, rootHash) {
-			return nil, storage.ErrNotFound
-		}
-
-		hash := state.Cell.HashKeyAt(0)
-		if !bytes.Equal(hash[:], state.StateRootHash) {
-			return nil, storage.ErrNotFound
-		}
-		return state.Cell, nil
+	if cached, err := s.cachedStateCellTree(block, rootHash); err == nil {
+		return cached, nil
+	} else if !errors.Is(err, errLiveStateNotCached) {
+		return nil, err
 	}
 
 	if !s.backingBlockAllowed(block) {
 		return nil, storage.ErrNotFound
 	}
 	return s.backing.LoadStateCellTree(ctx, block, rootHash)
+}
+
+// errLiveStateNotCached separates "the live view does not hold this state, go
+// ask the backing" from "the live view holds it and it does not match", which
+// is a real ErrNotFound that must not fall through to a second lookup.
+var errLiveStateNotCached = errors.New("liveview: state is not resident")
+
+func (s *Store) cachedStateCellTree(block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error) {
+	state, err := s.cachedBlockState(block)
+	if err != nil || state.Cell == nil {
+		return nil, errLiveStateNotCached
+	}
+
+	if len(rootHash) > 0 && !bytes.Equal(state.StateRootHash, rootHash) {
+		return nil, storage.ErrNotFound
+	}
+
+	hash := state.Cell.HashKeyAt(0)
+	if !bytes.Equal(hash[:], state.StateRootHash) {
+		return nil, storage.ErrNotFound
+	}
+	return state.Cell, nil
 }
 
 func (s *Store) BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error) {

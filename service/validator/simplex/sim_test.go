@@ -349,7 +349,7 @@ func (h *simHooks) HandleWindow(w Window) {
 	}
 }
 
-func (h *simHooks) OnNotarized(id CandidateID, cert *Certificate) {
+func (h *simHooks) OnNotarized(id CandidateID, cert VerifiedCertificate) {
 	prev, ok := h.node.notarized[id.Slot]
 	if ok && prev != id {
 		h.node.s.t.Errorf("node %d: conflicting notarizations at slot %d: %s vs %s",
@@ -358,7 +358,7 @@ func (h *simHooks) OnNotarized(id CandidateID, cert *Certificate) {
 	h.node.notarized[id.Slot] = id
 }
 
-func (h *simHooks) OnFinalized(id CandidateID, cert *Certificate) {
+func (h *simHooks) OnFinalized(id CandidateID, cert VerifiedCertificate) {
 	h.node.finalized = append(h.node.finalized, id)
 }
 

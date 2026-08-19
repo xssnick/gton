@@ -139,6 +139,17 @@ func (s *SyncCoordinator) CheckBlockBroadcastSignatures(ctx context.Context, req
 	return blockproof.CheckPreparedSignatures(req.Block, signatures, validators)
 }
 
+// CheckBlockFinalitySignatures authenticates a Simplex finality broadcast
+// received from an arbitrary network peer. It is the receiving side of what
+// validator.BlockAccepter publishes.
+//
+// It verifies in full, deliberately, and must keep doing so. This is the very
+// evidence the block accepter no longer re-verifies: there the certificate came
+// out of this node's own consensus engine, which had already checked the whole
+// quorum, and the accepter carries that fact in a simplex.VerifiedCertificate.
+// Here the certificate came from a peer and no engine of ours ever saw it, so
+// blockproof.CheckPreparedSignatures — never CheckPreparedSignatureWeight — is
+// what stands between a forged quorum and the block store.
 func (s *SyncCoordinator) CheckBlockFinalitySignatures(ctx context.Context, req p2p.BlockFinalitySignatureCheck) (*p2p.BlockFinalitySignatureCheckResult, error) {
 	if !req.Signatures.IsSimplex() {
 		return nil, fmt.Errorf("block finality broadcast %s has non-simplex validator signatures", storage.FormatBlockRef(req.Block))

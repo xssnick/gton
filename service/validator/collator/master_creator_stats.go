@@ -2,8 +2,8 @@ package collator
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"maps"
 	"math"
 	"math/big"
 	"slices"
@@ -14,6 +14,7 @@ import (
 const (
 	blockCreateStatsTag       = uint64(0x17)
 	creatorStatsTag           = uint64(0x4)
+	creatorStatsKeyBits       = uint(256)
 	discountedCounterFraction = uint(32)
 	discountedCounterBits     = uint(256)
 
@@ -40,14 +41,23 @@ type creatorStats struct {
 	shardchain  discountedCounter
 }
 
+// blockCreateStats is the block_create_stats#17 wrapper around the creator
+// dictionary, kept as a dictionary rather than a decoded map on purpose.
+//
+// The dictionary holds one entry per validator that produced a block recently,
+// while one masterchain block touches only the handful of creators named by its
+// shard tops plus the aggregate key. Materializing it costs a full traversal per
+// candidate — three of them on the masterchain validation path alone — to read
+// a few dozen entries. Both the collation update and the validation check
+// therefore work per key, exactly as the reference collator and validator do.
 type blockCreateStats struct {
-	entries map[[32]byte]creatorStats
+	dict *cell.Dictionary
 }
 
 type blockCreateStatsInput struct {
 	enabled bool
-	// previous is the statistics parseMasterStateInfoWithStats already decoded
-	// from the predecessor. A nil entries map represents a predecessor without
+	// previous is the statistics parseMasterStateInfoWithStats already opened
+	// from the predecessor. A nil dictionary represents a predecessor without
 	// the capability flag and therefore an empty creator dictionary.
 	previous           blockCreateStats
 	now                uint32
@@ -80,16 +90,25 @@ func countMasterShardCreators(tops []ShardTop) (map[[32]byte]uint32, error) {
 // updateBlockCreateStats applies the creator increments collected for one
 // masterchain block. A disabled capability deliberately returns no stats cell;
 // the caller must clear both the McStateExtra flag and its optional value.
+//
+// The predecessor dictionary is copied and then mutated one touched key at a
+// time, mirroring Collator::update_block_creator_count. Rebuilding the whole
+// dictionary instead would rehash every node on every path for entries that did
+// not move, and it would re-encode the predecessor's untouched nodes — a
+// canonical Hashmap is determined by its key set, but preserving the exact
+// predecessor subtrees keeps the result independent of any label-encoding
+// choice the reference collator made.
 func updateBlockCreateStats(input blockCreateStatsInput) (*cell.Cell, error) {
 	if !input.enabled {
 		return nil, nil
 	}
 
-	// The predecessor entries belong to the caller's decoded state, so they are
-	// copied before the increments are applied.
-	stats := blockCreateStats{entries: maps.Clone(input.previous.entries)}
-	if stats.entries == nil {
-		stats.entries = make(map[[32]byte]creatorStats)
+	dict := cell.NewDict(creatorStatsKeyBits)
+	if input.previous.dict != nil {
+		// Copy is copy-on-write: it shares the predecessor root and only
+		// replaces it locally as keys are set, so the caller's decoded state is
+		// left untouched.
+		dict = input.previous.dict.Copy()
 	}
 
 	increments, err := creatorStatsIncrements(input.shardBlockCreators, input.masterchainCreator)
@@ -98,7 +117,14 @@ func updateBlockCreateStats(input blockCreateStatsInput) (*cell.Cell, error) {
 	}
 	for _, creator := range sortedCreatorKeys(increments) {
 		increment := increments[creator]
-		entry := stats.entries[creator]
+		entry, _, err := lookupCreatorStats(dict, creator)
+		if err != nil {
+			return nil, fmt.Errorf("%w: decode block creator statistics %x: %v", ErrInvalidInput, creator, err)
+		}
+		// The zero-increment guards are load-bearing: the reference collator
+		// calls increase_by only for the component it is actually incrementing,
+		// so relaxing an untouched counter here would move its lastUpdated and
+		// decay its components for a creator the block never named.
 		if increment.masterchain != 0 {
 			if err = entry.masterchain.increaseBy(increment.masterchain, input.now); err != nil {
 				return nil, fmt.Errorf("%w: increase masterchain creator counter %x: %v", ErrInvalidInput, creator, err)
@@ -109,19 +135,58 @@ func updateBlockCreateStats(input blockCreateStatsInput) (*cell.Cell, error) {
 				return nil, fmt.Errorf("%w: increase shardchain creator counter %x: %v", ErrInvalidInput, creator, err)
 			}
 		}
-		stats.entries[creator] = entry
+		value, err := entry.toBuilder()
+		if err != nil {
+			return nil, fmt.Errorf("%w: serialize creator statistics %x: %v", ErrInvalidInput, creator, err)
+		}
+		if err = dict.SetBuilderByBytesKey(creator[:], value); err != nil {
+			return nil, fmt.Errorf("%w: store creator statistics %x: %v", ErrInvalidInput, creator, err)
+		}
 	}
 
-	root, err := stats.toCell()
-	if err != nil {
+	builder := cell.BeginCell()
+	if err = builder.StoreUInt(blockCreateStatsTag, 8); err != nil {
+		return nil, fmt.Errorf("%w: serialize block creator statistics tag: %v", ErrInvalidInput, err)
+	}
+	if err = builder.StoreDict(dict); err != nil {
 		return nil, fmt.Errorf("%w: serialize block creator statistics: %v", ErrInvalidInput, err)
 	}
-	return root, nil
+	return builder.EndCell(), nil
 }
 
-// verifyBlockCreateStatsUpdate takes both sides already decoded by
-// parseMasterStateInfoWithStats; a nil entries map means the statistics are
+// lookupCreatorStats reads one creator entry. An absent key is the zero entry,
+// exactly as block::unpack_CreatorStats treats a null value, and is reported
+// through the second result so callers that must distinguish "absent" from
+// "present and zero" can.
+func lookupCreatorStats(dict *cell.Dictionary, creator [32]byte) (creatorStats, bool, error) {
+	if dict == nil {
+		return creatorStats{}, false, nil
+	}
+	value, err := dict.LoadValueByBytesKey(creator[:])
+	if err != nil {
+		if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+			return creatorStats{}, false, nil
+		}
+		return creatorStats{}, false, err
+	}
+	entry, err := loadCreatorStats(value)
+	if err != nil {
+		return creatorStats{}, false, err
+	}
+	return entry, true, nil
+}
+
+// verifyBlockCreateStatsUpdate takes both sides already opened by
+// parseMasterStateInfoWithStats; a nil dictionary means the statistics are
 // absent from that state.
+//
+// It is a port of ValidateQuery::check_block_create_stats and runs in two
+// passes for the same reasons the reference does. The structural pass diffs the
+// two dictionaries, which reports every entry that actually moved while
+// skipping equal subtrees by hash — an untouched entry is pinned to the
+// already-accepted predecessor by that hash and needs no re-derivation. The
+// second pass covers the converse mistake the diff cannot see: a creator that
+// was required to move and whose entry the candidate left alone.
 func verifyBlockCreateStatsUpdate(
 	previous blockCreateStats,
 	next blockCreateStats,
@@ -129,56 +194,121 @@ func verifyBlockCreateStatsUpdate(
 	shardBlockCreators map[[32]byte]uint32,
 	masterchainCreator [32]byte,
 ) error {
-	oldStats := previous
-	if next.entries == nil {
+	if next.dict == nil {
 		return fmt.Errorf("%w: resulting block creator statistics are absent", ErrInvalidInput)
 	}
-	newStats := next
 	increments, err := creatorStatsIncrements(shardBlockCreators, masterchainCreator)
 	if err != nil {
 		return err
 	}
+	previousDict := previous.dict
+	if previousDict == nil {
+		previousDict = cell.NewDict(creatorStatsKeyBits)
+	}
 
-	keys := make(map[[32]byte]struct{}, len(oldStats.entries)+len(newStats.entries)+len(increments))
-	for creator := range oldStats.entries {
-		keys[creator] = struct{}{}
+	changed := make(map[[32]byte]struct{}, len(increments))
+	if err = previousDict.ScanDiff(next.dict, func(key *cell.Cell, oldValue, newValue *cell.Slice) error {
+		creator, keyErr := creatorStatsKeyBytes(key)
+		if keyErr != nil {
+			return keyErr
+		}
+		changed[creator] = struct{}{}
+
+		oldEntry, decodeErr := decodeCreatorStatsValue(oldValue)
+		if decodeErr != nil {
+			return fmt.Errorf("previous creator statistics %x: %w", creator, decodeErr)
+		}
+		newEntry, decodeErr := decodeCreatorStatsValue(newValue)
+		if decodeErr != nil {
+			return fmt.Errorf("resulting creator statistics %x: %w", creator, decodeErr)
+		}
+		return verifyOneCreatorStatsUpdate(creator, oldEntry, newEntry, newValue != nil, increments[creator], now)
+	}); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
-	for creator := range newStats.entries {
-		keys[creator] = struct{}{}
-	}
+
+	// The zero key carries the aggregate and is checked whether or not it moved,
+	// so a candidate cannot leave a stale or two-zero aggregate behind on a
+	// block that created nothing.
+	required := make(map[[32]byte]struct{}, len(increments)+1)
 	for creator := range increments {
-		keys[creator] = struct{}{}
+		required[creator] = struct{}{}
 	}
-	for _, creator := range sortedCreatorKeys(keys) {
-		oldEntry := oldStats.entries[creator]
-		newEntry, newExists := newStats.entries[creator]
-		increment := increments[creator]
-		if err = verifyDiscountedCounterUpdate(
-			oldEntry.masterchain,
-			newEntry.masterchain,
-			increment.masterchain,
-			now,
-		); err != nil {
-			return fmt.Errorf(
-				"%w: masterchain creator counter %x: %v", ErrInvalidInput, creator, err,
-			)
+	required[[32]byte{}] = struct{}{}
+	for _, creator := range sortedCreatorKeys(required) {
+		if _, moved := changed[creator]; moved {
+			continue
 		}
-		if err = verifyDiscountedCounterUpdate(
-			oldEntry.shardchain,
-			newEntry.shardchain,
-			increment.shardchain,
-			now,
-		); err != nil {
-			return fmt.Errorf(
-				"%w: shardchain creator counter %x: %v", ErrInvalidInput, creator, err,
-			)
+		oldEntry, _, lookupErr := lookupCreatorStats(previousDict, creator)
+		if lookupErr != nil {
+			return fmt.Errorf("%w: previous creator statistics %x: %v", ErrInvalidInput, creator, lookupErr)
 		}
-		if newExists && newEntry.masterchain.total == 0 && newEntry.shardchain.total == 0 {
-			return fmt.Errorf("%w: creator %x contains two zero counters", ErrInvalidInput, creator)
+		newEntry, newExists, lookupErr := lookupCreatorStats(next.dict, creator)
+		if lookupErr != nil {
+			return fmt.Errorf("%w: resulting creator statistics %x: %v", ErrInvalidInput, creator, lookupErr)
+		}
+		if err = verifyOneCreatorStatsUpdate(creator, oldEntry, newEntry, newExists, increments[creator], now); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidInput, err)
 		}
 	}
 
 	return nil
+}
+
+// verifyOneCreatorStatsUpdate is check_one_block_creator_update: both counters
+// must follow their increment, and an entry that survives with two zero totals
+// should have been deleted instead.
+func verifyOneCreatorStatsUpdate(
+	creator [32]byte,
+	oldEntry creatorStats,
+	newEntry creatorStats,
+	newExists bool,
+	increment creatorStatsIncrement,
+	now uint32,
+) error {
+	if err := verifyDiscountedCounterUpdate(
+		oldEntry.masterchain,
+		newEntry.masterchain,
+		increment.masterchain,
+		now,
+	); err != nil {
+		return fmt.Errorf("masterchain creator counter %x: %v", creator, err)
+	}
+	if err := verifyDiscountedCounterUpdate(
+		oldEntry.shardchain,
+		newEntry.shardchain,
+		increment.shardchain,
+		now,
+	); err != nil {
+		return fmt.Errorf("shardchain creator counter %x: %v", creator, err)
+	}
+	if newExists && newEntry.masterchain.total == 0 && newEntry.shardchain.total == 0 {
+		return fmt.Errorf("creator %x contains two zero counters", creator)
+	}
+	return nil
+}
+
+// decodeCreatorStatsValue treats an absent side of the diff as the zero entry,
+// as block::unpack_CreatorStats does for a null value.
+func decodeCreatorStatsValue(value *cell.Slice) (creatorStats, error) {
+	if value == nil {
+		return creatorStats{}, nil
+	}
+	return loadCreatorStats(value)
+}
+
+func creatorStatsKeyBytes(key *cell.Cell) ([32]byte, error) {
+	var creator [32]byte
+	loader, err := key.BeginParse()
+	if err != nil {
+		return creator, fmt.Errorf("parse creator statistics key: %w", err)
+	}
+	raw, err := loader.LoadSlice(creatorStatsKeyBits)
+	if err != nil || loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
+		return creator, fmt.Errorf("creator statistics key is malformed")
+	}
+	copy(creator[:], raw)
+	return creator, nil
 }
 
 func verifyDiscountedCounterUpdate(
@@ -260,7 +390,16 @@ func creatorStatsIncrements(
 	return increments, nil
 }
 
-func parseBlockCreateStats(root *cell.Cell) (blockCreateStats, error) {
+// openBlockCreateStats decodes the block_create_stats#17 header and hands back
+// the creator dictionary without walking it.
+//
+// The walk is deliberately not performed here. The predecessor side comes from
+// an already-accepted state, and the candidate side has every untouched subtree
+// pinned by hash to that same predecessor through verifyBlockCreateStatsUpdate's
+// diff, which validates exactly the nodes that moved. This is the same bound the
+// reference validator works under: DictionaryBase::validate checks the root
+// shape only, and scan_diff parses nothing else.
+func openBlockCreateStats(root *cell.Cell) (blockCreateStats, error) {
 	loader, err := root.BeginParse()
 	if err != nil {
 		return blockCreateStats{}, fmt.Errorf("%w: decode block creator statistics: %v", ErrInvalidInput, err)
@@ -269,54 +408,12 @@ func parseBlockCreateStats(root *cell.Cell) (blockCreateStats, error) {
 	if err != nil || tag != blockCreateStatsTag {
 		return blockCreateStats{}, fmt.Errorf("%w: invalid block creator statistics tag", ErrInvalidInput)
 	}
-	dict, err := loader.LoadDict(256)
-	if err != nil || loader.BitsLeft() != 0 || loader.RefsNum() != 0 || !dict.ValidateAll() {
+	dict, err := loader.LoadDict(creatorStatsKeyBits)
+	if err != nil || loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
 		return blockCreateStats{}, fmt.Errorf("%w: malformed block creator statistics dictionary", ErrInvalidInput)
 	}
-	items, err := dict.LoadAll()
-	if err != nil {
-		return blockCreateStats{}, fmt.Errorf("%w: load block creator statistics: %v", ErrInvalidInput, err)
-	}
 
-	entries := make(map[[32]byte]creatorStats, len(items))
-	for i := range items {
-		key, loadErr := items[i].Key.LoadSlice(256)
-		if loadErr != nil || items[i].Key.BitsLeft() != 0 || items[i].Key.RefsNum() != 0 {
-			return blockCreateStats{}, fmt.Errorf("%w: block creator statistics key %d is malformed", ErrInvalidInput, i)
-		}
-		var creator [32]byte
-		copy(creator[:], key)
-		entry, loadErr := loadCreatorStats(items[i].Value)
-		if loadErr != nil {
-			return blockCreateStats{}, fmt.Errorf("%w: block creator statistics %x: %v", ErrInvalidInput, creator, loadErr)
-		}
-		entries[creator] = entry
-	}
-
-	return blockCreateStats{entries: entries}, nil
-}
-
-func (s blockCreateStats) toCell() (*cell.Cell, error) {
-	dict := cell.NewDict(256)
-	for _, creator := range sortedCreatorKeys(s.entries) {
-		value, err := s.entries[creator].toCell()
-		if err != nil {
-			return nil, fmt.Errorf("creator %x: %w", creator, err)
-		}
-		key := cell.BeginCell().MustStoreSlice(creator[:], 256).EndCell()
-		if err = dict.Set(key, value); err != nil {
-			return nil, fmt.Errorf("store creator %x: %w", creator, err)
-		}
-	}
-
-	builder := cell.BeginCell()
-	if err := builder.StoreUInt(blockCreateStatsTag, 8); err != nil {
-		return nil, err
-	}
-	if err := builder.StoreDict(dict); err != nil {
-		return nil, err
-	}
-	return builder.EndCell(), nil
+	return blockCreateStats{dict: dict}, nil
 }
 
 func loadCreatorStats(loader *cell.Slice) (creatorStats, error) {
@@ -338,7 +435,11 @@ func loadCreatorStats(loader *cell.Slice) (creatorStats, error) {
 	return creatorStats{masterchain: masterchain, shardchain: shardchain}, nil
 }
 
-func (s creatorStats) toCell() (*cell.Cell, error) {
+// toBuilder is what the collation update stores. The dictionary takes a builder,
+// so finalizing a cell here would hash a value that is about to be re-embedded
+// anyway — the reference collator hands set_builder an unfinalized CellBuilder
+// for the same reason.
+func (s creatorStats) toBuilder() (*cell.Builder, error) {
 	builder := cell.BeginCell()
 	if err := builder.StoreUInt(creatorStatsTag, 4); err != nil {
 		return nil, err
@@ -348,6 +449,14 @@ func (s creatorStats) toCell() (*cell.Cell, error) {
 	}
 	if err := s.shardchain.store(builder); err != nil {
 		return nil, fmt.Errorf("shardchain counter: %w", err)
+	}
+	return builder, nil
+}
+
+func (s creatorStats) toCell() (*cell.Cell, error) {
+	builder, err := s.toBuilder()
+	if err != nil {
+		return nil, err
 	}
 	return builder.EndCell(), nil
 }
@@ -375,6 +484,11 @@ func loadDiscountedCounter(loader *cell.Slice) (discountedCounter, error) {
 		count2048:   count2048,
 		count65536:  count65536,
 	}
+	// This is the only place a touched entry's counter is checked for structural
+	// validity. verifyDiscountedCounterUpdate has two early returns that call
+	// neither increaseBy nor store — an unchanged counter, and a zero one that
+	// stayed zero — so dropping this check would accept states the reference
+	// rejects, which validates on every unpack.
 	if err = counter.validate(); err != nil {
 		return discountedCounter{}, err
 	}

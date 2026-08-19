@@ -110,7 +110,7 @@ const (
 
 // Extension adapts a standalone controller to the node lifecycle. It retains
 // only masterchain states observed before Start, then bootstraps exact history
-// before the controller opens its Delegated-v3 endpoint.
+// before the controller opens its delegated-collation endpoint.
 type Extension struct {
 	controller Controller
 	history    groups.MasterchainHistory

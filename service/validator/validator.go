@@ -39,9 +39,10 @@ type Options struct {
 	// Runtime owns the group tracker and message pool shared with an in-process
 	// local collator. The composition root closes it after all extensions stop.
 	Runtime *Runtime
-	// FreshnessWindow gates block bookkeeping by generation time: blocks
-	// older than the window (catch-up sync) are skipped entirely. 0 means
-	// 5m, negative processes every block.
+	// FreshnessWindow gates block bookkeeping and initial consensus admission
+	// by generation time. Historical catch-up blocks do not start sessions;
+	// once a current snapshot admits consensus, transient lag never stops it.
+	// 0 means 5m, negative processes and admits every block.
 	FreshnessWindow time.Duration
 	// HeadSettleDelay arms the pool from an old chain head: a stale block
 	// unsuperseded for this long is processed anyway — a halted chain
@@ -67,6 +68,9 @@ type Options struct {
 	// ownership alone does not imply that this process owns every associated
 	// ADNL identity.
 	ObserverADNLIDs [][32]byte
+	// Metrics receives bounded validator metrics, including session
+	// specification rejection transitions. Nil disables those metrics.
+	Metrics ValidationObserver
 	// LocalCollator is the in-process self-production backend used by voting
 	// sessions which do not select a configured remote collator. The validator
 	// lifecycle starts it before preparing sessions and closes it after every
@@ -147,6 +151,7 @@ func New(opts Options) hooks.ExtensionFactory {
 				resolved.PrepareSession,
 				resolved.ObserverADNLIDs...,
 			)
+			s.sessions.metrics = resolved.Metrics
 		}
 		close(s.hooksIdle)
 		s.runCtx, s.cancel = context.WithCancel(context.Background())
@@ -241,6 +246,12 @@ type Service struct {
 	// sizeUnverified latches the one-time warning about states that do not
 	// store the out-queue size.
 	sizeUnverified atomic.Bool
+
+	// consensusAdmitted is a one-way startup gate. C++ starts validator groups
+	// from the synchronized head rather than every historical state seen during
+	// catch-up; after admission it keeps them alive through transient lag.
+	consensusAdmitted atomic.Bool
+	consensusDeferred atomic.Bool
 }
 
 // pendingHead is one deferred stale-head candidate.
@@ -581,9 +592,7 @@ func (s *Service) OnBlockApplied(ctx context.Context, ev hooks.BlockAppliedEvent
 				return fmt.Errorf("reconcile internal-message destinations: %w", err)
 			}
 		}
-		if s.sessions != nil {
-			s.sessions.Reconcile(result.Snapshot)
-		}
+		s.reconcileConsensus(result.Snapshot)
 	}
 
 	s.processAppliedBlock(ev)
@@ -765,11 +774,36 @@ func (s *Service) reconcileInitialGroupSnapshot(snapshot *groups.Snapshot) error
 			return fmt.Errorf("reconcile internal-message destinations: %w", err)
 		}
 	}
-	if s.sessions != nil {
-		s.sessions.Reconcile(snapshot)
-	}
+	s.reconcileConsensus(snapshot)
 
 	return nil
+}
+
+func (s *Service) reconcileConsensus(snapshot *groups.Snapshot) {
+	if s.sessions == nil {
+		return
+	}
+	if !s.consensusAdmitted.Load() && s.opts.FreshnessWindow >= 0 {
+		generatedAt := time.Unix(int64(snapshot.GenUTime), 0)
+		lag := time.Since(generatedAt)
+		if snapshot.GenUTime == 0 || lag > s.opts.FreshnessWindow {
+			if s.consensusDeferred.CompareAndSwap(false, true) {
+				s.log.Warn().
+					Uint32("masterchain_seqno", snapshot.MasterchainBlock.SeqNo).
+					Dur("masterchain_lag", lag).
+					Msg("deferring consensus sessions while node catches up")
+			}
+
+			return
+		}
+	}
+	if s.consensusAdmitted.CompareAndSwap(false, true) && s.consensusDeferred.Load() {
+		s.log.Info().
+			Uint32("masterchain_seqno", snapshot.MasterchainBlock.SeqNo).
+			Msg("node caught up, admitting consensus sessions")
+	}
+
+	s.sessions.Reconcile(snapshot)
 }
 
 func (s *Service) reconcileInternals(snapshot *groups.Snapshot) error {

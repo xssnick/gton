@@ -12,19 +12,55 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Stats are engine counters; retrieve a snapshot via Engine.Stats.
+// Stats are engine counters and the engine's current consensus position;
+// retrieve a snapshot via Engine.Stats.
+//
+// The position fields are here rather than behind separate accessors because
+// they are read together, off the loop goroutine, by one process-wide metrics
+// collector: what a stalled session needs reported is the slot it is stuck on,
+// how long ago anything finalized and which validators are still signing, and
+// asking for those one at a time would be four round trips onto the very
+// goroutine that is wedged.
 type Stats struct {
-	VotesApplied       uint64
-	OwnVotesCast       uint64
-	MessagesDropped    uint64
-	CertificatesBuilt  uint64
-	CertificatesStored uint64
-	CandidatesAccepted uint64
-	CandidatesRejected uint64
-	SlotsFinalized     uint64
-	Misbehaviors       uint64
-	Bans               uint64
-	Standstills        uint64
+	VotesApplied        uint64
+	OwnVotesCast        uint64
+	MessagesDropped     uint64
+	CertificatesBuilt   uint64
+	CertificatesStored  uint64
+	CandidatesAccepted  uint64
+	CandidatesRejected  uint64
+	CandidatesAbstained uint64
+	SlotsFinalized      uint64
+	Misbehaviors        uint64
+	Bans                uint64
+	Standstills         uint64
+
+	// CertificatesByKind and SignaturesByKind split CertificatesStored where
+	// the kind is already in hand. A skip certificate and a finalize
+	// certificate are opposite facts about a session — one settles a slot with
+	// no block, the other settles it with one — and aggregating them was the
+	// reason a five-hour standstill could not be told from a healthy run
+	// without reading logs. Indexed by VoteKind.
+	CertificatesByKind [VoteKindCount]uint64
+	SignaturesByKind   [VoteKindCount]uint64
+
+	// Slot is the present slot, FinalizedSlot the highest finalized one, and
+	// HasFinalized whether anything has finalized in this session at all.
+	Slot          uint32
+	FinalizedSlot uint32
+	HasFinalized  bool
+	// LastFinalizedAt is when the last finalization was observed, by the wall
+	// clock the runner drives the engine from. Its age is the liveness signal.
+	LastFinalizedAt time.Time
+	// FirstBlockTimeout is the voter's current leader-window timeout, which the
+	// skip ladder scales. Zero for an observer, which has no voter.
+	FirstBlockTimeout time.Duration
+	// LastSignedSlot is, per validator index, the highest slot at which that
+	// validator's signature appeared in a certificate this engine stored. It is
+	// the continuous form of the per-certificate participation column the log
+	// prints, and it is the only place a silently absent voter shows up before
+	// the session stops finalizing. Nil for a session that has stored none.
+	LastSignedSlot []uint32
 }
 
 // Engine is the headless Simplex consensus state machine for one validator
@@ -36,12 +72,23 @@ type Stats struct {
 // use: every method must be called from one goroutine. Runner provides that
 // loop for production; deterministic tests drive the engine directly.
 type Engine struct {
-	sessionID   [32]byte
-	validators  []Validator
+	// certs is the whole basis on which this engine treats a quorum as proved:
+	// the session id, the roster the signature indices address, the 2/3+1
+	// threshold, and the binding every certificate it verifies or assembles
+	// carries out through the hooks (see VerifiedCertificate).
+	//
+	// It is one object rather than four fields on purpose. What an engine seals
+	// with has to be what it verified against, and while those were separate
+	// fields the two agreed only because one constructor happened to fill them
+	// from the same config — a later edit could move one and leave a seal
+	// asserting a session or a roster nothing was checked under. Here the
+	// binding is derived by NewCertificateVerifier from the very roster it
+	// stores, and sessionID(), validators(), threshold() and binding() all read
+	// out of it, so the agreement is not something a caller can get wrong.
+	certs *CertificateVerifier
+
 	totalWeight uint64
-	threshold   uint64
 	localIndex  int
-	protocol    uint8
 	spw         uint32
 	shardPfxLen uint32
 	maxCertWire int
@@ -129,7 +176,7 @@ func (e *Engine) votePayload(v Vote) []byte {
 	if !c.set || c.vote != v {
 		c.set = true
 		c.vote = v
-		c.payload = DataToSign(e.sessionID, VoteBytes(v))
+		c.payload = DataToSign(e.sessionID(), VoteBytes(v))
 	}
 	return c.payload
 }
@@ -140,8 +187,8 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if len(cfg.Validators) == 0 {
 		return nil, fmt.Errorf("simplex: empty validator set")
 	}
-	if cfg.ProtocolVersion < 3 {
-		return nil, fmt.Errorf("simplex: protocol version %d is unsupported, require 3 or newer", cfg.ProtocolVersion)
+	if cfg.ProtocolVersion > MaxProtocolVersion {
+		return nil, fmt.Errorf("simplex: protocol version %d is unsupported", cfg.ProtocolVersion)
 	}
 	if cfg.SlotsPerLeaderWindow == 0 {
 		return nil, fmt.Errorf("simplex: slots per leader window must be positive")
@@ -162,6 +209,23 @@ func NewEngine(cfg Config) (*Engine, error) {
 	total, err := totalValidatorWeight(cfg.Validators)
 	if err != nil {
 		return nil, err
+	}
+	certs, err := NewCertificateVerifier(cfg.SessionID, cfg.Validators)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.LocalIndex != ObserverIndex {
+		// The engine attests certificates it assembles itself instead of
+		// verifying them (Engine.seal), and one of the signatures in such a
+		// certificate is always our own. Nothing else ever checks that Signer
+		// produces signatures valid under the key the roster lists for us: a
+		// mis-wired signer used to be caught locally when block acceptance
+		// re-verified the quorum, and after the seal removed that pass it would
+		// instead be caught by the network, after publication. One sign+verify
+		// pair per session closes it.
+		if err = probeSignerIdentity(cfg.Signer, cfg.Validators[cfg.LocalIndex].PublicKey, cfg.SessionID); err != nil {
+			return nil, err
+		}
 	}
 
 	params := DefaultParams()
@@ -186,12 +250,9 @@ func NewEngine(cfg Config) (*Engine, error) {
 
 	nValidators := len(cfg.Validators)
 	e := &Engine{
-		sessionID:             cfg.SessionID,
-		validators:            cfg.Validators,
+		certs:                 certs,
 		totalWeight:           total,
-		threshold:             total*2/3 + 1,
 		localIndex:            cfg.LocalIndex,
-		protocol:              cfg.ProtocolVersion,
 		spw:                   cfg.SlotsPerLeaderWindow,
 		shardPfxLen:           cfg.ShardPrefixLen,
 		params:                params,
@@ -221,6 +282,27 @@ func NewEngine(cfg Config) (*Engine, error) {
 	return e, nil
 }
 
+// probeSignerIdentity checks that the injected Signer really holds the private
+// half of the public key the roster lists for this node. The probe payload is
+// a well-formed consensus.dataToSign over a skip vote for a slot no session
+// reaches, so a signer that refuses to sign anything but session payloads still
+// passes and nothing the probe produces is a usable protocol message.
+func probeSignerIdentity(signer Signer, publicKey ed25519.PublicKey, sessionID [32]byte) error {
+	if len(publicKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("simplex: local validator has an invalid public key")
+	}
+	payload := DataToSign(sessionID, VoteBytes(SkipVote(^uint32(0))))
+	sig, err := signer.Sign(payload)
+	if err != nil {
+		return fmt.Errorf("simplex: signer probe: %w", err)
+	}
+	if len(sig) != ed25519.SignatureSize || !ed25519.Verify(publicKey, payload, sig) {
+		return fmt.Errorf("simplex: signer does not hold the key of local validator")
+	}
+
+	return nil
+}
+
 // ---- lifecycle ----
 
 // Start loads the journal, replays certificates and own votes, re-casts the
@@ -244,10 +326,16 @@ func (e *Engine) Start() error {
 	// and verifying that state again would pay a quorum of ed25519
 	// verifications per saved certificate for nothing. Anything else, including
 	// a state that grew since, is verified here as before.
-	if e.bootstrap.State() != bs {
-		if _, err = ValidateBootstrap(e.sessionID, e.validators, bs); err != nil {
-			return err
+	//
+	// The binding comparison is what makes "already verified" mean verified for
+	// *this* session and roster: pointer identity alone would accept a state
+	// validated against someone else's.
+	if e.bootstrap.State() != bs || e.bootstrap.Binding() != e.binding() {
+		validated, validateErr := ValidateBootstrap(e.sessionID(), e.validators(), bs)
+		if validateErr != nil {
+			return validateErr
 		}
+		e.bootstrap = validated
 	}
 	e.firstNonAnnouncedWindow = bs.FirstNonAnnouncedWindow
 
@@ -269,7 +357,10 @@ func (e *Engine) Start() error {
 		if !slot.needs(cert.Vote) {
 			return fmt.Errorf("simplex: journal holds duplicate %s certificate for slot %d", cert.Vote.Kind, cert.Vote.Slot())
 		}
-		e.storeSavedCertificate(slot, cert)
+		// Every certificate here was verified against this engine's session id
+		// and roster, either by the bootstrap the caller handed us (binding
+		// checked above) or by the ValidateBootstrap just run.
+		e.storeSavedCertificate(slot, e.seal(cert))
 		if e.fatalErr != nil {
 			return e.fatalErr
 		}
@@ -294,7 +385,7 @@ func (e *Engine) Start() error {
 		Shard:                e.shard,
 		CCSeqno:              e.ccSeqno,
 		LocalIndex:           e.localIndex,
-		TotalValidators:      len(e.validators),
+		TotalValidators:      len(e.validators()),
 		Weight:               e.localWeight(),
 		TotalWeight:          e.totalWeight,
 		SlotsPerLeaderWindow: e.spw,
@@ -304,7 +395,7 @@ func (e *Engine) Start() error {
 
 	if e.localIndex >= 0 {
 		e.log.Info().Msgf("validator group started, we are validator %d with weight %d out of %d",
-			e.localIndex, e.validators[e.localIndex].Weight, e.totalWeight)
+			e.localIndex, e.validators()[e.localIndex].Weight, e.totalWeight)
 	} else {
 		e.log.Info().Msgf("validator group started, we are an observer")
 	}
@@ -325,8 +416,35 @@ func (e *Engine) Stop() {
 // Err returns the fatal session error, if any.
 func (e *Engine) Err() error { return e.fatalErr }
 
-// Stats returns a snapshot of the engine counters.
-func (e *Engine) Stats() Stats { return e.stats }
+// Stats returns a snapshot of the engine counters and its consensus position.
+// The per-validator participation slice is copied, so the snapshot can outlive
+// the loop turn it was taken on.
+func (e *Engine) Stats() Stats {
+	stats := e.statsAliased()
+	stats.LastSignedSlot = append([]uint32(nil), stats.LastSignedSlot...)
+
+	return stats
+}
+
+// statsAliased is Stats without that copy: LastSignedSlot in the returned value
+// is the engine's own slice, which the engine keeps writing to. Only a caller
+// on the loop goroutine that neither retains nor mutates it may use this, which
+// is Runner.publishStats and nothing else — it copies the slice exactly when it
+// has changed, so the roster-sized copy is paid per certificate rather than per
+// loop turn.
+func (e *Engine) statsAliased() Stats {
+	stats := e.stats
+	stats.Slot = e.now
+	if e.lastFinalized.Exists {
+		stats.FinalizedSlot = e.lastFinalized.ID.Slot
+		stats.HasFinalized = true
+	}
+	if e.voter != nil {
+		stats.FirstBlockTimeout = e.voter.firstBlockTimeout
+	}
+
+	return stats
+}
 
 // UpdateParams installs a new noncritical parameter set mid-session. Timers
 // already armed keep their deadline and pick up the new pacing on the next
@@ -343,7 +461,7 @@ func (e *Engine) localWeight() uint64 {
 	if e.localIndex < 0 {
 		return 0
 	}
-	return e.validators[e.localIndex].Weight
+	return e.validators()[e.localIndex].Weight
 }
 
 // trace hands one event to the optional Tracer.
@@ -537,7 +655,7 @@ func (e *Engine) handleMessage(src PeerID, srcValidator int, data []byte) {
 
 	switch binary.LittleEndian.Uint32(data) {
 	case idSignedVote:
-		if srcValidator < 0 || srcValidator >= len(e.validators) {
+		if srcValidator < 0 || srcValidator >= len(e.validators()) {
 			e.log.Warn().Msgf("dropping vote from a peer that is not a validator")
 			e.ban(src)
 			return
@@ -577,7 +695,7 @@ func (e *Engine) handleMessage(src PeerID, srcValidator int, data []byte) {
 			e.stats.MessagesDropped++
 			return
 		}
-		cert, err := parseCertificate(data, len(e.validators))
+		cert, err := parseCertificate(data, len(e.validators()))
 		if err != nil {
 			e.stats.MessagesDropped++
 			return
@@ -590,7 +708,8 @@ func (e *Engine) handleMessage(src PeerID, srcValidator int, data []byte) {
 				return
 			}
 		}
-		if err = e.verifyCertificate(cert); err != nil {
+		verified, err := e.verifyCertificate(cert)
+		if err != nil {
 			e.log.Warn().Msgf("dropping bad certificate: %v", err)
 			e.ban(src)
 			return
@@ -604,7 +723,7 @@ func (e *Engine) handleMessage(src PeerID, srcValidator int, data []byte) {
 				return
 			}
 		}
-		e.handleCertificate(cert)
+		e.handleCertificate(verified)
 
 	default:
 		e.stats.MessagesDropped++
@@ -631,7 +750,7 @@ func (e *Engine) flushVerify() {
 		return
 	}
 
-	verifyPendingVotes(e.validators, batch)
+	verifyPendingVotes(e.validators(), batch)
 
 	// The gates the admission path ran are re-run here against current state:
 	// applying an earlier entry of this very batch can ban the sender, finalize
@@ -695,6 +814,17 @@ func verifyPendingVote(validators []Validator, p *pendingVote) bool {
 		ed25519.Verify(validators[p.idx].PublicKey, p.payload, p.sig)
 }
 
+// sessionID, validators, threshold and binding all read one object, so an
+// engine can neither verify against a roster it does not seal with nor sign a
+// vote for a session it does not verify certificates under.
+func (e *Engine) sessionID() [32]byte { return e.certs.binding.sessionID }
+
+func (e *Engine) validators() []Validator { return e.certs.validators }
+
+func (e *Engine) threshold() uint64 { return e.certs.threshold }
+
+func (e *Engine) binding() CertificateBinding { return e.certs.binding }
+
 // verifyCertificate checks a certificate against the session validator set:
 // the vote shape, index bounds, per-validator uniqueness, the 2/3+1 weighted
 // quorum and every signature. The cheap structural checks run before any
@@ -704,16 +834,48 @@ func verifyPendingVote(validators []Validator, p *pendingVote) bool {
 // reuse the memoized dataToSign payload and the precomputed threshold — and
 // enforces the same precondition: the vote shape check keeps votePayload from
 // panicking on a kind voteToTL cannot encode.
-func (e *Engine) verifyCertificate(cert *Certificate) error {
+func (e *Engine) verifyCertificate(cert *Certificate) (VerifiedCertificate, error) {
 	if cert == nil {
-		return fmt.Errorf("simplex: nil certificate")
+		return VerifiedCertificate{}, fmt.Errorf("simplex: nil certificate")
 	}
 	if err := validateCertificateVote(cert.Vote); err != nil {
-		return err
+		return VerifiedCertificate{}, err
 	}
 	payload := e.votePayload(cert.Vote)
+	if err := verifyCertificatePayload(e.certs.validators, e.certs.threshold, payload, cert); err != nil {
+		return VerifiedCertificate{}, err
+	}
 
-	return verifyCertificatePayload(e.validators, e.threshold, payload, cert)
+	return sealCertificate(cert, e.certs.binding), nil
+}
+
+// seal attests a certificate whose quorum the engine did not verify as a
+// quorum, because it never needed to: it holds the evidence one signature at a
+// time.
+//
+// This is caller attestation, not verification, and it is the one seal that is
+// only as sound as the code around it. What makes it sound today:
+//
+//   - buildCertificate takes only records with p.set && !p.fromCert, i.e. votes
+//     that went through Engine.applyVote;
+//   - applyVote has exactly two non-test callers: finishVoteCast, whose
+//     signature we just produced with e.signer (and NewEngine proved that signer
+//     holds the roster key), and flushVerify, which applies an inbound vote only
+//     when verifyPendingVotes set p.ok;
+//   - the certificate is built only once onVoteApplied sees the accumulated
+//     weight cross e.threshold(), the same 2/3+1 bound verifyCertificatePayload
+//     enforces;
+//   - index bounds and per-validator uniqueness are structural: signatures are
+//     indexed by the slot's own votes[i] array, one record per validator.
+//
+// A third applyVote caller that skips verification would silently invalidate
+// this. TestEngineSelfSealedCertificateVerifies re-verifies a self-built
+// certificate from the outside and is what catches that.
+//
+// It has the same shape as the signatureChecked bypass in
+// PrecheckCandidateBroadcast.
+func (e *Engine) seal(cert *Certificate) VerifiedCertificate {
+	return sealCertificate(cert, e.certs.binding)
 }
 
 // ---- candidates ----
@@ -749,7 +911,7 @@ func (e *Engine) SubmitCandidate(c *Candidate) error {
 	// A custom LeaderSchedule is embedder-supplied while the candidate itself
 	// is untrusted input; refuse an out-of-range leader instead of indexing
 	// the validator set with it.
-	if int(leader) >= len(e.validators) {
+	if int(leader) >= len(e.validators()) {
 		return fmt.Errorf("simplex: leader schedule returned out-of-range validator %d for slot %d", leader, cc.ID.Slot)
 	}
 	if cc.Leader != leader {
@@ -758,14 +920,13 @@ func (e *Engine) SubmitCandidate(c *Candidate) error {
 	if cc.Delegation != nil {
 		if err := verifyDelegatedCandidate(
 			&cc,
-			e.validators[leader].PublicKey,
-			e.sessionID,
+			e.validators()[leader].PublicKey,
+			e.sessionID(),
 			e.spw,
-			e.protocol,
 		); err != nil {
 			return err
 		}
-	} else if !VerifyCandidateSignature(e.validators[leader].PublicKey, e.sessionID, cc.ID, cc.Signature) {
+	} else if !VerifyCandidateSignature(e.validators()[leader].PublicKey, e.sessionID(), cc.ID, cc.Signature) {
 		return fmt.Errorf("simplex: candidate signature is not valid")
 	}
 

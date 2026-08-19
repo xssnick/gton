@@ -9,6 +9,7 @@ import (
 
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 	"github.com/xssnick/gton/service/validator"
+	"github.com/xssnick/gton/service/validator/groups"
 )
 
 type validatorControlClient struct {
@@ -29,8 +30,13 @@ type validatorOptions struct {
 	Runtime   validator.SharedRuntimeOptions
 }
 
-func configureValidator(cfg nodeconfig.Validator) (validatorOptions, error) {
-	opts := validatorOptions{Enabled: cfg.Enabled}
+func configureValidator(cfg nodeconfig.Validator, maximalVerticalSeqno uint32) (validatorOptions, error) {
+	opts := validatorOptions{
+		Enabled: cfg.Enabled,
+		Runtime: validator.SharedRuntimeOptions{
+			Groups: groups.TrackerOptions{MaximalVerticalSeqno: maximalVerticalSeqno},
+		},
+	}
 	if !cfg.Enabled {
 		return opts, nil
 	}

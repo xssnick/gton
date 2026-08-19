@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -21,9 +22,20 @@ import (
 )
 
 type acceptanceTestNode struct {
-	blocks  []p2p.DownloadedBlock
-	proofs  map[string][]byte
-	history map[storage.BlockSeqRef]ton.BlockIDExt
+	blocks    []p2p.DownloadedBlock
+	proofs    map[string][]byte
+	history   map[storage.BlockSeqRef]ton.BlockIDExt
+	published []storage.LiveBlockArtifacts
+}
+
+func (n *acceptanceTestNode) PublishAcceptedBlockState(artifacts storage.LiveBlockArtifacts) error {
+	n.published = append(n.published, artifacts)
+
+	return nil
+}
+
+func (n *acceptanceTestNode) BlockArtifactsSignal() <-chan struct{} {
+	return make(chan struct{})
 }
 
 func (n *acceptanceTestNode) BlockData(context.Context, ton.BlockIDExt) ([]byte, error) {
@@ -379,7 +391,7 @@ func TestBlockAccepterRejectsInvalidBlockHeadersBeforeSignatures(t *testing.T) {
 				kind = simplex.VoteFinalize
 			}
 			acceptance := fixture.acceptance(kind, false)
-			acceptance.Certificate.Signatures[0].Signature[0] ^= 0xff
+			acceptance.Certificate.Certificate().Signatures[0].Signature[0] ^= 0xff
 			node := &acceptanceTestNode{}
 			accepter, err := newAcceptanceTestAccepter(fixture, node)
 			if err != nil {
@@ -575,10 +587,20 @@ func (f acceptanceTestFixture) acceptance(kind simplex.VoteKind, throughEmpty bo
 			),
 		}},
 	}
+	// The accepter only ever sees sealed certificates, so the fixture goes
+	// through the real verification rather than fabricating a seal.
+	verified, err := simplex.VerifyCertificate(
+		f.config.SessionID,
+		runtimeValidators(f.config.Validators),
+		certificate,
+	)
+	if err != nil {
+		panic(fmt.Sprintf("acceptance fixture: verify certificate: %v", err))
+	}
 
 	return BlockAcceptance{
 		Candidate:          f.candidate,
-		Certificate:        certificate,
+		Certificate:        verified,
 		CertifiedCandidate: certified,
 	}
 }
@@ -593,7 +615,7 @@ func (f acceptanceTestFixture) signatureSet(
 	if err != nil {
 		t.Fatalf("hash validator public key: %v", err)
 	}
-	certificate := acceptance.Certificate
+	certificate := acceptance.Certificate.Certificate()
 
 	return blockproof.NewSimplexValidatorSignatureSet(
 		f.config.CatchainSeqno,
@@ -764,4 +786,131 @@ func acceptanceTestBlockExtra(masterchain bool) *cell.Cell {
 		EndCell()
 
 	return builder.MustStoreBoolBit(true).MustStoreRef(masterchainExtra).EndCell()
+}
+
+// TestAcceptancePublishesTheShardStateAheadOfTheStore pins the write half of the
+// read rule at the point where it happens.
+//
+// Local submission is asynchronous by design, so a block this node has finalized
+// is invisible to every local reader until the shard client applies it — and for a
+// shard block that needs a masterchain block carrying this shard top. The
+// acceptance path already holds everything a reader needs, so it publishes:
+//
+//   - the state, BY REFERENCE. The pointer is the assertion, not the hash: the
+//     live view returns a resident state as itself and chain_state.go compares tip
+//     states by pointer, so a copy anywhere on this path costs a silent full
+//     re-apply per candidate.
+//   - the block BOC and root, because a chain tip carries both and the store's own
+//     readiness check does not even look at the BOC.
+//   - the proof link, which is what the NEXT block's shard top description reads
+//     and the other half of what the acceptance retry loop used to wait for.
+func TestAcceptancePublishesTheShardStateAheadOfTheStore(t *testing.T) {
+	fixture := newAcceptanceTestFixture(t, groups.ShardID{Workchain: 0, Shard: math.MinInt64})
+	acceptance := fixture.acceptance(simplex.VoteFinalize, false)
+	computed := cell.BeginCell().MustStoreUInt(0xc0ffee, 32).EndCell()
+	acceptance.state = &ChainState{
+		shard: fixture.config.Shard,
+		tips: []ChainTip{{
+			ID:       *acceptance.Candidate.Candidate.Block.Copy(),
+			BlockBOC: acceptance.Candidate.BlockBOC,
+			State:    computed,
+		}},
+		root: computed,
+	}
+
+	node := &acceptanceTestNode{}
+	accepter, err := newAcceptanceTestAccepter(fixture, node)
+	if err != nil {
+		t.Fatalf("construct block accepter: %v", err)
+	}
+	if err = accepter.Accept(context.Background(), acceptance, acceptanceTestViewResolver(fixture.view(t))); err != nil {
+		t.Fatalf("accept block: %v", err)
+	}
+
+	if len(node.published) != 1 {
+		t.Fatalf("published %d states, want the one just accepted", len(node.published))
+	}
+	published := node.published[0]
+	if !published.Block.Equals(&acceptance.Candidate.Candidate.Block) {
+		t.Fatal("the publication names another block")
+	}
+	if published.State == nil || published.State.Cell != computed {
+		t.Error("the published state is not the very cell this node computed")
+	}
+	if !bytes.Equal(published.BlockData, acceptance.Candidate.BlockBOC) {
+		t.Error("the publication carries no block data, so a chain tip read still cannot be served")
+	}
+	if published.Root == nil || !bytes.Equal(published.Root.Hash(), published.Block.RootHash) {
+		t.Error("the publication carries no parsed block root")
+	}
+	var link bool
+	for _, proof := range published.Proofs {
+		if proof.Kind == storage.ServedProofBlockLink && len(proof.Data) > 0 {
+			link = true
+		}
+	}
+	if !link {
+		t.Error("the publication carries no proof link, so the next shard top description still waits for the store")
+	}
+	// The publication is submitted before it is published, so a reader that finds
+	// it in the live view is never ahead of the pipeline that will commit it.
+	if len(node.blocks) != 1 {
+		t.Fatalf("submitted %d blocks, want one", len(node.blocks))
+	}
+}
+
+// Nothing is published without a state to publish. A replayed finalization after
+// a restart has none, and a block on its own would sit in the live view with no
+// bound of its own until its flush.
+func TestAcceptanceWithoutAResolvedStatePublishesNothing(t *testing.T) {
+	fixture := newAcceptanceTestFixture(t, groups.ShardID{Workchain: 0, Shard: math.MinInt64})
+	acceptance := fixture.acceptance(simplex.VoteFinalize, false)
+	acceptance.Replay = true
+
+	node := &acceptanceTestNode{}
+	accepter, err := newAcceptanceTestAccepter(fixture, node)
+	if err != nil {
+		t.Fatalf("construct block accepter: %v", err)
+	}
+	if err = accepter.Accept(context.Background(), acceptance, acceptanceTestViewResolver(fixture.view(t))); err != nil {
+		t.Fatalf("accept block: %v", err)
+	}
+	if len(node.published) != 0 {
+		t.Fatalf("published %d states without one to publish", len(node.published))
+	}
+}
+
+// The masterchain is deliberately out of scope. Its applied state follows within a
+// block or two, it never stalled in the measured incident, and its replay ordering
+// is a deliberate parity with the reference — while an uncommitted masterchain
+// state would additionally reach the masterchain state caches.
+func TestAcceptanceDoesNotPublishMasterchainStates(t *testing.T) {
+	fixture := newAcceptanceTestFixture(t, groups.ShardID{Workchain: -1, Shard: math.MinInt64})
+	acceptance := fixture.acceptance(simplex.VoteFinalize, false)
+	computed := cell.BeginCell().MustStoreUInt(0xdecaf, 32).EndCell()
+	acceptance.state = &ChainState{
+		shard: fixture.config.Shard,
+		tips: []ChainTip{{
+			ID:       *acceptance.Candidate.Candidate.Block.Copy(),
+			BlockBOC: acceptance.Candidate.BlockBOC,
+			State:    computed,
+		}},
+		root: computed,
+	}
+
+	node := &acceptanceTestNode{}
+	accepter, err := newAcceptanceTestAccepter(fixture, node)
+	if err != nil {
+		t.Fatalf("construct block accepter: %v", err)
+	}
+	if err = accepter.Accept(
+		context.Background(),
+		acceptance,
+		acceptanceTestViewResolver(BlockAcceptanceView{}),
+	); err != nil {
+		t.Fatalf("accept block: %v", err)
+	}
+	if len(node.published) != 0 {
+		t.Fatalf("published %d masterchain states, want none", len(node.published))
+	}
 }

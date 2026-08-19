@@ -2,7 +2,6 @@ package network
 
 import (
 	"crypto/ed25519"
-	"errors"
 	"reflect"
 	"testing"
 
@@ -11,58 +10,81 @@ import (
 )
 
 // specFieldMutation names one sessionSpec field together with a mutation of it.
-// mergeable records whether the mergeSessionSpecs precondition observes the
-// field; every field except the derived peers slice must be observed by equal,
-// which doubles as the handle-freshness check in session.handleMatches.
+// physical records whether the field affects an open overlay. Every field
+// except the derived peers slice must be observed by equal.
 type specFieldMutation struct {
-	field     string
-	mutate    func(*sessionSpec)
-	mergeable bool
-	observed  bool
+	field    string
+	mutate   func(*sessionSpec)
+	physical bool
+	observed bool
 }
 
 func sessionSpecFieldMutations() []specFieldMutation {
 	other := p2p.PeerID{0x50}
 
 	return []specFieldMutation{
-		{field: "id", mergeable: true, observed: true, mutate: func(s *sessionSpec) { s.id = [32]byte{9} }},
+		{field: "id", physical: true, observed: true, mutate: func(s *sessionSpec) { s.id = [32]byte{9} }},
 		{field: "kind", observed: true, mutate: func(s *sessionSpec) { s.kind = sessionKindObserver }},
 		{field: "role", observed: true, mutate: func(s *sessionSpec) { s.role = collator.OverlayRoleObserver }},
-		{field: "workchain", mergeable: true, observed: true, mutate: func(s *sessionSpec) { s.workchain = -1 }},
-		{field: "shard", mergeable: true, observed: true, mutate: func(s *sessionSpec) { s.shard = 1 }},
+		{field: "protocolVersion", physical: true, observed: true, mutate: func(s *sessionSpec) { s.protocolVersion = 1 }},
+		{field: "useQUIC", physical: true, observed: true, mutate: func(s *sessionSpec) { s.useQUIC = false }},
+		{field: "slotsPerLeaderWindow", physical: true, observed: true, mutate: func(s *sessionSpec) { s.slotsPerLeaderWindow = 2 }},
+		{field: "openConsensus", physical: true, observed: true, mutate: func(s *sessionSpec) { s.openConsensus = false }},
+		{field: "workchain", physical: true, observed: true, mutate: func(s *sessionSpec) { s.workchain = -1 }},
+		{field: "shard", physical: true, observed: true, mutate: func(s *sessionSpec) { s.shard = 1 }},
 		{
-			field: "fullOverlayID", mergeable: true, observed: true,
+			field: "fullOverlayID", physical: true, observed: true,
 			mutate: func(s *sessionSpec) { s.fullOverlayID = []byte{9, 9, 9} },
 		},
 		{
-			field: "members", observed: true,
+			field: "members", physical: true, observed: true,
 			mutate: func(s *sessionSpec) { s.members = append(append([]p2p.PeerID(nil), s.members...), other) },
 		},
 		// peers is derived: remoteMembers(members, localADNLID) at every
 		// construction site, so equal observes members instead.
 		{field: "peers", mutate: func(s *sessionSpec) { s.peers = append(append([]p2p.PeerID(nil), s.peers...), other) }},
 		{
-			field: "validatorByADNL", mergeable: true, observed: true,
+			field: "blockSyncFullID", physical: true, observed: true,
+			mutate: func(s *sessionSpec) { s.blockSyncFullID = []byte{8, 8, 8} },
+		},
+		{
+			field: "blockSyncMembers", physical: true, observed: true,
+			mutate: func(s *sessionSpec) { s.blockSyncMembers = []p2p.PeerID{other} },
+		},
+		{
+			field: "twoStepMembers", physical: true, observed: true,
+			mutate: func(s *sessionSpec) { s.twoStepMembers = []p2p.PeerID{other} },
+		},
+		{
+			field: "validatorByADNL", physical: true, observed: true,
 			mutate: func(s *sessionSpec) { s.validatorByADNL = map[p2p.PeerID]int{other: 0} },
 		},
-		{field: "validatorCount", mergeable: true, observed: true, mutate: func(s *sessionSpec) { s.validatorCount = 2 }},
-		{field: "catchainSeqno", mergeable: true, observed: true, mutate: func(s *sessionSpec) { s.catchainSeqno = 77 }},
 		{
-			field: "validatorSetHash", mergeable: true, observed: true,
+			field: "validatorKeys", physical: true, observed: true,
+			mutate: func(s *sessionSpec) { s.validatorKeys = [][32]byte{{0x51}} },
+		},
+		{field: "validatorCount", physical: true, observed: true, mutate: func(s *sessionSpec) { s.validatorCount = 2 }},
+		{field: "catchainSeqno", physical: true, observed: true, mutate: func(s *sessionSpec) { s.catchainSeqno = 77 }},
+		{
+			field: "validatorSetHash", physical: true, observed: true,
 			mutate: func(s *sessionSpec) { s.validatorSetHash = 78 },
 		},
-		{field: "maxReplyBytes", mergeable: true, observed: true, mutate: func(s *sessionSpec) { s.maxReplyBytes = 1 << 21 }},
+		{field: "maxReplyBytes", physical: true, observed: true, mutate: func(s *sessionSpec) { s.maxReplyBytes = 1 << 21 }},
 		{
-			field: "authorized", mergeable: true, observed: true,
+			field: "consensusAuthorized", physical: true, observed: true,
+			mutate: func(s *sessionSpec) { s.consensusAuthorized = map[p2p.PeerID]uint32{other: 1} },
+		},
+		{
+			field: "authorized", physical: true, observed: true,
 			mutate: func(s *sessionSpec) { s.authorized = map[p2p.PeerID]uint32{other: 1} },
 		},
 		{
-			field: "candidateADNL", mergeable: true, observed: true,
+			field: "candidateADNL", physical: true, observed: true,
 			mutate: func(s *sessionSpec) { s.candidateADNL = map[p2p.PeerID]p2p.PeerID{other: other} },
 		},
 		{
-			field: "validatorSource", mergeable: true, observed: true,
-			mutate: func(s *sessionSpec) { s.validatorSource = map[p2p.PeerID]struct{}{other: {}} },
+			field: "validatorSource", physical: true, observed: true,
+			mutate: func(s *sessionSpec) { s.validatorSource = map[p2p.PeerID]int{other: 0} },
 		},
 		{
 			field: "signer", observed: true,
@@ -78,30 +100,37 @@ func fullSessionSpec() sessionSpec {
 	member := p2p.PeerID{0x20}
 	source := p2p.PeerID{0x30}
 
+	authorized := map[p2p.PeerID]uint32{source: 1 << 20}
 	return sessionSpec{
-		id:               [32]byte{1},
-		kind:             sessionKindValidator,
-		role:             collator.OverlayRoleCollator,
-		workchain:        0,
-		shard:            -1 << 63,
-		fullOverlayID:    []byte{1, 2, 3},
-		members:          []p2p.PeerID{local, member},
-		peers:            []p2p.PeerID{member},
-		validatorByADNL:  map[p2p.PeerID]int{member: 0},
-		validatorCount:   1,
-		catchainSeqno:    9,
-		validatorSetHash: 10,
-		maxReplyBytes:    1 << 20,
-		authorized:       map[p2p.PeerID]uint32{source: 1 << 20},
-		candidateADNL:    map[p2p.PeerID]p2p.PeerID{source: member},
-		validatorSource:  map[p2p.PeerID]struct{}{source: {}},
-		signer:           testOverlaySigner{key: ed25519.NewKeyFromSeed(bytesOf(1, ed25519.SeedSize))},
+		id:                   [32]byte{1},
+		kind:                 sessionKindValidator,
+		role:                 0,
+		protocolVersion:      3,
+		useQUIC:              true,
+		slotsPerLeaderWindow: 1,
+		openConsensus:        true,
+		workchain:            0,
+		shard:                -1 << 63,
+		fullOverlayID:        []byte{1, 2, 3},
+		members:              []p2p.PeerID{local, member},
+		peers:                []p2p.PeerID{member},
+		twoStepMembers:       []p2p.PeerID{local, member},
+		validatorByADNL:      map[p2p.PeerID]int{member: 0},
+		validatorKeys:        [][32]byte{{1}},
+		validatorCount:       1,
+		catchainSeqno:        9,
+		validatorSetHash:     10,
+		maxReplyBytes:        1 << 20,
+		consensusAuthorized:  authorized,
+		authorized:           authorized,
+		candidateADNL:        map[p2p.PeerID]p2p.PeerID{source: member},
+		validatorSource:      map[p2p.PeerID]int{source: 0},
+		signer:               testOverlaySigner{key: ed25519.NewKeyFromSeed(bytesOf(1, ed25519.SeedSize))},
 	}
 }
 
-// TestSessionSpecMutationTableCoversEveryField is the guard the two predicates
-// need: a newly added sessionSpec field is silently absent from equal and from
-// the merge precondition by default, and neither omission is a compile error.
+// TestSessionSpecMutationTableCoversEveryField guards the two equality
+// predicates: adding a field cannot silently omit it from freshness checks.
 func TestSessionSpecMutationTableCoversEveryField(t *testing.T) {
 	covered := make(map[string]struct{}, len(sessionSpecFieldMutations()))
 	for _, mutation := range sessionSpecFieldMutations() {
@@ -115,7 +144,7 @@ func TestSessionSpecMutationTableCoversEveryField(t *testing.T) {
 	for i := range specType.NumField() {
 		name := specType.Field(i).Name
 		if _, ok := covered[name]; !ok {
-			t.Fatalf("sessionSpec field %s has no mutation: add it here and to equal/mergeableFieldsEqual", name)
+			t.Fatalf("sessionSpec field %s has no mutation: add it here and to the equality predicates", name)
 		}
 	}
 	if len(covered) != specType.NumField() {
@@ -143,56 +172,22 @@ func TestSessionSpecEqualObservesEveryFieldButDerivedPeers(t *testing.T) {
 	}
 }
 
-func TestSessionSpecMergePreconditionObservesSharedFields(t *testing.T) {
+func TestSessionSpecOverlayEqualityObservesPhysicalFields(t *testing.T) {
 	base := fullSessionSpec()
-	if !base.mergeableFieldsEqual(fullSessionSpec()) {
-		t.Fatal("mergeableFieldsEqual rejected two identical specs")
+	if !base.overlayFieldsEqual(fullSessionSpec()) {
+		t.Fatal("overlayFieldsEqual rejected two identical specs")
 	}
 
-	local := [32]byte{0x10}
 	for _, mutation := range sessionSpecFieldMutations() {
 		t.Run(mutation.field, func(t *testing.T) {
 			mutated := base
 			mutation.mutate(&mutated)
-			if base.mergeableFieldsEqual(mutated) == mutation.mergeable {
+			if base.overlayFieldsEqual(mutated) == mutation.physical {
 				t.Fatalf(
-					"mergeableFieldsEqual on mutated %s = %v, want %v",
-					mutation.field, base.mergeableFieldsEqual(mutated), !mutation.mergeable,
+					"overlayFieldsEqual on mutated %s = %v, want %v",
+					mutation.field, base.overlayFieldsEqual(mutated), !mutation.physical,
 				)
 			}
-
-			_, err := mergeSessionSpecs(base, mutated, local)
-			if mutation.mergeable != errors.Is(err, ErrSessionConflict) {
-				t.Fatalf("mergeSessionSpecs on mutated %s = %v, conflict expected: %v", mutation.field, err, mutation.mergeable)
-			}
 		})
-	}
-}
-
-// The merged spec is the input to overlayConfig and to handleMatches, so its
-// union order and its deliberately cleared role fields are load-bearing.
-func TestMergeSessionSpecsUnionsMembersAndClearsRoleFields(t *testing.T) {
-	local := [32]byte{0x10}
-	extra := p2p.PeerID{0x50}
-	left := fullSessionSpec()
-	right := fullSessionSpec()
-	right.kind = sessionKindObserver
-	right.role = collator.OverlayRoleObserver
-	right.signer = nil
-	right.members = []p2p.PeerID{p2p.PeerID(local), extra}
-
-	merged, err := mergeSessionSpecs(left, right, local)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if merged.kind != 0 || merged.role != 0 || merged.signer != nil {
-		t.Fatal("merge kept a role-scoped field that receiveCandidate resolves from the contribution instead")
-	}
-	wantMembers := []p2p.PeerID{p2p.PeerID(local), p2p.PeerID{0x20}, extra}
-	if !reflect.DeepEqual(merged.members, wantMembers) {
-		t.Fatalf("merged members = %v, want left-then-right union %v", merged.members, wantMembers)
-	}
-	if !reflect.DeepEqual(merged.peers, []p2p.PeerID{{0x20}, extra}) {
-		t.Fatalf("merged peers = %v, want the union without the local ID", merged.peers)
 	}
 }

@@ -37,7 +37,7 @@ const (
 	// service lifetime, so an RPC deadline cannot poison the deterministic
 	// session ID while shutdown still cancels it promptly.
 	prepareRollbackTimeout = 10 * time.Second
-	// The protocol's fixed maximum future window. This is a Delegated-v3
+	// The protocol's fixed maximum future window. This is a delegated-collation
 	// admission bound, not a configurable validator desync limit.
 	delegationWindowHorizon = uint32(20)
 	// retiredTombstoneLimit bounds the retirement fence. Session IDs are
@@ -2192,9 +2192,15 @@ func (s *Service) produceWindowWithRetry(job *productionJob) error {
 	}()
 
 	retries := 0
+	wait := productionInputWait{start: time.Now()}
 	for {
 		err := s.runProduction(job)
+		if errors.Is(err, ErrAcquisitionNotReady) {
+			wait.observe(err)
+		}
 		if !retryableProductionError(err) {
+			s.logProductionInputWait(job, wait, err)
+
 			return err
 		}
 		if s.opts.Observer != nil {
@@ -2230,6 +2236,47 @@ func (s *Service) produceWindowWithRetry(job *productionJob) error {
 			s.retrying.Add(-1)
 		}
 	}
+}
+
+// productionInputWait accumulates one leader window's wait for local inputs.
+// The per-attempt failure is not an event worth a line — the same window
+// produces a burst of identical ones — so the window reports what it waited for
+// once, when it stops waiting.
+type productionInputWait struct {
+	start    time.Time
+	attempts int
+	first    error
+}
+
+func (w *productionInputWait) observe(err error) {
+	w.attempts++
+	if w.first == nil {
+		w.first = err
+	}
+}
+
+// logProductionInputWait emits that one line. Its message is deliberately
+// distinct from "block collation failed" so a search for genuine build failures
+// does not have to filter this out — which is exactly what the previous shared
+// message forced, and what made a 0.18% real failure rate read as 39%.
+func (s *Service) logProductionInputWait(job *productionJob, wait productionInputWait, err error) {
+	if wait.attempts == 0 {
+		return
+	}
+	event := s.log.Debug()
+	if event == nil {
+		return
+	}
+
+	event.
+		Hex("session_id", job.window.ID.SessionID[:]).
+		Uint32("window_start", job.window.ID.StartSlot).
+		Uint32("leader", job.window.Leader).
+		Int("attempts", wait.attempts).
+		Dur("waited", time.Since(wait.start)).
+		AnErr("first_error", wait.first).
+		AnErr("outcome", err).
+		Msg("collation window waited for inputs")
 }
 
 func productionRetryDelay(retries int) time.Duration {
@@ -2552,20 +2599,20 @@ func (s *Service) runProduction(job *productionJob) error {
 			}
 			stageStarted := s.metricStageStarted()
 			if err = s.opts.Pipeline.RestoreCandidate(job.ctx, restore, artifact); err != nil {
-				s.observeMetricStage(chain, CollationStageRestore, stageStarted)
+				s.observeMetricStage(chain, CollationStageRestoreCandidate, stageStarted)
 				s.observeCandidateProduction(chain, CandidateKindRecovered, productionStarted, err)
 
 				return fmt.Errorf("collator runtime: restore candidate state: %w", err)
 			}
-			s.observeMetricStage(chain, CollationStageRestore, stageStarted)
+			s.observeMetricStage(chain, CollationStageRestoreCandidate, stageStarted)
 			stageStarted = s.metricStageStarted()
 			if err = waitUntil(job.ctx, broadcastTime(record, slot)); err != nil {
-				s.observeMetricStage(chain, CollationStageBroadcastWait, stageStarted)
+				s.observeMetricStage(chain, CollationStageWaitBroadcastSlot, stageStarted)
 				s.observeCandidateProduction(chain, CandidateKindRecovered, productionStarted, err)
 
 				return err
 			}
-			s.observeMetricStage(chain, CollationStageBroadcastWait, stageStarted)
+			s.observeMetricStage(chain, CollationStageWaitBroadcastSlot, stageStarted)
 			if s.opts.Observer != nil {
 				s.opts.Observer.ObserveScheduleLateness(
 					chain,
@@ -2575,12 +2622,12 @@ func (s *Service) runProduction(job *productionJob) error {
 			}
 			stageStarted = s.metricStageStarted()
 			if err = s.opts.Emit(job.ctx, artifact); err != nil {
-				s.observeMetricStage(chain, CollationStageEmit, stageStarted)
+				s.observeMetricStage(chain, CollationStageDeliverCandidate, stageStarted)
 				s.observeCandidateProduction(chain, CandidateKindRecovered, productionStarted, err)
 
 				return fmt.Errorf("collator runtime: emit recovered candidate: %w", err)
 			}
-			s.observeMetricStage(chain, CollationStageEmit, stageStarted)
+			s.observeMetricStage(chain, CollationStageDeliverCandidate, stageStarted)
 			s.observeCandidateProduction(chain, CandidateKindRecovered, productionStarted, nil)
 			advance(artifact)
 			continue
@@ -2598,6 +2645,7 @@ func (s *Service) runProduction(job *productionJob) error {
 			Previous:             previous,
 			ExternalWaitUntil:    externalWaitUntil(record, slot),
 			ExternalProcessUntil: externalProcessUntil(record, slot),
+			BuildSoftDeadline:    softBuildDeadline(record, slot),
 		}
 		// emitEmpty commits this slot as an empty candidate. It deliberately does
 		// not touch future: the soft-timeout path keeps its live build for the
@@ -2607,7 +2655,7 @@ func (s *Service) runProduction(job *productionJob) error {
 			started := time.Now()
 			stageStarted := s.metricStageStarted()
 			artifact, emptyErr := s.signEmptyArtifact(record.Session, job.window, slot, parent, block)
-			s.observeMetricStage(chain, CollationStageSign, stageStarted)
+			s.observeMetricStage(chain, CollationStageSignCandidate, stageStarted)
 			if emptyErr != nil {
 				s.observeCandidateProduction(chain, CandidateKindEmpty, started, emptyErr)
 
@@ -2638,7 +2686,7 @@ func (s *Service) runProduction(job *productionJob) error {
 			if parent.Exists {
 				stageStarted := s.metricStageStarted()
 				state, stateErr := s.opts.Pipeline.ResolveCandidateState(job.ctx, request)
-				s.observeMetricStage(chain, CollationStageResolveState, stageStarted)
+				s.observeMetricStage(chain, CollationStageResolveCandidateState, stageStarted)
 				if stateErr != nil {
 					return fmt.Errorf("collator runtime: resolve candidate state for slot %d: %w", slot, stateErr)
 				}
@@ -2659,10 +2707,16 @@ func (s *Service) runProduction(job *productionJob) error {
 		if softTimeout {
 			if !managed.allowEmptyOnGenerationFailure(record.Update.NoEmptyBlocksOnErrTimeout) {
 				if s.opts.Observer != nil {
+					// Distinct from an ordinary wait: this producer is not slow, it
+					// is forbidden to emit the empty block that would end the wait
+					// because the session has not finalized for
+					// NoEmptyBlocksOnErrTimeout. Reported as the same action, the
+					// two are indistinguishable — and in the field this one was the
+					// reason both Go nodes stayed silent in their own windows.
 					s.opts.Observer.ObserveCollationDeadline(
 						chain,
 						CollationDeadlineSoft,
-						DeadlineActionWait,
+						DeadlineActionWaitNoEmpty,
 					)
 				}
 				result, waitErr = awaitBuild(job.ctx, future)
@@ -2748,7 +2802,7 @@ func (s *Service) runProduction(job *productionJob) error {
 		}
 		stageStarted := s.metricStageStarted()
 		artifact, err := s.signArtifact(record.Session, job.window, slot, parent, result.candidate)
-		s.observeMetricStage(chain, CollationStageSign, stageStarted)
+		s.observeMetricStage(chain, CollationStageSignCandidate, stageStarted)
 		if err != nil {
 			s.observeCandidateProduction(chain, CandidateKindBlock, finishedFuture.started, err)
 
@@ -2813,8 +2867,16 @@ func (s *Service) startBuildFuture(
 				Duration: elapsed,
 			})
 		}
-		if err != nil {
-			if event := s.log.Debug(); event != nil {
+		// A build that stopped because a local input has not arrived is not a
+		// failure and is deliberately silent here. The window producer retries it
+		// on a 0/5/10/20/20 ms schedule, so one waiting window used to emit
+		// around twenty-one of these lines in well under a second — measured on
+		// the test network as 27,027 of 27,103 "block collation failed" lines in
+		// five hours, which made the collator read as failing 39% of its builds.
+		// The wait is reported once per window by logProductionInputWait, and
+		// counted honestly by gton_collator_retries_total{reason="not_ready"}.
+		if err != nil && !errors.Is(err, ErrAcquisitionNotReady) {
+			if event := s.log.Warn(); event != nil {
 				event.
 					Hex("session_id", request.Session.ID[:]).
 					Int32("workchain", request.Session.Shard.Workchain).
@@ -2951,31 +3013,51 @@ func (s *Service) persistAndEmit(
 	// while its payload was never remembered is unresumable, and the write is
 	// abandonable, so its outcome can be unknown to this goroutine.
 	managed.rememberEmitted(artifact.WindowID, artifact)
-	stageStarted := s.metricStageStarted()
-	if err := awaitStorageWrite(ctx, func(done func(error)) {
+	// Submitted here, awaited below. The marker's whole cost is one synced
+	// commit — measured at 4.88 ms per candidate against 4.87 ms for a bare
+	// synced Pebble commit on the same device, so the encoding, the window scan
+	// and the signature checks together are under 1% of it — and waiting for it
+	// here served nothing: what the marker has to be earlier than is the
+	// broadcast, not the state commit that follows building the block. The
+	// reference does not wait for its equivalent at all; the collator producer
+	// detaches its store (simplex/collator-producer.cpp:81) and consensus.cpp
+	// starts one at :228 and collects it at :252, after the parent wait, the
+	// state resolve, the block interval and a whole validation.
+	//
+	// The property is unchanged, and it is the one that matters: no candidate is
+	// emitted for a slot whose marker is not durable.
+	markerWrite := startStorageWrite(func(done func(error)) {
 		s.opts.Storage.SaveCandidate(candidateRecord, done)
-	}); err != nil {
-		s.observeMetricStage(chain, CollationStagePersist, stageStarted)
-
-		return fmt.Errorf("collator runtime: save candidate: %w", err)
-	}
-	s.observeMetricStage(chain, CollationStagePersist, stageStarted)
+	})
+	var stageStarted time.Time
 	if commit != nil {
 		stageStarted = s.metricStageStarted()
 		if err := s.opts.Pipeline.CommitCandidate(ctx, *commit); err != nil {
-			s.observeMetricStage(chain, CollationStageCommit, stageStarted)
+			s.observeMetricStage(chain, CollationStageCommitCandidateState, stageStarted)
 
 			return fmt.Errorf("collator runtime: commit candidate state: %w", err)
 		}
-		s.observeMetricStage(chain, CollationStageCommit, stageStarted)
+		s.observeMetricStage(chain, CollationStageCommitCandidateState, stageStarted)
 	}
 	stageStarted = s.metricStageStarted()
 	if err := waitUntil(ctx, broadcastTime(record, artifact.Candidate.ID.Slot)); err != nil {
-		s.observeMetricStage(chain, CollationStageBroadcastWait, stageStarted)
+		s.observeMetricStage(chain, CollationStageWaitBroadcastSlot, stageStarted)
 
 		return err
 	}
-	s.observeMetricStage(chain, CollationStageBroadcastWait, stageStarted)
+	s.observeMetricStage(chain, CollationStageWaitBroadcastSlot, stageStarted)
+	// The marker's commit has to have landed before this candidate reaches
+	// anyone, and this is the last instant where that is still true. The stage
+	// keeps its name and now reports what the producer actually spends on the
+	// marker rather than the whole synced commit: everything above overlapped
+	// it, so on a healthy device this is the residue.
+	stageStarted = s.metricStageStarted()
+	if err := markerWrite.wait(ctx); err != nil {
+		s.observeMetricStage(chain, CollationStagePersistCandidate, stageStarted)
+
+		return fmt.Errorf("collator runtime: save candidate: %w", err)
+	}
+	s.observeMetricStage(chain, CollationStagePersistCandidate, stageStarted)
 	if s.opts.Observer != nil {
 		s.opts.Observer.ObserveScheduleLateness(
 			chain,
@@ -2985,11 +3067,11 @@ func (s *Service) persistAndEmit(
 	}
 	stageStarted = s.metricStageStarted()
 	if err := s.opts.Emit(ctx, artifact); err != nil {
-		s.observeMetricStage(chain, CollationStageEmit, stageStarted)
+		s.observeMetricStage(chain, CollationStageDeliverCandidate, stageStarted)
 
 		return fmt.Errorf("collator runtime: emit candidate: %w", err)
 	}
-	s.observeMetricStage(chain, CollationStageEmit, stageStarted)
+	s.observeMetricStage(chain, CollationStageDeliverCandidate, stageStarted)
 	return nil
 }
 
@@ -3055,12 +3137,23 @@ func (s *Service) signArtifact(
 	if len(built.ID.RootHash) != sha256.Size || len(built.ID.FileHash) != sha256.Size {
 		return CandidateArtifact{}, fmt.Errorf("%w: candidate block hashes have invalid length", ErrCandidateConflict)
 	}
-	fileHash := sha256.Sum256(built.BlockBOC)
-	if !bytes.Equal(fileHash[:], built.ID.FileHash) {
-		return CandidateArtifact{}, fmt.Errorf("%w: candidate file hash does not match block BOC", ErrCandidateConflict)
-	}
-	if sha256.Sum256(built.CollatedData) != built.CollatedFileHash {
-		return CandidateArtifact{}, fmt.Errorf("%w: collated file hash does not match collated data", ErrCandidateConflict)
+	// Only for a candidate whose digests this process did not compute. Our own
+	// builder returns ID.FileHash and CollatedFileHash as the sha256 it took of
+	// these exact buffers inside finish(), so the two hashes below would be a
+	// megabyte of sha256 spent comparing a value with itself — the reference
+	// producer takes the collator's hashes as given and re-derives neither
+	// (window-producer.cpp:99-131). A Pipeline supplied from outside this
+	// package is a different matter: there the hashes are a claim, and a claim
+	// that is wrong is a signature over an ID no other validator can reproduce,
+	// which burns the whole leader window.
+	if !built.digested {
+		fileHash := sha256.Sum256(built.BlockBOC)
+		if !bytes.Equal(fileHash[:], built.ID.FileHash) {
+			return CandidateArtifact{}, fmt.Errorf("%w: candidate file hash does not match block BOC", ErrCandidateConflict)
+		}
+		if sha256.Sum256(built.CollatedData) != built.CollatedFileHash {
+			return CandidateArtifact{}, fmt.Errorf("%w: collated file hash does not match collated data", ErrCandidateConflict)
+		}
 	}
 
 	candidate := simplex.Candidate{
@@ -3084,6 +3177,12 @@ func (s *Service) signArtifact(
 		BlockBOC:     built.BlockBOC,
 		CollatedData: built.CollatedData,
 		prepared:     built.prepared,
+		// Either the builder took both digests of these very buffers, or the
+		// block above just re-derived them and compared. Both are the same
+		// statement, and it is the one the leader's own validation of this
+		// candidate would otherwise re-establish by hashing the collated data
+		// again.
+		digested: true,
 	}, nil
 }
 
@@ -3207,12 +3306,24 @@ func (s *Service) artifactFromRecord(
 		}
 	}
 
+	// The capsule rides along for the same reason the BOCs do: this artifact is
+	// the one this process built, and the two hash checks just above are exactly
+	// the binding a serializer would otherwise re-derive by parsing both BOCs
+	// again. Keeping it is also what makes rememberEmitted's retention of it pay
+	// for itself instead of holding a compressed payload nobody reads.
 	return CandidateArtifact{
 		SessionID:    session.ID,
 		WindowID:     window.ID,
 		Candidate:    candidate,
 		BlockBOC:     remembered.BlockBOC,
 		CollatedData: remembered.CollatedData,
+		prepared:     remembered.prepared,
+		// Established by the two hash checks above, which had to run here: they
+		// bind the payload this process still holds in memory to the digests the
+		// durable marker recorded for the candidate this window already signed.
+		// An empty candidate takes neither of them and carries no payload to
+		// have digested.
+		digested: !candidate.Empty,
 	}, nil
 }
 
@@ -3268,11 +3379,29 @@ func awaitSessionWrite(ctx context.Context, submit func(func(error))) error {
 // straggler that lands later, and every write this package abandons is either
 // idempotent on retry or belongs to a window that is being torn down.
 func awaitStorageWrite(ctx context.Context, submit func(func(error))) error {
-	result := make(chan error, 1)
-	go submit(func(err error) { result <- err })
+	return startStorageWrite(submit).wait(ctx)
+}
 
+// storageWriteFlight is one submitted durable write whose outcome has not been
+// collected yet. It exists so a caller can put the write in the store's queue
+// at the point in its sequence where it belongs and collect the result at the
+// point where the write actually has to have landed — which for the candidate
+// marker is immediately before the candidate is emitted, not before the state
+// commit that follows building it.
+type storageWriteFlight struct {
+	result chan error
+}
+
+func startStorageWrite(submit func(func(error))) *storageWriteFlight {
+	flight := &storageWriteFlight{result: make(chan error, 1)}
+	go submit(func(err error) { flight.result <- err })
+
+	return flight
+}
+
+func (f *storageWriteFlight) wait(ctx context.Context) error {
 	select {
-	case err := <-result:
+	case err := <-f.result:
 		return err
 	case <-ctx.Done():
 	}
@@ -3281,7 +3410,7 @@ func awaitStorageWrite(ctx context.Context, submit func(func(error))) error {
 	// committed write as abandoned would send the caller down the retry path it
 	// keeps for genuinely unknown results.
 	select {
-	case err := <-result:
+	case err := <-f.result:
 		return err
 	default:
 		return ctx.Err()

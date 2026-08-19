@@ -2,13 +2,17 @@ package collator
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"math/big"
+	"os"
 	"testing"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm"
 	"github.com/xssnick/tonutils-go/tvm/cell"
+	vmcore "github.com/xssnick/tonutils-go/tvm/vm"
 )
 
 func TestUpdateMasterPublicLibrariesAddsAndRemovesPublisher(t *testing.T) {
@@ -76,7 +80,7 @@ func TestRemoveMasterPublicLibraryKeepsOtherPublisher(t *testing.T) {
 	}
 }
 
-func TestMasterExecutionLibrariesConvertsAndValidatesDescriptors(t *testing.T) {
+func TestMasterExecutionLibrariesUsesGlobalDescriptorIndexDirectly(t *testing.T) {
 	library := cell.BeginCell().MustStoreUInt(0x1234, 16).EndCell()
 	key := library.HashKey()
 	publisher := [32]byte{1}
@@ -85,26 +89,35 @@ func TestMasterExecutionLibrariesConvertsAndValidatesDescriptors(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	converted, err := masterExecutionLibraries(global)
+	execution, err := masterExecutionLibraries(global)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(converted) != 1 {
-		t.Fatalf("execution library roots = %d, want 1", len(converted))
+	if len(execution) != 1 {
+		t.Fatalf("execution library roots = %d, want 1", len(execution))
 	}
-	value, err := converted[0].AsDict(256).LoadValue(
-		cell.BeginCell().MustStoreSlice(key[:], 256).EndCell(),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err := value.LoadRefCell()
-	if err != nil || value.BitsLeft() != 0 || value.RefsNum() != 0 || root.HashKey() != key {
-		t.Fatalf("converted library is malformed: err=%v bits=%d refs=%d", err, value.BitsLeft(), value.RefsNum())
+	if execution[0].HashKey() != global.AsCell().HashKey() {
+		t.Fatal("execution library collection differs from the LibDescr index")
 	}
 
+	state := &vmcore.State{GlobalVersion: 14}
+	state.SetLibraries(execution...)
+	resolved, err := state.LoadLibraryByHash(key[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved == nil || resolved.HashKey() != key {
+		t.Fatal("TVM did not resolve the library from its LibDescr")
+	}
+}
+
+func TestMasterExecutionLibrariesDefersDescriptorValidationToLookup(t *testing.T) {
+	library := cell.BeginCell().MustStoreUInt(0x1234, 16).EndCell()
+	key := library.HashKey()
 	wrongKey := key
 	wrongKey[0] ^= 0xff
+	publisher := [32]byte{1}
+
 	malformed := cell.NewDict(256)
 	descriptor, err := serializeGlobalLibrary(globalLibrary{
 		root:       library,
@@ -119,19 +132,30 @@ func TestMasterExecutionLibrariesConvertsAndValidatesDescriptors(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = masterExecutionLibraries(malformed); err == nil {
-		t.Fatal("library descriptor whose root differs from its key was accepted")
+	execution, err := masterExecutionLibraries(malformed)
+	if err != nil {
+		t.Fatalf("unused inherited descriptor rejected before lookup: %v", err)
+	}
+
+	state := &vmcore.State{GlobalVersion: 14}
+	state.SetLibraries(execution...)
+	resolved, err := state.LoadLibraryByHash(wrongKey[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != nil {
+		t.Fatal("TVM accepted a library whose root differs from the requested hash")
 	}
 }
 
 func TestMasterExecutionLibrariesEmpty(t *testing.T) {
 	for _, libraries := range []*cell.Dictionary{nil, cell.NewDict(256)} {
-		converted, err := masterExecutionLibraries(libraries)
+		execution, err := masterExecutionLibraries(libraries)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if converted != nil {
-			t.Fatalf("empty libraries converted to %d roots", len(converted))
+		if execution != nil {
+			t.Fatalf("empty libraries exposed as %d roots", len(execution))
 		}
 	}
 }
@@ -247,4 +271,79 @@ func loadTestGlobalLibrary(t *testing.T, libraries *cell.Dictionary, key [32]byt
 		t.Fatal(err)
 	}
 	return descriptor
+}
+
+func TestMasterExecutionLibrariesPreservesLookupTrace(t *testing.T) {
+	library := cell.BeginCell().MustStoreUInt(0x1234, 16).EndCell()
+	publisher := [32]byte{1}
+	global := cell.NewDict(256)
+	if err := addLibraryPublisher(global, library.HashKey(), publisher, library); err != nil {
+		t.Fatal(err)
+	}
+
+	loads := 0
+	trace := cell.NewTrace(cell.TraceHooks{OnLoad: func(*cell.Cell) { loads++ }})
+	traced := global.Copy().SetTrace(trace)
+
+	execution, err := masterExecutionLibraries(traced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := loads
+	state := &vmcore.State{GlobalVersion: 14}
+	state.SetLibraries(execution...)
+	root, err := state.LoadLibraryByHash(library.Hash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root == nil || root.HashKey() != library.HashKey() {
+		t.Fatal("TVM did not resolve traced library")
+	}
+	if loads == before {
+		t.Fatal("library lookup did not record its path in the predecessor trace")
+	}
+}
+
+// benchMainnetLibraryIndex loads the public library index the mainnet fixture
+// captured. It is the only realistically sized one available offline: 1322
+// descriptors over roughly 750 KB of cells.
+func benchMainnetLibraryIndex(tb testing.TB) *cell.Dictionary {
+	tb.Helper()
+
+	raw, err := os.ReadFile(benchMainnetFixturePath)
+	if err != nil {
+		tb.Skip(err)
+	}
+	var doc struct {
+		Config struct {
+			LibrariesBOCBase64 []string `json:"libraries_boc_base64"`
+		} `json:"config"`
+	}
+	if err = json.Unmarshal(raw, &doc); err != nil {
+		tb.Fatal(err)
+	}
+	if len(doc.Config.LibrariesBOCBase64) == 0 {
+		tb.Skip("mainnet fixture carries no public libraries")
+	}
+	boc, err := base64.StdEncoding.DecodeString(doc.Config.LibrariesBOCBase64[0])
+	if err != nil {
+		tb.Fatal(err)
+	}
+	root, err := cell.FromBOC(boc)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return root.AsDict(256)
+}
+
+// BenchmarkMasterExecutionLibrariesMainnet keeps the hot-path contract honest:
+// exposing an immutable LibDescr root must stay independent of index size.
+func BenchmarkMasterExecutionLibrariesMainnet(b *testing.B) {
+	libraries := benchMainnetLibraryIndex(b)
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := masterExecutionLibraries(libraries); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

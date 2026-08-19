@@ -33,7 +33,7 @@ type SessionReceiver interface {
 	// successful return transfers an immutable decoded view to the transport so
 	// it can relay the non-empty block into public/custom overlays without a
 	// second candidate decompression pass.
-	ReceiveCandidate(ctx context.Context, wire []byte) (CandidateArtifact, error)
+	ReceiveCandidate(ctx context.Context, expectedSlot uint32, wire []byte) (CandidateArtifact, error)
 	ServeCandidate(
 		ctx context.Context,
 		source simplex.PeerID,
@@ -157,6 +157,18 @@ type sessionRuntime struct {
 	leaderWindowRecordPending LeaderWindowRecord
 	leaderWindowRecordSet     bool
 	leaderWindowRecordWake    chan struct{}
+
+	// candidateCache is the last cache projection this session published. The
+	// gauges behind it are process-wide while several sessions of one chain are
+	// live at once, so a session only ever reports its own change.
+	candidateCacheMu sync.Mutex
+	candidateCache   candidateCacheStats
+	// retentionCapped is whether the last sweep pruned past what the local
+	// producer asked to keep. It exists so entering that state is logged once
+	// instead of on every finalization, and it is the one part of the retention
+	// gauge set that is a statement about a sweep rather than about now — the
+	// rest is read live off the resolvers, see ConsensusStats.
+	retentionCapped bool
 
 	windowMu sync.Mutex
 	window   *windowSubmitter
@@ -302,6 +314,8 @@ func prepareSessionRuntime(
 		resolver,
 		stored,
 		recoveryFinalizations,
+		params,
+		config.Protocol.SlotsPerLeaderWindow,
 	)
 
 	localIndex := simplex.ObserverIndex
@@ -336,6 +350,11 @@ func prepareSessionRuntime(
 	}
 	runtime.engine = engine
 	runtime.runner = simplex.NewRunner(engine)
+	if options.Observer != nil {
+		// From here on this session has a consensus position worth reporting,
+		// and closeResources is the only way out of every path below.
+		options.Observer.RegisterConsensusSession(config.StorageID, runtime)
+	}
 	if err = options.Backend.UpdateSession(ctx, runtime.state); err != nil {
 		updateErr := fmt.Errorf("validator runtime: initialize session backend: %w", err)
 		closeErr := runtime.closeResources()
@@ -431,7 +450,7 @@ func runtimeValidators(validators []groups.Validator) []simplex.Validator {
 func masterchainRecoveryFinalizations(
 	shard groups.ShardID,
 	bootstrap simplex.ValidatedBootstrap,
-) ([]*simplex.Certificate, error) {
+) ([]simplex.VerifiedCertificate, error) {
 	if !shard.IsMasterchain() {
 		return nil, nil
 	}
@@ -440,15 +459,15 @@ func masterchainRecoveryFinalizations(
 		return nil, errors.New("validator runtime: bootstrap state was not validated")
 	}
 
-	certificates := state.Certificates
-	finalizations := make([]*simplex.Certificate, 0, len(certificates)/2)
+	certificates := bootstrap.Certificates()
+	finalizations := make([]simplex.VerifiedCertificate, 0, len(certificates)/2)
 	bySlot := make(map[uint32]simplex.CandidateID, len(certificates)/2)
 	for _, certificate := range certificates {
-		if certificate.Vote.Kind != simplex.VoteFinalize {
+		if certificate.Vote().Kind != simplex.VoteFinalize {
 			continue
 		}
 
-		id := certificate.Vote.ID
+		id := certificate.Vote().ID
 		if previous, exists := bySlot[id.Slot]; exists {
 			if previous != id {
 				return nil, fmt.Errorf(
@@ -464,7 +483,7 @@ func masterchainRecoveryFinalizations(
 	}
 
 	sort.Slice(finalizations, func(i, j int) bool {
-		return finalizations[i].Vote.ID.Slot < finalizations[j].Vote.ID.Slot
+		return finalizations[i].Vote().ID.Slot < finalizations[j].Vote().ID.Slot
 	})
 
 	return finalizations, nil
@@ -720,6 +739,7 @@ func (r *sessionRuntime) Update(ctx context.Context, state SessionState) error {
 	}
 
 	r.candidates.updateParams(state.Params)
+	r.states.updateParams(state.Params)
 
 	r.stateMu.Lock()
 	r.state = state
@@ -773,6 +793,13 @@ func (r *sessionRuntime) closeResources() error {
 	r.resourceCloseOnce.Do(func() {
 		r.states.close()
 		r.candidates.close()
+		// A retired session must not leave its share of the process-wide gauges
+		// behind. Its counters do stay: the collector takes a final reading and
+		// keeps it, because work this session did is work the process did.
+		r.publishCandidateCache(candidateCacheStats{})
+		if r.metrics != nil {
+			r.metrics.UnregisterConsensusSession(r.config.StorageID)
+		}
 	})
 
 	r.backendCloseMu.Lock()
@@ -894,13 +921,20 @@ func (r *sessionRuntime) PrecheckCandidateBroadcast(
 	})
 }
 
-func (r *sessionRuntime) ReceiveCandidate(ctx context.Context, wire []byte) (received CandidateArtifact, err error) {
+func (r *sessionRuntime) ReceiveCandidate(
+	ctx context.Context,
+	expectedSlot uint32,
+	wire []byte,
+) (received CandidateArtifact, err error) {
 	err = r.execute(ctx, func(context.Context) error {
 		// decodeCanonical derives the wire from the roots it just parsed, so the
 		// signature is verified once and neither BOC is parsed a second time.
 		artifact, canonical, err := r.codec.decodeCanonical(wire, nil)
 		if err != nil {
 			return err
+		}
+		if artifact.Candidate.ID.Slot != expectedSlot {
+			return errors.New("validator runtime: candidate broadcast slot mismatch")
 		}
 		if err = r.candidates.stage(artifact, canonical); err != nil {
 			return err
@@ -937,7 +971,14 @@ func (r *sessionRuntime) ValidateCandidate(candidate *simplex.Candidate, done fu
 		// validation-task error abort only this candidate, never the consensus
 		// actor. Preserve that distinction in the error chain for diagnostics, but
 		// deliver either outcome solely through the candidate continuation.
-		done(r.validateCandidate(ctx, candidate))
+		// The deadline is wall clock and flat, because the reference's is and
+		// because most of it is a wait on this node's apply pipeline rather than
+		// validation work; see retention.go. It expires into an abstention, never
+		// into a rejection, and session retirement cancels it earlier.
+		validationCtx, cancel := context.WithTimeout(ctx, candidateValidationTimeout)
+		defer cancel()
+
+		done(r.validateCandidate(validationCtx, candidate))
 	}) {
 		done(context.Canceled)
 	}
@@ -995,11 +1036,11 @@ func (r *sessionRuntime) validateCandidateCore(
 		stageStarted = r.validationStageStarted()
 		normal, normalErr := parent.State.NormalBlock()
 		if normalErr != nil || !sameBlockID(normal, candidate.Block) {
-			r.observeValidationStage(chain, ValidationStageBackend, stageStarted)
+			r.observeValidationStage(chain, ValidationStageSemanticValidation, stageStarted)
 
 			return 0, fmt.Errorf("%w: empty candidate references the wrong block", ErrCandidateRejected)
 		}
-		r.observeValidationStage(chain, ValidationStageBackend, stageStarted)
+		r.observeValidationStage(chain, ValidationStageSemanticValidation, stageStarted)
 		r.logBlockValidated(candidate, artifact, time.Since(started))
 
 		return validationDecisionDuration(validationStarted), nil
@@ -1010,70 +1051,125 @@ func (r *sessionRuntime) validateCandidateCore(
 	if !parent.GenUtime.IsZero() {
 		stageStarted = r.validationStageStarted()
 		if err = waitUntil(ctx, parent.GenUtime.Add(minBlockInterval)); err != nil {
-			r.observeValidationStage(chain, ValidationStageMinBlockIntervalWait, stageStarted)
+			r.observeValidationStage(chain, ValidationStageWaitMinBlockInterval, stageStarted)
 
 			return 0, err
 		}
-		r.observeValidationStage(chain, ValidationStageMinBlockIntervalWait, stageStarted)
+		r.observeValidationStage(chain, ValidationStageWaitMinBlockInterval, stageStarted)
 	}
 
-	waited := time.Duration(0)
-	for {
-		started := time.Now()
+	request := CandidateValidationRequest{
+		Parent:    parent.State,
+		Artifact:  artifact,
+		successor: parent.State.pendingSuccessor(ctx),
+	}
+	started := time.Now()
+	stageStarted = r.validationStageStarted()
+	validation, validateErr := r.backend.ValidateCandidate(ctx, request)
+	semanticDuration := time.Since(started)
+	r.observeValidationStage(chain, ValidationStageSemanticValidation, stageStarted)
+	if r.metrics != nil {
+		r.metrics.ObserveValidationTask(ValidationTaskObservation{
+			Chain:    chain,
+			Result:   validationTaskResult(validateErr),
+			Duration: semanticDuration,
+		})
+	}
+	if validateErr == nil {
+		r.states.rememberValidatedState(candidate.ID, ResolvedState{
+			State:    validation.State,
+			GenUtime: validation.ValidAfter,
+		})
+		r.logBlockValidated(candidate, artifact, semanticDuration)
+		decisionDuration := validationDecisionDuration(validationStarted)
+
 		stageStarted = r.validationStageStarted()
-		validation, validateErr := r.backend.ValidateCandidate(ctx, parent.State, artifact)
-		attemptDuration := time.Since(started)
-		r.observeValidationStage(chain, ValidationStageBackend, stageStarted)
-		if r.metrics != nil {
-			r.metrics.ObserveValidationAttempt(ValidationAttemptObservation{
-				Chain:    chain,
-				Result:   validationAttemptResult(validateErr),
-				Duration: attemptDuration,
-			})
-		}
-		if validateErr == nil {
-			r.logBlockValidated(candidate, artifact, attemptDuration)
-			decisionDuration := validationDecisionDuration(validationStarted)
+		err = waitUntil(ctx, validation.ValidAfter)
+		r.observeValidationStage(chain, ValidationStageWaitValidAfter, stageStarted)
 
-			stageStarted = r.validationStageStarted()
-			err = waitUntil(ctx, validation.ValidAfter)
-			r.observeValidationStage(chain, ValidationStageValidAfterWait, stageStarted)
-
-			return decisionDuration, err
-		}
-		if errors.Is(validateErr, ErrCandidateRejected) {
-			return 0, validateErr
-		}
-		if !errors.Is(validateErr, ErrBlockNotReady) && !errors.Is(validateErr, context.DeadlineExceeded) {
-			return 0, fmt.Errorf("validator runtime: validate candidate: %w", validateErr)
-		}
-		if r.metrics != nil {
-			reason := ValidationRetryStateNotReady
-			if errors.Is(validateErr, context.DeadlineExceeded) {
-				reason = ValidationRetryAttemptDeadline
-			}
-			r.metrics.ObserveValidationRetry(chain, reason)
-		}
+		return decisionDuration, err
+	}
+	if errors.Is(validateErr, ErrCandidateRejected) {
+		r.reportSelfRejection(candidate, validateErr)
 		if r.log != nil {
-			r.log.WithLevel(candidateNotReadyLevel(waited)).
+			r.log.Debug().
 				Err(validateErr).
 				Hex("session_id", r.config.SessionID[:]).
 				Uint32("slot", candidate.ID.Slot).
 				Int32("workchain", candidate.Block.Workchain).
 				Int64("shard", candidate.Block.Shard).
 				Uint32("block_seqno", candidate.Block.SeqNo).
-				Dur("waited", waited).
-				Msg("candidate validation is waiting for local state")
+				Msg("candidate validation rejected")
 		}
-		stageStarted = r.validationStageStarted()
-		if err = waitDuration(ctx, candidateNotReadyRetryInterval); err != nil {
-			r.observeValidationStage(chain, ValidationStageRetryWait, stageStarted)
 
-			return 0, err
-		}
-		r.observeValidationStage(chain, ValidationStageRetryWait, stageStarted)
-		waited += candidateNotReadyRetryInterval
+		return 0, validateErr
 	}
+	if err = ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	return 0, fmt.Errorf("validator runtime: validate candidate: %w", validateErr)
+}
+
+// reportSelfRejection raises the alarm for a candidate this node produced and
+// then refused. It mirrors the reference exactly, including the wording:
+// BlockValidator's try_notarize logs
+//
+//	LOG(ERROR) << "BUG! Candidate " << event->candidate->id
+//	           << " is self-rejected: " << ...get<CandidateReject>().reason;
+//
+// when a rejected candidate's leader is the local index
+// (cppnode/ton/validator/consensus/block-validator.cpp:112-117), on the same
+// branch, before returning the same rejection.
+//
+// We do re-validate our own candidates and that is a deliberate decision, not
+// an oversight: publishCandidate broadcasts at session_runtime.go:1821 and only
+// submits for validation at :1842, so the candidate is on the wire before this
+// runs and this work overlaps the remote validators' identical work rather than
+// delaying it. C++ makes the same choice — try_notarize (consensus.cpp:225-260)
+// awaits the validation result before voting with no local-index short circuit.
+// What the two get for it is this: a producer and a validator that disagree
+// about the same bytes is a collator/validator asymmetry, which is a defect in
+// this node and nowhere else, and it is otherwise silent — the candidate simply
+// never gets our vote and every peer's rejection log names their node.
+//
+// The predicate is the reference's, and it is not a heuristic. candidate.Leader
+// is not attacker-controlled: verifyCandidate pins it to
+// schedule.ExpectedLeader(slot) and then verifies the candidate signature
+// against that leader's key (candidate_artifact.go:445-460), so a remote peer
+// cannot present a candidate carrying our index without our key. An observer
+// runtime has no Identity.Validator at all and therefore no local index to
+// match, which is the second reason a remote candidate can never reach this.
+//
+// A delegated window is included on purpose. The block was built by a collator
+// we authorized with our own delegation signature and it is published under our
+// leadership, so it is our production path failing our validation path — the
+// thing this alarm exists to surface.
+func (r *sessionRuntime) reportSelfRejection(candidate *simplex.Candidate, reason error) {
+	if r.config.Identity.Validator == nil || candidate.Leader != r.config.Identity.Validator.Index {
+		return
+	}
+	if r.metrics != nil {
+		r.metrics.AddSelfRejectedCandidate(r.validationChain())
+	}
+	if r.log == nil {
+		return
+	}
+	event := r.log.Error()
+	if event == nil {
+		return
+	}
+	event.
+		Err(reason).
+		Hex("session_id", r.config.SessionID[:]).
+		Uint32("slot", candidate.ID.Slot).
+		Uint32("leader", candidate.Leader).
+		Hex("candidate_hash", candidate.ID.Hash[:]).
+		Int32("workchain", candidate.Block.Workchain).
+		Int64("shard", candidate.Block.Shard).
+		Uint32("block_seqno", candidate.Block.SeqNo).
+		Bool("is_empty", candidate.Empty).
+		Msg("BUG! candidate is self-rejected: this node produced a block its own validator refuses")
 }
 
 func (r *sessionRuntime) logBlockValidated(
@@ -1482,12 +1578,17 @@ func (r *sessionRuntime) resolveWindowLineage(
 	finalizedBlock *ton.BlockIDExt,
 ) (resolvedLineage, error) {
 	loggedNotReady := false
+	started := time.Now()
 	for {
 		lineage, err := r.states.lineage(ctx, window.Base, finalizedBlock)
 		if err == nil {
+			r.observeLineageWalk(LineageWalkSuccess, lineage.Walk, started)
+
 			return lineage, nil
 		}
 		if !errors.Is(err, ErrBlockNotReady) {
+			r.observeLineageWalk(LineageWalkFailure, lineage.Walk, started)
+
 			return resolvedLineage{}, err
 		}
 		if ctx.Err() != nil {
@@ -1513,15 +1614,64 @@ func (r *sessionRuntime) resolveWindowLineage(
 	}
 }
 
-func (r *sessionRuntime) OnNotarized(id simplex.CandidateID, certificate *simplex.Certificate) {
+// observeLineageWalk reports one completed walk. The retry loop above waits for
+// a state rather than walking again, so a walk is observed once per attempt that
+// reached a verdict, with the wait it ended on included in its duration: the
+// wait is what the walk costs.
+//
+// A walk with Visited == 0 is reported too, and that is the point of this
+// function rather than an edge case it tolerates. This used to return early on
+// it, which blinded the instrumentation to precisely the failure it was added
+// for: a walk that finds the session finalized ahead of the base it was handed
+// descends nothing, fails immediately, and therefore had Visited == 0 every
+// time. Zero visits in a bounded duration under LineageWalkFailure is the
+// signature of that shape; dropping the sample left it indistinguishable from a
+// window that never walked at all.
+func (r *sessionRuntime) observeLineageWalk(
+	result LineageWalkResult,
+	walk lineageWalkStats,
+	started time.Time,
+) {
+	if r.metrics == nil {
+		return
+	}
+
+	r.metrics.ObserveLineageWalk(LineageWalkObservation{
+		Chain:      r.validationChain(),
+		Result:     result,
+		Candidates: walk.Visited,
+		Duration:   time.Since(started),
+		Steps:      walk.Steps,
+	})
+}
+
+func (r *sessionRuntime) OnNotarized(id simplex.CandidateID, certificate simplex.VerifiedCertificate) {
 	r.candidates.observeNotarization(id, certificate)
 }
 
-func (r *sessionRuntime) OnFinalized(id simplex.CandidateID, certificate *simplex.Certificate) {
+func (r *sessionRuntime) OnFinalized(id simplex.CandidateID, certificate simplex.VerifiedCertificate) {
 	// Simplex maintains this watermark for its own slot map; the resolver
-	// caches are the only session-scoped structures that never saw it.
-	r.states.notifyFinalized(id.Slot)
-	r.logResolverCaches(id.Slot)
+	// caches are the only session-scoped structures that never saw it. The
+	// candidate sweep runs before finalization is spawned below, which then walks
+	// back over parents it may have just released; that order is safe only
+	// because a released payload is either durable or one consensus never
+	// accepted.
+	//
+	// Both sweeps run under one floor. The margins below the finalized slot are
+	// fixed, and the leader window that consumes what they retain is not: it
+	// walks back to the applied anchor, so the state resolver reports how far
+	// that is and neither sweep releases above it.
+	//
+	// What bounds that request is measured first, off the candidate resolver's
+	// own retained payloads, and handed to the state resolver: the two never
+	// nest their locks, and the bound is a memory budget rather than a slot
+	// distance.
+	budgetFloor := r.candidates.retentionCapFloor(id.Slot)
+	floor := r.states.notifyFinalized(id.Slot, budgetFloor)
+	candidates := r.candidates.notifyFinalized(id.Slot, floor.Slot)
+	r.publishCandidateCache(candidates)
+	r.noteRetentionFloorCapped(id.Slot, floor, candidates)
+	r.logResolverCaches(id.Slot, candidates)
 
 	if !r.spawn(func(ctx context.Context) {
 		if err := r.states.finalize(ctx, id, certificate); err != nil {
@@ -1542,49 +1692,137 @@ func (r *sessionRuntime) OnFinalized(id simplex.CandidateID, certificate *simple
 	}
 }
 
-// resolverCacheLogPeriod spaces the cache projection out over roughly a minute
-// of ordinary two-second slots. Both snapshots walk their whole map, so this
-// stays off the per-slot path and out of the way unless debug logging is on.
-const resolverCacheLogPeriod = 32
-
 const (
 	// consensusProgressRetryInterval keeps a locally incomplete state or
 	// acquisition on the same leader window without consuming most of a
 	// short block interval. It is only reached after a typed local-readiness
 	// error and its wait is cancelled at the next observed window boundary.
 	consensusProgressRetryInterval = 20 * time.Millisecond
-	// candidateNotReadyRetryInterval paces the retry of a candidate whose local
-	// state has not arrived yet.
-	candidateNotReadyRetryInterval = time.Second
-	// candidateNotReadyWarnAfter is how long that wait stays an ordinary debug
-	// line. Past it the node is far enough behind the consensus it votes in that
-	// the condition has to be visible at the default log level.
-	candidateNotReadyWarnAfter = 3 * time.Second
 )
 
-// candidateNotReadyLevel escalates a wait for local state out of debug once it
-// stops being ordinary. A short wait is the node applying the parent this
-// candidate builds on. A long one means this validator is behind the consensus
-// it votes in and is casting no vote at all, which must not need debug logging
-// to notice.
-func candidateNotReadyLevel(waited time.Duration) zerolog.Level {
-	if waited >= candidateNotReadyWarnAfter {
-		return zerolog.WarnLevel
-	}
+// ConsensusStats reports this session's consensus position for the
+// process-wide collector. It is called from a Prometheus scrape, so it reads
+// the Simplex counters through the runner's published snapshot and never posts
+// onto the consensus loop: a scrape must not be able to block behind the
+// goroutine whose stall it is being scraped to explain.
+// The retained payloads and the lineage anchor are read from the resolvers
+// themselves rather than from what the last finalization published. A session
+// that has stopped finalizing keeps accepting candidates and keeps walking a
+// lineage per leader window, so both of those numbers move; a projection
+// refreshed only by OnFinalized would hold its pre-standstill values for the
+// whole standstill, which is the one interval these gauges exist for. Capped is
+// the exception and stays as the last sweep left it, because it is a statement
+// about a sweep and no sweep has run since.
+func (r *sessionRuntime) ConsensusStats() ConsensusSessionStats {
+	r.candidateCacheMu.Lock()
+	capped := r.retentionCapped
+	r.candidateCacheMu.Unlock()
 
-	return zerolog.DebugLevel
+	cache := r.candidates.cacheProjection()
+	anchor, anchorKnown := r.states.lineageAnchor()
+
+	return ConsensusSessionStats{
+		Chain: r.validationChain(),
+		Stats: r.runner.StatsSnapshot(),
+		Retention: ConsensusRetentionStats{
+			AnchorSlot:       anchor,
+			AnchorKnown:      anchorKnown,
+			Capped:           capped,
+			BudgetBytes:      r.candidates.retentionBudgetBytes(),
+			RetainedPayloads: cache.Candidates,
+			RetainedBytes:    cache.Bytes,
+		},
+	}
 }
 
-// logResolverCaches reports what the session-scoped resolver caches retain.
-// The candidate cache is still unbounded by design and there is no other way
-// to see its size on a running node, so measuring it has to precede deciding
-// whether the payloads it pins are worth dropping.
-func (r *sessionRuntime) logResolverCaches(slot uint32) {
-	if r.log == nil || r.log.GetLevel() > zerolog.DebugLevel || slot%resolverCacheLogPeriod != 0 {
+// publishCandidateCache reports this session's own change to the process-wide
+// candidate cache gauges.
+func (r *sessionRuntime) publishCandidateCache(stats candidateCacheStats) {
+	if r.metrics == nil {
 		return
 	}
 
-	candidates := r.candidates.cacheStats()
+	r.candidateCacheMu.Lock()
+	previous := r.candidateCache
+	r.candidateCache = stats
+	r.candidateCacheMu.Unlock()
+
+	r.metrics.AddCandidateCache(r.validationChain(), CandidateCacheDelta{
+		Retained: int64(stats.Candidates - previous.Candidates),
+		Released: int64((stats.Entries - stats.Candidates) - (previous.Entries - previous.Candidates)),
+		Bytes:    stats.Bytes - previous.Bytes,
+	})
+}
+
+// noteRetentionFloorCapped reports the sweeps pruning past what the local
+// producer asked them to keep. That happens when the payloads between the
+// producer's anchor and the finalized slot no longer fit this session's
+// retention budget — so it is not an error, but it is the point where the
+// lineage walk starts paying storage reads again and it must not be invisible.
+//
+// The wording is deliberately about memory and not about how far behind this
+// node is. The previous line said "local block production is too far behind
+// consensus", which was drawn from a slot distance that skipped slots inflated
+// on their own; in the field it fired a median of 94 s after the fault it was
+// read as announcing, and it sent an investigation to the wrong subsystem.
+//
+// The counter ticks for every finalization spent in that state, which is what
+// makes the condition a rate rather than an event. The log line marks the
+// transitions only.
+func (r *sessionRuntime) noteRetentionFloorCapped(
+	slot uint32,
+	floor retentionFloor,
+	candidates candidateCacheStats,
+) {
+	if r.metrics != nil && floor.Capped {
+		r.metrics.AddCandidateRetentionCapped(r.validationChain())
+	}
+
+	r.candidateCacheMu.Lock()
+	changed := r.retentionCapped != floor.Capped
+	r.retentionCapped = floor.Capped
+	r.candidateCacheMu.Unlock()
+	if !changed || r.log == nil {
+		return
+	}
+	if !floor.Capped {
+		r.log.Info().
+			Hex("session_id", r.config.SessionID[:]).
+			Uint32("slot", slot).
+			Msg("consensus candidate retention follows the local producer again")
+
+		return
+	}
+	r.log.Warn().
+		Hex("session_id", r.config.SessionID[:]).
+		Uint32("slot", slot).
+		Uint32("retention_floor", floor.Slot).
+		Uint32("lineage_anchor", floor.Anchor).
+		Int("retained_payloads", candidates.Candidates).
+		Int64("retained_bytes", candidates.Bytes).
+		Msg("consensus candidate retention reached its memory budget and resumed pruning below " +
+			"the lineage the local producer asked to keep; lineage walks will read from storage")
+}
+
+// resolverCacheLogPeriod spaces the cache projection out over roughly a minute
+// of this session's own slots. Both snapshots walk their whole map, so this
+// stays off the per-slot path and out of the way unless debug logging is on.
+func (r *sessionRuntime) resolverCacheLogPeriod() uint32 {
+	r.stateMu.RLock()
+	params := r.state.Params
+	r.stateMu.RUnlock()
+
+	return resolverCacheLogPeriod(params.TargetRate)
+}
+
+// logResolverCaches reports what the session-scoped resolver caches retain.
+// The candidate projection is the one the finalization sweep just produced, so
+// this costs no second walk of that map; it reports what survived the sweep.
+func (r *sessionRuntime) logResolverCaches(slot uint32, candidates candidateCacheStats) {
+	if r.log == nil || r.log.GetLevel() > zerolog.DebugLevel || slot%r.resolverCacheLogPeriod() != 0 {
+		return
+	}
+
 	states := r.states.cacheStats()
 	r.log.Debug().
 		Hex("session_id", r.config.SessionID[:]).
@@ -1596,7 +1834,12 @@ func (r *sessionRuntime) logResolverCaches(slot uint32) {
 		Int("state_flights", states.States).
 		Int("states_retained", states.Resolved).
 		Int("states_finalized", states.Finalized).
-		Int64("state_block_bytes", states.BlockBOCBytes).
+		Int("states_applied", states.AppliedStates).
+		// Named for what it counts. The retained block payloads are a floor on
+		// the footprint of these tips, not a measure of it: the state roots and
+		// the parsed block DAGs beside them are larger and cannot be sized
+		// without a walk this log line has no business doing.
+		Int64("state_block_boc_bytes", states.BlockBOCBytes).
 		Msg("consensus session resolver caches")
 }
 
@@ -1717,6 +1960,25 @@ func (s *windowSubmitter) submit(ctx context.Context, artifact *CandidateArtifac
 	return nil
 }
 
+// publishCandidate hands one locally produced candidate to the network, to the
+// resolver and to Simplex. Everything here is synchronous except the wait on
+// the durable write: the record is submitted to the store from this goroutine,
+// at this point in the sequence, and only the fsync is left behind.
+//
+// The wait belongs to the voter, not to the producer. Simplex enqueues its own
+// StoreCandidate hook for every accepted candidate including our own
+// (simplex/voter.go:216), joins this same flight, and gates the notarize vote on
+// it — so nothing irreversible happens before the wire is readable. That is
+// exactly where the reference keeps the wait: the C++ producer detaches its
+// store (collator-producer.cpp:81) and consensus co_awaits it on the voting path
+// (consensus.cpp:253).
+//
+// The submission itself must stay here. An observer runtime — the standalone or
+// delegated collator composition — has no voter at all (Engine.SubmitCandidate
+// returns early when e.voter is nil), so this call is the only durable write of
+// its own candidate wire that ever happens. Nothing downstream ever looks at its
+// outcome, so reportCandidatePersistFailure is where a failure goes: a counter
+// to alert on and, on that runtime, an Error naming what was lost.
 func (r *sessionRuntime) publishCandidate(ctx context.Context, artifact *CandidateArtifact) error {
 	return r.execute(ctx, func(commandCtx context.Context) error {
 		wire, broadcast, err := r.codec.encodeForBroadcast(artifact)
@@ -1737,12 +1999,57 @@ func (r *sessionRuntime) publishCandidate(ctx context.Context, artifact *Candida
 		if err = r.candidates.stage(artifact, wire); err != nil {
 			return err
 		}
-		if err = r.candidates.store(commandCtx, artifact.Candidate.ID); err != nil {
+		slot := artifact.Candidate.ID.Slot
+		if _, err = r.candidates.storeAsync(artifact.Candidate.ID, func(storeErr error) {
+			if storeErr == nil {
+				return
+			}
+			r.reportCandidatePersistFailure(slot, storeErr)
+		}); err != nil {
 			return err
 		}
 
 		return r.runner.SubmitCandidate(&artifact.Candidate)
 	})
+}
+
+// reportCandidatePersistFailure is where a failed durable write of our own
+// candidate ends up. It runs on the store's callback goroutine.
+//
+// On a voting runtime the voter joins the same flight and gates its notarize
+// vote on it, so this is a second report of a failure consensus already acts
+// on. On an observer runtime — the delegated and standalone collator
+// composition — Engine.SubmitCandidate returns before acceptCandidate and there
+// is no voter, so this write is the only durable copy of a candidate that has
+// already been broadcast, and this is the only place its failure is ever
+// mentioned. It is reported at Error there for that reason, and the counter is
+// what an operator can alert on.
+//
+// It does not retry. The only durable path is the store's own write FIFO, and
+// re-entering it from inside its completion callback is how that FIFO
+// deadlocks; its failures are a closed store, a conflicting record, or the
+// device, none of which a retry from here resolves.
+func (r *sessionRuntime) reportCandidatePersistFailure(slot uint32, err error) {
+	if r.metrics != nil {
+		r.metrics.AddCandidatePersistFailure(r.validationChain())
+	}
+	if r.log == nil {
+		return
+	}
+	if r.config.Identity.Validator != nil {
+		r.log.Warn().
+			Err(err).
+			Hex("session_id", r.config.SessionID[:]).
+			Uint32("slot", slot).
+			Msg("durable write of our own candidate failed; the notarize vote for it will fail too")
+
+		return
+	}
+	r.log.Error().
+		Err(err).
+		Hex("session_id", r.config.SessionID[:]).
+		Uint32("slot", slot).
+		Msg("durable write of our own candidate failed on a runtime with no voter; the candidate was broadcast but is not recoverable from this node")
 }
 
 func (s *windowSubmitter) close(err error) {

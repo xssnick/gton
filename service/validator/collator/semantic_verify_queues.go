@@ -339,7 +339,7 @@ func parseSemanticQueueEntry(
 	value *cell.Slice,
 	extra *cell.Slice,
 ) (semanticQueueEntry, error) {
-	return parseSemanticQueueEntryWithMode(keyCell, value, extra, false)
+	return parseSemanticQueueEntryWithMode(keyCell, value, extra, false, semanticQueueLeafCells{})
 }
 
 func parseSemanticNeighborQueueEntry(
@@ -347,7 +347,21 @@ func parseSemanticNeighborQueueEntry(
 	value *cell.Slice,
 	extra *cell.Slice,
 ) (semanticQueueEntry, error) {
-	return parseSemanticQueueEntryWithMode(keyCell, value, extra, true)
+	return parseSemanticQueueEntryWithMode(keyCell, value, extra, true, semanticQueueLeafCells{})
+}
+
+// parseSemanticNeighborQueueEntryLoaded is parseSemanticNeighborQueueEntry over
+// cells the caller has already taken out of storage. Handing them in is what
+// lets walkSemanticQueuePrefix raise a load failure from the loading step
+// instead of from the parse; see materialiseSemanticQueueLeaf for why that
+// distinction is load-bearing and not tidiness.
+func parseSemanticNeighborQueueEntryLoaded(
+	keyCell *cell.Cell,
+	value *cell.Slice,
+	extra *cell.Slice,
+	leaf semanticQueueLeafCells,
+) (semanticQueueEntry, error) {
+	return parseSemanticQueueEntryWithMode(keyCell, value, extra, true, leaf)
 }
 
 func parseSemanticQueueEntryWithMode(
@@ -355,6 +369,7 @@ func parseSemanticQueueEntryWithMode(
 	value *cell.Slice,
 	extra *cell.Slice,
 	neighborProof bool,
+	leaf semanticQueueLeafCells,
 ) (semanticQueueEntry, error) {
 	keyLoader := keyCell.MustBeginParse()
 	keyBytes, err := keyLoader.LoadSlice(352)
@@ -368,11 +383,18 @@ func parseSemanticQueueEntryWithMode(
 	if err = loadExactSlice(&enqueued, value); err != nil {
 		return semanticQueueEntry{}, fmt.Errorf("%w: decode outbound queue entry %x: %v", ErrInvalidInput, key, err)
 	}
+	// A caller that already materialised the entry's cells hands them in, and
+	// they are the same cells by hash: the loader validates every lazy load
+	// against the placeholder it replaces (cell.validateLoadedLazyRef).
+	envelopeRoot := enqueued.Msg
+	if leaf.envelope != nil {
+		envelopeRoot = leaf.envelope
+	}
 	var envelope *semanticEnvelope
 	if neighborProof {
-		envelope, err = parseSemanticNeighborEnvelope(enqueued.Msg)
+		envelope, err = parseSemanticNeighborEnvelopeLoaded(envelopeRoot, leaf.message)
 	} else {
-		envelope, err = parseSemanticEnvelope(enqueued.Msg)
+		envelope, err = parseSemanticEnvelope(envelopeRoot)
 	}
 	if err != nil {
 		return semanticQueueEntry{}, fmt.Errorf("%w: decode outbound queue envelope %x: %v", ErrInvalidInput, key, err)
@@ -437,7 +459,7 @@ func loadSemanticQueueEntryWithMode(
 	if err != nil {
 		return semanticQueueEntry{}, err
 	}
-	return parseSemanticQueueEntryWithMode(keyCell, value, extra, neighborProof)
+	return parseSemanticQueueEntryWithMode(keyCell, value, extra, neighborProof, semanticQueueLeafCells{})
 }
 
 func (v *semanticQueueValidation) verifyQueueRoots() error {

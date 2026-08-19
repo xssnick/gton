@@ -124,11 +124,11 @@ func newCurrentStatePersistenceTestService(t testing.TB, store testStorage, shut
 
 func newArchivePersistenceTestRunner(svc *SyncCoordinator) *ArchiveRunner {
 	return &ArchiveRunner{
-		log:                   svc.log,
-		storage:               svc.storage,
-		state:                 svc.state,
-		checkpointTransitions: svc,
-		checkpointBlocks:      DefaultArchiveCatchUpCheckpointBlocks,
+		log:                svc.log,
+		storage:            svc.storage,
+		state:              svc.state,
+		currentTransitions: svc,
+		checkpointBlocks:   DefaultArchiveCatchUpCheckpointBlocks,
 	}
 }
 
@@ -333,6 +333,32 @@ func TestPublishCommittedCurrentStateDoesNotRegressStatus(t *testing.T) {
 	}
 	if got := svc.status.current.Masterchain.Block.SeqNo; got != newerMaster.SeqNo {
 		t.Fatalf("current status regressed to seqno %d", got)
+	}
+}
+
+func TestArchiveCurrentAdvancedPublishesLiveViewBeforeCheckpoint(t *testing.T) {
+	svc := newMasterchainProbeTestService(t)
+	flusher := &testLiveCheckpointFlusher{}
+	svc.liveState = flusher
+
+	master := testBlockID(-1, topShard, 101)
+	current := &tnstore.CurrentState{
+		ShardClientSeqno: master.SeqNo,
+		Masterchain: tnstore.BlockState{
+			Block: master,
+		},
+	}
+
+	svc.archiveCurrentAdvanced(current)
+
+	if flusher.current == nil || flusher.current.Masterchain.Block.SeqNo != master.SeqNo {
+		t.Fatalf("live current masterchain = %#v, want seqno %d", flusher.current, master.SeqNo)
+	}
+	svc.status.mu.RLock()
+	statusCurrent := svc.status.current
+	svc.status.mu.RUnlock()
+	if statusCurrent == nil || statusCurrent.Masterchain.Block.SeqNo != master.SeqNo {
+		t.Fatalf("status current masterchain = %#v, want seqno %d", statusCurrent, master.SeqNo)
 	}
 }
 
@@ -883,7 +909,7 @@ func TestPersistArchiveCurrentStateMarksLiveCheckpointStatesFlushed(t *testing.T
 	if err != nil {
 		t.Fatalf("persist archive current state: %v", err)
 	}
-	runner.archive.checkpointTransitions.archiveCheckpointCommitted(persisted, entries)
+	runner.archive.currentTransitions.archiveCheckpointCommitted(persisted, entries)
 
 	var want []ton.BlockIDExt
 	for _, entry := range entries {

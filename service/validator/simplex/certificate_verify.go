@@ -2,6 +2,8 @@ package simplex
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"runtime"
 	"sync"
@@ -12,29 +14,216 @@ import (
 // verification fans out across cores.
 const parallelVerifyMinSigs = 8
 
+// RosterDigest commits to the exact validator slice a certificate was verified
+// against: the length, the order (certificate signatures address validators by
+// index), every public key (what was verified) and every weight (what the
+// 2/3+1 quorum threshold was computed from). The count is length-prefixed and
+// every field is fixed-size, so the digest is injective over rosters.
+func RosterDigest(validators []Validator) ([32]byte, error) {
+	var out [32]byte
+	if len(validators) == 0 {
+		return out, fmt.Errorf("simplex: empty validator set")
+	}
+
+	h := sha256.New()
+	var scratch [8]byte
+	binary.LittleEndian.PutUint64(scratch[:], uint64(len(validators)))
+	h.Write(scratch[:])
+	for i := range validators {
+		if len(validators[i].PublicKey) != ed25519.PublicKeySize {
+			return out, fmt.Errorf("simplex: validator %d has invalid public key", i)
+		}
+		h.Write(validators[i].PublicKey)
+		binary.LittleEndian.PutUint64(scratch[:], validators[i].Weight)
+		h.Write(scratch[:])
+	}
+	copy(out[:], h.Sum(nil))
+
+	return out, nil
+}
+
+// CertificateBinding is the (session id, validator roster) pair a certificate
+// was verified against. A certificate proves a quorum only relative to this
+// pair: the signed payload commits to the session id (see DataToSign), and the
+// signature indices, the public keys and the 2/3+1 weight threshold all come
+// from the roster slice. Two bindings are equal iff both halves are.
+//
+// The session id already commits to the roster through groups.SessionID, so the
+// roster digest is nominally redundant — but only while that derivation, which
+// lives in another package, is correct. A seal must not rest on a property
+// proved elsewhere, so both halves are carried and both are checked.
+type CertificateBinding struct {
+	sessionID [32]byte
+	roster    [32]byte
+}
+
+// NewCertificateBinding derives the binding of one consensus session.
+func NewCertificateBinding(sessionID [32]byte, validators []Validator) (CertificateBinding, error) {
+	roster, err := RosterDigest(validators)
+	if err != nil {
+		return CertificateBinding{}, err
+	}
+
+	return CertificateBinding{sessionID: sessionID, roster: roster}, nil
+}
+
+// SessionID is the session id half of the binding.
+func (b CertificateBinding) SessionID() [32]byte { return b.sessionID }
+
+// IsZero reports the unusable zero binding, which no roster can produce: a
+// roster digest is a sha256 over at least one entry.
+func (b CertificateBinding) IsZero() bool { return b == CertificateBinding{} }
+
+// Check accepts a verified certificate only if it was verified under exactly
+// this binding. It rejects the zero binding, the zero (never verified)
+// certificate, and any certificate sealed for another session or another
+// validator roster.
+//
+// This is the whole guard a consumer runs in place of re-verifying the quorum,
+// so it is deliberately total: two 32-byte comparisons, no fallthrough.
+func (b CertificateBinding) Check(c VerifiedCertificate) error {
+	if b.IsZero() {
+		return fmt.Errorf("simplex: certificate binding is not initialized")
+	}
+	if c.IsZero() {
+		return fmt.Errorf("simplex: certificate was not verified")
+	}
+	if c.binding.sessionID != b.sessionID {
+		return fmt.Errorf("simplex: certificate was verified for another consensus session")
+	}
+	if c.binding.roster != b.roster {
+		return fmt.Errorf("simplex: certificate was verified against another validator set")
+	}
+
+	return nil
+}
+
+// VerifiedCertificate is a Certificate whose entire quorum of Ed25519
+// signatures has been verified, carried together with the binding it was
+// verified under.
+//
+// Both fields are unexported and the type has no populated literal form outside
+// this package: every value in existence came out of sealCertificate, which has
+// exactly four callers, each of which has just verified or attested the quorum:
+//
+//  1. CertificateVerifier.Verify (and the free VerifyCertificate) — ran
+//     verifyCertificatePayload over the certificate;
+//  2. ValidateBootstrap — ran verifyCertificatePayload over every journaled
+//     certificate;
+//  3. Engine.verifyCertificate — ran verifyCertificatePayload with the memoized
+//     payload and the precomputed threshold;
+//  4. Engine.seal — caller attestation for a certificate the engine assembled
+//     itself out of votes it had already verified one by one; see the comment
+//     there.
+//
+// A consumer holding one, after checking its binding, has cryptographic proof
+// of the quorum and does not repeat it. That is what lets the Simplex block
+// accepter call blockproof.CheckPreparedSignatureWeight instead of
+// blockproof.CheckPreparedSignatures.
+//
+// The referenced Certificate must be treated as immutable: the seal proves a
+// statement about the signature slice as it was at verification time.
+type VerifiedCertificate struct {
+	cert    *Certificate
+	binding CertificateBinding
+}
+
+// sealCertificate is the single funnel every VerifiedCertificate comes out of.
+// It is unexported and takes no error path on purpose: its callers are the
+// verification sites, and the type is meaningless without one of them.
+func sealCertificate(cert *Certificate, binding CertificateBinding) VerifiedCertificate {
+	return VerifiedCertificate{cert: cert, binding: binding}
+}
+
+// Certificate is the verified certificate, or nil for the zero value.
+func (c VerifiedCertificate) Certificate() *Certificate { return c.cert }
+
+// Vote is the certified vote, or the zero Vote (Kind 0, which no VoteKind
+// constant uses) for the zero value.
+func (c VerifiedCertificate) Vote() Vote {
+	if c.cert == nil {
+		return Vote{}
+	}
+
+	return c.cert.Vote
+}
+
+// Binding is the (session id, roster) pair this certificate was verified under.
+func (c VerifiedCertificate) Binding() CertificateBinding { return c.binding }
+
+// IsZero reports the never-verified zero value.
+func (c VerifiedCertificate) IsZero() bool { return c.cert == nil }
+
+// CertificateVerifier verifies certificates of one session without an Engine.
+// It exists so that the roster digest and the quorum threshold are derived once
+// per session rather than once per certificate; the candidate resolver holds
+// one for the whole session.
+type CertificateVerifier struct {
+	binding    CertificateBinding
+	validators []Validator
+	threshold  uint64
+}
+
+// NewCertificateVerifier prepares the per-session verification state.
+func NewCertificateVerifier(sessionID [32]byte, validators []Validator) (*CertificateVerifier, error) {
+	if len(validators) == 0 {
+		return nil, fmt.Errorf("simplex: empty validator set")
+	}
+	totalWeight, err := totalValidatorWeight(validators)
+	if err != nil {
+		return nil, err
+	}
+	binding, err := NewCertificateBinding(sessionID, validators)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CertificateVerifier{
+		binding:    binding,
+		validators: validators,
+		threshold:  totalWeight*2/3 + 1,
+	}, nil
+}
+
+// Binding is the binding every certificate this verifier seals carries.
+func (v *CertificateVerifier) Binding() CertificateBinding { return v.binding }
+
+// Verify checks the vote shape, index bounds, per-validator uniqueness, the
+// 2/3+1 weighted quorum and every signature, and seals the result.
+func (v *CertificateVerifier) Verify(cert *Certificate) (VerifiedCertificate, error) {
+	if cert == nil {
+		return VerifiedCertificate{}, fmt.Errorf("simplex: nil certificate")
+	}
+	if err := validateCertificateVote(cert.Vote); err != nil {
+		return VerifiedCertificate{}, err
+	}
+
+	payload := DataToSign(v.binding.sessionID, VoteBytes(cert.Vote))
+	if err := verifyCertificatePayload(v.validators, v.threshold, payload, cert); err != nil {
+		return VerifiedCertificate{}, err
+	}
+
+	return sealCertificate(cert, v.binding), nil
+}
+
 // VerifyCertificate checks a certificate without requiring an Engine. It is
 // used by the candidate resolver before data received through the request
 // protocol is allowed into session state.
-func VerifyCertificate(sessionID [32]byte, validators []Validator, cert *Certificate) error {
-	if len(validators) == 0 {
-		return fmt.Errorf("simplex: empty validator set")
-	}
-	if cert == nil {
-		return fmt.Errorf("simplex: nil certificate")
-	}
-	if err := validateCertificateVote(cert.Vote); err != nil {
-		return err
-	}
-
-	totalWeight, err := totalValidatorWeight(validators)
+//
+// Callers verifying more than one certificate of the same session should hold a
+// CertificateVerifier instead: this rebuilds the roster digest and the quorum
+// threshold on every call.
+func VerifyCertificate(
+	sessionID [32]byte,
+	validators []Validator,
+	cert *Certificate,
+) (VerifiedCertificate, error) {
+	verifier, err := NewCertificateVerifier(sessionID, validators)
 	if err != nil {
-		return err
+		return VerifiedCertificate{}, err
 	}
 
-	threshold := totalWeight*2/3 + 1
-	payload := DataToSign(sessionID, VoteBytes(cert.Vote))
-
-	return verifyCertificatePayload(validators, threshold, payload, cert)
+	return verifier.Verify(cert)
 }
 
 func validateCertificateVote(vote Vote) error {

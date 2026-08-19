@@ -424,7 +424,16 @@ func predecessorDispatchQueue(info *tlb.OutMsgQueueInfo) *tlb.DispatchQueueAugDi
 	return info.Extra.DispatchQueue
 }
 
-func mechanicalSplitState(left, right *cell.Cell) (*cell.Cell, error) {
+// MergedPredecessorStates is the split_state wrapper a merge candidate's Merkle
+// update is applied to: shard_state_split with the two children as references,
+// in order.
+//
+// It is exported because the consensus runtime builds the very same cell for
+// the same purpose — it is the root of a ChainState with two tips — and the two
+// have to be the same bytes or the two sides disagree about which tree a merge
+// candidate is a successor of. Sharing the constructor is what makes that
+// agreement structural instead of a comment in two places.
+func MergedPredecessorStates(left, right *cell.Cell) (*cell.Cell, error) {
 	builder := cell.BeginCell().MustStoreUInt(shardStateSplitTag, 32)
 	if err := builder.StoreRef(left); err != nil {
 		return nil, fmt.Errorf("%w: store left merge state: %v", ErrInvalidInput, err)
@@ -433,6 +442,10 @@ func mechanicalSplitState(left, right *cell.Cell) (*cell.Cell, error) {
 		return nil, fmt.Errorf("%w: store right merge state: %v", ErrInvalidInput, err)
 	}
 	return builder.EndCell(), nil
+}
+
+func mechanicalSplitState(left, right *cell.Cell) (*cell.Cell, error) {
+	return MergedPredecessorStates(left, right)
 }
 
 func shardPrefixCell(shard tlb.ShardIdent) *cell.Cell {

@@ -17,20 +17,47 @@ import (
 // Those proofs are what remote validators check the block against, so a silent
 // change there is worse than a changed block: the block still verifies locally.
 //
-// What is pinned here is the property, not a constant: the same inputs must
-// produce the same proofs. A hash constant would be the stronger guard, but it
-// can only be taken from a tree that is not being changed underneath it, and
-// pinning one during in-flight work encodes somebody's intermediate state as
-// the reference.
+// What is pinned here is byte identity, as constants. It used to be only the
+// property — the same inputs produce the same proofs — because a hash taken
+// during in-flight work would encode somebody's intermediate state as the
+// reference, and the hashes were merely logged. That deferral has been paid for
+// roughly ten times over two days of hand-checking the printed digests against
+// each other across runs, which is a guard that only works when a person
+// remembers to look. The tree is settled, so the constants below are recorded
+// from it and asserted.
+//
+// A deliberate change to the collated proofs is expected to fail this test.
+// Regenerate the constants ONLY from a run whose output has been reviewed on
+// purpose, never by copying whatever the failure printed.
+
+// The recorded output of fullCollatedMainnetCandidate. Both halves matter and
+// for different reasons: the block is what consensus finalizes, and the
+// collated data is what remote validators check it against — a change confined
+// to the second one leaves the block verifying locally and rejected everywhere
+// else, which is the failure this file exists for.
+const (
+	fullCollatedGoldenBlockBytes    = 270276
+	fullCollatedGoldenBlockSum      = "b4817ecd423702cf2ba6207ad06d068d4934f5b262a3b6208b0607de3dc0cdec"
+	fullCollatedGoldenCollatedBytes = 136298
+	fullCollatedGoldenCollatedSum   = "65f1547faa3b4a93ea4e7d3ed9df1319dbdee977d39c113ed9411d08db47518d"
+)
+
+// fullCollatedMainnetRequest is the shared input. The capability is set on the
+// caller's own Config copy, never on the cached one, which is why the cache key
+// does not mention it.
+func fullCollatedMainnetRequest(tb testing.TB) ShardRequest {
+	tb.Helper()
+
+	req := benchMainnetHandout(benchMainnetWorkloadFor(tb, benchMainnetVariant{repeat: 1, mint: true}))
+	req.Masterchain.Config.capabilities |= capFullCollatedData
+
+	return req
+}
 
 func fullCollatedMainnetCandidate(tb testing.TB) (ShardRequest, *Candidate) {
 	tb.Helper()
 
-	now, floorLT := benchMainnetTimeBase(tb)
-	base := benchRebaseTime(tb, emptyCandidateRequest(tb), now, floorLT)
-	req, _ := benchMainnetRequestFrom(tb, 0, 1, true, base)
-	req.Masterchain.Config.capabilities |= capFullCollatedData
-
+	req := fullCollatedMainnetRequest(tb)
 	candidate, err := testBuilder().BuildShard(context.Background(), req)
 	if err != nil {
 		tb.Fatalf("collate mainnet workload with full collated data: %v", err)
@@ -50,6 +77,27 @@ func TestFullCollatedMainnetCandidateCarriesAnOpenableProof(t *testing.T) {
 	t.Logf("block %d bytes %s, collated %d bytes %s",
 		len(candidate.BlockBOC), hex.EncodeToString(blockSum[:]),
 		len(candidate.CollatedData), hex.EncodeToString(collatedSum[:]))
+	for _, check := range []struct {
+		what      string
+		gotBytes  int
+		wantBytes int
+		gotSum    string
+		wantSum   string
+	}{
+		{
+			"block", len(candidate.BlockBOC), fullCollatedGoldenBlockBytes,
+			hex.EncodeToString(blockSum[:]), fullCollatedGoldenBlockSum,
+		},
+		{
+			"collated data", len(candidate.CollatedData), fullCollatedGoldenCollatedBytes,
+			hex.EncodeToString(collatedSum[:]), fullCollatedGoldenCollatedSum,
+		},
+	} {
+		if check.gotBytes != check.wantBytes || check.gotSum != check.wantSum {
+			t.Fatalf("%s is %d bytes %s, want the recorded %d bytes %s",
+				check.what, check.gotBytes, check.gotSum, check.wantBytes, check.wantSum)
+		}
+	}
 
 	// A proof that serialises but does not open is the failure a hash alone
 	// would let through whenever the hash itself is regenerated.
@@ -125,7 +173,21 @@ func TestFullCollatedLazyPredecessorDoesNotMaterializeIdleAccounts(t *testing.T)
 // passes any single golden check and still makes two validators disagree, and
 // unlike the block itself nothing downstream would notice locally.
 func TestFullCollatedMainnetCandidateIsDeterministic(t *testing.T) {
-	_, first := fullCollatedMainnetCandidate(t)
+	// One request, nine collations. Rebuilding the input on every iteration was
+	// not the property being asserted and weakened it: a divergence could then
+	// have come from the fixture rather than from the collator, which is exactly
+	// the reading this test must not admit.
+	req := fullCollatedMainnetRequest(t)
+	collate := func() *Candidate {
+		candidate, err := testBuilder().BuildShard(context.Background(), req)
+		if err != nil {
+			t.Fatalf("collate mainnet workload with full collated data: %v", err)
+		}
+
+		return candidate
+	}
+
+	first := collate()
 	firstBlock := sha256.Sum256(first.BlockBOC)
 	firstCollated := sha256.Sum256(first.CollatedData)
 
@@ -133,7 +195,7 @@ func TestFullCollatedMainnetCandidateIsDeterministic(t *testing.T) {
 	// three to one in twelve, depending on the tree) most of the time; a loop
 	// that has to be lucky is a loop that will be believed when it is quiet.
 	for i := range 8 {
-		_, next := fullCollatedMainnetCandidate(t)
+		next := collate()
 		if sha256.Sum256(next.BlockBOC) != firstBlock {
 			t.Fatalf("run %d produced a different block", i+1)
 		}

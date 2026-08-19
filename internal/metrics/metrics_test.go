@@ -161,7 +161,21 @@ func TestMetricsHandlerExposesSyncAndStatusMetrics(t *testing.T) {
 		return pebblestore.DBStatus{
 			LazyCellLoads: []storage.LazyCellLoadMetric{
 				{Layer: storage.LazyCellLoadLayerDecodedCache, Count: 3},
-				{Layer: storage.LazyCellLoadLayerPebble, Count: 5},
+				{Layer: storage.LazyCellLoadLayerBlockCache, Count: 5},
+				{Layer: storage.LazyCellLoadLayerPageCache, Count: 13},
+				{Layer: storage.LazyCellLoadLayerDisk, Count: 2},
+			},
+			// RecordCache set, but the record_cache LAYER deliberately absent
+			// from LazyCellLoads above: the layer must still export, at zero,
+			// because the collector seeds from the canonical layer list.
+			RecordCache: &pebblestore.RecordCacheStatus{
+				Entries:          17,
+				ResidentBytes:    2389,
+				CapacityBytes:    8192,
+				IndexBytes:       1024,
+				Inserts:          19,
+				Declined:         3,
+				SalvageTruncated: 1,
 			},
 			CellGenerations: []pebblestore.CellDBGenerationStatus{
 				{
@@ -247,8 +261,18 @@ func TestMetricsHandlerExposesSyncAndStatusMetrics(t *testing.T) {
 		namespace + `_storage_persistent_state_bytes 21`,
 		namespace + `_storage_cell_db_generation{generation="active"} 1`,
 		namespace + `_storage_lazy_cell_loads_total{layer="decoded_cache"} 3`,
-		namespace + `_storage_lazy_cell_loads_total{layer="pebble"} 5`,
+		namespace + `_storage_lazy_cell_loads_total{layer="block_cache"} 5`,
+		namespace + `_storage_lazy_cell_loads_total{layer="page_cache"} 13`,
+		namespace + `_storage_lazy_cell_loads_total{layer="disk"} 2`,
 		namespace + `_storage_lazy_cell_loads_total{layer="state_window"} 2`,
+		namespace + `_storage_lazy_cell_loads_total{layer="record_cache"} 0`,
+		namespace + `_storage_record_cache_entries 17`,
+		namespace + `_storage_record_cache_bytes{kind="resident"} 2389`,
+		namespace + `_storage_record_cache_bytes{kind="capacity"} 8192`,
+		namespace + `_storage_record_cache_bytes{kind="index"} 1024`,
+		namespace + `_storage_record_cache_inserts_total 19`,
+		namespace + `_storage_record_cache_declined_inserts_total 3`,
+		namespace + `_storage_record_cache_salvage_truncated_total 1`,
 		namespace + `_storage_cell_db_read_cells_total{generation="active",shard="0"} 7`,
 		namespace + `_storage_cell_db_written_cells_total{generation="active",shard="0"} 11`,
 	} {

@@ -33,6 +33,7 @@ type PrivateOverlayConfig struct {
 	UseQUIC                         bool
 	AllowLegacyBroadcasts           bool
 	EnableTwoStep                   bool
+	TwoStepIntermediateMembers      []PeerID
 	BroadcastSigner                 overlay.BroadcastSigner
 }
 
@@ -230,6 +231,20 @@ func (r *PrivateOverlayRegistry) buildSpec(
 		}
 		authorized[string(id[:])] = maxSize
 	}
+	var twoStepIntermediateIDs map[PeerID]struct{}
+	if cfg.EnableTwoStep {
+		if len(cfg.TwoStepIntermediateMembers) == 0 {
+			return overlaySpec{}, nil, errors.New("private overlay has no two-step intermediate members")
+		}
+
+		twoStepIntermediateIDs = make(map[PeerID]struct{}, len(cfg.TwoStepIntermediateMembers))
+		for _, id := range cfg.TwoStepIntermediateMembers {
+			if id.IsZero() {
+				return overlaySpec{}, nil, errors.New("private overlay has an empty two-step intermediate member id")
+			}
+			twoStepIntermediateIDs[id] = struct{}{}
+		}
+	}
 
 	signer := cfg.BroadcastSigner
 	if signer == nil {
@@ -254,6 +269,7 @@ func (r *PrivateOverlayRegistry) buildSpec(
 		UseQUIC:                         cfg.UseQUIC,
 		PrivateAllowLegacyBroadcasts:    cfg.AllowLegacyBroadcasts,
 		PrivateTwoStep:                  cfg.EnableTwoStep,
+		PrivateTwoStepIntermediateIDs:   twoStepIntermediateIDs,
 		PrivateUnauthenticatedBroadcast: cfg.MaxUnauthenticatedBroadcastSize,
 	}, signer, nil
 }

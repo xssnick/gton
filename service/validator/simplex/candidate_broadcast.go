@@ -266,15 +266,25 @@ func serializeCandidatePayload(candidate Candidate, blockBOC, collatedData []byt
 	roots[0] = blockRoot
 	roots = append(roots, collatedRoots...)
 
-	return compressCandidatePayload(candidate.Block.SeqNo, candidate.Block.RootHash, roots)
+	return compressCandidatePayload(
+		candidate.Block.SeqNo,
+		candidate.Block.RootHash,
+		roots,
+		PayloadCellHint(blockBOC, collatedData),
+	)
 }
 
 // compressCandidatePayload is the reference wire algorithm of
 // compress_candidate_data (payload.cpp): one mode-2 BOC over the block root
 // followed by the collated roots, raw LZ4 over it, wrapped in
 // validatorSession.compressedCandidate. roots carries that order already.
-func compressCandidatePayload(seqNo uint32, rootHash []byte, roots []*cell.Cell) ([]byte, error) {
-	combined, err := cell.ToBOCWithOptionsErr(roots, cell.BOCSerializeOptions{WithCRC32C: true})
+// cellsHint presizes the serializer's dedup structures and changes no byte of
+// the output; see PayloadCellHint for where it comes from and what bounds it.
+func compressCandidatePayload(seqNo uint32, rootHash []byte, roots []*cell.Cell, cellsHint int) ([]byte, error) {
+	combined, err := cell.ToBOCWithOptionsErr(roots, cell.BOCSerializeOptions{
+		WithCRC32C:     true,
+		CellsCountHint: cellsHint,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("simplex: serialize combined candidate BOC: %w", err)
 	}

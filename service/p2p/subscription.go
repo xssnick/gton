@@ -338,7 +338,9 @@ func (s *overlaySubscription) run(ctx context.Context) {
 		defer s.plumtree.Wait()
 	}
 
-	s.log.Info().Msg("starting overlay peer discovery")
+	s.log.Info().
+		Hex("short_id", s.spec.ShortID).
+		Msg("starting overlay peer discovery")
 	s.startPeerDiscovery(ctx)
 
 	dhtTicker := time.NewTicker(dhtRefreshInterval)

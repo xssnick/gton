@@ -12,6 +12,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/gton/service/validator/blockstats"
 	"github.com/xssnick/gton/service/validator/keyring"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/liteclient"
@@ -45,6 +46,11 @@ type StateReader interface {
 	BlockMeta(ctx context.Context, block ton.BlockIDExt) (*storage.BlockMeta, error)
 }
 
+// BlockStatsReader provides the process-lifetime terminal block counters.
+type BlockStatsReader interface {
+	BlockStats() blockstats.Snapshot
+}
+
 type TrustedClient struct {
 	ID          [32]byte
 	Permissions uint32
@@ -57,6 +63,7 @@ type Options struct {
 	Keys           Keys
 	LocalADNLID    [32]byte
 	State          StateReader
+	BlockStats     BlockStatsReader
 	Logger         zerolog.Logger
 }
 
@@ -67,6 +74,7 @@ type Server struct {
 	keys          Keys
 	localADNLID   [32]byte
 	state         StateReader
+	blockStats    BlockStatsReader
 	logger        zerolog.Logger
 
 	lifecycleMu sync.Mutex
@@ -99,6 +107,9 @@ func New(options Options) (*Server, error) {
 	}
 	if options.State == nil {
 		return nil, errors.New("validator control: state reader is required")
+	}
+	if options.BlockStats == nil {
+		return nil, errors.New("validator control: block stats reader is required")
 	}
 	if options.LocalADNLID == ([32]byte{}) {
 		return nil, errors.New("validator control: local ADNL ID is required")
@@ -135,6 +146,7 @@ func New(options Options) (*Server, error) {
 		keys:          options.Keys,
 		localADNLID:   options.LocalADNLID,
 		state:         options.State,
+		blockStats:    options.BlockStats,
 		logger:        options.Logger,
 		connections:   make(map[*liteclient.ServerClient]struct{}),
 	}

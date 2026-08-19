@@ -24,6 +24,7 @@ func TestPrivateOverlayRegistryBuildsRawFullIDAndOwnsConfig(t *testing.T) {
 		Members:                    []PeerID{node.localID, node.localID},
 		AuthorizedBroadcastSources: map[PeerID]uint32{source: 1234},
 		EnableTwoStep:              true,
+		TwoStepIntermediateMembers: []PeerID{node.localID},
 	}
 
 	handle, err := node.PrivateOverlays().Open(cfg, PrivateOverlayCallbacks{})
@@ -54,6 +55,58 @@ func TestPrivateOverlayRegistryBuildsRawFullIDAndOwnsConfig(t *testing.T) {
 	}
 	if handle.sub.plumtree != nil {
 		t.Fatal("private overlay created an unsupported Plumtree runtime")
+	}
+}
+
+func TestPrivateOverlayTwoStepRequiresExplicitIntermediates(t *testing.T) {
+	node := newPrivateOverlayTestNode(t)
+	remote := testPeerID("private-overlay-intermediate")
+
+	_, err := node.PrivateOverlays().Open(PrivateOverlayConfig{
+		FullID:        []byte("missing two-step intermediates"),
+		Members:       []PeerID{node.localID, remote},
+		EnableTwoStep: true,
+	}, PrivateOverlayCallbacks{})
+	if err == nil {
+		t.Fatal("two-step overlay accepted an implicit intermediate set")
+	}
+
+	handle, err := node.PrivateOverlays().Open(PrivateOverlayConfig{
+		FullID:                     []byte("foreign two-step intermediate"),
+		Members:                    []PeerID{node.localID},
+		EnableTwoStep:              true,
+		TwoStepIntermediateMembers: []PeerID{remote},
+	}, PrivateOverlayCallbacks{})
+	if err != nil {
+		t.Fatalf("two-step overlay rejected an intermediate allow-set wider than its members: %v", err)
+	}
+	t.Cleanup(func() { _ = handle.Close() })
+	if _, ok := handle.sub.spec.PrivateTwoStepIntermediateIDs[remote]; !ok {
+		t.Fatal("two-step overlay lost the configured current-validator intermediate")
+	}
+}
+
+func TestPrivateOverlayTwoStepTargetsOnlyConfiguredIntermediates(t *testing.T) {
+	validator := testPeerID("two-step-validator")
+	observer := testPeerID("two-step-observer")
+	validatorPeer := &overlayPeer{id: validator}
+	observerPeer := &overlayPeer{id: observer}
+	sub := &overlaySubscription{spec: overlaySpec{
+		Kind:                          overlayKindPrivate,
+		PrivateTwoStep:                true,
+		PrivateTwoStepIntermediateIDs: map[PeerID]struct{}{validator: {}},
+	}}
+	sub.broadcastTargets.Store(&broadcastTargetsSnapshot{
+		builtAt: time.Now(),
+		peers:   []*overlayPeer{validatorPeer, observerPeer},
+	})
+
+	got := sub.twoStepIntermediateCandidates()
+	if len(got) != 1 || got[0] != validatorPeer {
+		t.Fatalf("two-step candidates = %#v, want only current validator", got)
+	}
+	if got = sub.twoStepCandidates(validator); len(got) != 1 || got[0] != observerPeer {
+		t.Fatalf("two-step relay candidates = %#v, want every peer except the source", got)
 	}
 }
 
@@ -310,6 +363,7 @@ func TestPrivateOverlayBroadcastCallbacksBypassTONClassifier(t *testing.T) {
 		Members:                    []PeerID{node.localID, immediate},
 		AuthorizedBroadcastSources: map[PeerID]uint32{source: 1024},
 		EnableTwoStep:              true,
+		TwoStepIntermediateMembers: []PeerID{immediate},
 	}, PrivateOverlayCallbacks{
 		BroadcastPrecheck: func(_ context.Context, request PrivateOverlayBroadcastPrecheck) error {
 			prechecked++
@@ -406,6 +460,7 @@ func TestPrivateOverlayQUICIngressRoutesTwoStepBroadcast(t *testing.T) {
 		AuthorizedBroadcastSources: map[PeerID]uint32{sourceID: 1024},
 		UseQUIC:                    true,
 		EnableTwoStep:              true,
+		TwoStepIntermediateMembers: []PeerID{immediate},
 	}, PrivateOverlayCallbacks{
 		BroadcastPrecheck: func(_ context.Context, request PrivateOverlayBroadcastPrecheck) error {
 			if request.Source != sourceID || request.ImmediatePeer != immediate ||
@@ -467,10 +522,11 @@ func TestPrivateOverlayTwoStepUsesPerCallSignerAndRawExtra(t *testing.T) {
 	configuredKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x41}, ed25519.SeedSize))
 	configuredSigner := privateOverlayTestSigner{key: configuredKey}
 	handle, err := node.PrivateOverlays().Open(PrivateOverlayConfig{
-		FullID:          []byte("two-step per-call signer"),
-		Members:         []PeerID{node.localID},
-		EnableTwoStep:   true,
-		BroadcastSigner: configuredSigner,
+		FullID:                     []byte("two-step per-call signer"),
+		Members:                    []PeerID{node.localID},
+		EnableTwoStep:              true,
+		TwoStepIntermediateMembers: []PeerID{node.localID},
+		BroadcastSigner:            configuredSigner,
 	}, PrivateOverlayCallbacks{})
 	if err != nil {
 		t.Fatalf("open private overlay: %v", err)

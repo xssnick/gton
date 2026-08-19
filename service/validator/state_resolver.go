@@ -32,6 +32,16 @@ type resolvedLineage struct {
 	Candidates         []*CandidateArtifact
 	AppliedAnchor      *ton.BlockIDExt
 	AppliedAnchorState *ChainState
+	// Walk is what the walk cost, which is not derivable from the result: the
+	// returned lineage is trimmed at the applied anchor, while the walk visited
+	// everything down to it and paid per step.
+	Walk lineageWalkStats
+}
+
+// lineageWalkStats is one walk's depth and the residency of each step.
+type lineageWalkStats struct {
+	Visited int
+	Steps   [lineageStepSourceCount]int
 }
 
 type stateResolver struct {
@@ -40,24 +50,46 @@ type stateResolver struct {
 	storage    ValidatorStorage
 	backend    SessionBackend
 	candidates *candidateResolver
-	recovery   []*simplex.Certificate
+	recovery   []simplex.VerifiedCertificate
+	// slotsPerLeaderWindow is a critical session parameter and never changes for
+	// the life of this resolver. targetRate is noncritical and does, through
+	// updateParams; both retention margins here are derived from them rather
+	// than written as slot literals.
+	slotsPerLeaderWindow uint32
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu        sync.Mutex
-	genesis   *ChainState
-	startAt   *SessionStart
-	anchor    *resolvedAnchorState
-	states    map[simplex.ParentID]*stateFlight
-	finalized map[simplex.CandidateID]*finalizedState
+	mu sync.Mutex
+	// targetRate is the noncritical slot rate the wall-clock retention margins
+	// are converted against. It is read under mu because updateParams writes it.
+	targetRate time.Duration
+	genesis    *ChainState
+	startAt    *SessionStart
+	anchor     *resolvedAnchorState
+	states     map[simplex.ParentID]*stateFlight
+	finalized  map[simplex.CandidateID]*finalizedState
+	// applied holds exactly the finalization markers still carrying a loaded
+	// state. finalized itself is never pruned — its markers are what keep an
+	// already-final block from being re-applied through a Merkle update — so the
+	// release sweep is driven from here instead, and costs what it retains.
+	applied   map[simplex.CandidateID]*finalizedState
 	persisted map[simplex.CandidateID]struct{}
-	isClosed  bool
+	// lineageFloor is the oldest slot a leader window's lineage walk has had to
+	// reach, and lineageFloorKnown says whether any walk has happened at all. It
+	// is the producer stating its own retention requirement: the walk descends to
+	// the masterchain-visible finalized anchor, and both sweeps must leave
+	// everything from there up alone. Its monotone maximum is what frees the
+	// slots the anchor has moved past.
+	lineageFloor      uint32
+	lineageFloorKnown bool
+	isClosed          bool
 }
 
 type stateFlight struct {
 	done   chan struct{}
+	cancel context.CancelFunc
 	result ResolvedState
 	err    error
 }
@@ -65,10 +97,14 @@ type stateFlight struct {
 type finalizedState struct {
 	isDone     bool
 	reconciled bool
-	applied    bool
 	// appliedState is the exact immutable state loaded from the ordinary node
 	// store. Keeping it with the finalization marker lets the in-process
 	// collator restore the same anchor without a second storage read.
+	//
+	// It is a whole separately loaded state tree, so it is kept only while a
+	// lineage walk can still reach this slot: past that, notifyFinalized drops
+	// it and loadAppliedCandidateState reloads on demand. The marker beside it
+	// never goes away.
 	appliedState *ChainState
 	inFlight     *resolverFlight
 }
@@ -90,21 +126,26 @@ func newStateResolver(
 	backend SessionBackend,
 	candidates *candidateResolver,
 	stored StoredSessionState,
-	recovery []*simplex.Certificate,
+	recovery []simplex.VerifiedCertificate,
+	params simplex.Params,
+	slotsPerLeaderWindow uint32,
 ) *stateResolver {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &stateResolver{
-		shard:      shard,
-		storageID:  storageID,
-		storage:    storage,
-		backend:    backend,
-		candidates: candidates,
-		recovery:   recovery,
-		ctx:        ctx,
-		cancel:     cancel,
-		states:     make(map[simplex.ParentID]*stateFlight),
-		finalized:  make(map[simplex.CandidateID]*finalizedState, len(stored.Finalized)),
-		persisted:  make(map[simplex.CandidateID]struct{}, len(stored.Finalized)),
+		shard:                shard,
+		storageID:            storageID,
+		storage:              storage,
+		backend:              backend,
+		candidates:           candidates,
+		recovery:             recovery,
+		slotsPerLeaderWindow: slotsPerLeaderWindow,
+		targetRate:           params.TargetRate,
+		ctx:                  ctx,
+		cancel:               cancel,
+		states:               make(map[simplex.ParentID]*stateFlight),
+		finalized:            make(map[simplex.CandidateID]*finalizedState, len(stored.Finalized)),
+		applied:              make(map[simplex.CandidateID]*finalizedState),
+		persisted:            make(map[simplex.CandidateID]struct{}, len(stored.Finalized)),
 	}
 	for _, id := range stored.Finalized {
 		r.finalized[id] = &finalizedState{isDone: true}
@@ -113,13 +154,22 @@ func newStateResolver(
 	// A final certificate is itself durable consensus evidence. Include it in
 	// the replay set even if the process crashed before MarkFinalized completed.
 	for _, certificate := range recovery {
-		id := certificate.Vote.ID
+		id := certificate.Vote().ID
 		if r.finalized[id] == nil {
 			r.finalized[id] = &finalizedState{isDone: true}
 		}
 	}
 
 	return r
+}
+
+// updateParams installs a new noncritical parameter set. Only the slot rate
+// matters here, and only because the retention margins are wall-clock budgets
+// converted against it.
+func (r *stateResolver) updateParams(params simplex.Params) {
+	r.mu.Lock()
+	r.targetRate = params.TargetRate
+	r.mu.Unlock()
 }
 
 func (r *stateResolver) start(ctx context.Context, start SessionStart) error {
@@ -189,7 +239,7 @@ func (r *stateResolver) start(ctx context.Context, start SessionStart) error {
 	// unordered certificate bootstrap may prune older slots after seeing the
 	// newest certificate and therefore cannot repair the missing prefix itself.
 	for _, certificate := range r.recovery {
-		if err = r.finalizeWith(ctx, certificate.Vote.ID, certificate, nil); err != nil {
+		if err = r.finalizeWith(ctx, certificate.Vote().ID, certificate, nil); err != nil {
 			return fmt.Errorf("validator runtime: replay masterchain finalization: %w", err)
 		}
 	}
@@ -212,7 +262,7 @@ func (r *stateResolver) reconcileAppliedRecovery(ctx context.Context) error {
 	var appliedStateID simplex.CandidateID
 	var lastChecked *ton.BlockIDExt
 	for i := len(r.recovery) - 1; i >= 0; i-- {
-		id := r.recovery[i].Vote.ID
+		id := r.recovery[i].Vote().ID
 		if _, persisted := r.persisted[id]; !persisted {
 			continue
 		}
@@ -256,7 +306,7 @@ func (r *stateResolver) reconcileAppliedRecovery(ctx context.Context) error {
 
 	r.mu.Lock()
 	for i := 0; i <= appliedThrough; i++ {
-		id := r.recovery[i].Vote.ID
+		id := r.recovery[i].Vote().ID
 		if _, persisted := r.persisted[id]; !persisted {
 			continue
 		}
@@ -264,9 +314,8 @@ func (r *stateResolver) reconcileAppliedRecovery(ctx context.Context) error {
 		if state != nil {
 			state.isDone = true
 			state.reconciled = true
-			state.applied = true
 			if appliedState != nil && id == appliedStateID {
-				state.appliedState = appliedState
+				r.rememberAppliedStateLocked(id, state, appliedState)
 			}
 		}
 	}
@@ -296,10 +345,11 @@ func (r *stateResolver) resolve(ctx context.Context, id simplex.ParentID) (Resol
 	}
 	flight := r.states[id]
 	if flight == nil {
-		flight = &stateFlight{done: make(chan struct{})}
+		flightCtx, cancel := context.WithCancel(r.ctx)
+		flight = &stateFlight{done: make(chan struct{}), cancel: cancel}
 		r.states[id] = flight
 		r.wg.Add(1)
-		go r.resolveLoop(id, flight)
+		go r.resolveLoop(flightCtx, id, flight)
 	}
 	r.mu.Unlock()
 
@@ -311,56 +361,230 @@ func (r *stateResolver) resolve(ctx context.Context, id simplex.ParentID) (Resol
 	}
 }
 
-// stateCacheRetainedSlots is the margin of already-finalized parents kept
-// resolved. Simplex prunes its own slot map at slot+1, so nothing below the
-// finalized slot can become the parent of a new candidate; the margin only
-// absorbs a leader window that opened just before the finalization it now
-// trails, because re-resolving a released parent reloads a whole state from
-// the node.
-const stateCacheRetainedSlots = 4
+// rememberValidatedState makes an exact post-validation state available to
+// descendants before notarization, finalization, or the ordinary node apply
+// pipeline. If a finalized-state store lookup won the race and is already
+// polling, this result completes the same flight and cancels the redundant
+// lookup without replacing the identity seen by its waiters.
+func (r *stateResolver) rememberValidatedState(id simplex.CandidateID, resolved ResolvedState) {
+	parent := simplex.Parent(id)
+
+	r.mu.Lock()
+	if r.isClosed {
+		r.mu.Unlock()
+
+		return
+	}
+	flight := r.states[parent]
+	if flight == nil {
+		done := make(chan struct{})
+		close(done)
+		r.states[parent] = &stateFlight{done: done, result: resolved}
+		r.mu.Unlock()
+
+		return
+	}
+	select {
+	case <-flight.done:
+		r.mu.Unlock()
+
+		return
+	default:
+	}
+	flight.result = resolved
+	flight.err = nil
+	close(flight.done)
+	cancel := flight.cancel
+	r.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// stateRetainedSlots is the margin of already-finalized parents kept resolved.
+// Simplex prunes its own slot map at slot+1, so nothing below the finalized
+// slot can become the parent of a new candidate; the margin only absorbs a
+// leader window that opened just before the finalization it now trails, because
+// re-resolving a released parent reloads a whole state from the node.
+//
+// A leader window is SlotsPerLeaderWindow slots, which is configured per
+// session, so the margin is derived from that value rather than from the four
+// slots this network happens to use.
+func (r *stateResolver) stateRetainedSlots() uint32 {
+	return stateRetainedSlots(r.slotsPerLeaderWindow)
+}
+
+// finalizedStateRetainedSlots is the margin of applied finalized states kept in
+// memory. It matches the candidate payload margin deliberately, because the
+// same lineage walk consumes both: a walk that still finds its candidates
+// resident still finds their states, and one that has gone far enough back to
+// reload the bytes reloads the state with them. The anchor of the current
+// leader window is not in this set — resolvedAnchorState is separate for
+// exactly that reason.
+func (r *stateResolver) finalizedStateRetainedSlots() uint32 {
+	return candidateRetainedSlots(r.targetRate)
+}
+
+// retentionFloorNone is the floor of a session no consumer constrains: nothing
+// has walked a lineage here yet, so the fixed margins are the whole policy.
+const retentionFloorNone = ^uint32(0)
+
+// retentionFloor is the oldest slot the finalization sweeps must not release
+// below, together with the producer's own request and whether the retention
+// budget is what overrode it.
+//
+// Capped is not a statement about how far behind this node is. It says the
+// retained payloads between the producer's anchor and the tip no longer fit the
+// session's memory budget, which is the only reason to stop honouring a request
+// that costs memory.
+type retentionFloor struct {
+	Slot   uint32
+	Capped bool
+	// Anchor is where the last completed lineage walk stopped, and AnchorKnown
+	// whether any walk has completed at all. It is reported so the distance
+	// between it and the finalized slot stays visible without being what the
+	// sweeps are bounded by.
+	Anchor      uint32
+	AnchorKnown bool
+}
 
 // notifyFinalized releases resolved parent states consensus can no longer
-// build on. Nothing else drops them before the session object itself is
-// released, so a long catchain otherwise keeps every intermediate state
-// version of the session reachable. An applied successor shares the unchanged
-// subtrees of its parent, so an ordinary flight uniquely pins the superseded
-// part of that state plus its block BOC; a finalized parent pins a whole
-// separately loaded state tree, which is where the bulk of the bytes are.
+// build on, and the applied states of finalizations it has left behind.
+// Nothing else drops either before the session object itself is released, so a
+// long catchain otherwise keeps every intermediate state version of the session
+// reachable. An applied successor shares the unchanged subtrees of its parent,
+// so an ordinary flight uniquely pins the superseded part of that state plus
+// its block BOC; a finalized parent pins a whole separately loaded state tree,
+// which is where the bulk of the bytes are.
 //
 // A flight that is still resolving is never removed. resolveLoop reconciles
 // r.states[id] against its own flight only on the error path, so dropping an
 // in-flight entry would let the next resolve start a second, concurrent
 // ApplyMerkleUpdate over a full state.
-func (r *stateResolver) notifyFinalized(slot uint32) {
-	if slot < stateCacheRetainedSlots {
-		return
-	}
-	watermark := slot - stateCacheRetainedSlots
-
+//
+// It returns the floor both sweeps ran under, because the candidate payloads
+// have the same consumer and must be released against the same bound.
+//
+// budgetFloor is the oldest slot the session's retention budget still allows,
+// computed from the retained payloads themselves by candidateResolver.
+// retentionCapFloor. It is passed in rather than read here so neither resolver
+// takes the other's lock.
+func (r *stateResolver) notifyFinalized(slot uint32, budgetFloor uint32) retentionFloor {
 	r.mu.Lock()
-	for id, flight := range r.states {
-		if !id.Exists || id.ID.Slot >= watermark {
+	defer r.mu.Unlock()
+
+	floor := r.retentionFloorLocked(slot, budgetFloor)
+	if margin := r.stateRetainedSlots(); slot >= margin {
+		watermark := slot - margin
+		for id, flight := range r.states {
+			if !id.Exists || id.ID.Slot >= watermark {
+				continue
+			}
+			select {
+			case <-flight.done:
+				delete(r.states, id)
+			default:
+			}
+		}
+	}
+	stateMargin := r.finalizedStateRetainedSlots()
+	if slot < stateMargin {
+		return floor
+	}
+
+	// The finalization marker stays; only the state tree behind it goes. A
+	// finalization still being applied keeps its own, and is reconsidered at the
+	// next finalization. The producer's floor bounds this exactly as it bounds
+	// the candidate payloads: the state the next leader window anchors on is the
+	// one at the bottom of the same walk, and reloading it is a whole ChainState
+	// out of the node backend.
+	watermark := min(slot-stateMargin, floor.Slot)
+	for id, state := range r.applied {
+		if id.Slot >= watermark || state.inFlight != nil {
 			continue
 		}
-		select {
-		case <-flight.done:
-			delete(r.states, id)
-		default:
-		}
+		state.appliedState = nil
+		delete(r.applied, id)
 	}
-	r.mu.Unlock()
+
+	return floor
+}
+
+// retentionFloorLocked reports what the local producer still needs, bounded by
+// the session's retention budget.
+//
+// The requirement is stated by the consumer rather than guessed at: a lineage
+// walk reports where it stopped, which is the masterchain-visible finalized
+// anchor and therefore the oldest slot the next one can be asked to reach. A
+// session that has never walked one constrains nothing, which is what keeps an
+// observer — or any session with no local producer — on the fixed margins.
+//
+// What bounds that requirement is budgetFloor, and it is a measurement of the
+// retained payloads rather than a slot distance. The distinction is the whole
+// point: this bound used to be slot - 64, so a session that skipped 64 slots
+// gave up on its producer's lineage while holding nothing at all — skips are
+// slots that never had a block and never will, and charging them as production
+// lag turned a stalled session into one that also had to read its lineage back
+// from storage. Slots the session never produced in are now free, because they
+// cost nothing.
+func (r *stateResolver) retentionFloorLocked(slot uint32, budgetFloor uint32) retentionFloor {
+	if !r.lineageFloorKnown {
+		return retentionFloor{Slot: retentionFloorNone}
+	}
+
+	floor := retentionFloor{Slot: r.lineageFloor, Anchor: r.lineageFloor, AnchorKnown: true}
+	if budgetFloor > r.lineageFloor && budgetFloor <= slot {
+		floor.Slot = budgetFloor
+		floor.Capped = true
+	}
+
+	return floor
+}
+
+// noteLineageFloorLocked records how far back a completed lineage walk reached.
+// It only ever moves forward: the anchor advances as the node applies, and the
+// slots it has moved past are the ones the sweeps are free to release again.
+func (r *stateResolver) noteLineageFloorLocked(slot uint32) {
+	if !r.lineageFloorKnown || slot > r.lineageFloor {
+		r.lineageFloor = slot
+		r.lineageFloorKnown = true
+	}
+}
+
+// lineageAnchor is where the last completed leader-window walk stopped, as of
+// right now. Lineage walks run per leader window and keep running through a
+// standstill — they are what a stalled session spends its time on — so this
+// advances between finalizations, and reading it from the last finalization
+// instead would freeze it for exactly as long as the session is stuck.
+func (r *stateResolver) lineageAnchor() (uint32, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.lineageFloor, r.lineageFloorKnown
 }
 
 // stateCacheStats is a debug projection of the session-scoped state cache.
-// BlockBOCBytes covers only the block payloads of the retained tips: the
-// applied state roots dominate the real footprint, but they are shared,
-// immutable cell trees whose size cannot be taken without walking them, so
-// Resolved — one distinct retained root each — is the growth figure that
-// matters.
+//
+// BlockBOCBytes is the one figure here that is bytes, and it is a floor rather
+// than a measurement: it counts the block payloads of the retained tips and
+// nothing else. Two much larger things sit beside every one of those payloads
+// and cannot be sized without walking them — the applied state root, and the
+// parsed block DAG each tip pins through ChainTip.Block, which is typically
+// several times the payload it was decoded from. Both are shared immutable cell
+// trees, so Resolved — one distinct retained tip set each — is the growth
+// figure that matters, and the byte count is only useful for spotting a retained
+// count that stops matching the payload sizes.
+//
+// AppliedStates counts the same kind of root held beside a finalization
+// marker. It is the figure that turns from a margin into a leak if a path that
+// stores one ever escapes the release sweep, which is why it is reported
+// separately from the finalization markers themselves.
 type stateCacheStats struct {
 	States        int
 	Resolved      int
 	Finalized     int
+	AppliedStates int
 	BlockBOCBytes int64
 }
 
@@ -368,7 +592,11 @@ func (r *stateResolver) cacheStats() stateCacheStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	stats := stateCacheStats{States: len(r.states), Finalized: len(r.finalized)}
+	stats := stateCacheStats{
+		States:        len(r.states),
+		Finalized:     len(r.finalized),
+		AppliedStates: len(r.applied),
+	}
 	for _, flight := range r.states {
 		select {
 		case <-flight.done:
@@ -387,6 +615,16 @@ func (r *stateResolver) cacheStats() stateCacheStats {
 	return stats
 }
 
+// lineage walks back from base to the applied anchor.
+//
+// Every return carries Walk, including the error ones. The walk stats are the
+// only account of what a failed walk cost — how deep it got, and how many of
+// those steps had to leave memory — and the caller's failure observation exists
+// for exactly that case: an abstain that came from a lineage that could not be
+// assembled. Returning a zero resolvedLineage alongside the error dropped the
+// depth and the step sources on the floor and left the instrumentation dead on
+// the only path it was added for. Nothing else on an error return is meaningful
+// and no caller reads it; Walk is, and callers must be able to.
 func (r *stateResolver) lineage(
 	ctx context.Context,
 	base simplex.ParentID,
@@ -395,15 +633,18 @@ func (r *stateResolver) lineage(
 	lineage := make([]*CandidateArtifact, 0)
 	matchedAnchor := finalizedBlock == nil
 	appliedIndex := -1
+	var walk lineageWalkStats
 	var appliedState *ChainState
 	for base.Exists {
+		walk.Visited++
+		walk.Steps[r.candidates.payloadResidency(base.ID)]++
 		resolution, err := r.candidates.resolve(ctx, base.ID)
 		if err != nil {
-			return resolvedLineage{}, err
+			return resolvedLineage{Walk: walk}, err
 		}
 		artifact := resolution.Candidate
 		if artifact == nil || artifact.Candidate.ID != base.ID {
-			return resolvedLineage{}, errors.New("validator runtime: resolved lineage candidate differs from its id")
+			return resolvedLineage{Walk: walk}, errors.New("validator runtime: resolved lineage candidate differs from its id")
 		}
 		lineage = append(lineage, artifact)
 		attemptedAppliedState := false
@@ -418,7 +659,7 @@ func (r *stateResolver) lineage(
 				appliedState = state
 			} else if !errors.Is(stateErr, errFinalizedCandidateNotApplied) &&
 				!errors.Is(stateErr, ErrBlockNotReady) && !errors.Is(stateErr, context.DeadlineExceeded) {
-				return resolvedLineage{}, stateErr
+				return resolvedLineage{Walk: walk}, stateErr
 			}
 		}
 		if finalizedBlock != nil && sameBlockID(artifact.Candidate.Block, *finalizedBlock) {
@@ -430,7 +671,7 @@ func (r *stateResolver) lineage(
 					appliedStateErr = stateErr
 				}
 				if appliedStateErr != nil {
-					return resolvedLineage{}, appliedStateErr
+					return resolvedLineage{Walk: walk}, appliedStateErr
 				}
 				appliedIndex = len(lineage) - 1
 			}
@@ -443,7 +684,7 @@ func (r *stateResolver) lineage(
 		genesis := r.genesis
 		r.mu.Unlock()
 		if genesis == nil {
-			return resolvedLineage{}, errors.New("validator runtime: state resolver is not started")
+			return resolvedLineage{Walk: walk}, errors.New("validator runtime: state resolver is not started")
 		}
 		for i := range genesis.tips {
 			if sameBlockID(genesis.tips[i].ID, *finalizedBlock) {
@@ -452,8 +693,19 @@ func (r *stateResolver) lineage(
 			}
 		}
 		if !matchedAnchor {
-			return resolvedLineage{}, errFinalizedLineageAhead
+			return resolvedLineage{Walk: walk}, errFinalizedLineageAhead
 		}
+	}
+	// The walk is the consumer both retention sweeps exist for, so it states what
+	// it needed as soon as it is known to have succeeded: everything from the
+	// slot it stopped at up to the tip, which is the whole visited range and not
+	// only the part trimmed below. Nothing here depends on the trimming, because
+	// a walk that reads a candidate needed that candidate whether or not it ends
+	// up handing it to the producer.
+	if len(lineage) > 0 {
+		r.mu.Lock()
+		r.noteLineageFloorLocked(lineage[len(lineage)-1].Candidate.ID.Slot)
+		r.mu.Unlock()
 	}
 	var appliedAnchor *ton.BlockIDExt
 	if appliedIndex >= 0 {
@@ -469,6 +721,7 @@ func (r *stateResolver) lineage(
 		Candidates:         lineage,
 		AppliedAnchor:      appliedAnchor,
 		AppliedAnchorState: appliedState,
+		Walk:               walk,
 	}, nil
 }
 
@@ -539,10 +792,7 @@ func (r *stateResolver) loadAppliedCandidateState(
 	r.mu.Lock()
 	state = r.finalized[id]
 	if state != nil && state.isDone {
-		state.applied = true
-		if state.appliedState == nil {
-			state.appliedState = resolved
-		}
+		r.rememberAppliedStateLocked(id, state, resolved)
 		resolved = state.appliedState
 	}
 	r.mu.Unlock()
@@ -592,19 +842,30 @@ func (r *stateResolver) finalizedAnchorState(
 		r.anchor = &resolvedAnchorState{id: id, block: *block.Copy(), state: resolved}
 	}
 	if state := r.finalized[id]; state != nil && state.isDone && state.appliedState == nil {
-		state.applied = true
-		state.appliedState = resolved
+		r.rememberAppliedStateLocked(id, state, resolved)
 	}
 	r.mu.Unlock()
 
 	return resolved, nil
 }
 
-func (r *stateResolver) resolveLoop(id simplex.ParentID, flight *stateFlight) {
+func (r *stateResolver) resolveLoop(
+	ctx context.Context,
+	id simplex.ParentID,
+	flight *stateFlight,
+) {
 	defer r.wg.Done()
+	defer flight.cancel()
 
-	result, err := r.resolveInner(id)
+	result, err := r.resolveInner(ctx, id)
 	r.mu.Lock()
+	select {
+	case <-flight.done:
+		r.mu.Unlock()
+
+		return
+	default:
+	}
 	flight.result = result
 	flight.err = err
 	if err != nil && r.states[id] == flight {
@@ -614,7 +875,7 @@ func (r *stateResolver) resolveLoop(id simplex.ParentID, flight *stateFlight) {
 	r.mu.Unlock()
 }
 
-func (r *stateResolver) resolveInner(id simplex.ParentID) (ResolvedState, error) {
+func (r *stateResolver) resolveInner(ctx context.Context, id simplex.ParentID) (ResolvedState, error) {
 	if !id.Exists {
 		r.mu.Lock()
 		genesis := r.genesis
@@ -626,13 +887,13 @@ func (r *stateResolver) resolveInner(id simplex.ParentID) (ResolvedState, error)
 		return ResolvedState{State: genesis}, nil
 	}
 
-	resolution, err := r.candidates.resolve(r.ctx, id.ID)
+	resolution, err := r.candidates.resolve(ctx, id.ID)
 	if err != nil {
 		return ResolvedState{}, err
 	}
 	artifact := resolution.Candidate
 	if artifact.Candidate.Empty {
-		return r.resolve(r.ctx, artifact.Candidate.Parent)
+		return r.resolve(ctx, artifact.Candidate.Parent)
 	}
 	genUtime, err := candidateGenUtime(artifact.CollatedData)
 	if err != nil {
@@ -647,12 +908,27 @@ func (r *stateResolver) resolveInner(id simplex.ParentID) (ResolvedState, error)
 		if genesis == nil {
 			return ResolvedState{}, errors.New("validator runtime: state resolver is not started")
 		}
+		// The state this session may already hold for this exact block, before any
+		// store read. Two things were wrong with going straight to the load:
+		//
+		//   - it re-read a state that was already in memory, and when the store
+		//     could not answer it waited for one it was holding;
+		//   - it returned the freshly built state rather than the one already
+		//     cached under this marker, so one parent could end up with two
+		//     materializations. chain_state.go compares tip states BY POINTER for
+		//     the live-successor carry-back, so the second one silently costs a
+		//     full re-apply per candidate — with no error and no metric.
+		//
+		// Both are fixed by asking first and by returning the canonical object.
+		if state := r.residentAppliedState(id.ID, artifact.Candidate.Block); state != nil {
+			return ResolvedState{State: state, GenUtime: genUtime}, nil
+		}
 		request := ChainStateRequest{
 			Shard:          r.shard,
 			Blocks:         []ton.BlockIDExt{artifact.Candidate.Block},
 			MinMasterchain: genesis.minMasterchain,
 		}
-		data, loadErr := r.loadFinalizedChainState(request)
+		data, loadErr := r.loadFinalizedChainState(ctx, request)
 		if loadErr != nil {
 			return ResolvedState{}, loadErr
 		}
@@ -660,12 +936,11 @@ func (r *stateResolver) resolveInner(id simplex.ParentID) (ResolvedState, error)
 		if loadErr != nil {
 			return ResolvedState{}, loadErr
 		}
-		r.rememberAppliedCandidateState(id.ID, state)
 
-		return ResolvedState{State: state, GenUtime: genUtime}, nil
+		return ResolvedState{State: r.rememberAppliedCandidateState(id.ID, state), GenUtime: genUtime}, nil
 	}
 
-	previous, err := r.resolve(r.ctx, artifact.Candidate.Parent)
+	previous, err := r.resolve(ctx, artifact.Candidate.Parent)
 	if err != nil {
 		return ResolvedState{}, err
 	}
@@ -677,35 +952,106 @@ func (r *stateResolver) resolveInner(id simplex.ParentID) (ResolvedState, error)
 	return ResolvedState{State: state, GenUtime: genUtime}, nil
 }
 
-func (r *stateResolver) rememberAppliedCandidateState(id simplex.CandidateID, resolved *ChainState) {
+// residentAppliedState returns the applied state this session already holds for
+// one finalized candidate, or nil. It never reads anything: it is the question
+// "do we already have this" asked before the read that would answer it again.
+//
+// The tip is checked against the block the caller is resolving. The marker is
+// keyed by candidate id and only ever carries that candidate's own state, so the
+// check cannot fail today; it is here because a mismatch would hand out a state
+// for another block, which is not a failure worth discovering later.
+func (r *stateResolver) residentAppliedState(
+	id simplex.CandidateID,
+	block ton.BlockIDExt,
+) *ChainState {
 	r.mu.Lock()
-	state := r.finalized[id]
-	if state != nil && state.isDone {
-		state.applied = true
-		if state.appliedState == nil {
-			state.appliedState = resolved
-		}
+	var resolved *ChainState
+	if state := r.finalized[id]; state != nil && state.isDone && state.appliedState != nil {
+		resolved = state.appliedState
+		r.applied[id] = state
 	}
 	r.mu.Unlock()
+	if resolved == nil {
+		return nil
+	}
+	if tip, err := resolved.NormalBlock(); err != nil || !sameBlockID(tip, block) {
+		return nil
+	}
+
+	return resolved
 }
 
-// loadFinalizedChainState waits for the node's normal apply pipeline to make
-// an already-finalized block readable. SubmitBlockLocally deliberately only
-// queues acceptance, so a final certificate can arrive before its state is in
-// the live store. Treating that short gap as a fatal session error stops every
-// validator in an otherwise healthy network.
+// rememberAppliedCandidateState caches one loaded state under its finalization
+// marker and returns the CANONICAL state for that marker — the one already
+// cached when a concurrent resolve won the race, and the argument otherwise.
+// Callers must use the returned value: handing out a state the marker did not
+// adopt is how one block ends up with two materializations, which
+// chain_state.go's pointer comparison turns into a silent full re-apply.
+func (r *stateResolver) rememberAppliedCandidateState(
+	id simplex.CandidateID,
+	resolved *ChainState,
+) *ChainState {
+	r.mu.Lock()
+	if state := r.finalized[id]; state != nil && state.isDone {
+		r.rememberAppliedStateLocked(id, state, resolved)
+		resolved = state.appliedState
+	}
+	r.mu.Unlock()
+
+	return resolved
+}
+
+// rememberAppliedStateLocked keeps one loaded state with its finalization
+// marker and queues it for release. Every assignment to appliedState goes
+// through here: the queue is what keeps the release sweep proportional to what
+// is retained rather than to every candidate this session has finalized.
+func (r *stateResolver) rememberAppliedStateLocked(
+	id simplex.CandidateID,
+	state *finalizedState,
+	resolved *ChainState,
+) {
+	if state.appliedState == nil {
+		state.appliedState = resolved
+	}
+	r.applied[id] = state
+}
+
+// loadFinalizedChainState reads an already-finalized block's state, tolerating
+// the gap between the final certificate and the block becoming readable.
+// SubmitBlockLocally deliberately only queues acceptance, so that gap exists by
+// design and treating it as a fatal session error stops every validator in an
+// otherwise healthy network.
+//
+// THE WAIT IS NOT HERE ANY MORE, and this loop is no longer a poll. A local
+// backend blocks inside its own read until a publication edge tells it to look
+// again — see LocalSessionBackend.loadChainTip — and it returns not-ready only
+// after its backstop has fired and complained. The interval below is therefore
+// what paces a backend that does not wait at all, which is the only case left
+// where returning instantly in a tight loop would spin. On the real path it is
+// reached at most once per backstop, so the 1 Hz that used to be the whole
+// mechanism is now the fallback of a fallback.
+//
+// Two callers, two very different bounds, and both are deliberate: resolveInner
+// runs under the resolve flight (session lifetime, with the caller's own
+// validation deadline observed by resolve() itself), and waitReplayApplied runs
+// under r.ctx during crash replay, which is exact parity with the reference's
+// masterchain finalize ordering.
 func (r *stateResolver) loadFinalizedChainState(
+	ctx context.Context,
 	request ChainStateRequest,
 ) (ChainStateData, error) {
+	// This is the caller that exists in order to wait, so it asks the backend to
+	// wait rather than asking it again every second.
+	request.Wait = true
 	for {
-		data, err := r.backend.LoadChainState(r.ctx, request)
+		data, err := r.backend.LoadChainState(ctx, request)
 		if err == nil {
 			return data, nil
 		}
 		if !errors.Is(err, ErrBlockNotReady) && !errors.Is(err, context.DeadlineExceeded) {
 			return ChainStateData{}, fmt.Errorf("validator runtime: load finalized chain state: %w", err)
 		}
-		if err = waitDuration(r.ctx, time.Second); err != nil {
+		if err = waitDuration(ctx, time.Second); err != nil {
 			return ChainStateData{}, ErrResolverClosed
 		}
 	}
@@ -745,7 +1091,7 @@ func candidateGenUtime(collatedData []byte) (time.Time, error) {
 func (r *stateResolver) finalize(
 	ctx context.Context,
 	id simplex.CandidateID,
-	certificate *simplex.Certificate,
+	certificate simplex.VerifiedCertificate,
 ) error {
 	return r.finalizeWith(ctx, id, certificate, nil)
 }
@@ -753,7 +1099,7 @@ func (r *stateResolver) finalize(
 func (r *stateResolver) finalizeWith(
 	ctx context.Context,
 	id simplex.CandidateID,
-	certificate *simplex.Certificate,
+	certificate simplex.VerifiedCertificate,
 	certifiedCandidate *CandidateArtifact,
 ) error {
 	r.mu.Lock()
@@ -792,7 +1138,7 @@ func (r *stateResolver) finalizeWith(
 
 func (r *stateResolver) finalizeLoop(
 	id simplex.CandidateID,
-	certificate *simplex.Certificate,
+	certificate simplex.VerifiedCertificate,
 	certifiedCandidate *CandidateArtifact,
 	replay bool,
 	flight *resolverFlight,
@@ -815,6 +1161,7 @@ func (r *stateResolver) finalizeLoop(
 			state.inFlight = nil
 		} else {
 			delete(r.finalized, id)
+			delete(r.applied, id)
 		}
 	}
 	close(flight.done)
@@ -823,11 +1170,11 @@ func (r *stateResolver) finalizeLoop(
 
 func (r *stateResolver) finalizeInner(
 	id simplex.CandidateID,
-	finalCertificate *simplex.Certificate,
+	finalCertificate simplex.VerifiedCertificate,
 	certifiedCandidate *CandidateArtifact,
 	replay bool,
 ) error {
-	if finalCertificate == nil && r.shard.IsMasterchain() {
+	if finalCertificate.IsZero() && r.shard.IsMasterchain() {
 		return nil
 	}
 
@@ -836,8 +1183,8 @@ func (r *stateResolver) finalizeInner(
 		return err
 	}
 	artifact := resolution.Candidate
-	if finalCertificate != nil && certifiedCandidate == nil {
-		if finalCertificate.Vote != simplex.FinalizeVote(id) {
+	if !finalCertificate.IsZero() && certifiedCandidate == nil {
+		if finalCertificate.Vote() != simplex.FinalizeVote(id) {
 			return errors.New("validator runtime: finalization vote mismatch")
 		}
 		certifiedCandidate = artifact
@@ -856,14 +1203,19 @@ func (r *stateResolver) finalizeInner(
 		}
 	} else {
 		if artifact.Candidate.Parent.Exists {
-			if err = r.finalizeWith(r.ctx, artifact.Candidate.Parent.ID, nil, nil); err != nil {
+			if err = r.finalizeWith(
+				r.ctx,
+				artifact.Candidate.Parent.ID,
+				simplex.VerifiedCertificate{},
+				nil,
+			); err != nil {
 				return err
 			}
 		}
 
 		certificate := resolution.Notarization
 		certified := artifact
-		if finalCertificate != nil {
+		if !finalCertificate.IsZero() {
 			certificate = finalCertificate
 			certified = certifiedCandidate
 		}
@@ -872,6 +1224,7 @@ func (r *stateResolver) finalizeInner(
 			Certificate:        certificate,
 			CertifiedCandidate: certified,
 			Replay:             replay,
+			state:              r.acceptedCandidateState(id, artifact.Candidate.Block),
 		}); err != nil {
 			return err
 		}
@@ -914,7 +1267,7 @@ func (r *stateResolver) waitReplayApplied(block ton.BlockIDExt) error {
 		Blocks:         []ton.BlockIDExt{block},
 		MinMasterchain: genesis.minMasterchain,
 	}
-	data, err := r.loadFinalizedChainState(request)
+	data, err := r.loadFinalizedChainState(r.ctx, request)
 	if err != nil {
 		return err
 	}
@@ -925,6 +1278,68 @@ func (r *stateResolver) waitReplayApplied(block ton.BlockIDExt) error {
 	return nil
 }
 
+// acceptedCandidateState returns the state this session already holds for the
+// block being accepted, so acceptance can publish it into the live view.
+//
+// It reads what is already there and computes nothing. The state of candidate id
+// is the resolved state of the parent relation "my parent is id", which is where
+// rememberValidatedState installs it after a successful validation, and where the
+// applied-state cache keeps it after a load. Both are the same immutable object
+// every other reader of this slot got, so publishing it cannot introduce a second
+// materialization of one block.
+//
+// Nil is the ordinary answer in three cases, none of them an error: a replayed
+// finalization after a restart (nothing was validated in this process), a
+// finalization whose flight is still resolving, and a state the retention margins
+// have already released. In all three the reader falls back to the wait, which is
+// what happens today for every block.
+func (r *stateResolver) acceptedCandidateState(
+	id simplex.CandidateID,
+	block ton.BlockIDExt,
+) *ChainState {
+	r.mu.Lock()
+	var resolved *ChainState
+	if state := r.finalized[id]; state != nil && state.appliedState != nil {
+		resolved = state.appliedState
+	} else if flight := r.states[simplex.Parent(id)]; flight != nil {
+		select {
+		case <-flight.done:
+			if flight.err == nil {
+				resolved = flight.result.State
+			}
+		default:
+		}
+	}
+	r.mu.Unlock()
+	if resolved == nil {
+		return nil
+	}
+	// The tip has to be this exact block. An empty-candidate chain resolves the
+	// same parent relation for several slots, so the state under this key is not
+	// necessarily the successor of THIS block.
+	if tip, err := resolved.NormalBlock(); err != nil || !sameBlockID(tip, block) {
+		return nil
+	}
+
+	return resolved
+}
+
+// acceptBlock hands one finalized block to the node, retrying at 1 Hz for as long
+// as the session lives.
+//
+// THIS POLL IS DELIBERATE, and it is the one that stays. It is parity with
+// cppnode/ton/validator/consensus/bridge.cpp:69, where accept_block retries after
+// coro_sleep(Timestamp::in(1.0)) on timeout or notready, forever, with the
+// broadcast modes cleared on the second attempt — the same shape as
+// acceptance.Retry here. The 1 Hz polls the change around it removed were reads of
+// state this node itself had published, where the thing being waited for raises an
+// edge; this one waits on the node's whole apply pipeline accepting a block, which
+// publishes no such edge and whose failure modes are not ours to interpret. There
+// is nothing to subscribe to, and the reference paces it exactly this way.
+//
+// Anyone tidying this into an edge-triggered wait would have to invent the edge,
+// and would be diverging from the reference to do it. The retry above it in
+// loadFinalizedChainState is the converted one; this is not that.
 func (r *stateResolver) acceptBlock(acceptance BlockAcceptance) error {
 	for {
 		err := r.backend.AcceptBlock(r.ctx, acceptance)

@@ -9,10 +9,86 @@ import (
 	"github.com/xssnick/gton/service/validator/msgpool"
 )
 
+// readyExternalSource is the whole of what the wave loop does to the external
+// pool: take whatever is admitted right now, or park until more arrives. It is
+// an interface rather than *msgpool.ExternalStream so a test can decide WHEN a
+// wave becomes visible by control flow instead of by sleeping.
+//
+// That distinction is not cosmetic. Whether wave two is served from TakeReady —
+// in the same pass, before processNewMessages — or from Next, after it, changes
+// the logical time the wave-two transaction runs at and therefore the bytes of
+// the produced block, and the two shapes report IDENTICAL Stats counters
+// (ExternalBatches, ExternalIncluded, ImmediateDelivered, EnqueuedMessages,
+// ExternalStop all equal). Nothing observable downstream separates them, so a
+// golden driven by a real pool plus a sleep pins whichever one the scheduler
+// happened to produce. *msgpool.ExternalStream satisfies this as it stands;
+// production wiring is unchanged.
+type readyExternalSource interface {
+	TakeReady(limit int) []msgpool.ExternalSnapshot
+	Next(ctx context.Context, limit int) ([]msgpool.ExternalSnapshot, error)
+}
+
 type readyExternalStats struct {
 	wait    time.Duration
 	batches uint32
 	stop    ExternalStopReason
+	// attempts counts the collation attempts retryUnderSizeLimit ran. Only
+	// attempt zero observes the pool, so wait and batches belong to it alone and
+	// are carried unchanged into any replay. Without this counter a failure on a
+	// replay attempt is indistinguishable in the field log from a failure inside
+	// the live wave loop -- exactly the ambiguity that left five of the field's
+	// order-violation events unattributable.
+	attempts uint32
+	// failedAt names the phase of the live wave loop an attempt died in. Every
+	// error return inside buildShardReadyAttempt / buildMasterReadyAttempt sets
+	// it; stop is written by a defer so it survives those returns too.
+	//
+	// Before this existed, stop was assigned only AFTER the loop, i.e. only on
+	// success, so every one of the 71 field order-violation events logged
+	// external_stop="unknown" — the zero value's String() — and the field looked
+	// like three phenomena when it was one. "unknown" on a failure carried no
+	// information at all, and it excluded the retry-replay hypothesis only by
+	// accident. This one string would have attributed all 71 on sight.
+	failedAt string
+	// shape is the collation state at the moment the attempt ended. These
+	// counters live on the candidate's Stats, and the candidate is nil on every
+	// failure — which is why block_bytes and collated_bytes were 0 on all 71
+	// events and no field record said how many externals were pre-admitted or
+	// how far the internal import had got. Lifting them here is the same fix as
+	// the earlier "lineage walk stats survive error returns" one, and with
+	// metrics disabled on the field nodes the zerolog record is the only channel.
+	shape readyExternalShape
+}
+
+// readyExternalShape is the minimum needed to reconstruct which route an attempt
+// took without a candidate to read it off.
+type readyExternalShape struct {
+	// preAdmitted is len(req.Externals) — the batch that made external_batches
+	// == 1 reachable with a real wait, which was read in the field as an
+	// unreachable third path when it is the ordinary route with an empty
+	// pre-admitted snapshot.
+	preAdmitted        int
+	internalsImported  uint32
+	immediateDelivered uint32
+	enqueuedMessages   uint32
+	startLT            uint64
+	lastProcLT         uint64
+	valid              bool
+}
+
+func (s *readyExternalStats) observe(c *collation, preAdmitted int) {
+	if c == nil {
+		return
+	}
+	s.shape = readyExternalShape{
+		preAdmitted:        preAdmitted,
+		internalsImported:  c.stats.InternalsImported,
+		immediateDelivered: c.stats.ImmediateDelivered,
+		enqueuedMessages:   c.stats.EnqueuedMessages,
+		startLT:            c.header.StartLt,
+		lastProcLT:         c.lastProcLT,
+		valid:              true,
+	}
 }
 
 // buildShardWithReadyExternals runs the reference shardchain schedule: prepare
@@ -28,26 +104,26 @@ type readyExternalStats struct {
 func (b *Builder) buildShardWithReadyExternals(
 	ctx context.Context,
 	req ShardRequest,
-	stream *msgpool.ExternalStream,
+	stream readyExternalSource,
 	processUntil time.Time,
 	waitUntil time.Time,
 	batchLimit int,
 	startedAt time.Time,
-) (*Candidate, error) {
+) (*Candidate, readyExternalStats, error) {
+	var live readyExternalStats
 	if batchLimit <= 0 {
-		return nil, fmt.Errorf("%w: ready external batch limit must be positive", ErrInvalidInput)
+		return nil, live, fmt.Errorf("%w: ready external batch limit must be positive", ErrInvalidInput)
 	}
 	if req.MaxExternalAttempts <= 0 {
-		return nil, fmt.Errorf("%w: external attempt limit must be positive", ErrInvalidInput)
+		return nil, live, fmt.Errorf("%w: external attempt limit must be positive", ErrInvalidInput)
 	}
 	common := shardCollationRequest(req)
 	if err := validateCollationRequest(&common); err != nil {
-		return nil, err
+		return nil, live, err
 	}
 
 	transcript := make([]ExternalInput, 0, len(req.Externals))
 	attempt := 0
-	var live readyExternalStats
 	// A size retry re-enters collation, so the body span restarts with it while
 	// the span that began before acquisition does not — the same asymmetry the
 	// reference collator gets from a member initializer and a per-call
@@ -66,6 +142,7 @@ func (b *Builder) buildShardWithReadyExternals(
 	candidate, err := retryUnderSizeLimit(func(narrowing sizeBudgetCap) (*Candidate, error) {
 		current := attempt
 		attempt++
+		live.attempts++
 		if current == 0 {
 			return b.buildShardReadyAttempt(
 				ctx,
@@ -95,14 +172,14 @@ func (b *Builder) buildShardWithReadyExternals(
 		candidate.Stats.ExternalStop = live.stop
 	}
 
-	return candidate, err
+	return candidate, live, err
 }
 
 func (b *Builder) buildShardReadyAttempt(
 	ctx context.Context,
 	req ShardRequest,
 	narrowing sizeBudgetCap,
-	stream *msgpool.ExternalStream,
+	stream readyExternalSource,
 	processUntil time.Time,
 	waitUntil time.Time,
 	batchLimit int,
@@ -112,6 +189,7 @@ func (b *Builder) buildShardReadyAttempt(
 ) (*Candidate, error) {
 	c, err := b.prepareShardPhases(ctx, req, narrowing)
 	if err != nil {
+		live.failedAt = externalPhasePrepare
 		return nil, err
 	}
 	c.pace = pace
@@ -124,12 +202,23 @@ func (b *Builder) buildShardReadyAttempt(
 	defer cancel()
 
 	stop := ExternalStopUnknown
+	// Written by a defer, not after the loop. Assigned at the tail it was only
+	// ever set on success, which is what made external_stop="unknown" mean
+	// nothing but "it failed" on all 71 field events. The shape snapshot goes the
+	// same way, because the candidate that carries those counters is nil on every
+	// failing return.
+	defer func() {
+		live.stop = stop
+		live.observe(c, len(req.Externals))
+	}()
+
 	if len(req.Externals) > 0 {
 		live.batches++
 		result, processErr := c.processExternalBatch(req.Externals, processUntil)
 		*transcript = append(*transcript, req.Externals[:result.consumed]...)
 		stop, err = result.stop, processErr
 		if err != nil {
+			live.failedAt = externalPhasePreAdmittedBatch
 			return nil, err
 		}
 	}
@@ -141,6 +230,7 @@ func (b *Builder) buildShardReadyAttempt(
 			}
 			inputs, prepareErr := prepareExternalSnapshots(snapshots)
 			if prepareErr != nil {
+				live.failedAt = externalPhaseTakeReadyBatch
 				return nil, prepareErr
 			}
 			live.batches++
@@ -148,11 +238,17 @@ func (b *Builder) buildShardReadyAttempt(
 			*transcript = append(*transcript, inputs[:result.consumed]...)
 			stop, err = result.stop, processErr
 			if err != nil {
+				live.failedAt = externalPhaseTakeReadyBatch
 				return nil, err
 			}
 		}
 
 		if err = c.processNewMessages(c.blockFull || c.haveUnprocessedDispatchQueue || req.internalsIncomplete()); err != nil {
+			// The phase every one of the field's seven external_batches==1 events
+			// died in, and the only one that can raise the order violation:
+			// advanceProcessedBound's "generated" caller is deliverImmediate, which
+			// is reachable from here alone.
+			live.failedAt = externalPhaseProcessNewMessages
 			return nil, err
 		}
 		if stop != ExternalStopUnknown {
@@ -176,10 +272,12 @@ func (b *Builder) buildShardReadyAttempt(
 				stop = ExternalStopDeadline
 				break
 			}
+			live.failedAt = externalPhaseWait
 			return nil, nextErr
 		}
 		inputs, prepareErr := prepareExternalSnapshots(snapshots)
 		if prepareErr != nil {
+			live.failedAt = externalPhaseWaitedBatch
 			return nil, prepareErr
 		}
 		live.batches++
@@ -187,12 +285,16 @@ func (b *Builder) buildShardReadyAttempt(
 		*transcript = append(*transcript, inputs[:result.consumed]...)
 		stop, err = result.stop, processErr
 		if err != nil {
+			live.failedAt = externalPhaseWaitedBatch
 			return nil, err
 		}
 	}
 
-	live.stop = stop
-	return c.finishShard()
+	candidate, finishErr := c.finishShard()
+	if finishErr != nil {
+		live.failedAt = externalPhaseFinish
+	}
+	return candidate, finishErr
 }
 
 func prepareExternalSnapshots(snapshots []msgpool.ExternalSnapshot) ([]ExternalInput, error) {
@@ -215,27 +317,28 @@ func prepareExternalSnapshots(snapshots []msgpool.ExternalSnapshot) ([]ExternalI
 func (b *Builder) buildMasterWithReadyExternals(
 	ctx context.Context,
 	req MasterRequest,
-	stream *msgpool.ExternalStream,
+	stream readyExternalSource,
 	processUntil time.Time,
 	batchLimit int,
-) (*Candidate, error) {
+) (*Candidate, readyExternalStats, error) {
+	var live readyExternalStats
 	if batchLimit <= 0 {
-		return nil, fmt.Errorf("%w: ready external batch limit must be positive", ErrInvalidInput)
+		return nil, live, fmt.Errorf("%w: ready external batch limit must be positive", ErrInvalidInput)
 	}
 	if req.MaxExternalAttempts <= 0 {
-		return nil, fmt.Errorf("%w: external attempt limit must be positive", ErrInvalidInput)
+		return nil, live, fmt.Errorf("%w: external attempt limit must be positive", ErrInvalidInput)
 	}
 	common := masterCollationRequest(req)
 	if err := validateCollationRequest(&common); err != nil {
-		return nil, err
+		return nil, live, err
 	}
 
 	transcript := make([]ExternalInput, 0, len(req.Externals))
 	attempt := 0
-	var live readyExternalStats
 	candidate, err := retryUnderSizeLimit(func(narrowing sizeBudgetCap) (*Candidate, error) {
 		current := attempt
 		attempt++
+		live.attempts++
 		if current == 0 {
 			return b.buildMasterReadyAttempt(
 				ctx,
@@ -262,14 +365,14 @@ func (b *Builder) buildMasterWithReadyExternals(
 		candidate.Stats.ExternalStop = live.stop
 	}
 
-	return candidate, err
+	return candidate, live, err
 }
 
 func (b *Builder) buildMasterReadyAttempt(
 	ctx context.Context,
 	req MasterRequest,
 	narrowing sizeBudgetCap,
-	stream *msgpool.ExternalStream,
+	stream readyExternalSource,
 	processUntil time.Time,
 	batchLimit int,
 	transcript *[]ExternalInput,
@@ -277,16 +380,23 @@ func (b *Builder) buildMasterReadyAttempt(
 ) (*Candidate, error) {
 	c, err := b.prepareMasterPhases(ctx, req, narrowing)
 	if err != nil {
+		live.failedAt = externalPhasePrepare
 		return nil, err
 	}
 
 	stop := ExternalStopUnknown
+	defer func() {
+		live.stop = stop
+		live.observe(c, len(req.Externals))
+	}()
+
 	if len(req.Externals) > 0 {
 		live.batches++
 		result, processErr := c.processExternalBatch(req.Externals, processUntil)
 		*transcript = append(*transcript, req.Externals[:result.consumed]...)
 		stop, err = result.stop, processErr
 		if err != nil {
+			live.failedAt = externalPhasePreAdmittedBatch
 			return nil, err
 		}
 	}
@@ -298,6 +408,7 @@ func (b *Builder) buildMasterReadyAttempt(
 		}
 		inputs, prepareErr := prepareExternalSnapshots(snapshots)
 		if prepareErr != nil {
+			live.failedAt = externalPhaseTakeReadyBatch
 			return nil, prepareErr
 		}
 		live.batches++
@@ -305,10 +416,28 @@ func (b *Builder) buildMasterReadyAttempt(
 		*transcript = append(*transcript, inputs[:result.consumed]...)
 		stop, err = result.stop, processErr
 		if err != nil {
+			live.failedAt = externalPhaseTakeReadyBatch
 			return nil, err
 		}
 	}
 
-	live.stop = stop
-	return c.finishMaster(req)
+	candidate, finishErr := c.finishMaster(req)
+	if finishErr != nil {
+		live.failedAt = externalPhaseFinish
+	}
+	return candidate, finishErr
 }
+
+// The phases an attempt can die in. They are strings and not an enum because
+// they only ever reach a log field, and a new one must never require a String()
+// method to be remembered — the ExternalStopReason enum's forgotten default
+// branch is exactly how "unknown" came to mean two different things.
+const (
+	externalPhasePrepare            = "prepare"
+	externalPhasePreAdmittedBatch   = "pre_admitted_batch"
+	externalPhaseTakeReadyBatch     = "take_ready_batch"
+	externalPhaseProcessNewMessages = "process_new_messages"
+	externalPhaseWait               = "wait"
+	externalPhaseWaitedBatch        = "waited_batch"
+	externalPhaseFinish             = "finish"
+)

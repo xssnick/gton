@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
 	"github.com/xssnick/gton/service/hooks"
+	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/validator"
 	core "github.com/xssnick/gton/service/validator/collator"
 	"github.com/xssnick/gton/service/validator/groups"
@@ -17,11 +19,25 @@ import (
 	"github.com/xssnick/gton/service/validator/simplex"
 
 	"github.com/rs/zerolog"
+	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm"
 )
 
+// compositionStore is a store that satisfies everything the consensus seam asks
+// for WITHOUT being the live view. It is the shape consensusLiveView refuses, and
+// TestConsensusCompositionRefusesAStoreThatIsNotTheLiveView is what it is for.
 type compositionStore struct {
 	hooks.Store
+}
+
+func (*compositionStore) WaitBlockArtifacts(context.Context, ton.BlockIDExt) error {
+	return nil
+}
+
+// compositionLiveView is the store a real node hands the compositions: the live
+// view itself, over a backing that holds nothing.
+func compositionLiveView() *liveview.Store {
+	return liveview.New(nothingBacked{})
 }
 
 type compositionNetwork struct {
@@ -73,6 +89,33 @@ func (*compositionNetwork) Close(context.Context) error                         
 
 type compositionSessionRuntime struct {
 	closed bool
+}
+
+type compositionPreparedSessionNetwork struct{}
+
+func (*compositionPreparedSessionNetwork) BroadcastToAll([]byte)            {}
+func (*compositionPreparedSessionNetwork) BroadcastToValidators([]byte)     {}
+func (*compositionPreparedSessionNetwork) BroadcastToRandom(uint32, []byte) {}
+func (*compositionPreparedSessionNetwork) BroadcastCandidate(
+	context.Context,
+	simplex.CandidateBroadcast,
+	validator.CandidateArtifact,
+) error {
+	return nil
+}
+func (*compositionPreparedSessionNetwork) RequestCandidate(
+	context.Context,
+	validator.CandidateRequest,
+) (validator.CandidateResponse, error) {
+	return validator.CandidateResponse{}, validator.ErrCandidateUnavailable
+}
+func (*compositionPreparedSessionNetwork) Start(context.Context, validator.SessionReceiver) error {
+	return nil
+}
+func (*compositionPreparedSessionNetwork) Run(ctx context.Context) error {
+	<-ctx.Done()
+
+	return nil
 }
 
 type compositionRemoteTransport struct {
@@ -353,6 +396,69 @@ func TestPrepareValidatorSessionNetworkSelectsIdentityRole(t *testing.T) {
 	}
 }
 
+func TestPrepareBlockSyncObserverSessionOwnsOnlyPreparedTransport(t *testing.T) {
+	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x71}, ed25519.SeedSize))
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	var public [32]byte
+	copy(public[:], publicKey)
+	config := validator.SessionConfig{
+		SessionID: [32]byte{0x81},
+		Shard: groups.ShardID{
+			Workchain: 0,
+			Shard:     math.MinInt64,
+		},
+		Validators: []groups.Validator{{
+			PublicKey:     public,
+			PublicKeyHash: simplex.KeyNodeIDShort(publicKey),
+			Weight:        1,
+		}},
+		Protocol: validator.SessionProtocol{
+			Version:              2,
+			ProtocolVersion:      1,
+			SlotsPerLeaderWindow: 4,
+		},
+		CandidateLimits: validator.CandidateLimits{
+			MaxBlockBytes:        1 << 20,
+			MaxCollatedDataBytes: 1 << 20,
+		},
+		Identity: validator.SessionIdentity{ADNLID: [32]byte{0x91}},
+	}
+	network := &compositionNetwork{id: config.Identity.ADNLID}
+	runtime, err := prepareBlockSyncObserverSession(
+		context.Background(),
+		network,
+		config,
+		&compositionPreparedSessionNetwork{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, ok := runtime.(*validatorSessionRuntime)
+	if !ok || owned.ownedCollator != nil {
+		t.Fatalf("block-sync observer runtime wiring = %#v", runtime)
+	}
+	if err = runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if network.retired != 1 {
+		t.Fatalf("retired transports = %d, want 1", network.retired)
+	}
+
+	invalid := config
+	invalid.Identity.Validator = &validator.ValidatorIdentity{}
+	if _, err = prepareBlockSyncObserverSession(
+		context.Background(),
+		network,
+		invalid,
+		&compositionPreparedSessionNetwork{},
+	); err == nil {
+		t.Fatal("validator identity was accepted by block-sync observer composition")
+	}
+	if network.retired != 2 {
+		t.Fatalf("retired transports after failed preparation = %d, want 2", network.retired)
+	}
+}
+
 func TestValidatorStackCompositionRequiresP2PCapabilities(t *testing.T) {
 	node := hooks.Node{
 		Store:   &compositionStore{},
@@ -399,7 +505,7 @@ func TestLocalValidatorCompositionExposesShardTopInbox(t *testing.T) {
 		collatorKeys:    identity.keys,
 		collatorKeyID:   identity.keyID,
 	}, network, nil, nil, nil)(hooks.Node{
-		Store:   &compositionStore{},
+		Store:   compositionLiveView(),
 		Network: network,
 		TVM:     tvm.NewTVM(),
 		Logger:  zerolog.Nop(),
@@ -444,7 +550,7 @@ func TestStandaloneCollatorCompositionBuildsCompleteExtension(t *testing.T) {
 		keyID:              identity.keyID,
 		allowAllValidators: true,
 	}, network, nil)(hooks.Node{
-		Store:   &compositionStore{},
+		Store:   compositionLiveView(),
 		Network: network,
 		TVM:     tvm.NewTVM(),
 		Logger:  zerolog.Nop(),

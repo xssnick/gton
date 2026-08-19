@@ -5,9 +5,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
+	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -60,18 +64,66 @@ type benchMainnetShape struct {
 	now       uint32
 }
 
+// runPackageTests runs the package and, when the run was asked to repeat
+// itself, says out loud what the repeat does not repeat.
+//
+// The fixtures below — the mainnet JSON, the account dictionaries, the
+// assembled workloads, and the synthetic ones in bench_workload_test.go — are
+// memoized per process, and -count repeats the test list inside one process.
+// Go offers no per-iteration hook to reset them on (m.Run is entered once), and
+// making them per-test would give the race suite its ~420 s back, so the
+// limitation is reported instead of removed: a second iteration re-runs every
+// test but reuses the fixtures the first one built, which is a weaker repeat
+// than -count usually implies. Repeating the fixture construction as well means
+// separate processes: `go test -count=1` run twice, or -shuffle to reorder
+// within one.
+func runPackageTests(m *testing.M) int {
+	code := m.Run()
+	if count := flag.Lookup("test.count"); count != nil && count.Value.String() != "1" {
+		fmt.Fprintf(
+			os.Stderr,
+			"NOTE: -count=%s repeated the tests in one process; the collation fixtures"+
+				" (bench_mainnet_test.go, bench_workload_test.go) are memoized per process"+
+				" and were built once. Run separate `go test -count=1` processes to repeat those too.\n",
+			count.Value.String(),
+		)
+	}
+
+	return code
+}
+
+// The fixture file is 2.7 MB of JSON and every reader of it only reads: the
+// accounts are decoded into a dictionary, never edited in place. Re-reading and
+// re-unmarshalling it per call cost a quarter of a second each time, on a path
+// several assembly variants share.
+//
+// Memoization is per process and survives -count; runPackageTests above says so
+// on any run that asked for more than one iteration.
+var (
+	benchMainnetFixtureOnce  sync.Once
+	benchMainnetFixtureValue benchMainnetFixture
+	benchMainnetFixtureErr   error
+)
+
 func loadBenchMainnetFixture(tb testing.TB) benchMainnetFixture {
 	tb.Helper()
 
-	raw, err := os.ReadFile(benchMainnetFixturePath)
-	if err != nil {
-		tb.Fatalf("read mainnet fixture: %v", err)
+	benchMainnetFixtureOnce.Do(func() {
+		raw, err := os.ReadFile(benchMainnetFixturePath)
+		if err != nil {
+			benchMainnetFixtureErr = fmt.Errorf("read mainnet fixture: %w", err)
+
+			return
+		}
+		if err = json.Unmarshal(raw, &benchMainnetFixtureValue); err != nil {
+			benchMainnetFixtureErr = fmt.Errorf("decode mainnet fixture: %w", err)
+		}
+	})
+	if benchMainnetFixtureErr != nil {
+		tb.Fatal(benchMainnetFixtureErr)
 	}
-	var fixture benchMainnetFixture
-	if err = json.Unmarshal(raw, &fixture); err != nil {
-		tb.Fatalf("decode mainnet fixture: %v", err)
-	}
-	return fixture
+
+	return benchMainnetFixtureValue
 }
 
 // benchShardAccountExists reports whether a ShardAccount holds an account at
@@ -113,12 +165,209 @@ func benchMainnetBlock(tb testing.TB) *tlb.Block {
 	return &block
 }
 
+type benchMainnetAccountsKey struct {
+	filler   int
+	genUtime uint32
+}
+
+type benchMainnetAccountSet struct {
+	accounts    *tlb.ShardAccountsAugDict
+	nonexistent int
+}
+
+var (
+	benchMainnetAccountsMu    sync.Mutex
+	benchMainnetAccountsCache = map[benchMainnetAccountsKey]benchMainnetAccountSet{}
+)
+
+// benchMainnetAccounts is the predecessor account dictionary: the fixture's real
+// mainnet contracts, plus filler idle contracts to give the dictionary the depth
+// a real shard has.
+//
+// It is memoized because it is by far the most expensive thing any of these
+// assemblies does — a profile of the race suite put benchSetAccount at 90% of
+// all Go-visible work in the heavy tests — and because every variant that asks
+// for the same filler count gets a byte-identical dictionary: the real accounts
+// come from one fixture, and the filler is generated from benchAddress,
+// externalAcceptCode and a fixed balance at the request's GenUtime, which
+// benchRebaseTime pins to the fixture block's own second for every variant. The
+// generation time is part of the key rather than assumed, so a variant that ever
+// did move it would build its own.
+//
+// Handing the same dictionary to several requests is safe because nothing writes
+// to it: benchPreviousState reads the balance out of it and serializes it into a
+// state cell, and collation works from that cell, never from this object.
+func benchMainnetAccounts(tb testing.TB, filler int, genUtime uint32) (*tlb.ShardAccountsAugDict, int) {
+	tb.Helper()
+
+	key := benchMainnetAccountsKey{filler: filler, genUtime: genUtime}
+	benchMainnetAccountsMu.Lock()
+	defer benchMainnetAccountsMu.Unlock()
+	if cached, ok := benchMainnetAccountsCache[key]; ok {
+		return cached.accounts, cached.nonexistent
+	}
+
+	fixture := loadBenchMainnetFixture(tb)
+	accounts, err := tlb.NewShardAccountsAugDict()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	var nonexistent int
+	for _, entry := range fixture.PreviousAccounts {
+		workchain, rest, found := strings.Cut(entry.Account, ":")
+		if !found || workchain != "0" {
+			tb.Fatalf("account %q is not a basechain address", entry.Account)
+		}
+		addr, err := hex.DecodeString(rest)
+		if err != nil || len(addr) != 32 {
+			tb.Fatalf("account %q is not a 256-bit address: %v", entry.Account, err)
+		}
+		accountBOC, err := base64.StdEncoding.DecodeString(entry.ShardAccountBOCBase64)
+		if err != nil {
+			tb.Fatalf("decode shard account %s: %v", entry.Account, err)
+		}
+		accountRoot, err := cell.FromBOC(accountBOC)
+		if err != nil {
+			tb.Fatalf("parse shard account %s: %v", entry.Account, err)
+		}
+		// Some of these accounts do not exist yet — the block is what creates
+		// them, so their prior state is account_none. A non-existent account has
+		// no key in ShardAccounts at all, and leaving one there is not a
+		// harmless extra: the reference collator adds a created account with
+		// Add mode and fails outright on the key already being present.
+		if !benchShardAccountExists(tb, accountRoot) {
+			nonexistent++
+			continue
+		}
+		key := cell.BeginCell().MustStoreSlice(addr, 256).EndCell()
+		if err = accounts.Set(key, accountRoot); err != nil {
+			tb.Fatalf("insert shard account %s: %v", entry.Account, err)
+		}
+	}
+	idleCode := externalAcceptCode(tb)
+	for i := range filler {
+		benchSetAccount(tb, accounts, activeContract{
+			address: benchAddress("mainnet-idle", i),
+			code:    idleCode,
+			balance: 1_000_000_000,
+		}, genUtime)
+	}
+
+	benchMainnetAccountsCache[key] = benchMainnetAccountSet{accounts: accounts, nonexistent: nonexistent}
+
+	return accounts, nonexistent
+}
+
+// benchMainnetVariant names one assembled mainnet workload. Everything that
+// changes what gets built belongs here; everything a caller adjusts afterwards
+// — the block-size limits, the full-collated capability, a substituted
+// predecessor state — belongs to the caller's own copy and must not be a key,
+// or the cache degenerates back into one construction per test.
+type benchMainnetVariant struct {
+	filler int
+	repeat int
+	// fixture selects the export-grade assembly: a real masterchain block,
+	// masterchain state and group snapshot, on top of a minted predecessor.
+	fixture bool
+	// mint asks benchMainnetRequestFrom for a real predecessor block.
+	mint bool
+}
+
+type benchMainnetWorkload struct {
+	req     ShardRequest
+	shape   benchMainnetShape
+	mcState *cell.Cell
+	mcBlock *cell.Cell
+}
+
+var (
+	benchMainnetMu    sync.Mutex
+	benchMainnetCache = map[benchMainnetVariant]*benchMainnetWorkload{}
+)
+
+// benchMainnetWorkloadFor assembles one mainnet workload per process, for the
+// same reason benchWorkloadFor does it for the synthetic profiles: filling a
+// 100,000-account dictionary costs far more than the block that walks it. Some
+// twenty test call sites were each building their own, and in the tests where
+// this dominates the collation they exist to check is under two per cent of the
+// runtime.
+//
+// Neither BuildShard nor VerifyShardCandidate mutates its request —
+// TestBuildShardFinishIsByteIdenticalAcrossRuns builds nine candidates from one
+// request and asserts the block, the collated data and the root hash are
+// byte-identical, and the mainnet benchmarks have always reused a single
+// request across b.N — so sharing the assembled inputs is safe, including
+// against the rule that a reused parse must not move produced bytes.
+//
+// What is not safe is sharing the pointers a caller writes through, which is
+// what benchMainnetHandout exists for.
+func benchMainnetWorkloadFor(tb testing.TB, variant benchMainnetVariant) *benchMainnetWorkload {
+	tb.Helper()
+
+	benchMainnetMu.Lock()
+	defer benchMainnetMu.Unlock()
+	if cached, ok := benchMainnetCache[variant]; ok {
+		return cached
+	}
+	built := buildBenchMainnetWorkload(tb, variant)
+	benchMainnetCache[variant] = built
+
+	return built
+}
+
+func buildBenchMainnetWorkload(tb testing.TB, variant benchMainnetVariant) *benchMainnetWorkload {
+	tb.Helper()
+
+	if variant.fixture {
+		req, mcState, mcBlock := buildBenchMainnetFixtureRequest(tb, variant.repeat)
+
+		return &benchMainnetWorkload{req: req, mcState: mcState, mcBlock: mcBlock}
+	}
+	base := emptyCandidateRequest(tb)
+	if variant.mint {
+		now, floorLT := benchMainnetTimeBase(tb)
+		base = benchRebaseTime(tb, base, now, floorLT)
+	}
+	req, shape := benchMainnetRequestFrom(tb, variant.filler, variant.repeat, variant.mint, base)
+
+	return &benchMainnetWorkload{req: req, shape: shape}
+}
+
+// benchMainnetHandout returns a caller's own view of a shared workload.
+//
+// ShardRequest is a value, so every field a test assigns — Previous.State,
+// Externals, Internals, Header, Neighbors — already lands on the copy. The
+// exception is Masterchain.Config, which is a pointer that nine call sites
+// write through (block and collated size limits, the basechain block limits,
+// and the full-collated capability in both directions). Every one of them
+// writes a value field on the config or on the chainConfig value embedded in
+// it, so one shallow copy isolates them all; the map and pointer fields behind
+// it — workchains, execution, footprint, specials, fees — are read-only in this
+// package's tests. Groups is copied for the same reason: benchRebaseTime writes
+// its GenUTime through the pointer.
+func benchMainnetHandout(workload *benchMainnetWorkload) ShardRequest {
+	req := workload.req
+	if req.Masterchain.Config != nil {
+		config := *req.Masterchain.Config
+		req.Masterchain.Config = &config
+	}
+	if req.Masterchain.Groups != nil {
+		groupsSnapshot := *req.Masterchain.Groups
+		req.Masterchain.Groups = &groupsSnapshot
+	}
+	req.Neighbors = slices.Clone(req.Neighbors)
+
+	return req
+}
+
 // benchMainnetRequest builds a shard request whose accounts and inbound
 // messages come from the fixture. filler pads the account dictionary with idle
 // contracts: the block touches 234 accounts, and a dictionary that small would
 // under-report the lookup and rebuild costs that dominate a real shard.
 func benchMainnetRequest(tb testing.TB, filler int) (ShardRequest, benchMainnetShape) {
-	return benchMainnetRequestFrom(tb, filler, 1, false, emptyCandidateRequest(tb))
+	workload := benchMainnetWorkloadFor(tb, benchMainnetVariant{filler: filler, repeat: 1})
+
+	return benchMainnetHandout(workload), workload.shape
 }
 
 // benchMainnetRequestRepeated offers the block's internal traffic several times
@@ -133,7 +382,9 @@ func benchMainnetRequest(tb testing.TB, filler int) (ShardRequest, benchMainnetS
 // second copy of one would be rejected rather than executed, and a benchmark
 // full of rejections measures nothing.
 func benchMainnetRequestRepeated(tb testing.TB, filler, repeat int) (ShardRequest, benchMainnetShape) {
-	return benchMainnetRequestFrom(tb, filler, repeat, false, emptyCandidateRequest(tb))
+	workload := benchMainnetWorkloadFor(tb, benchMainnetVariant{filler: filler, repeat: repeat})
+
+	return benchMainnetHandout(workload), workload.shape
 }
 
 // benchMainnetTimeBase reports the wall clock and the logical time floor the
@@ -160,6 +411,19 @@ func benchMainnetTimeBase(tb testing.TB) (uint32, uint64) {
 // masterchain state, predecessor block and group snapshot the reference collator
 // needs, over real traffic instead of a synthetic profile.
 func benchMainnetFixtureRequest(tb testing.TB, repeat int) (ShardRequest, *cell.Cell, *cell.Cell) {
+	tb.Helper()
+
+	workload := benchMainnetWorkloadFor(tb, benchMainnetVariant{
+		filler:  benchMainnetFiller,
+		repeat:  repeat,
+		fixture: true,
+		mint:    true,
+	})
+
+	return benchMainnetHandout(workload), workload.mcState, workload.mcBlock
+}
+
+func buildBenchMainnetFixtureRequest(tb testing.TB, repeat int) (ShardRequest, *cell.Cell, *cell.Cell) {
 	tb.Helper()
 
 	now, floorLT := benchMainnetTimeBase(tb)
@@ -250,50 +514,7 @@ func benchMainnetRequestFrom(
 	}
 	req = benchRebaseTime(tb, req, block.BlockInfo.GenUtime, floorLT)
 
-	accounts, err := tlb.NewShardAccountsAugDict()
-	if err != nil {
-		tb.Fatal(err)
-	}
-	var nonexistent int
-	for _, entry := range fixture.PreviousAccounts {
-		workchain, rest, found := strings.Cut(entry.Account, ":")
-		if !found || workchain != "0" {
-			tb.Fatalf("account %q is not a basechain address", entry.Account)
-		}
-		addr, err := hex.DecodeString(rest)
-		if err != nil || len(addr) != 32 {
-			tb.Fatalf("account %q is not a 256-bit address: %v", entry.Account, err)
-		}
-		accountBOC, err := base64.StdEncoding.DecodeString(entry.ShardAccountBOCBase64)
-		if err != nil {
-			tb.Fatalf("decode shard account %s: %v", entry.Account, err)
-		}
-		accountRoot, err := cell.FromBOC(accountBOC)
-		if err != nil {
-			tb.Fatalf("parse shard account %s: %v", entry.Account, err)
-		}
-		// Some of these accounts do not exist yet — the block is what creates
-		// them, so their prior state is account_none. A non-existent account has
-		// no key in ShardAccounts at all, and leaving one there is not a
-		// harmless extra: the reference collator adds a created account with
-		// Add mode and fails outright on the key already being present.
-		if !benchShardAccountExists(tb, accountRoot) {
-			nonexistent++
-			continue
-		}
-		key := cell.BeginCell().MustStoreSlice(addr, 256).EndCell()
-		if err = accounts.Set(key, accountRoot); err != nil {
-			tb.Fatalf("insert shard account %s: %v", entry.Account, err)
-		}
-	}
-	idleCode := externalAcceptCode(tb)
-	for i := range filler {
-		benchSetAccount(tb, accounts, activeContract{
-			address: benchAddress("mainnet-idle", i),
-			code:    idleCode,
-			balance: 1_000_000_000,
-		}, req.Header.GenUtime)
-	}
+	accounts, nonexistent := benchMainnetAccounts(tb, filler, req.Header.GenUtime)
 
 	// Inbound work is the message each transaction consumed. Externals go in as
 	// externals; internals are re-emitted onto this request's logical time base
@@ -597,19 +818,81 @@ func BenchmarkCollateMainnetHeavyFixture(b *testing.B) {
 	b.ReportMetric(float64(len(candidate.BlockBOC)), "blockB")
 }
 
-func BenchmarkCollateMainnetHeavyLazyFixture(b *testing.B) {
-	req, _, _ := benchMainnetFixtureRequest(b, benchMainnetExportRepeat())
-	predecessorBOC, err := req.Previous.State.ToBOCWithOptionsErr(cell.BOCSerializeOptions{
+// benchMainnetPredecessorBOC serializes a request's predecessor state once, so
+// a store-shaped copy of it can be rebuilt as often as a caller needs one.
+func benchMainnetPredecessorBOC(tb testing.TB, req ShardRequest) []byte {
+	tb.Helper()
+
+	boc, err := req.Previous.State.ToBOCWithOptionsErr(cell.BOCSerializeOptions{
 		WithIndex:     true,
 		WithCacheBits: true,
 	})
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
-	req.Previous.State, err = cell.FromBOCWithOptions(predecessorBOC, cell.BOCParseOptions{Lazy: true})
+
+	return boc
+}
+
+// benchMainnetLazyPredecessor parses a fresh store-shaped predecessor: the root
+// resident, everything below it an unresolved stub. Each call returns a new
+// tree, which is the whole point — a lazy tree materializes as it is read, so
+// one shared between iterations is a different input on the second one.
+func benchMainnetLazyPredecessor(tb testing.TB, predecessorBOC []byte) *cell.Cell {
+	tb.Helper()
+
+	state, err := cell.FromBOCWithOptions(predecessorBOC, cell.BOCParseOptions{Lazy: true})
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
+
+	return state
+}
+
+// The lazy fixture parses its predecessor per iteration rather than once, and
+// that is not tidiness. A store-shaped tree materializes the cells it is read
+// through, so a predecessor shared across iterations is fully lazy for the first
+// collation and progressively resident afterwards — and the pruning predicate
+// that decides childless boundaries reads exactly that. Reusing one made
+// iteration 0 produce a 688,134-byte block and every later iteration a
+// 688,052-byte one: two different blocks timed as if they were one, and any
+// identity gate built on this row would flap between them.
+//
+// The parse is excluded from the timer rather than merged into the measurement:
+// it is fixture assembly, not collation. It is not a rounding error — on the
+// measurement box (i7-6700, go1.26.2, 8 cores) it costs 83.0 ms and 39.1 MB
+// against the 83.4 ms of the collation it precedes, so this row now takes about
+// twice as long to run. What it does not do is move the number: measured against
+// the shared-predecessor version, ns/op went from 85.9 ms to 83.4 ms (-2.9%) and
+// B/op from 37.0 MB to 34.5 MB, with allocs/op up 1,363 (+0.46%) — the reported
+// figure moved down, not up. BenchmarkMainnetLazyPredecessorParse below is the
+// row that keeps that exclusion honest; it is a measurement, not a gate.
+//
+// WHAT THE EXCLUSION CANNOT EXCLUDE, stated because a reader comparing this row
+// to its pre-fix self deserves it: StopTimer removes the parse's wall time, and
+// because testing accumulates the memstats deltas across the timer windows it
+// removes the parse's ~39 MB from B/op as well. It does not remove the GC WORK
+// that garbage causes. A collection triggered by allocations made outside the
+// timer can fire inside it and is charged to ns/op there, so this row now runs
+// under roughly twice the garbage per iteration that the shared-predecessor
+// version did — ~39 MB out of timer against 34.5 MB in it. The -2.9% above says
+// that did not show up as a penalty on this fixture and this box, which is a
+// measurement and not a guarantee. Two consequences: this row is comparable to
+// the pre-fix number only approximately, and it must not be compared against the
+// other collation rows in this file, none of which rebuild their predecessor.
+func BenchmarkCollateMainnetHeavyLazyFixture(b *testing.B) {
+	req, _, _ := benchMainnetFixtureRequest(b, benchMainnetExportRepeat())
+	// capFullCollatedData is OFF on this row, explicitly and not by inheritance.
+	// The subject here is what the parent's SHAPE costs collation; the proof
+	// building the capability adds is a different subject with its own rows, which
+	// go through benchMainnetCollatedRequest. Clearing it in the request states
+	// the choice, and the assertion below is what keeps it a choice: with the
+	// capability off the collated data degenerates to a 33-byte marker, so a
+	// "collatedB" metric taken from this row would have reported 33 bytes as if it
+	// were a size. It is asserted instead of reported.
+	req.Masterchain.Config.capabilities &^= capFullCollatedData
+	predecessorBOC := benchMainnetPredecessorBOC(b, req)
+	req.Previous.State = benchMainnetLazyPredecessor(b, predecessorBOC)
 
 	builder := testBuilder()
 	ctx := context.Background()
@@ -617,19 +900,50 @@ func BenchmarkCollateMainnetHeavyLazyFixture(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	if len(candidate.CollatedData) != benchMainnetCollatedMarkerBytes {
+		b.Fatalf("collated data is %d bytes, want the %d-byte marker: this row is meant to run "+
+			"WITHOUT capFullCollatedData", len(candidate.CollatedData), benchMainnetCollatedMarkerBytes)
+	}
+	blockBytes := len(candidate.BlockBOC)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if _, err := builder.BuildShard(ctx, req); err != nil {
+		b.StopTimer()
+		req.Previous.State = benchMainnetLazyPredecessor(b, predecessorBOC)
+		b.StartTimer()
+		built, err := builder.BuildShard(ctx, req)
+		if err != nil {
 			b.Fatal(err)
+		}
+		// The drift this fix exists for is visible in one integer, so it is
+		// checked on every iteration rather than trusted.
+		if len(built.BlockBOC) != blockBytes {
+			b.Fatalf("iteration produced a %d-byte block against the %d-byte first one: "+
+				"the predecessor is not being rebuilt", len(built.BlockBOC), blockBytes)
 		}
 	}
 	b.StopTimer()
 	b.ReportMetric(float64(candidate.Stats.Transactions), "tx/block")
 	b.ReportMetric(float64(candidate.Stats.GasUsed), "gas/block")
-	b.ReportMetric(float64(len(candidate.BlockBOC)), "blockB")
-	b.ReportMetric(float64(len(candidate.CollatedData)), "collatedB")
+	b.ReportMetric(float64(blockBytes), "blockB")
+}
+
+// The per-iteration price of the fixture rebuild the row above excludes.
+func BenchmarkMainnetLazyPredecessorParse(b *testing.B) {
+	req, _, _ := benchMainnetFixtureRequest(b, benchMainnetExportRepeat())
+	predecessorBOC := benchMainnetPredecessorBOC(b, req)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		state := benchMainnetLazyPredecessor(b, predecessorBOC)
+		if state == nil {
+			b.Fatal("no predecessor")
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(len(predecessorBOC)), "predecessorB")
 }
 
 func BenchmarkVerifyMainnetHeavyFixture(b *testing.B) {
@@ -691,6 +1005,12 @@ func benchMainnetCollatedRequest(tb testing.TB, repeat int) ShardRequest {
 // the capability would still benchmark, at a number that means nothing.
 const benchMainnetCollatedFloor = 64 << 10
 
+// benchMainnetCollatedMarkerBytes is what collated data degenerates to with
+// capFullCollatedData clear: the consensus extra root alone. A row that means to
+// run without the capability asserts this exact size, so "no proof was built"
+// and "the proof came out suspiciously small" can never be confused.
+const benchMainnetCollatedMarkerBytes = 33
+
 func assertBenchMainnetCollated(tb testing.TB, candidate *Candidate) {
 	tb.Helper()
 
@@ -714,6 +1034,40 @@ func reportMainnetCollated(b *testing.B, candidate *Candidate) {
 	b.ReportMetric(float64(len(candidate.CollatedData)), "collatedB")
 }
 
+// THE GOGC LEVER, measured on the current tree, because a claim about it kept
+// being repeated and then deleted rather than booked. This is the honest figure
+// and its method.
+//
+// Method, on BenchmarkCollateMainnetHeavyCollated (Apple M1 Pro, go1.26.4,
+// darwin/arm64): process CPU (user+sys from /usr/bin/time -l) at -benchtime 90x
+// minus the same at 30x, three samples each, so the fixture build, the process
+// start and the one warm-up collation all cancel and what remains is 60 real
+// collations. A single-run process CPU number does NOT work here and was tried
+// first: at GOGC=100 two consecutive whole-process runs came out at 8.35 s and
+// 16.38 s of user time, a 2x spread that swamps the effect. The differencing
+// removes it.
+//
+//	CPU per collation   GOGC=100  92.2 ms  (89.0-95.5 across sample pairs)
+//	                    GOGC=400  67.1 ms  (62.2-73.2)
+//	                    -> -27.3% on the sample means, -18% .. -35% at the bounds
+//
+// Wall time per op did NOT move outside its own noise (50.0/50.4 ms at GOGC=100
+// against 52.6/48.1 ms at GOGC=400): this is a CPU lever, not a latency one, and
+// nothing here licenses a wall-clock claim.
+//
+// The heap it acts on, live OBJECTS and live BYTES reported separately as they
+// must be, sampled through runtime/metrics after three collations and two forced
+// GCs: 461,895 live objects and 91.6 MB live bytes, IDENTICAL at both GOGC values
+// to within 0.01% — live heap is a property of the program and GOGC does not
+// change it. What GOGC changes is the goal computed from it: /gc/heap/goal:bytes
+// went 183.6 MB at GOGC=100 to 459.5 MB at GOGC=400, and maximum resident set
+// size followed, 413-671 MB to 639-652 MB. That is the price of the 27%, and it
+// is why this is recorded as a measurement and not as a recommendation — see
+// service/validator/retention.go on why nothing in this tree derives a budget
+// from GOMEMLIMIT.
+//
+// The box was at load average 12-13 on 10 cores throughout. That widens the
+// upper tails of both arms, so the bounds above are conservative.
 func BenchmarkCollateMainnetCollated(b *testing.B) {
 	benchmarkCollateMainnetCollated(b, 1)
 }

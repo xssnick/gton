@@ -45,14 +45,8 @@ func projectCollatorSessions(
 	if snapshot.Config == nil {
 		return nil, errors.New("collator controller: validator config is absent")
 	}
-	registeredLocalCollator := false
-	for i := range snapshot.CollatorsByValidator {
-		if slices.Contains(snapshot.CollatorsByValidator[i].CollatorADNLIDs, policy.localADNLID) {
-			registeredLocalCollator = true
-			break
-		}
-	}
-	if !registeredLocalCollator {
+	allCollators := groups.AllCollatorADNLIDs(snapshot.CollatorsByValidator)
+	if !slices.Contains(allCollators, policy.localADNLID) {
 		return map[[32]byte]projectedCollatorSession{}, nil
 	}
 
@@ -63,7 +57,15 @@ func projectCollatorSessions(
 
 	projected := make(map[[32]byte]projectedCollatorSession, len(snapshot.Active)+len(snapshot.Future))
 	add := func(group groups.Session, active bool) error {
-		role, registry := projectedCollatorRole(snapshot, group, policy)
+		for i := range group.Validators {
+			if groups.ValidatorADNL(group.Validators[i]) == policy.localADNLID {
+				// The reference assigns one role per ADNL and gives a group
+				// validator precedence over collator and observer identities.
+				return nil
+			}
+		}
+
+		role, registry := projectedCollatorRole(snapshot, group)
 		consensus := snapshot.Config.NewConsensus.Shard
 		if group.Shard.IsMasterchain() {
 			consensus = snapshot.Config.NewConsensus.Masterchain
@@ -81,15 +83,23 @@ func projectCollatorSessions(
 			}
 
 			return fmt.Errorf(
-				"collator controller: session %x requires simplex v2 protocol version 3 or newer",
+				"collator controller: session %x has unsupported simplex v%d protocol version %d",
 				group.ID,
+				consensus.Version,
+				consensus.ProtocolVersion,
 			)
+		}
+		// Protocol 0 omits every pure non-validator identity. Delegation itself
+		// is not version-gated; the topology simply instantiates no local role.
+		if consensus.ProtocolVersion == 0 {
+			return nil
 		}
 
 		session := projectCollatorSession(
 			snapshot,
 			group,
 			allOverlayNodes,
+			allCollators,
 			*consensus,
 			role,
 			registry,
@@ -120,6 +130,7 @@ func projectCollatorSession(
 	snapshot *groups.Snapshot,
 	group groups.Session,
 	allOverlayNodes [][32]byte,
+	allCollators [][32]byte,
 	consensus groups.SimplexConfig,
 	role OverlayRole,
 	registry []groups.CollatorRegistryEntry,
@@ -178,15 +189,21 @@ func projectCollatorSession(
 		update.FinalizedBlock = cloneBlockID(*group.FinalizedBlock)
 	}
 
+	broadcastMode := CandidateBroadcastPrivateOverlay
+	if consensus.EnableBlockSync() {
+		broadcastMode = CandidateBroadcastBlockSyncOverlay
+	}
 	overlay := OverlaySession{
 		Session:                   session,
 		Role:                      role,
 		CollatorsByValidator:      registry,
+		AllCollators:              allCollators,
+		AllCurrentValidators:      snapshot.Config.AllCurrentValidators,
 		AllOverlayNodes:           allOverlayNodes,
 		MaxBlockSize:              snapshot.Config.MaxBlockSize,
 		MaxCollatedDataSize:       snapshot.Config.MaxCollatedDataSize,
-		BroadcastMode:             CandidateBroadcastPrivateOverlay,
-		ObserversInPrivateOverlay: true,
+		BroadcastMode:             broadcastMode,
+		ObserversInPrivateOverlay: consensus.ObserversInPrivateOverlay(),
 	}
 
 	return projectedCollatorSession{
@@ -201,7 +218,6 @@ func projectCollatorSession(
 func projectedCollatorRole(
 	snapshot *groups.Snapshot,
 	group groups.Session,
-	policy sessionProjectionPolicy,
 ) (OverlayRole, []groups.CollatorRegistryEntry) {
 	if group.Shard.IsMasterchain() {
 		return OverlayRoleObserver, nil
@@ -213,19 +229,18 @@ func projectedCollatorRole(
 	}
 
 	registry := make([]groups.CollatorRegistryEntry, 0, len(group.Validators))
-	role := OverlayRoleObserver
 	for i := range snapshot.CollatorsByValidator {
 		entry := snapshot.CollatorsByValidator[i]
 		if _, inRoster := rosterKeys[entry.ValidatorKeyID]; !inRoster {
 			continue
 		}
 		registry = append(registry, entry)
-		if slices.Contains(entry.CollatorADNLIDs, policy.localADNLID) {
-			role = OverlayRoleCollator
-		}
 	}
 
-	return role, registry
+	// The reference marks a globally registered collator identity as a
+	// collator for every non-masterchain group. Filtering the registry to this
+	// roster only scopes which validators may delegate to it.
+	return OverlayRoleCollator, registry
 }
 
 func (s projectedCollatorSession) observerSession() ConsensusObserverSession {
@@ -242,6 +257,8 @@ func (o OverlaySession) Equal(other OverlaySession) bool {
 
 	return left.Session.Equal(right.Session) && left.Role == right.Role &&
 		slices.EqualFunc(left.CollatorsByValidator, right.CollatorsByValidator, sameCollatorRegistryEntry) &&
+		slices.Equal(left.AllCollators, right.AllCollators) &&
+		slices.Equal(left.AllCurrentValidators, right.AllCurrentValidators) &&
 		slices.Equal(left.AllOverlayNodes, right.AllOverlayNodes) &&
 		left.MaxBlockSize == right.MaxBlockSize &&
 		left.MaxCollatedDataSize == right.MaxCollatedDataSize &&

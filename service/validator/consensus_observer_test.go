@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -379,6 +380,8 @@ func newObserverFixture(
 				ValidatorKeyID:  validatorHash,
 				CollatorADNLIDs: [][32]byte{localADNL},
 			}},
+			AllCollators:              [][32]byte{localADNL},
+			AllCurrentValidators:      [][32]byte{validatorADNL},
 			AllOverlayNodes:           [][32]byte{validatorADNL, localADNL},
 			MaxBlockSize:              1 << 20,
 			MaxCollatedDataSize:       1 << 20,
@@ -456,6 +459,102 @@ func newObserverFixture(
 		validatorKey: validatorKey,
 		collatorKey:  collatorKey,
 		progress:     progress,
+	}
+}
+
+func TestConsensusObserverRuntimeInputProtocolRoleMatrix(t *testing.T) {
+	fixture := newObserverFixture(t, nil, nil)
+	t.Cleanup(func() {
+		if err := fixture.observer.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+
+	for _, test := range []struct {
+		name             string
+		protocolVersion  uint8
+		role             collator.OverlayRole
+		broadcastMode    collator.CandidateBroadcastMode
+		privateObservers bool
+		want             bool
+	}{
+		{name: "protocol zero observer", protocolVersion: 0, role: collator.OverlayRoleObserver,
+			broadcastMode: collator.CandidateBroadcastPrivateOverlay},
+		{name: "protocol zero collator", protocolVersion: 0, role: collator.OverlayRoleCollator,
+			broadcastMode: collator.CandidateBroadcastPrivateOverlay},
+		{name: "protocol one observer", protocolVersion: 1, role: collator.OverlayRoleObserver,
+			broadcastMode: collator.CandidateBroadcastBlockSyncOverlay, want: true},
+		{name: "protocol one collator", protocolVersion: 1, role: collator.OverlayRoleCollator,
+			broadcastMode: collator.CandidateBroadcastBlockSyncOverlay, want: true},
+		{name: "protocol two observer", protocolVersion: 2, role: collator.OverlayRoleObserver,
+			broadcastMode: collator.CandidateBroadcastPrivateOverlay, privateObservers: true, want: true},
+		{name: "protocol two collator", protocolVersion: 2, role: collator.OverlayRoleCollator,
+			broadcastMode: collator.CandidateBroadcastPrivateOverlay, privateObservers: true, want: true},
+		{name: "protocol three observer", protocolVersion: 3, role: collator.OverlayRoleObserver,
+			broadcastMode: collator.CandidateBroadcastPrivateOverlay, privateObservers: true, want: true},
+		{name: "protocol three collator", protocolVersion: 3, role: collator.OverlayRoleCollator,
+			broadcastMode: collator.CandidateBroadcastPrivateOverlay, privateObservers: true, want: true},
+		{name: "unrepresentable protocol", protocolVersion: simplex.MaxProtocolVersion + 1,
+			role: collator.OverlayRoleObserver, broadcastMode: collator.CandidateBroadcastPrivateOverlay},
+		{name: "protocol one wrong route", protocolVersion: 1, role: collator.OverlayRoleObserver,
+			broadcastMode: collator.CandidateBroadcastPrivateOverlay},
+		{name: "protocol two wrong observer policy", protocolVersion: 2, role: collator.OverlayRoleObserver,
+			broadcastMode: collator.CandidateBroadcastPrivateOverlay},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			descriptor := fixture.descriptor
+			descriptor.Overlay.Session.ProtocolVersion = test.protocolVersion
+			descriptor.Overlay.Role = test.role
+			if test.role == collator.OverlayRoleObserver {
+				descriptor.Overlay.CollatorsByValidator = nil
+				descriptor.Overlay.AllCollators = nil
+			}
+			descriptor.Overlay.BroadcastMode = test.broadcastMode
+			descriptor.Overlay.ObserversInPrivateOverlay = test.privateObservers
+			input, err := fixture.observer.runtimeInput(descriptor)
+			if (err == nil) != test.want {
+				t.Fatalf("runtimeInput error = %v, want success %v", err, test.want)
+			}
+			if err == nil && !slices.Equal(input.config.AllCollators, descriptor.Overlay.AllCollators) {
+				t.Fatalf("all-collator roster = %x, want %x",
+					input.config.AllCollators, descriptor.Overlay.AllCollators)
+			}
+		})
+	}
+}
+
+func TestConsensusObserverUsesBlockSyncOnlyRuntimeForProtocolOneObserver(t *testing.T) {
+	fixture := newObserverFixture(t, nil, nil)
+	descriptor := fixture.descriptor
+	descriptor.Overlay.Session.ProtocolVersion = 1
+	descriptor.Overlay.Role = collator.OverlayRoleObserver
+	descriptor.Overlay.CollatorsByValidator = nil
+	descriptor.Overlay.AllCollators = nil
+	descriptor.Overlay.BroadcastMode = collator.CandidateBroadcastBlockSyncOverlay
+	descriptor.Overlay.ObserversInPrivateOverlay = false
+
+	if err := fixture.observer.PrepareSession(context.Background(), descriptor); err != nil {
+		t.Fatal(err)
+	}
+	session, err := fixture.observer.session(descriptor.Overlay.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	runtime := session.runtime
+	_, lightweight := runtime.(*blockSyncObserverRuntime)
+	session.mu.Unlock()
+	if !lightweight {
+		t.Fatalf("protocol-1 observer runtime = %T, want block-sync-only", runtime)
+	}
+	if err = fixture.observer.ActivateSession(context.Background(), fixture.activation); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, broadcasts := fixture.sessionNet.counts(); broadcasts != 0 {
+		t.Fatalf("block-sync observer originated %d candidate broadcasts", broadcasts)
+	}
+	if err = fixture.observer.Close(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -564,6 +663,7 @@ func TestConsensusObserverPrepareActivateAndAuthenticatedProgress(t *testing.T) 
 	}
 	session.mu.Lock()
 	activeRuntime := session.runtime
+	activeConfig := session.config
 	session.mu.Unlock()
 	if activeRuntime != preparedRuntime {
 		t.Fatal("activation replaced the future session runtime")
@@ -605,7 +705,7 @@ func TestConsensusObserverPrepareActivateAndAuthenticatedProgress(t *testing.T) 
 
 	artifact := runtimeOrdinaryArtifact(
 		t,
-		activeRuntime.config,
+		activeConfig,
 		fixture.validatorKey,
 		advanced.Window.StartSlot,
 		advanced.Window.Base,
@@ -650,6 +750,22 @@ func TestConsensusObserverPrepareActivateAndAuthenticatedProgress(t *testing.T) 
 	}
 	if extra.Delegation == nil || extra.Slot != artifact.Candidate.ID.Slot || fixture.storage.saveCount() != 1 {
 		t.Fatalf("delegated candidate was not broadcast and stored: extra=%+v saves=%d", extra, fixture.storage.saveCount())
+	}
+	// The delegated route reaches its payload through the capsule the collator
+	// built, the self route through the same capsule, and a replay through the
+	// BOCs. All three must put the same bytes on the overlay, so pin the emitted
+	// payload against the route-independent serialization of the same inputs.
+	expected, err := simplex.SerializeCandidateForBroadcast(
+		artifact.Candidate,
+		artifact.BlockBOC,
+		artifact.CollatedData,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fixture.sessionNet.lastBroadcast().Data, expected.Data) ||
+		!bytes.Equal(fixture.sessionNet.lastBroadcast().Extra, expected.Extra) {
+		t.Fatal("delegated broadcast bytes differ from the candidate serialization")
 	}
 
 	retireCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

@@ -25,6 +25,7 @@ var (
 	ansiPattern       = regexp.MustCompile("\\x1b\\[[0-9;?]*[ -/]*[@-~]")
 	goBlockPattern    = regexp.MustCompile(`wc=(-?\d+)\s+shard=([0-9a-fA-F]{16}|-?\d+)\s+seqno=(\d+)`)
 	cppBlockPattern   = regexp.MustCompile(`\((-?\d+),([0-9a-fA-F]{16}),(\d+)\)`)
+	cppBlockIDPattern = regexp.MustCompile(`\((-?\d+),([0-9a-fA-F]{16}),(\d+)\):([0-9a-fA-F]{64}):([0-9a-fA-F]{64})`)
 	hardErrorMessages = []string{
 		"validator session preparation failed",
 		"validator session state update failed",
@@ -151,6 +152,8 @@ func parseJSONLog(node NodeConfig, line []byte) (Event, bool) {
 	event.Transition = jsonString(record, "transition")
 	event.Leader = jsonScalar(record, "leader")
 	event.CandidateHash = strings.ToLower(jsonString(record, "candidate_hash"))
+	event.BlockRootHash = strings.ToLower(jsonString(record, "block_root_hash"))
+	event.BlockFileHash = strings.ToLower(jsonString(record, "block_file_hash"))
 	event.Error = jsonScalar(record, "error")
 
 	switch message {
@@ -222,7 +225,7 @@ func parseTextLog(node NodeConfig, line string) (Event, bool) {
 	}
 	if strings.Contains(line, "Published event") && strings.Contains(line, "CandidateGenerated") {
 		event.Kind = "block_collated"
-		fillBlockRef(&event, line, cppBlockPattern)
+		fillCPPBlockID(&event, line)
 		event.CandidateHash = cppCandidateHash(line)
 		return event, true
 	}
@@ -287,6 +290,19 @@ func fillBlockRef(event *Event, line string, pattern *regexp.Regexp) {
 	event.Workchain = int32(parseInt(match[1]))
 	event.Shard = parseShard(match[2])
 	event.Seqno = uint32(parseUint(match[3]))
+}
+
+func fillCPPBlockID(event *Event, line string) {
+	match := cppBlockIDPattern.FindStringSubmatch(line)
+	if len(match) != 6 {
+		fillBlockRef(event, line, cppBlockPattern)
+		return
+	}
+	event.Workchain = int32(parseInt(match[1]))
+	event.Shard = parseShard(match[2])
+	event.Seqno = uint32(parseUint(match[3]))
+	event.BlockRootHash = strings.ToLower(match[4])
+	event.BlockFileHash = strings.ToLower(match[5])
 }
 
 func textField(line, key string) string {

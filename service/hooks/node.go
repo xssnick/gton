@@ -67,4 +67,15 @@ type Store interface {
 	WaitMasterchainSeqno(ctx context.Context, seqno uint32, timeout time.Duration) error
 	NonfinalPendingShardBlocks(filter *storage.ShardKey) ([]ton.BlockIDExt, []ton.BlockIDExt)
 	LazyCellLoader() cell.LazyCellLoader
+
+	// PublishAcceptedBlockState makes a block this node finalized itself, and the
+	// state it computed for it, readable before either is committed. It is how a
+	// consensus participant extends the live view rather than waiting for a flush
+	// it does not need; see liveview.Store.PublishAcceptedBlockState for what may
+	// be published and for how long it lives.
+	PublishAcceptedBlockState(artifacts storage.LiveBlockArtifacts) error
+	// BlockArtifactsSignal is the edge a reader waits on instead of polling for a
+	// block that has not arrived yet. The signal says only "something was
+	// published"; the caller's own read stays the predicate.
+	BlockArtifactsSignal() <-chan struct{}
 }

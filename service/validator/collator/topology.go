@@ -483,7 +483,7 @@ func expectedShardNeighbors(
 // derives it, validation re-derives it, and verifyFullMasterNeighborSet checks
 // the transmitted set against it — the three must agree by construction, so the
 // first two share this one derivation. The third keeps its own loop because it
-// additionally needs each leaf's descriptor fields and their parse error path.
+// additionally carries each leaf's registered end lt.
 //
 // A registered shard that has produced no block yet is skipped: there is no
 // out-queue to import from. The masterchain's own predecessor is always a

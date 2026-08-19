@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
@@ -39,7 +40,7 @@ func (n *Node) serveDetachedADNLQuery(pooled *pooledPeer, msg *adnl.MessageQuery
 	unwrapped, overlayID := overlay.UnwrapQuery(msg.Data)
 	sub := n.detachedSubscription(pooled, overlayID)
 	if sub == nil {
-		return errDetachedUnknownOverlay
+		return fmt.Errorf("%w: %x", errDetachedUnknownOverlay, overlayID)
 	}
 	return sub.serveDetachedADNLQuery(pooled, msg, unwrapped)
 }
@@ -48,7 +49,7 @@ func (n *Node) serveDetachedRLDPQuery(pooled *pooledPeer, transferID []byte, que
 	unwrapped, overlayID := overlay.UnwrapQuery(query.Data)
 	sub := n.detachedSubscription(pooled, overlayID)
 	if sub == nil {
-		return errDetachedUnknownOverlay
+		return fmt.Errorf("%w: %x", errDetachedUnknownOverlay, overlayID)
 	}
 	return sub.serveDetachedRLDPQuery(pooled, transferID, query, unwrapped)
 }

@@ -69,6 +69,10 @@ func TestBuildShardGivesUpOnUnreachableSizeLimit(t *testing.T) {
 // estimate (build.go) silently moved the ratio onto the post-admission scale,
 // and every case below stopped recovering while the one-byte case still passed.
 func TestBuildShardRebuildsUnderBindingSizeLimits(t *testing.T) {
+	// Runs in the shared-fixture parallel batch: it reads the cached mainnet
+	// workload and keeps every mutation on its own copy, holds no package-level
+	// counter and derives nothing from wall-clock timing.
+	t.Parallel()
 	req, _ := benchMainnetRequestRepeated(t, benchMainnetFiller, benchMainnetHeavyRepeat)
 	natural, err := testBuilder().BuildShard(context.Background(), req)
 	if err != nil {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/gton/service/validator/blockstats"
 	"github.com/xssnick/gton/service/validator/keyring"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/liteclient"
@@ -121,6 +122,16 @@ func TestServerMTCKeyFlow(t *testing.T) {
 	}
 	if values["masterchainblocktime"] != "1699999999" || values["shardclientmasterchainseqno"] != "123" {
 		t.Fatalf("unexpected sync stats: %#v", values)
+	}
+	for _, key := range []string{
+		"total.collated_blocks.master",
+		"total.collated_blocks.shard",
+		"total.validated_blocks.master",
+		"total.validated_blocks.shard",
+	} {
+		if values[key] != "ok:0 error:0" {
+			t.Fatalf("%s = %q, want zero block counters", key, values[key])
+		}
 	}
 
 	var initialConfig JSONConfig
@@ -300,7 +311,8 @@ func TestGetStatsUsesBlockMetadataDuringInitialSync(t *testing.T) {
 			current: current,
 			meta:    &storage.BlockMeta{GenUTime: 1_699_999_998},
 		},
-		startedAt: time.Unix(1_699_999_000, 0),
+		blockStats: blockstats.New(),
+		startedAt:  time.Unix(1_699_999_000, 0),
 	}
 
 	stats, err := server.stats(t.Context())
@@ -322,6 +334,48 @@ func TestGetStatsUsesBlockMetadataDuringInitialSync(t *testing.T) {
 	}
 	if values["unixtime"] == "" || values["masterchainblock"] == "" {
 		t.Fatalf("missing sync stats: %#v", values)
+	}
+	for _, key := range []string{
+		"total.collated_blocks.master",
+		"total.collated_blocks.shard",
+		"total.validated_blocks.master",
+		"total.validated_blocks.shard",
+	} {
+		if values[key] != "ok:0 error:0" {
+			t.Fatalf("%s = %q during initial sync, want zero block counters", key, values[key])
+		}
+	}
+}
+
+func TestGetStatsReadsLatestBlockCounters(t *testing.T) {
+	t.Parallel()
+
+	blockStats := blockstats.New()
+	server := &Server{
+		state: fakeStateReader{current: &storage.CurrentState{Masterchain: storage.BlockState{
+			Block: ton.BlockIDExt{
+				RootHash: repeatedBytes(0xaa, 32),
+				FileHash: repeatedBytes(0xbb, 32),
+			},
+			Parsed: &tlb.ShardStateUnsplit{},
+		}}},
+		blockStats: blockStats,
+	}
+
+	blockStats.ObserveCollation(true, true)
+	blockStats.ObserveValidation(false, false)
+	stats, err := server.stats(t.Context())
+	if err != nil {
+		t.Fatalf("get stats: %v", err)
+	}
+
+	values := make(map[string]string, len(stats.Stats))
+	for _, stat := range stats.Stats {
+		values[stat.Key] = stat.Value
+	}
+	if values["total.collated_blocks.master"] != "ok:1 error:0" ||
+		values["total.validated_blocks.shard"] != "ok:0 error:1" {
+		t.Fatalf("block counters = %#v", values)
 	}
 }
 
@@ -394,6 +448,7 @@ func startTestServer(
 		Keys:        keyStore,
 		LocalADNLID: localADNLID,
 		State:       state,
+		BlockStats:  blockstats.New(),
 		Logger:      zerolog.Nop(),
 	})
 	if err != nil {

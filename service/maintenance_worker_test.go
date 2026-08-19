@@ -8,6 +8,12 @@ import (
 	"github.com/xssnick/gton/service/storage"
 )
 
+func TestDefaultPersistentStateKeepRecentIsOne(t *testing.T) {
+	if DefaultPersistentStateKeepRecent != 1 {
+		t.Fatalf("default persistent state keep recent = %d, want 1", DefaultPersistentStateKeepRecent)
+	}
+}
+
 func TestComponentConstructorsKeepZeroTTLs(t *testing.T) {
 	status := newTestStatusTracker(nil, nil)
 	state := NewStateLifecycle(zerolog.Nop(), nil, status, StateLifecycleOptions{})

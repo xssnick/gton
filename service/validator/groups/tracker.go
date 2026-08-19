@@ -2,6 +2,7 @@ package groups
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -165,6 +166,7 @@ type Tracker struct {
 	snapshot             atomic.Pointer[Snapshot]
 	history              map[replayBlockKey]*Snapshot
 	historyOrder         []replayBlockKey
+	changed              chan struct{}
 }
 
 // NewTracker constructs an empty tracker and validates all local rotation
@@ -191,6 +193,7 @@ func NewTracker(options TrackerOptions) (*Tracker, error) {
 		startGroupsFromSeqno: options.StartGroupsFromSeqno,
 		unsafeRotations:      unsafeRotations,
 		initialCollators:     initialCollators,
+		changed:              make(chan struct{}),
 	}, nil
 }
 
@@ -218,6 +221,8 @@ func (t *Tracker) Apply(input ApplyInput) (ApplyResult, error) {
 	if result.Snapshot != previous {
 		t.recordSnapshotLocked(result.Snapshot)
 		t.snapshot.Store(result.Snapshot)
+		close(t.changed)
+		t.changed = make(chan struct{})
 	}
 
 	return result, nil
@@ -242,6 +247,39 @@ func (t *Tracker) Apply(input ApplyInput) (ApplyResult, error) {
 func (t *Tracker) Project(previous *Snapshot, input ApplyInput) (*Snapshot, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+
+	return t.projectLocked(previous, input)
+}
+
+// WaitProject returns the exact immutable snapshot once it is ready for
+// validator-group decisions. Project remains the non-blocking speculative API;
+// validation uses this method while the referenced masterchain block is still
+// being applied and resumes the same query after Apply publishes it.
+func (t *Tracker) WaitProject(
+	ctx context.Context,
+	previous *Snapshot,
+	input ApplyInput,
+) (*Snapshot, error) {
+	for {
+		t.mu.RLock()
+		result, err := t.projectLocked(previous, input)
+		if err != nil || result.Ready {
+			t.mu.RUnlock()
+
+			return result, err
+		}
+		changed := t.changed
+		t.mu.RUnlock()
+
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (t *Tracker) projectLocked(previous *Snapshot, input ApplyInput) (*Snapshot, error) {
 
 	if previous == nil {
 		if snapshot := t.history[replayKey(input.Block)]; snapshot != nil {

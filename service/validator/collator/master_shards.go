@@ -136,7 +136,8 @@ func ParseShardRegistry(shardHashes *cell.Dictionary) (*ShardRegistry, error) {
 }
 
 // Tops returns the current registry leaves in canonical order. Descriptor cells
-// are immutable and shared; block hash byte slices are copied at this boundary.
+// are immutable and shared; block hash byte slices are copied, which is what a
+// caller reading r.leaves directly has to do for itself.
 func (r *ShardRegistry) Tops() []ShardTop {
 	leaves := sortedShardRegistryLeaves(r.leaves)
 	tops := make([]ShardTop, len(leaves))

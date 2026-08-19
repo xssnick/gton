@@ -56,6 +56,8 @@ type Event struct {
 	SessionID     string    `json:"session_id,omitempty"`
 	Leader        string    `json:"leader,omitempty"`
 	CandidateHash string    `json:"candidate_hash,omitempty"`
+	BlockRootHash string    `json:"block_root_hash,omitempty"`
+	BlockFileHash string    `json:"block_file_hash,omitempty"`
 	Error         string    `json:"error,omitempty"`
 }
 

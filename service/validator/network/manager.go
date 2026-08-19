@@ -22,9 +22,8 @@ var (
 	// ErrSessionNotFound reports a session which has not been prepared or was
 	// already retired.
 	ErrSessionNotFound = errors.New("validator network: session not found")
-	// ErrSessionConflict reports incompatible contributions for a shared
-	// session ID. Validator and observer roles may coexist when their immutable
-	// consensus and candidate-authorization inputs agree.
+	// ErrSessionConflict reports a second local role or an incompatible
+	// descriptor for an existing session ID.
 	ErrSessionConflict = errors.New("validator network: conflicting session descriptor")
 	// ErrSessionInactive reports ingress or an operation outside SessionNetwork.Run.
 	ErrSessionInactive = errors.New("validator network: session is inactive")
@@ -32,8 +31,7 @@ var (
 	// ADNL identity configured for this node.
 	ErrLocalADNLUnavailable = errors.New("validator network: local ADNL identity is unavailable")
 	// ErrUnsupportedBroadcastMode rejects an inbound candidate which did not
-	// arrive over the one delivery Delegated-v3 defines for candidates:
-	// private-overlay two-step FEC.
+	// arrive over private-overlay two-step FEC.
 	ErrUnsupportedBroadcastMode = errors.New("validator network: candidate broadcast mode is unsupported")
 )
 
@@ -100,7 +98,7 @@ func (m *Manager) LocalADNLID() [32]byte {
 	return m.localADNLID
 }
 
-// Start installs the process-wide Delegated-v3 server handlers. Session
+// Start installs the process-wide delegated-collation server handlers. Session
 // overlays become active when their SessionNetwork.Start completes.
 func (m *Manager) Start(ctx context.Context, handlers collator.RemoteHandlers) error {
 	if err := ctx.Err(); err != nil {
@@ -136,13 +134,16 @@ func (m *Manager) PrepareValidatorSession(
 		return nil, err
 	}
 
-	return m.prepare(ctx, spec)
+	endpoint, err := m.prepare(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	return endpoint, nil
 }
 
 // PreparePersistentObserverSession opens an inactive validator-service
-// endpoint for one configured persistent-overlay identity. It shares the
-// physical session hub with a standalone observer endpoint, but has no voting
-// or candidate-signing authority.
+// endpoint for one configured persistent-overlay identity. It has no voting or
+// candidate-signing authority.
 func (m *Manager) PreparePersistentObserverSession(
 	ctx context.Context,
 	config validator.SessionConfig,
@@ -152,7 +153,11 @@ func (m *Manager) PreparePersistentObserverSession(
 		return nil, err
 	}
 
-	return m.prepare(ctx, spec)
+	endpoint, err := m.prepare(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	return endpoint, nil
 }
 
 // PrepareSession opens an inactive standalone observer/collator overlay.
@@ -168,7 +173,11 @@ func (m *Manager) PrepareSession(
 		return nil, err
 	}
 
-	return m.prepare(ctx, spec)
+	endpoint, err := m.prepare(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	return endpoint, nil
 }
 
 func (m *Manager) prepare(ctx context.Context, spec sessionSpec) (*sessionEndpoint, error) {
@@ -190,11 +199,9 @@ func (m *Manager) prepare(ctx context.Context, spec sessionSpec) (*sessionEndpoi
 	}
 
 	s := newSession(m, spec)
-	handle, err := m.openOverlay(spec.overlayConfig(), s.callbacks())
-	if err != nil {
-		return nil, fmt.Errorf("validator network: open session %x overlay: %w", spec.id, err)
+	if err := s.openHandles(spec); err != nil {
+		return nil, err
 	}
-	s.installInitialHandle(handle, spec)
 	m.mu.Lock()
 	m.sessions[spec.id] = s
 	m.mu.Unlock()
@@ -269,7 +276,7 @@ func (m *Manager) retire(ctx context.Context, sessionID [32]byte, kind sessionKi
 	return err
 }
 
-// Close idempotently retires every session and disables Delegated-v3 handlers.
+// Close idempotently retires every session and disables delegated-collation handlers.
 func (m *Manager) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -343,59 +350,64 @@ const (
 	sessionKindObserver
 )
 
-// sessionKindOrder fixes the iteration order over the kinds one shared hub can
-// hold. Go map iteration is randomized, and two behaviours depend on this order
-// being stable: the effective spec folds contributions with the order-sensitive
-// mergeSessionSpecs, and the callback bindings are consumed validator-first.
-var sessionKindOrder = [...]sessionKind{sessionKindValidator, sessionKindObserver}
-
 type sessionSpec struct {
-	id               [32]byte
-	kind             sessionKind
-	role             collator.OverlayRole
-	workchain        int32
-	shard            int64
-	fullOverlayID    []byte
-	members          []p2p.PeerID
-	peers            []p2p.PeerID
-	validatorByADNL  map[p2p.PeerID]int
-	validatorCount   int
-	catchainSeqno    uint32
-	validatorSetHash uint32
-	maxReplyBytes    uint32
-	authorized       map[p2p.PeerID]uint32
-	candidateADNL    map[p2p.PeerID]p2p.PeerID
-	validatorSource  map[p2p.PeerID]struct{}
-	signer           overlay.BroadcastSigner
+	id                   [32]byte
+	kind                 sessionKind
+	role                 collator.OverlayRole
+	protocolVersion      uint8
+	useQUIC              bool
+	slotsPerLeaderWindow uint32
+	openConsensus        bool
+	workchain            int32
+	shard                int64
+	fullOverlayID        []byte
+	members              []p2p.PeerID
+	peers                []p2p.PeerID
+	blockSyncFullID      []byte
+	blockSyncMembers     []p2p.PeerID
+	twoStepMembers       []p2p.PeerID
+	validatorByADNL      map[p2p.PeerID]int
+	validatorKeys        [][32]byte
+	validatorCount       int
+	catchainSeqno        uint32
+	validatorSetHash     uint32
+	maxReplyBytes        uint32
+	consensusAuthorized  map[p2p.PeerID]uint32
+	authorized           map[p2p.PeerID]uint32
+	candidateADNL        map[p2p.PeerID]p2p.PeerID
+	validatorSource      map[p2p.PeerID]int
+	signer               overlay.BroadcastSigner
 }
 
-// mergeableFieldsEqual holds the immutable consensus and candidate-authorization
-// inputs which two contributions to one shared session must agree on. It is the
-// mergeSessionSpecs precondition, and equal is defined on top of it so a new
-// sessionSpec field cannot be added to one predicate and silently omitted from
-// the other.
-func (s sessionSpec) mergeableFieldsEqual(other sessionSpec) bool {
+// overlayFieldsEqual compares every immutable input used by the physical
+// consensus and block-sync overlays.
+func (s sessionSpec) overlayFieldsEqual(other sessionSpec) bool {
 	return s.id == other.id && bytes.Equal(s.fullOverlayID, other.fullOverlayID) &&
+		bytes.Equal(s.blockSyncFullID, other.blockSyncFullID) &&
+		s.protocolVersion == other.protocolVersion && s.useQUIC == other.useQUIC &&
+		s.slotsPerLeaderWindow == other.slotsPerLeaderWindow &&
+		s.openConsensus == other.openConsensus &&
 		s.workchain == other.workchain && s.shard == other.shard &&
+		slices.Equal(s.members, other.members) &&
+		slices.Equal(s.blockSyncMembers, other.blockSyncMembers) &&
 		s.validatorCount == other.validatorCount && s.catchainSeqno == other.catchainSeqno &&
 		s.validatorSetHash == other.validatorSetHash && s.maxReplyBytes == other.maxReplyBytes &&
+		slices.Equal(s.twoStepMembers, other.twoStepMembers) &&
 		peerIndexMapsEqual(s.validatorByADNL, other.validatorByADNL) &&
+		slices.Equal(s.validatorKeys, other.validatorKeys) &&
+		peerSizeMapsEqual(s.consensusAuthorized, other.consensusAuthorized) &&
 		peerSizeMapsEqual(s.authorized, other.authorized) &&
 		peerPeerMapsEqual(s.candidateADNL, other.candidateADNL) &&
-		peerSetsEqual(s.validatorSource, other.validatorSource)
+		peerIndexMapsEqual(s.validatorSource, other.validatorSource)
 }
 
-// equal is a TOTAL comparison of every sessionSpec field which is not derived
-// from another one. session.handleMatches uses it against merged effective
-// specs whose kind, role and signer mergeSessionSpecs deliberately zeroes, so a
-// shared-fields-only comparison would accept a stale handle and leave a
-// validator transport running with the wrong signer after a role change. peers
-// is the one exception: it is remoteMembers(members, localADNLID) at every
-// construction site, so comparing members already covers it.
+// equal is a total comparison of every sessionSpec field which is not derived
+// from another one. It detects an incompatible replacement of one logical
+// contribution. peers is the one exception: it is remoteMembers(members,
+// localADNLID) at every construction site, so comparing members covers it.
 func (s sessionSpec) equal(other sessionSpec) bool {
-	return s.mergeableFieldsEqual(other) &&
+	return s.overlayFieldsEqual(other) &&
 		s.kind == other.kind && s.role == other.role &&
-		slices.Equal(s.members, other.members) &&
 		signerPublicKeysEqual(s.signer, other.signer)
 }
 
@@ -407,21 +419,46 @@ func signerPublicKeysEqual(left, right overlay.BroadcastSigner) bool {
 	return bytes.Equal(left.PublicKey(), right.PublicKey())
 }
 
-func (s sessionSpec) overlayConfig() p2p.PrivateOverlayConfig {
+func (s sessionSpec) consensusOverlayConfig() p2p.PrivateOverlayConfig {
 	return p2p.PrivateOverlayConfig{
 		Name:                            fmt.Sprintf("consensus.%x", s.id[:6]),
 		FullID:                          s.fullOverlayID,
 		Members:                         s.members,
-		AuthorizedBroadcastSources:      s.authorized,
+		AuthorizedBroadcastSources:      s.consensusAuthorized,
 		MaxUnauthenticatedBroadcastSize: 0,
-		UseQUIC:                         true,
+		UseQUIC:                         s.useQUIC,
 		AllowLegacyBroadcasts:           false,
 		EnableTwoStep:                   true,
-		// The shared handle has two possible origins. Each two-step send binds
-		// its signer explicitly; nil at open keeps the node ADNL signer as the
-		// standalone-collator default without exposing its private key.
+		TwoStepIntermediateMembers:      s.twoStepMembers,
+		// Each send binds its signer explicitly. Nil at open keeps the node ADNL
+		// signer available to protocol 1 and standalone collators without
+		// exposing its private key.
 		BroadcastSigner: nil,
 	}
+}
+
+func (s sessionSpec) blockSyncOverlayConfig() p2p.PrivateOverlayConfig {
+	return p2p.PrivateOverlayConfig{
+		Name:                            fmt.Sprintf("block-sync.%x", s.id[:6]),
+		FullID:                          s.blockSyncFullID,
+		Members:                         s.blockSyncMembers,
+		AuthorizedBroadcastSources:      s.authorized,
+		MaxUnauthenticatedBroadcastSize: 0,
+		UseQUIC:                         s.useQUIC,
+		AllowLegacyBroadcasts:           false,
+		EnableTwoStep:                   true,
+		TwoStepIntermediateMembers:      s.twoStepMembers,
+		BroadcastSigner:                 nil,
+	}
+}
+
+func (s sessionSpec) hasBlockSync() bool {
+	return s.protocolVersion == 1
+}
+
+func (s sessionSpec) canOriginateCandidate() bool {
+	return s.signer != nil ||
+		(s.kind == sessionKindObserver && s.role == collator.OverlayRoleCollator)
 }
 
 func peerIndexMapsEqual(left, right map[p2p.PeerID]int) bool {
@@ -461,45 +498,4 @@ func peerPeerMapsEqual(left, right map[p2p.PeerID]p2p.PeerID) bool {
 		}
 	}
 	return true
-}
-
-func peerSetsEqual(left, right map[p2p.PeerID]struct{}) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for id := range left {
-		if _, ok := right[id]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-func mergeSessionSpecs(
-	left sessionSpec,
-	right sessionSpec,
-	localADNLID [32]byte,
-) (sessionSpec, error) {
-	if !left.mergeableFieldsEqual(right) {
-		return sessionSpec{}, fmt.Errorf("%w: incompatible shared session %x", ErrSessionConflict, left.id)
-	}
-
-	merged := left
-	merged.kind = 0
-	merged.role = 0
-	merged.signer = nil
-	memberSet := make(map[p2p.PeerID]struct{}, len(left.members)+len(right.members))
-	merged.members = make([]p2p.PeerID, 0, len(left.members)+len(right.members))
-	for _, members := range [][]p2p.PeerID{left.members, right.members} {
-		for _, member := range members {
-			if _, exists := memberSet[member]; exists {
-				continue
-			}
-			memberSet[member] = struct{}{}
-			merged.members = append(merged.members, member)
-		}
-	}
-	merged.peers = remoteMembers(merged.members, localADNLID)
-
-	return merged, nil
 }

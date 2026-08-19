@@ -9,6 +9,7 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/xssnick/gton/internal/logutil"
+	"github.com/xssnick/gton/internal/manualmem"
 	"github.com/xssnick/gton/service/storage"
 )
 
@@ -58,9 +59,16 @@ func Open(opts Options) (*Store, error) {
 	if opts.ArtifactFileMaxOpen == 0 {
 		opts.ArtifactFileMaxOpen = DefaultArtifactFileMaxOpen
 	}
-	decodedCellCache, err := decodedCellCacheConfigFromOptions(opts)
+	decodedCellCacheCfg, err := decodedCellCacheConfigFromOptions(opts)
 	if err != nil {
 		return nil, err
+	}
+	if opts.CellRecordCacheBytes < 0 {
+		return nil, fmt.Errorf("cell record cache bytes cannot be negative")
+	}
+	var recordCacheCfg cellRecordCacheConfig
+	if opts.CellRecordCacheBytes > 0 {
+		recordCacheCfg = cellRecordCacheConfigFromBytes(opts.CellRecordCacheBytes)
 	}
 
 	metaMemTableSize := opts.MetaMemTableSize
@@ -95,11 +103,15 @@ func Open(opts Options) (*Store, error) {
 		Str("dir", opts.Dir).
 		Int64("meta_cache_size", opts.MetaCacheSize).
 		Int64("cell_total_cache_size", opts.CellCacheSize).
-		Bool("decoded_cell_cache_enabled", decodedCellCache.enabled).
-		Int("decoded_cell_cache_shards", decodedCellCache.shards).
-		Int64("decoded_cell_cache_bytes_per_entry", decodedCellCache.bytesPerEntry).
-		Int("decoded_cell_cache_min_entries", decodedCellCache.minEntries).
-		Int("decoded_cell_cache_max_entries", decodedCellCache.maxEntries).
+		Bool("decoded_cell_cache_enabled", decodedCellCacheCfg.enabled).
+		// Requested, not effective, for both shards and entries. The cache is
+		// sharded, so each shard rounds the entry budget down, and the shard
+		// count itself is clamped to the entry count. The pair of log lines is
+		// deliberate: this one says what was asked for, the one after Open says
+		// what exists.
+		Int("decoded_cell_cache_shards_requested", decodedCellCacheCfg.shards).
+		Int("decoded_cell_cache_entries_requested", decodedCellCacheCfg.entries).
+		Int64("cell_record_cache_bytes_requested", opts.CellRecordCacheBytes).
 		Int("meta_memtable_size", metaMemTableSize).
 		Int("cell_total_memtable_size", cellMemTableSize).
 		Int("cell_shard_memtable_size", cellShardMemTable).
@@ -227,7 +239,8 @@ func Open(opts Options) (*Store, error) {
 		pendingCellMigration:            cloneCellGenerationPendingMigration(manifest.pending),
 		retiredGenerations:              cloneUint64Slice(manifest.retired),
 		nextCellGeneration:              manifest.next,
-		cellCache:                       newDecodedCellCache(decodedCellCache),
+		decodedCells:                    newDecodedCellCache(decodedCellCacheCfg),
+		recordCache:                     newCellRecordCache(recordCacheCfg),
 		dir:                             opts.Dir,
 		cellCacheSize:                   opts.CellCacheSize,
 		cellShardMemTable:               cellShardMemTable,
@@ -250,6 +263,7 @@ func Open(opts Options) (*Store, error) {
 		logger.Info().Msg("recovering artifact pack journals")
 		if err = store.recoverPackJournals(context.Background()); err != nil {
 			_ = store.closeCellGenerations()
+			store.recordCache.free()
 			_ = hot.Close()
 			_ = store.artifactFiles.close()
 			hotCache.Unref()
@@ -260,6 +274,7 @@ func Open(opts Options) (*Store, error) {
 		logger.Info().Msg("cleaning retired cell generations")
 		if err = store.cleanupRetiredCellGenerations(context.Background()); err != nil {
 			_ = store.closeCellGenerations()
+			store.recordCache.free()
 			_ = hot.Close()
 			_ = store.artifactFiles.close()
 			hotCache.Unref()
@@ -270,6 +285,7 @@ func Open(opts Options) (*Store, error) {
 		logger.Info().Msg("cleaning unreferenced cell generations")
 		if err = store.cleanupUnreferencedCellGenerationDirs(); err != nil {
 			_ = store.closeCellGenerations()
+			store.recordCache.free()
 			_ = hot.Close()
 			_ = store.artifactFiles.close()
 			hotCache.Unref()
@@ -282,11 +298,26 @@ func Open(opts Options) (*Store, error) {
 	logger.Info().
 		Int64("meta_cache_size", opts.MetaCacheSize).
 		Int64("cell_total_cache_size", opts.CellCacheSize).
-		Bool("decoded_cell_cache_enabled", decodedCellCache.enabled).
-		Int("decoded_cell_cache_shards", decodedCellCache.shards).
-		Int64("decoded_cell_cache_bytes_per_entry", decodedCellCache.bytesPerEntry).
-		Int("decoded_cell_cache_min_entries", decodedCellCache.minEntries).
-		Int("decoded_cell_cache_max_entries", decodedCellCache.maxEntries).
+		Bool("decoded_cell_cache_enabled", decodedCellCacheCfg.enabled).
+		// Effective, meaning read off the cache that exists rather than off the
+		// request. Both numbers can be lower than the *_requested values logged
+		// before Open: the shard count is clamped down to the entry count, the
+		// entry budget is divided across the shards rounding down, and each
+		// shard then rounds its budget down to its set-associative bucket
+		// geometry (a power of two of buckets times up to 8 ways). So shards=64
+		// with entries=100 yields 64 shards of 1, shards=64 with entries=32
+		// yields 32 shards, and shards=4 with entries=100 yields 4 shards of 16
+		// rather than 25. Never higher than the request.
+		Int("decoded_cell_cache_shards_effective", store.decodedCells.shardCount()).
+		Int("decoded_cell_cache_entries_effective", store.decodedCells.capacity()).
+		// The record cache pair follows the same requested/effective split: the
+		// effective arena rounds the request down to whole regions (or up to
+		// the smallest workable ring), and the index is derived on top of it —
+		// see record_cache.go for the measured sizing.
+		Bool("cell_record_cache_enabled", store.recordCache != nil).
+		Int64("cell_record_cache_bytes_effective", store.recordCache.capacityBytes()).
+		Int64("cell_record_cache_index_bytes", store.recordCache.indexBytes()).
+		Bool("cell_record_cache_gc_managed", manualmem.ManagedByGC).
 		Int("meta_memtable_size", metaMemTableSize).
 		Int("cell_total_memtable_size", cellMemTableSize).
 		Int("cell_shard_memtable_size", cellShardMemTable).
@@ -324,41 +355,32 @@ func Open(opts Options) (*Store, error) {
 	return store, nil
 }
 
+// decodedCellCacheConfigFromOptions derives the decoded cell cache
+// configuration. Note what it does NOT read: opts.CellCacheSize. That knob is
+// the pebble block cache budget and nothing else. Deriving a Go-object entry
+// count from it coupled a GC-visible cache to an opaque byte budget, so raising
+// the pebble cache — the normal thing to do on a large machine — silently
+// multiplied the number of live Go objects every mark cycle has to scan.
 func decodedCellCacheConfigFromOptions(opts Options) (decodedCellCacheConfig, error) {
-	cfg := decodedCellCacheConfig{
-		enabled:       !opts.DisableDecodedCellCache,
-		shards:        opts.DecodedCellCacheShards,
-		cacheBytes:    opts.CellCacheSize,
-		bytesPerEntry: opts.DecodedCellCacheBytesPerEntry,
-		minEntries:    opts.DecodedCellCacheMinEntries,
-		maxEntries:    opts.DecodedCellCacheMaxEntries,
-	}
-	if cfg.bytesPerEntry < 0 {
-		return decodedCellCacheConfig{}, fmt.Errorf("decoded cell cache bytes per entry cannot be negative")
-	}
-	if cfg.shards < 0 {
+	if opts.DecodedCellCacheShards < 0 {
 		return decodedCellCacheConfig{}, fmt.Errorf("decoded cell cache shards cannot be negative")
 	}
-	if cfg.minEntries < 0 {
-		return decodedCellCacheConfig{}, fmt.Errorf("decoded cell cache min entries cannot be negative")
+	if opts.DecodedCellCacheEntries < 0 {
+		return decodedCellCacheConfig{}, fmt.Errorf("decoded cell cache entries cannot be negative")
 	}
-	if cfg.maxEntries < 0 {
-		return decodedCellCacheConfig{}, fmt.Errorf("decoded cell cache max entries cannot be negative")
+
+	shards := opts.DecodedCellCacheShards
+	if shards == 0 {
+		shards = DefaultDecodedCellCacheShards
 	}
-	if cfg.bytesPerEntry == 0 {
-		cfg.bytesPerEntry = DefaultDecodedCellCacheBytesPerEntry
+	entries := opts.DecodedCellCacheEntries
+	if entries == 0 {
+		entries = DefaultDecodedCellCacheEntries
 	}
-	if cfg.shards == 0 {
-		cfg.shards = DefaultDecodedCellCacheShards
-	}
-	if cfg.minEntries == 0 {
-		cfg.minEntries = DefaultDecodedCellCacheMinEntries
-	}
-	if cfg.maxEntries == 0 {
-		cfg.maxEntries = DefaultDecodedCellCacheMaxEntries
-	}
-	if cfg.minEntries > cfg.maxEntries {
-		return decodedCellCacheConfig{}, fmt.Errorf("decoded cell cache min entries cannot exceed max entries")
-	}
-	return cfg, nil
+
+	return decodedCellCacheConfig{
+		enabled: !opts.DisableDecodedCellCache,
+		shards:  shards,
+		entries: entries,
+	}, nil
 }

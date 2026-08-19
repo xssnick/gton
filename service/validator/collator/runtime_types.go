@@ -105,6 +105,14 @@ type CandidateArtifact struct {
 	CollatedData []byte
 
 	prepared *simplex.PreparedCandidate
+
+	// digested records that Candidate.Block.FileHash and
+	// Candidate.CollatedFileHash are the sha256 of BlockBOC and CollatedData as
+	// they stand here. It is set where that has just been established — by the
+	// builder that took both digests of these buffers, or by the resume path
+	// that compared them against the durable marker — and it is unexported so
+	// an artifact assembled outside this package cannot assert it.
+	digested bool
 }
 
 // Prepared is the broadcast payload this candidate was built with, or nil for
@@ -116,6 +124,16 @@ type CandidateArtifact struct {
 // claim a candidate's payload was compressed from its own roots.
 func (a CandidateArtifact) Prepared() *simplex.PreparedCandidate {
 	return a.prepared
+}
+
+// Digested reports that this artifact's two file hashes are already known to be
+// the digests of the two payloads beside them, so a consumer that would
+// otherwise re-derive them to check has nothing to learn from doing so.
+//
+// False is the safe answer and the answer every artifact this package did not
+// itself digest gives.
+func (a CandidateArtifact) Digested() bool {
+	return a.digested
 }
 
 // FinalizedAnchorState is the immutable exact state a validator resolver has
@@ -191,6 +209,12 @@ type BuildRequest struct {
 	// slot start for shardchain and three quarters of one target rate after slot
 	// start for masterchain. Restore requests leave it zero.
 	ExternalProcessUntil time.Time
+	// BuildSoftDeadline is the instant awaitBuildUntil gives up waiting for this
+	// build. It is carried in so the collation can size its own internal
+	// budgets — today only out-queue cleanup — the way the reference collator
+	// derives them from params_.soft_timeout. Restore requests leave it zero,
+	// which leaves those budgets inert.
+	BuildSoftDeadline time.Time
 }
 
 // CandidateCommit publishes one already durable candidate transition to the
@@ -271,7 +295,7 @@ type SigningKeys interface {
 
 // Collator is the transport-independent validator-facing collation boundary.
 // Service executes it in-process, while RemoteCollator translates the same
-// operations to the Delegated-v3 client transport.
+// operations to the delegated-collation client transport.
 type Collator interface {
 	CollatorID() [32]byte
 	Start(context.Context) error
@@ -288,7 +312,7 @@ type Collator interface {
 
 // RemoteCollatorTransport is the wire/control-plane boundary used by a
 // validator connected to a standalone collator. It deliberately exposes the
-// exact authenticated Delegated-v3 query payloads while keeping transport,
+// exact authenticated delegated-collation query payloads while keeping transport,
 // reconnect, framing, and remote status protocols outside this package.
 // Implementations must wrap only failures to deliver a request or receive its
 // response with ErrUnavailable. Authenticated remote domain verdicts and
@@ -311,7 +335,7 @@ type AuthenticatedQuery struct {
 	SourceADNL [32]byte
 }
 
-// RemoteHandlers is the server-side Delegated-v3 wire endpoint table. Session
+// RemoteHandlers is the server-side delegated-collation wire endpoint table. Session
 // lifecycle is deliberately absent: it is a trusted local control-plane
 // operation, not an ADNL query understood by other nodes.
 type RemoteHandlers struct {

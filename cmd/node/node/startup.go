@@ -25,6 +25,7 @@ import (
 	"github.com/xssnick/gton/internal/logutil"
 	"github.com/xssnick/gton/service/hooks"
 	"github.com/xssnick/gton/service/validator"
+	"github.com/xssnick/gton/service/validator/groups"
 	"github.com/xssnick/gton/service/validator/keyring"
 	"github.com/xssnick/gton/service/validator/msgpool"
 	validatorpebble "github.com/xssnick/gton/service/validator/pebblestore"
@@ -187,6 +188,25 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return 1
 	}
+	// An operator who tuned one of these deserves to be told it stopped doing
+	// anything, rather than to discover it from a graph months later. The list
+	// excludes the values the node's own earlier releases wrote, so this fires
+	// for a choice somebody made and not for every config.json on upgrade.
+	for _, field := range nodeconfig.DeprecatedDecodedCellCacheFields(cfg.Storage) {
+		logger.Warn().
+			Str("field", field).
+			Int("decoded_cell_cache_entries_requested", runtimeOpts.Node.Storage.DecodedCellCache.Entries).
+			Msg("config field is deprecated and ignored: the decoded cell cache is sized in entries by storage.decoded_cell_cache_entries")
+	}
+	// A renamed knob is a different message: the value IS in force, only the
+	// name is stale. Warning that it does nothing would be a lie.
+	for field, replacement := range nodeconfig.RenamedDecodedCellCacheFields(cfg.Storage) {
+		logger.Warn().
+			Str("field", field).
+			Str("renamed_to", replacement).
+			Int("decoded_cell_cache_entries_requested", runtimeOpts.Node.Storage.DecodedCellCache.Entries).
+			Msg("config field was renamed; its value is still honoured, rename it in config.json")
+	}
 	if startOpts.DataDir != "" {
 		runtimeOpts.Node.Storage.Dir = startOpts.DataDir
 	}
@@ -247,7 +267,8 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 		Dur("http_api_request_timeout", httpOpts.RequestTimeout).
 		Msg("configured http api")
 
-	validatorOpts, err := configureValidator(cfg.Validator)
+	maximalVerticalSeqno := uint32(len(globalConfig.Validator.Hardforks))
+	validatorOpts, err := configureValidator(cfg.Validator, maximalVerticalSeqno)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return 1
@@ -384,6 +405,9 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 		poolLog := logger.With().Str("component", "collator").Str("subcomponent", "msgpool").Logger()
 		collatorRuntime, runtimeErr := validator.NewRuntime(validator.SharedRuntimeOptions{
 			Messages: msgpool.Config{Logger: &poolLog},
+			Groups: groups.TrackerOptions{
+				MaximalVerticalSeqno: maximalVerticalSeqno,
+			},
 		})
 		if runtimeErr != nil {
 			logger.Error().Err(runtimeErr).Msg("failed to initialize standalone collator runtime")

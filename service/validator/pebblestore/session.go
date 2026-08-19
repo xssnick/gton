@@ -19,8 +19,34 @@ type pebbleReader interface {
 	NewIter(options *pebble.IterOptions) (*pebble.Iterator, error)
 }
 
-// SaveCandidate stores candidate content and its ID index atomically. Wire is
-// cloned before enqueue so the caller may reuse its buffer on return.
+// SaveCandidate stores candidate content and its ID index atomically.
+//
+// Wire is borrowed, not copied: the write goroutine reads it when it applies
+// the batch, so it must stay unmodified until done fires, and is free
+// afterwards. It used to be cloned here on entry, which meant a full extra copy
+// of a multi-megabyte payload for every candidate produced or received — to
+// guard a window no caller uses, since the resolver hands over a wire it has
+// already published as immutable, and pebble copies the value into the batch
+// itself.
+//
+// THIS IS THE ONE RECOVERABLE PAYLOAD in the store, and the only write that does
+// not wait for an fsync. The obligation the durable write exists for is real —
+// simplex/voter.go gates the notarize vote on slot.stored because a validator must
+// be able to serve every candidate it votes to notarize (simplex/types.go:392) — but
+// it is satisfied REDUNDANTLY: the candidate is broadcast before it is stored, and
+// notarization requires 2/3 of weight to have voted, which requires those 2/3 to
+// have stored it. So a notarized candidate is held by at least 2/3 of the network,
+// and a candidate only we hold cannot be notarized. Losing this write to a crash
+// costs a re-fetch, never a conflicting record.
+//
+// What it buys: the fsync in front of the vote. Measured on the field box, on the
+// filesystem the store lives on, with a 760 KB payload matching a real candidate
+// wire — write only 0.669 ms median, write plus fsync 19.35 ms median and up to
+// ~60 ms in the tail, against a 200 ms slot. One candidate per slot per node means
+// there is nothing to coalesce that fsync with.
+//
+// The write is still ordered through the same FIFO, its failure is still fatal, and
+// its callback still gates the vote. Only the wait for the disk is gone.
 func (s *ValidatorStore) SaveCandidate(
 	session validator.SessionStorageID,
 	candidate validator.CandidateRecord,
@@ -32,11 +58,22 @@ func (s *ValidatorStore) SaveCandidate(
 
 		return
 	}
-	wire := append([]byte(nil), candidate.Wire...)
-	wireHash := sha256.Sum256(wire)
+	wire := candidate.Wire
+	// The caller's digest of these bytes when it has one — the resolver hashed
+	// this wire to admit it and to refuse a conflicting duplicate under it — and
+	// otherwise our own. Deriving it a second time here cost a full sha256 of a
+	// multi-megabyte payload per candidate on the producer's goroutine, for a
+	// content-addressing indirection the reference does not have at all: C++
+	// keys candidate content by candidate id and hashes no wire on the store
+	// path (candidate-resolver.cpp:373).
+	wireHash := candidate.ContentHash
+	if wireHash == ([32]byte{}) {
+		wireHash = sha256.Sum256(wire)
+	}
 
 	s.submitSessionAsync(namespace, writeRequest{
-		sizeHint: len(wire),
+		sizeHint:   len(wire),
+		durability: recoverablePayload,
 		apply: func(batch *pebble.Batch) error {
 			summary, err := ensureSession(batch, session, namespace)
 			if err != nil {
@@ -60,35 +97,17 @@ func (s *ValidatorStore) SaveCandidate(
 					return rejectRequest(validator.ErrCandidateConflict)
 				}
 
-				storedWire, contentErr := getBatchCopy(batch, candidateContentKey(namespace, wireHash))
-				if errors.Is(contentErr, pebble.ErrNotFound) {
-					return rejectRequest(errors.New("validator pebblestore: candidate index points to missing content"))
-				}
-				if contentErr != nil {
-					return fmt.Errorf("validator pebblestore: read candidate content: %w", contentErr)
-				}
-				if !bytes.Equal(storedWire, wire) {
-					return rejectRequest(errors.New("validator pebblestore: candidate content hash collision"))
-				}
-
+				// The index hash equals this request's, so the stored content is
+				// this wire. Reading it back to compare would be a full copy of
+				// the payload to rule out a sha256 collision.
 				return nil
 			}
 			if !errors.Is(err, pebble.ErrNotFound) {
 				return fmt.Errorf("validator pebblestore: read candidate index: %w", err)
 			}
 
-			contentKey := candidateContentKey(namespace, wireHash)
-			storedWire, err := getBatchCopy(batch, contentKey)
-			switch {
-			case err == nil && !bytes.Equal(storedWire, wire):
-				return rejectRequest(errors.New("validator pebblestore: candidate content hash collision"))
-			case err == nil:
-			case errors.Is(err, pebble.ErrNotFound):
-				if err = batch.Set(contentKey, wire, nil); err != nil {
-					return fmt.Errorf("validator pebblestore: save candidate content: %w", err)
-				}
-			default:
-				return fmt.Errorf("validator pebblestore: read candidate content: %w", err)
+			if err = batch.Set(candidateContentKey(namespace, wireHash), wire, nil); err != nil {
+				return fmt.Errorf("validator pebblestore: save candidate content: %w", err)
 			}
 
 			if err = batch.Set(indexKey, wireHash[:], nil); err != nil {
@@ -145,11 +164,12 @@ func (s *ValidatorStore) Candidate(
 	if err != nil {
 		return validator.CandidateRecord{}, fmt.Errorf("validator pebblestore: read candidate content: %w", err)
 	}
-	if sha256.Sum256(wire) != contentHash {
-		return validator.CandidateRecord{}, errors.New("validator pebblestore: candidate content hash mismatch")
-	}
-
-	return validator.CandidateRecord{ID: id, Wire: wire}, nil
+	// The wire is returned unhashed: this store wrote it, pebble verifies its own
+	// block checksums on read, and both consumers authenticate it downstream —
+	// a loaded candidate is decoded through the codec's signature and identity
+	// checks, and one served to a peer is verified by that peer. Re-deriving the
+	// key from a multi-megabyte payload on every read buys none of that.
+	return validator.CandidateRecord{ID: id, Wire: wire, ContentHash: contentHash}, nil
 }
 
 // MarkFinalized durably records one candidate finality marker.
@@ -196,6 +216,18 @@ func (s *ValidatorStore) MarkFinalized(
 }
 
 // RecordLeaderWindow stores the latest observation for a leader-window start.
+//
+// Only the session summary is written. There used to be a row per observed
+// window under keyLeaderWindow as well, and nothing ever read one: LoadSession
+// deliberately skips them, and the count the status and debug views report
+// comes from the summary. The reference keeps no such history either — its
+// LeaderWindowObserved handler (db.cpp) overwrites one pool-state key and
+// stores nothing per window — so the rows were durable bytes with no consumer
+// in either implementation, accumulating for the life of a session.
+//
+// keyLeaderWindow stays reserved and DeleteSession still range-deletes it, so a
+// database written before this change is cleaned up by the ordinary teardown
+// path rather than needing a migration.
 func (s *ValidatorStore) RecordLeaderWindow(
 	session validator.SessionStorageID,
 	window validator.LeaderWindowRecord,
@@ -212,7 +244,6 @@ func (s *ValidatorStore) RecordLeaderWindow(
 
 		return
 	}
-	value := encodeLeaderWindow(window)
 
 	s.submitSessionAsync(namespace, writeRequest{
 		apply: func(batch *pebble.Batch) error {
@@ -221,16 +252,10 @@ func (s *ValidatorStore) RecordLeaderWindow(
 				return err
 			}
 
-			key := leaderWindowKey(namespace, window.StartSlot)
-			_, err = getBatchCopy(batch, key)
-			isNew := errors.Is(err, pebble.ErrNotFound)
-			if err != nil && !isNew {
-				return fmt.Errorf("validator pebblestore: check leader window: %w", err)
-			}
-			if err = batch.Set(key, value, nil); err != nil {
-				return fmt.Errorf("validator pebblestore: save leader window: %w", err)
-			}
-			if isNew {
+			// Windows are observed in order, so "starts later than the last one
+			// recorded" counts exactly the distinct windows the per-window keys
+			// used to count — without the point read that decided it.
+			if summary.lastLeaderWindow == nil || window.StartSlot > summary.lastLeaderWindow.StartSlot {
 				if err = incrementSummaryCount("leader window", &summary.leaderWindows); err != nil {
 					return err
 				}
@@ -449,6 +474,11 @@ func (s *ValidatorStore) DeleteSession(ctx context.Context, session validator.Se
 			return err
 		}
 
+		// Every namespaced prefix in the key schema, including the retired one.
+		// keyAcceptedProof carries no new rows, but a database written before it
+		// was retired holds them, and once the descriptor is gone nothing can
+		// name them again — so they would outlive the namespace with no path
+		// left to reach them.
 		prefixes := [][]byte{
 			votePrefix(namespace),
 			poolStateKey(namespace),
@@ -456,6 +486,7 @@ func (s *ValidatorStore) DeleteSession(ctx context.Context, session validator.Se
 			candidateContentPrefix(namespace),
 			finalizedPrefix(namespace),
 			leaderWindowPrefix(namespace),
+			acceptedProofPrefix(namespace),
 			delegationAuthorizationPrefix(namespace),
 			summaryKey(namespace),
 		}

@@ -18,10 +18,11 @@ type globalLibrary struct {
 	publishers *cell.Dictionary
 }
 
-// masterExecutionLibraries converts the masterchain LibDescr index into the
-// VmLibraries dictionary consumed by TVM. The conversion also validates every
-// descriptor before transactions begin, so an invalid inherited library
-// collection cannot be hidden by an unrelated account update.
+// masterExecutionLibraries exposes the masterchain LibDescr index directly to
+// TVM. The reference VM accepts this dictionary as a library collection: a
+// lookup reads the descriptor's first reference and verifies its hash. Keeping
+// the original root also keeps the predecessor trace, so only a library path
+// actually used by a transaction enters the block read set.
 func masterExecutionLibraries(libraries *cell.Dictionary) ([]*cell.Cell, error) {
 	if libraries == nil || libraries.IsEmpty() {
 		return nil, nil
@@ -29,29 +30,8 @@ func masterExecutionLibraries(libraries *cell.Dictionary) ([]*cell.Cell, error) 
 	if libraries.GetKeySize() != 256 {
 		return nil, fmt.Errorf("%w: public library dictionary has key size %d", ErrInvalidInput, libraries.GetKeySize())
 	}
-	items, err := libraries.LoadAll()
-	if err != nil {
-		return nil, fmt.Errorf("%w: load public libraries: %v", ErrInvalidInput, err)
-	}
-	vmLibraries := cell.NewDict(256)
-	for i := range items {
-		keyBytes, loadErr := items[i].Key.LoadSlice(256)
-		if loadErr != nil || items[i].Key.BitsLeft() != 0 || items[i].Key.RefsNum() != 0 {
-			return nil, fmt.Errorf("%w: public library %d has a malformed key", ErrInvalidInput, i)
-		}
-		var key [32]byte
-		copy(key[:], keyBytes)
-		descriptor, parseErr := parseGlobalLibrary(items[i].Value, key)
-		if parseErr != nil {
-			return nil, fmt.Errorf("%w: decode public library %x: %v", ErrInvalidInput, key, parseErr)
-		}
-		value := cell.BeginCell().MustStoreRef(descriptor.root).EndCell()
-		if err = vmLibraries.Set(cell.BeginCell().MustStoreSlice(key[:], 256).EndCell(), value); err != nil {
-			return nil, fmt.Errorf("build TVM library %x: %w", key, err)
-		}
-	}
 
-	return []*cell.Cell{vmLibraries.AsCell()}, nil
+	return []*cell.Cell{libraries.AsCell()}, nil
 }
 
 // updateMasterPublicLibraries applies account SimpleLib visibility changes to

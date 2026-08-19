@@ -389,7 +389,7 @@ func TestSplitOutboundQueueProofIncludesEnvelopeLoadedThroughAliasedTrace(t *tes
 	root := stateWithSplitOutboundQueue(t, req.Previous.State, queueEntries)
 
 	usage := cell.NewReadSet(root)
-	estimator := newProofSizeEstimator()
+	estimator := newProofSizeEstimator(0)
 	usage.SetRecordCallback(estimator.addLoadedCell)
 	tracedRoot := usage.Root()
 

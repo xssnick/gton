@@ -32,11 +32,18 @@ type BlockAccepter struct {
 	validatorSetHash uint32
 	validatorIDs     [][32]byte
 	validators       *blockproof.PreparedValidatorSet
-	localValidator   *ValidatorIdentity
-	node             LocalSessionNode
-	publisher        BlockPublisher
-	shardTops        *collator.ShardTopInbox
-	log              zerolog.Logger
+	// binding is the (session id, validator roster) pair this accepter will
+	// honour a certificate seal for. It is the only non-vacuous cross-check
+	// between the consensus engine's roster and this accepter's: the
+	// validatorSetHash comparison in blockproof.CheckPreparedSignatureWeight
+	// compares the accepter's roster against itself, because
+	// signatureSet stamps a.validatorSetHash onto the set it builds.
+	binding        simplex.CertificateBinding
+	localValidator *ValidatorIdentity
+	node           LocalSessionNode
+	publisher      BlockPublisher
+	shardTops      *collator.ShardTopInbox
+	log            zerolog.Logger
 }
 
 type BlockAccepterOptions struct {
@@ -96,6 +103,10 @@ func NewBlockAccepter(options BlockAccepterOptions) (*BlockAccepter, error) {
 			validators.Hash(),
 		)
 	}
+	binding, err := simplex.NewCertificateBinding(config.SessionID, runtimeValidators(config.Validators))
+	if err != nil {
+		return nil, fmt.Errorf("validator block acceptance: derive certificate binding: %w", err)
+	}
 
 	return &BlockAccepter{
 		shard:            config.Shard,
@@ -104,6 +115,7 @@ func NewBlockAccepter(options BlockAccepterOptions) (*BlockAccepter, error) {
 		validatorSetHash: config.ValidatorSetHash,
 		validatorIDs:     validatorIDs,
 		validators:       validators,
+		binding:          binding,
 		localValidator:   config.Identity.Validator,
 		node:             options.Node,
 		publisher:        options.Publisher,
@@ -136,6 +148,12 @@ func (a *BlockAccepter) Accept(
 	}
 
 	a.node.SubmitBlockLocally(prepared.block)
+	// Immediately after local submission and before anything can wait on it. The
+	// submission is asynchronous by design, so without this the block and its
+	// state are invisible to every local reader until the shard client applies
+	// the block — which for a shard block means waiting for a masterchain block
+	// that carries this shard top.
+	a.publishAcceptedState(acceptance, prepared)
 	if !acceptance.Retry && !acceptance.Replay && a.publisher != nil {
 		a.publisher.PublishAcceptedBlock(AcceptedBlockPublication{
 			SessionID:  a.sessionID,
@@ -150,6 +168,90 @@ func (a *BlockAccepter) Accept(
 	}
 
 	return a.buildShardTopDescription(ctx, resolveView, prepared)
+}
+
+// publishAcceptedState hands the accepted block and the state this session
+// computed for it to the live view, so a reader that needs either does not wait
+// for a database commit it has no reason to wait for.
+//
+// WHAT IS PUBLISHED, and why each part is needed by a reader that is polling for
+// it today:
+//   - the state tree, BY REFERENCE — the tip of the ChainState the resolver
+//     already holds. loadChainTip and the collator's readPrevious both need it,
+//     and passing the very cell keeps the one materialization chain_state.go
+//     compares parents by.
+//   - the block root and BOC — loadChainTip needs the BOC (ChainTip.BlockBOC)
+//     and the collator needs the root. WaitBlockArtifacts does not even check the
+//     BOC, so publishing the state alone would report "ready" to a reader that
+//     then fails.
+//   - the proof link — loadAcceptedProofLink reads it for the NEXT block's shard
+//     top description, and that read is the other half of the acceptance retry
+//     loop. The bytes are the ones just submitted, so what the store will hold
+//     later is byte-identical.
+//
+// WHAT IS NOT PUBLISHED. Nothing without a state: a block on its own would be
+// pinned in the live view until its flush with no bound of its own. Nothing on
+// the masterchain, which liveview refuses. Nothing when the state is absent,
+// which is the replay-after-restart case — there the reader waits as before, and
+// the catch-up that repopulates the store is what ends the wait.
+//
+// A failure here — and equally a restart that loses the publication — is logged
+// and swallowed, because the publication is a latency improvement over a path that
+// still exists: a reader that does not find the block in the live view waits for
+// the ordinary apply exactly as it did before.
+//
+// WHAT MAKES THAT SAFE is the quorum certificate, not local durability. At this
+// instant the block is NOT durable here: the candidate wire went to the store
+// through storeAsync, this call runs before PublishAcceptedBlock below, and
+// finalizeInner's awaitStorageWrite(MarkFinalized) is later still. What is already
+// true is that 2/3 of weight voted to notarize this candidate, and each of those
+// votes was gated on that validator having durably stored it (simplex/voter.go
+// maybeVoteNotar on slot.stored), so the block is held by at least 2/3 of the
+// network and is recoverable from it. The local submission and the acceptance
+// broadcast are how it gets applied and re-fetched; the store write is how THIS
+// node serves it, and neither has to have completed for losing this publication to
+// be merely slow. Nothing here may be used to justify a change that does depend on
+// local durability having happened by this point, because it has not.
+func (a *BlockAccepter) publishAcceptedState(
+	acceptance BlockAcceptance,
+	prepared *preparedBlockAcceptance,
+) {
+	if a.shard.IsMasterchain() || acceptance.state == nil {
+		return
+	}
+
+	block := prepared.block.ID
+	state, err := acceptance.state.acceptedTipState(block)
+	if err != nil {
+		a.log.Debug().
+			Err(err).
+			Str("block", storage.FormatBlockRef(block)).
+			Msg("skip publishing the accepted block state")
+
+		return
+	}
+
+	var proofs []storage.LiveBlockProofArtifact
+	if len(prepared.block.ProofBOC) > 0 {
+		isKeyBlock := prepared.block.Meta.Has(storage.BlockMetaIsKeyBlock)
+		for _, kind := range storage.StoredProofKindsForServedBlock(block, prepared.block.IsLink, isKeyBlock) {
+			proofs = append(proofs, storage.LiveBlockProofArtifact{Kind: kind, Data: prepared.block.ProofBOC})
+		}
+	}
+
+	if err = a.node.PublishAcceptedBlockState(storage.LiveBlockArtifacts{
+		Block:     block,
+		Root:      prepared.block.Block,
+		BlockData: prepared.block.BlockBOC,
+		Meta:      prepared.block.Meta,
+		State:     state,
+		Proofs:    proofs,
+	}); err != nil {
+		a.log.Debug().
+			Err(err).
+			Str("block", storage.FormatBlockRef(block)).
+			Msg("skip publishing the accepted block state")
+	}
 }
 
 func (a *BlockAccepter) prepare(acceptance BlockAcceptance) (*preparedBlockAcceptance, error) {
@@ -178,7 +280,32 @@ func (a *BlockAccepter) prepare(acceptance BlockAcceptance) (*preparedBlockAccep
 	if err != nil {
 		return nil, fmt.Errorf("validator block acceptance: build block metadata: %w", err)
 	}
-	if err = blockproof.CheckPreparedSignatures(blockID, signatures, a.validators); err != nil {
+	// Everything CheckPreparedSignatures does except the Ed25519 pass: roster
+	// identity, per-signature length, unknown-validator and duplicate
+	// rejection, and the 2/3+1 weighted threshold in blockproof's own weight
+	// model — the model whose numbers land on the wire.
+	//
+	// The Ed25519 pass is dropped here, and only here. acceptance.Certificate is
+	// a simplex.VerifiedCertificate: the consensus engine already verified this
+	// quorum over a byte-identical payload (validate() checked a.binding, which
+	// is what makes "this quorum, this session, this roster" a checked fact
+	// rather than an assembly-order assumption), and every source that reaches
+	// this accepter went through that verification — live engine hooks,
+	// simplex.ValidateBootstrap on journal recovery, CertificateVerifier.Verify
+	// on a certificate fetched from a peer.
+	//
+	// This is a deliberate departure from the C++ reference, whose
+	// AcceptBlockQuery step 7 (validator/impl/accept-block.cpp) re-verifies the
+	// whole set sequentially with a fresh Encryptor per signature. The reference
+	// pays it for the same redundancy: run_accept_block_query is reached only
+	// from consensus (validator/consensus/bridge.cpp), and its one-second retry
+	// loop re-pays it on every iteration, as ours would.
+	//
+	// Our trust boundary with the network is elsewhere and is untouched:
+	// SyncCoordinator.CheckBlockBroadcastSignatures and
+	// CheckBlockFinalitySignatures still verify in full, and the second of those
+	// is the receiving side of exactly what this function publishes.
+	if _, err = blockproof.CheckPreparedSignatureWeight(blockID, signatures, a.validators); err != nil {
 		return nil, fmt.Errorf("validator block acceptance: %w", err)
 	}
 
@@ -209,7 +336,7 @@ func (a *BlockAccepter) prepare(acceptance BlockAcceptance) (*preparedBlockAccep
 		parsed:     parsed,
 		proofRoot:  proofRoot,
 		signatures: signatures,
-		final:      acceptance.Certificate.Vote.Kind == simplex.VoteFinalize,
+		final:      acceptance.Certificate.Vote().Kind == simplex.VoteFinalize,
 	}
 	if !a.shard.IsMasterchain() && prepared.final {
 		prepared.signaturesCell, err = signatures.FinalitySignaturesCell(a.validators)
@@ -222,11 +349,17 @@ func (a *BlockAccepter) prepare(acceptance BlockAcceptance) (*preparedBlockAccep
 }
 
 func (a *BlockAccepter) validate(acceptance BlockAcceptance) error {
+	// First, before anything reads the certificate. A seal proves a quorum only
+	// relative to the session id and validator roster it was verified under, and
+	// the signed payload this accepter reconstructs is built from *its own*
+	// a.sessionID. Without this check a certificate verified for another session
+	// would be stamped SignaturesVerifiedKey over a payload nobody ever
+	// verified. It also rejects the zero seal, which no verification produced.
+	if err := a.binding.Check(acceptance.Certificate); err != nil {
+		return fmt.Errorf("validator block acceptance: %w", err)
+	}
 	if acceptance.Candidate == nil {
 		return errors.New("validator block acceptance: candidate is absent")
-	}
-	if acceptance.Certificate == nil {
-		return errors.New("validator block acceptance: certificate is absent")
 	}
 	if acceptance.CertifiedCandidate == nil {
 		return errors.New("validator block acceptance: certified candidate is absent")
@@ -234,7 +367,7 @@ func (a *BlockAccepter) validate(acceptance BlockAcceptance) error {
 
 	candidate := &acceptance.Candidate.Candidate
 	certified := &acceptance.CertifiedCandidate.Candidate
-	certificate := acceptance.Certificate
+	certificate := acceptance.Certificate.Certificate()
 	if candidate.Empty {
 		return errors.New("validator block acceptance: accepted candidate is empty")
 	}
@@ -283,7 +416,7 @@ func (a *BlockAccepter) validate(acceptance BlockAcceptance) error {
 }
 
 func (a *BlockAccepter) signatureSet(acceptance BlockAcceptance) (*blockproof.ValidatorSignatureSet, error) {
-	certificate := acceptance.Certificate
+	certificate := acceptance.Certificate.Certificate()
 	signatures := make([]ton.Signature, len(certificate.Signatures))
 	for i, signature := range certificate.Signatures {
 		if int(signature.ValidatorIndex) >= len(a.validatorIDs) {

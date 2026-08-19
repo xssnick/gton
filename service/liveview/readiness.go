@@ -49,6 +49,47 @@ func (s *Store) WaitMasterchainSeqno(ctx context.Context, seqno uint32, timeout 
 	}
 }
 
+// WaitBlockArtifacts waits until the exact block and state inputs required by
+// validator acquisition are readable from the live view or its backing store.
+// Publications signal blockArtifacts under the same lock used to install the
+// artifacts; taking the channel before each read therefore cannot lose a wake-up.
+func (s *Store) WaitBlockArtifacts(ctx context.Context, block ton.BlockIDExt) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		s.mu.RLock()
+		notify := s.blockArtifacts
+		s.mu.RUnlock()
+
+		state, err := s.BlockState(ctx, block)
+		if err == nil && state.Cell == nil {
+			_, err = s.LoadStateCellTree(ctx, block, state.StateRootHash)
+		}
+		if err == nil && block.SeqNo != 0 {
+			_, err = s.BlockRoot(ctx, block)
+		}
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, storage.ErrNotFound) {
+			return err
+		}
+
+		select {
+		case <-notify:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *Store) signalBlockArtifactsLocked() {
+	close(s.blockArtifacts)
+	s.blockArtifacts = make(chan struct{})
+}
+
 func (s *Store) publishPendingCurrentLocked() bool {
 	if s.pendingCurrent == nil || !s.currentStateShardsReadyLocked(s.pendingCurrent) {
 		return false

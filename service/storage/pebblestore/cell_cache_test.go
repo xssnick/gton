@@ -14,30 +14,24 @@ func TestDecodedCellCacheConfigDefaults(t *testing.T) {
 		t.Fatalf("decoded cell cache config: %v", err)
 	}
 	if !cfg.enabled {
-		t.Fatal("decoded cell cache should be enabled by default")
+		t.Fatal("the decoded cell cache should be enabled by default")
 	}
 	if cfg.shards != DefaultDecodedCellCacheShards {
 		t.Fatalf("shards = %d, want %d", cfg.shards, DefaultDecodedCellCacheShards)
 	}
-	if cfg.bytesPerEntry != DefaultDecodedCellCacheBytesPerEntry {
-		t.Fatalf("bytes per entry = %d, want %d", cfg.bytesPerEntry, DefaultDecodedCellCacheBytesPerEntry)
-	}
-	if cfg.minEntries != DefaultDecodedCellCacheMinEntries {
-		t.Fatalf("min entries = %d, want %d", cfg.minEntries, DefaultDecodedCellCacheMinEntries)
-	}
-	if cfg.maxEntries != DefaultDecodedCellCacheMaxEntries {
-		t.Fatalf("max entries = %d, want %d", cfg.maxEntries, DefaultDecodedCellCacheMaxEntries)
+	if cfg.entries != DefaultDecodedCellCacheEntries {
+		t.Fatalf("entries = %d, want %d", cfg.entries, DefaultDecodedCellCacheEntries)
 	}
 
 	cache := newDecodedCellCache(cfg)
 	if cache == nil {
 		t.Fatal("decoded cell cache is nil")
 	}
-	if len(cache.shards) != DefaultDecodedCellCacheShards {
-		t.Fatalf("cache shards = %d, want %d", len(cache.shards), DefaultDecodedCellCacheShards)
+	if cache.shardCount() != DefaultDecodedCellCacheShards {
+		t.Fatalf("cache shards = %d, want %d", cache.shardCount(), DefaultDecodedCellCacheShards)
 	}
-	if got := cache.shards[0].capacity * len(cache.shards); got != int(defaultPebbleCellTotalCacheSize/DefaultDecodedCellCacheBytesPerEntry) {
-		t.Fatalf("decoded cell cache capacity = %d", got)
+	if got := cache.capacity(); got != DefaultDecodedCellCacheEntries {
+		t.Fatalf("decoded cell cache capacity = %d, want %d", got, DefaultDecodedCellCacheEntries)
 	}
 }
 
@@ -50,7 +44,7 @@ func TestDecodedCellCacheDisabled(t *testing.T) {
 		t.Fatalf("decoded cell cache config: %v", err)
 	}
 	if cfg.enabled {
-		t.Fatal("decoded cell cache should be disabled")
+		t.Fatal("the decoded cell cache should be disabled")
 	}
 	if cache := newDecodedCellCache(cfg); cache != nil {
 		t.Fatal("disabled decoded cell cache should be nil")
@@ -67,12 +61,9 @@ func TestDecodedCellCacheHashLookupMatchesSliceLookup(t *testing.T) {
 	}
 
 	cache := newDecodedCellCache(decodedCellCacheConfig{
-		enabled:       true,
-		shards:        1,
-		cacheBytes:    1,
-		bytesPerEntry: 1,
-		minEntries:    1,
-		maxEntries:    1,
+		enabled: true,
+		shards:  1,
+		entries: 1,
 	})
 	cache.set(1, hash[:], loaded)
 
@@ -103,20 +94,8 @@ func TestDecodedCellCacheConfigRejectsInvalidValues(t *testing.T) {
 			opts: Options{DecodedCellCacheShards: -1},
 		},
 		{
-			name: "negative bytes per entry",
-			opts: Options{DecodedCellCacheBytesPerEntry: -1},
-		},
-		{
-			name: "negative min entries",
-			opts: Options{DecodedCellCacheMinEntries: -1},
-		},
-		{
-			name: "negative max entries",
-			opts: Options{DecodedCellCacheMaxEntries: -1},
-		},
-		{
-			name: "min over max",
-			opts: Options{DecodedCellCacheMinEntries: 20, DecodedCellCacheMaxEntries: 10},
+			name: "negative entries",
+			opts: Options{DecodedCellCacheEntries: -1},
 		},
 	}
 

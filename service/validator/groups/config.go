@@ -82,12 +82,10 @@ type NoncriticalParam struct {
 	Value uint32
 }
 
-// SimplexConfig contains the #22 simplex configuration. The pre-Delegated-v3
-// #21 constructor is not parsed: this node only joins simplex v2 with protocol
-// version 3 or newer (see SupportedProtocol), so accepting #21 only ever
-// produced a config the supervisor refused a moment later. Version is kept
-// because it is carried in durable session records and on the wire, where it
-// still has to be checked against externally supplied values.
+// SimplexConfig contains the #22 simplex configuration. The #21 constructor is
+// a different schema and is deliberately not interpreted as #22. Version is
+// kept because it is carried in durable session records and on the wire, where
+// it still has to be checked against externally supplied values.
 type SimplexConfig struct {
 	Version               uint8
 	Flags                 uint8
@@ -107,15 +105,18 @@ type NewConsensusConfig struct {
 
 // Config contains the validator-group configuration needed by the tracker.
 // ActiveValidators selects parameter 35 over 34. NextValidators selects 37
-// over 36 and is nil when neither next set is present. Parsed values are
-// immutable and may share their backing storage.
+// over 36 and is nil when neither next set is present. AllCurrentValidators is
+// the ADNL roster of persistent parameter 34, matching the reference private
+// overlay's all_current_validators set. Parsed values are immutable and may
+// share their backing storage.
 type Config struct {
-	Catchain            CatchainConfig
-	NewConsensus        NewConsensusConfig
-	MaxBlockSize        uint32
-	MaxCollatedDataSize uint32
-	ActiveValidators    ValidatorSet
-	NextValidators      *ValidatorSet
+	Catchain             CatchainConfig
+	NewConsensus         NewConsensusConfig
+	MaxBlockSize         uint32
+	MaxCollatedDataSize  uint32
+	ActiveValidators     ValidatorSet
+	NextValidators       *ValidatorSet
+	AllCurrentValidators [][32]byte
 
 	persistentOverlayMembers []PersistentOverlayMember
 	persistentValidatorSets  []ValidatorSet
@@ -226,6 +227,7 @@ func ParseConfig(root *cell.Cell) (*Config, error) {
 		MaxCollatedDataSize:      maxCollatedDataSize,
 		ActiveValidators:         active,
 		NextValidators:           next,
+		AllCurrentValidators:     validatorADNLIDs(current.Validators),
 		persistentOverlayMembers: buildPersistentOverlayMembers(persistentValidatorSets),
 		persistentValidatorSets:  persistentValidatorSets,
 		fundamentalContracts:     params[configParamFundamentalContracts],
@@ -885,12 +887,28 @@ func (c SimplexConfig) Protocol() SimplexProtocol {
 }
 
 // SupportedProtocol reports whether c describes a consensus this node can join.
-// Delegated-v3 is simplex config v2 with protocol version 3 or newer; newer
-// protocol versions are admitted here on purpose, and the exact-equality rule
-// the network layer applies to an already-admitted session is deliberately
-// stricter than this one.
+// The #22 protocol_version field is two bits wide, so 0 through 3 are the
+// complete supported range.
 func (c SimplexConfig) SupportedProtocol() bool {
-	return c.Version == 2 && c.ProtocolVersion >= 3
+	return c.Version == 2 && c.ProtocolVersion <= simplex.MaxProtocolVersion
+}
+
+// EnableBlockSync reports whether candidate transfer uses the dedicated
+// block-sync overlay. The reference enables it only for protocol version 1.
+func (c SimplexConfig) EnableBlockSync() bool {
+	return c.SupportedProtocol() && c.ProtocolVersion == 1
+}
+
+// ObserversInPrivateOverlay reports whether non-validator observer identities
+// participate in the private consensus overlay.
+func (c SimplexConfig) ObserversInPrivateOverlay() bool {
+	return c.SupportedProtocol() && c.ProtocolVersion >= 2
+}
+
+// EnablePlumtree reports whether public candidate and finality publication may
+// use Plumtree.
+func (c SimplexConfig) EnablePlumtree() bool {
+	return c.SupportedProtocol() && c.ProtocolVersion >= 2
 }
 
 // SimplexParams projects the noncritical consensus parameters onto the engine's

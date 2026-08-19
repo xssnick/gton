@@ -1378,6 +1378,7 @@ func TestHistoricalShardEndLTReusesMatchingNeighborFrontier(t *testing.T) {
 		[]Neighbor{{Block: id}},
 		nil,
 		nil,
+		acquisitionReadImmediate,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1411,6 +1412,7 @@ func TestHistoricalShardEndLTUsesCandidateRegistryForNewMasterFrontier(t *testin
 		nil,
 		nil,
 		next,
+		acquisitionReadImmediate,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1726,12 +1728,27 @@ func TestLocalSessionWindowAdvanceCheckpointsCommittedBranch(t *testing.T) {
 	candidateBlock := cloneBlockID(base)
 	candidateBlock.SeqNo++
 	candidateBlock.RootHash = bytes.Clone(tip[:])
+	message, _ := queuedInternal(
+		t,
+		address.NewAddress(0, 0xff, bytes.Repeat([]byte{0x73}, 32)),
+		address.NewAddress(0, 0xff, bytes.Repeat([]byte{0x74}, 32)),
+		1,
+		1,
+		tlb.FromNanoTONU(1),
+		tlb.FromNanoTONU(1),
+		0,
+		destination,
+	)
+	delta := &msgpool.InternalsDelta{
+		Added:      []*msgpool.InternalMessage{message},
+		AddedTotal: 1,
+	}
 	candidateID := simplex.CandidateID{Slot: update.CurrentWindowStart, Hash: [32]byte{0x71}}
 	if err = managed.branch.AddCandidate(msgpool.CandidateRequest{
 		ID:    tip,
 		Seqno: candidateBlock.SeqNo,
 		Base:  []msgpool.CandidateSource{{Source: blockShardIdent(base), Visible: baseRef}},
-		Delta: &msgpool.InternalsDelta{},
+		Delta: delta,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1750,7 +1767,7 @@ func TestLocalSessionWindowAdvanceCheckpointsCommittedBranch(t *testing.T) {
 		destination,
 		blockShardIdent(candidateBlock),
 		ref,
-		&msgpool.InternalsDelta{},
+		delta,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1774,6 +1791,26 @@ func TestLocalSessionWindowAdvanceCheckpointsCommittedBranch(t *testing.T) {
 	}
 	if _, cutErr := managed.branch.Cut(msgpool.CutRequest{CandidateTip: &tip}); !errors.Is(cutErr, msgpool.ErrCutStale) {
 		t.Fatalf("checkpoint retained preceding branch tip: %v", cutErr)
+	}
+
+	// The masterchain registry intentionally still names the pre-window base.
+	// Once Retain(nil) drops the speculative lineage, the committed cut must
+	// nevertheless bind our source to the newer consensus predecessor.
+	registered := map[msgpool.ShardIdent]*localNeighborView{
+		destination: {previous: PreviousBlock{ID: base}},
+	}
+	cut, err := acquisition.cutCommittedViews(
+		managed.branch,
+		destination,
+		effectiveShardMessageViews(destination, []PreviousBlock{checkpoint.block}, registered),
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cut.Messages) != 1 || cut.Messages[0].EnvHash != message.EnvHash {
+		t.Fatalf("post-checkpoint cut = %+v, want committed predecessor envelope %x", cut.Messages, message.EnvHash)
 	}
 }
 
@@ -2526,6 +2563,12 @@ func (s *finalizedAnchorNoReadStore) BlockRoot(context.Context, ton.BlockIDExt) 
 	return nil, errors.New("unexpected finalized-anchor block read")
 }
 
+func (s *finalizedAnchorNoReadStore) WaitBlockArtifacts(context.Context, ton.BlockIDExt) error {
+	s.calls++
+
+	return errors.New("unexpected finalized-anchor readiness wait")
+}
+
 type localAcquisitionTestStore struct {
 	block ton.BlockIDExt
 	state *cell.Cell
@@ -2569,6 +2612,15 @@ func (*localAcquisitionTestStore) BlockRoot(context.Context, ton.BlockIDExt) (*c
 	return nil, storage.ErrNotFound
 }
 
+func (s *localAcquisitionTestStore) WaitBlockArtifacts(ctx context.Context, block ton.BlockIDExt) error {
+	_, err := s.BlockState(ctx, block)
+	if err == nil && block.SeqNo != 0 {
+		_, err = s.BlockRoot(ctx, block)
+	}
+
+	return err
+}
+
 type localAcquisitionTestGroups struct {
 	snapshot  *groups.Snapshot
 	projected *groups.Snapshot
@@ -2587,6 +2639,18 @@ func (g *localAcquisitionTestGroups) Project(
 	}
 
 	return g.snapshot, nil
+}
+
+func (g *localAcquisitionTestGroups) WaitProject(
+	ctx context.Context,
+	previous *groups.Snapshot,
+	input groups.ApplyInput,
+) (*groups.Snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	return g.Project(previous, input)
 }
 
 func localRotationFixture(

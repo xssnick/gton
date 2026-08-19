@@ -35,10 +35,10 @@ func validateSession(session Session) error {
 		return errors.New("collator runtime: session shard is invalid")
 	}
 	if session.ConsensusVersion != 2 {
-		return errors.New("collator runtime: delegated collation requires simplex version 2")
+		return errors.New("collator runtime: unsupported simplex version")
 	}
-	if session.ProtocolVersion < 3 {
-		return errors.New("collator runtime: delegated collation requires protocol version 3")
+	if session.ProtocolVersion > simplex.MaxProtocolVersion {
+		return errors.New("collator runtime: unsupported simplex protocol version")
 	}
 	if session.SlotsPerLeaderWindow == 0 {
 		return errors.New("collator runtime: slots per leader window is zero")

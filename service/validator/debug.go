@@ -587,18 +587,34 @@ func selectValidatorDebugStoredSessions(
 		return sessionStorageIDLess(ordered[i].ID, ordered[j].ID)
 	})
 
-	var runtime map[SessionStorageID]struct{}
+	// Keyed by the namespace, not by the descriptor. A running session's
+	// descriptor is rebuilt from the current config on every reconciliation
+	// while the stored one keeps what it was opened with, so matching on the
+	// whole SessionStorageID hides a live session's own durable telemetry from
+	// the operator in exactly the situations they are looking at this view for.
+	var runtime map[sessionNamespaceKey]struct{}
 	if supervisor != nil && len(supervisor.Sessions) > 0 {
-		runtime = make(map[SessionStorageID]struct{}, len(supervisor.Sessions))
+		runtime = make(map[sessionNamespaceKey]struct{}, len(supervisor.Sessions))
 		for i := range supervisor.Sessions {
-			runtime[supervisor.Sessions[i].StorageID] = struct{}{}
+			if key, err := sessionNamespaceKeyOf(supervisor.Sessions[i].StorageID); err == nil {
+				runtime[key] = struct{}{}
+			}
 		}
+	}
+	isRuntime := func(id SessionStorageID) bool {
+		key, err := sessionNamespaceKeyOf(id)
+		if err != nil {
+			return false
+		}
+		_, exists := runtime[key]
+
+		return exists
 	}
 
 	limit := min(len(ordered), maxValidatorDebugStoredSessions)
 	selected := make([]StoredSession, 0, limit)
 	for i := range ordered {
-		if _, exists := runtime[ordered[i].ID]; exists {
+		if isRuntime(ordered[i].ID) {
 			selected = append(selected, ordered[i])
 			if len(selected) == limit {
 				break
@@ -607,7 +623,7 @@ func selectValidatorDebugStoredSessions(
 	}
 	if len(selected) < limit {
 		for i := range ordered {
-			if _, exists := runtime[ordered[i].ID]; exists {
+			if isRuntime(ordered[i].ID) {
 				continue
 			}
 			selected = append(selected, ordered[i])

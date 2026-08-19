@@ -24,8 +24,14 @@ type BootstrapState struct {
 // saved certificate paid its quorum of ed25519 verifications twice. This type
 // is the single check they share: the state is only reachable through State(),
 // and the only way to construct one is ValidateBootstrap.
+//
+// Certificates() hands the same certificates out already sealed, so a consumer
+// that must prove the quorum further downstream — block acceptance does —
+// carries the proof in the type instead of repeating the work.
 type ValidatedBootstrap struct {
-	state *BootstrapState
+	state   *BootstrapState
+	binding CertificateBinding
+	sealed  []VerifiedCertificate
 }
 
 // ValidateBootstrap verifies every certificate in state against sessionID and
@@ -39,7 +45,17 @@ func ValidateBootstrap(
 		return ValidatedBootstrap{}, errors.New("simplex: bootstrap state is absent")
 	}
 	if len(state.Certificates) == 0 {
-		return ValidatedBootstrap{state: state}, nil
+		// Nothing to verify, so an unusable roster is not an error here — it
+		// never was, and a caller reading an empty journal legitimately has one.
+		// The binding is still derived when the roster allows it, so that a
+		// consumer comparing bindings sees the real one rather than the zero
+		// value; with no certificates there is nothing sealed to leak either way.
+		binding, err := NewCertificateBinding(sessionID, validators)
+		if err != nil {
+			return ValidatedBootstrap{state: state}, nil
+		}
+
+		return ValidatedBootstrap{state: state, binding: binding}, nil
 	}
 	if len(validators) == 0 {
 		return ValidatedBootstrap{}, errors.New("simplex: empty validator set")
@@ -50,7 +66,12 @@ func ValidateBootstrap(
 		return ValidatedBootstrap{}, err
 	}
 	threshold := totalWeight*2/3 + 1
+	binding, err := NewCertificateBinding(sessionID, validators)
+	if err != nil {
+		return ValidatedBootstrap{}, err
+	}
 
+	sealed := make([]VerifiedCertificate, 0, len(state.Certificates))
 	for _, cert := range state.Certificates {
 		if cert == nil {
 			return ValidatedBootstrap{}, errors.New("simplex: nil journaled certificate")
@@ -62,14 +83,27 @@ func ValidateBootstrap(
 		if err = verifyCertificatePayload(validators, threshold, payload, cert); err != nil {
 			return ValidatedBootstrap{}, fmt.Errorf("simplex: corrupt journaled certificate for %s: %w", cert.Vote, err)
 		}
+		sealed = append(sealed, sealCertificate(cert, binding))
 	}
 
-	return ValidatedBootstrap{state: state}, nil
+	return ValidatedBootstrap{state: state, binding: binding, sealed: sealed}, nil
 }
 
 // State is the verified journal state, or nil for the zero value.
 func (b ValidatedBootstrap) State() *BootstrapState {
 	return b.state
+}
+
+// Certificates are the journaled certificates, sealed under Binding(). The
+// order matches State().Certificates.
+func (b ValidatedBootstrap) Certificates() []VerifiedCertificate {
+	return b.sealed
+}
+
+// Binding is the (session id, roster) pair the certificates were verified
+// under. It is the zero binding only when nothing was sealed.
+func (b ValidatedBootstrap) Binding() CertificateBinding {
+	return b.binding
 }
 
 // Journal is the durable intent log of the session.

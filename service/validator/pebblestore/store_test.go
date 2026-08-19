@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"math"
@@ -305,6 +306,8 @@ func TestWriteBatchByteLimit(t *testing.T) {
 		name       string
 		batchBytes int
 		nextBytes  int
+		batchClass durabilityClass
+		nextClass  durabilityClass
 		want       bool
 	}{
 		{name: "request after oversized batch", batchBytes: maxWriteBatchBytes + 1},
@@ -312,10 +315,19 @@ func TestWriteBatchByteLimit(t *testing.T) {
 		{name: "within cap", batchBytes: maxWriteBatchBytes / 2, nextBytes: maxWriteBatchBytes / 2, want: true},
 		{name: "crosses cap", batchBytes: maxWriteBatchBytes / 2, nextBytes: maxWriteBatchBytes/2 + 1},
 		{name: "zero-size request", batchBytes: maxWriteBatchBytes / 2, want: true},
+		// The durability partition: one batch commits with one WriteOptions, so a
+		// payload may not join a commitment batch however small it is, and coalescing
+		// within one class is untouched.
+		{name: "payload after commitment", nextClass: recoverablePayload},
+		{name: "commitment after payload", batchClass: recoverablePayload},
+		{name: "payload after payload", batchClass: recoverablePayload, nextClass: recoverablePayload, want: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := writeBatchCanAppend(test.batchBytes, writeRequest{sizeHint: test.nextBytes})
+			got := writeBatchCanAppend(test.batchBytes, test.batchClass, writeRequest{
+				sizeHint:   test.nextBytes,
+				durability: test.nextClass,
+			})
 			if got != test.want {
 				t.Fatalf("writeBatchCanAppend() = %v, want %v", got, test.want)
 			}
@@ -571,11 +583,14 @@ func TestCandidateAtomicIdempotentConflictAndNotFound(t *testing.T) {
 	store.Validator().SaveCandidate(session, validator.CandidateRecord{ID: id, Wire: wire}, func(err error) {
 		result <- err
 	})
-	for i := range wire {
-		wire[i] = 0xff
-	}
 	if err := receiveTestResult(t, result); err != nil {
 		t.Fatalf("save candidate: %v", err)
+	}
+	// The store borrows the wire until its callback fires and reuses the
+	// caller's buffer rather than copying a multi-megabyte payload on entry, so
+	// the buffer is the caller's again only from here.
+	for i := range wire {
+		wire[i] = 0xff
 	}
 
 	got, err := store.Validator().Candidate(context.Background(), session, id)
@@ -1021,7 +1036,10 @@ func TestFinalLeaderStatusAndLoadSession(t *testing.T) {
 		t.Fatalf("sessions = %d, want 1", len(status.Sessions))
 	}
 	s := status.Sessions[0]
-	if s.Candidates != 2 || s.Finalized != 2 || s.Votes != 1 || s.Certificates != 1 || s.LeaderWindows != 2 {
+	// The second record starts earlier than the first, so it neither advances
+	// the window count nor replaces the last record. Simplex reports windows in
+	// order, so only the staleness half of this is reachable in production.
+	if s.Candidates != 2 || s.Finalized != 2 || s.Votes != 1 || s.Certificates != 1 || s.LeaderWindows != 1 {
 		t.Fatalf("session counts = %+v", s)
 	}
 	if s.FirstNonAnnouncedWindow != 8 || s.LastFinalized == nil || s.LastFinalized.Slot != 9 {
@@ -1099,7 +1117,9 @@ func TestSessionSummaryPersistsAcrossReopen(t *testing.T) {
 	if got.ID != session {
 		t.Fatalf("reopened session descriptor = %+v, want %+v", got.ID, session)
 	}
-	if got.Candidates != 2 || got.Finalized != 2 || got.Votes != 1 || got.Certificates != 1 || got.LeaderWindows != 2 {
+	// Only the first of the three records advanced the window: the second is
+	// stale and the third repeats the first's start slot.
+	if got.Candidates != 2 || got.Finalized != 2 || got.Votes != 1 || got.Certificates != 1 || got.LeaderWindows != 1 {
 		t.Fatalf("reopened summary counts = %+v", got)
 	}
 	if got.FirstNonAnnouncedWindow != 3 || got.LastFinalized == nil || *got.LastFinalized != id2 {
@@ -1867,5 +1887,251 @@ func TestJournalBootstrapCacheFailsClosedAfterDelete(t *testing.T) {
 	}
 	if _, err := j.Bootstrap(); !errors.Is(err, validator.ErrSessionClosed) {
 		t.Fatalf("bootstrap after delete = %v, want ErrSessionClosed", err)
+	}
+}
+
+// TestLeaderWindowsWriteNoPerWindowRows pins the one durable record a leader
+// window leaves behind. The per-window rows this used to write were never read
+// by anything — LoadSession skips the prefix on purpose, the reported count
+// comes from the summary, and the reference stores no window history at all —
+// so they were bytes that only ever accumulated. The prefix stays reserved and
+// DeleteSession still sweeps it, which is what cleans up a database written
+// before this change.
+func TestLeaderWindowsWriteNoPerWindowRows(t *testing.T) {
+	store := openTestStore(t, t.TempDir())
+	defer closeTestStore(t, store)
+
+	session := testSession(21)
+	namespace, err := namespaceForSession(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := time.Unix(900, 0).UTC()
+	for slot := uint32(0); slot < 12; slot += 4 {
+		awaitTestSave(t, func(done func(error)) {
+			store.Validator().RecordLeaderWindow(session, validator.LeaderWindowRecord{
+				Base:       simplex.Genesis(),
+				StartSlot:  slot,
+				EndSlot:    slot + 4,
+				ObservedAt: observed.Add(time.Duration(slot) * time.Second),
+			}, done)
+		})
+	}
+
+	if hasCollatorPrefix(t, store, leaderWindowPrefix(namespace)) {
+		t.Fatal("leader window observations wrote per-window rows")
+	}
+
+	status, err := store.Validator().Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(status.Sessions))
+	}
+	stored := status.Sessions[0]
+	if stored.LeaderWindows != 3 {
+		t.Fatalf("leader window count = %d, want 3", stored.LeaderWindows)
+	}
+	if stored.LastLeaderWindow == nil || stored.LastLeaderWindow.StartSlot != 8 {
+		t.Fatalf("last leader window = %+v", stored.LastLeaderWindow)
+	}
+}
+
+// TestSaveCandidateBorrowsTheWireUntilItsCallback documents the contract change
+// that removed a full copy of every candidate payload from the store path. The
+// write goroutine reads Wire when it applies the batch, which is before done
+// fires, so the buffer belongs to the caller again from that point on. The one
+// production caller satisfies this trivially: it hands over a wire it has
+// already published as immutable and shares with the request path.
+func TestSaveCandidateBorrowsTheWireUntilItsCallback(t *testing.T) {
+	store := openTestStore(t, t.TempDir())
+	defer closeTestStore(t, store)
+
+	session := testSession(22)
+	id := simplex.CandidateID{Slot: 3, Hash: [32]byte{0x33}}
+	wire := bytes.Repeat([]byte{0xab}, 4096)
+	awaitTestSave(t, func(done func(error)) {
+		store.Validator().SaveCandidate(session, validator.CandidateRecord{ID: id, Wire: wire}, done)
+	})
+
+	// The borrow ends with the callback, so a caller that reuses its buffer
+	// afterwards cannot corrupt what was stored.
+	for i := range wire {
+		wire[i] = 0xcd
+	}
+	record, err := store.Validator().Candidate(context.Background(), session, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(record.Wire, bytes.Repeat([]byte{0xab}, 4096)) {
+		t.Fatal("stored candidate wire does not match the bytes handed over")
+	}
+	if record.ID != id {
+		t.Fatalf("stored candidate id = %+v, want %+v", record.ID, id)
+	}
+}
+
+// TestSaveCandidateTakesTheCallersContentHash pins both halves of the optional
+// digest. A caller that has already hashed the wire — the resolver hashes it to
+// admit the candidate and to refuse a conflicting duplicate under that identity
+// — hands the digest over instead of making the store take a second full sha256
+// of a multi-megabyte payload; a caller that has not leaves the field zero and
+// the store derives it as before.
+func TestSaveCandidateTakesTheCallersContentHash(t *testing.T) {
+	store := openTestStore(t, t.TempDir())
+	defer closeTestStore(t, store)
+
+	session := testSession(23)
+	wire := bytes.Repeat([]byte{0x5e}, 4096)
+	hash := sha256.Sum256(wire)
+
+	supplied := simplex.CandidateID{Slot: 4, Hash: [32]byte{0x44}}
+	awaitTestSave(t, func(done func(error)) {
+		store.Validator().SaveCandidate(
+			session,
+			validator.CandidateRecord{ID: supplied, Wire: wire, ContentHash: hash},
+			done,
+		)
+	})
+	derived := simplex.CandidateID{Slot: 5, Hash: [32]byte{0x55}}
+	awaitTestSave(t, func(done func(error)) {
+		store.Validator().SaveCandidate(
+			session,
+			validator.CandidateRecord{ID: derived, Wire: wire},
+			done,
+		)
+	})
+
+	for _, id := range []simplex.CandidateID{supplied, derived} {
+		record, err := store.Validator().Candidate(context.Background(), session, id)
+		if err != nil {
+			t.Fatalf("candidate %v: %v", id, err)
+		}
+		if record.ContentHash != hash {
+			t.Fatalf("candidate %v content hash = %x, want %x", id, record.ContentHash, hash)
+		}
+		if !bytes.Equal(record.Wire, wire) {
+			t.Fatalf("candidate %v wire differs from the bytes handed over", id)
+		}
+	}
+}
+
+// TestDeleteSessionSweepsEveryNamespacedPrefix pins the sweep against the key
+// schema itself rather than against the list DeleteSession happens to carry.
+// keyAcceptedProof is retired but explicitly reserved because it once held
+// rows, and rows an older build wrote under it outlived namespace deletion with
+// no descriptor left to find them by — a leak nothing could ever address again.
+//
+// The loop covers every namespaced prefix, so a prefix added later and not
+// swept fails here instead of leaking silently.
+func TestDeleteSessionSweepsEveryNamespacedPrefix(t *testing.T) {
+	store := openTestStore(t, t.TempDir())
+	defer closeTestStore(t, store)
+
+	session := testSession(11)
+	namespace, err := namespaceForSession(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One real write bootstraps the descriptor and the summary row, which is
+	// what DeleteSession requires before it will delete anything.
+	awaitTestSave(t, func(done func(error)) {
+		store.Validator().MarkFinalized(session, testCandidateID(1, 1), done)
+	})
+
+	namespacedKinds := []byte{
+		keySession, keyVote, keyPoolState, keyCandidateIndex, keyCandidateContent,
+		keyFinalized, keyLeaderWindow, keySummary, keyAcceptedProof,
+		keyDelegationAuthorization,
+	}
+	// The descriptor and the summary carry their real rows: DeleteSession reads
+	// and decodes both before it deletes anything. Every other kind is seeded
+	// with a row the way an older build would have left one.
+	for _, kind := range namespacedKinds {
+		if kind == keySession || kind == keySummary {
+			continue
+		}
+		if err = store.db.Set(namespacedPrefix(kind, namespace), []byte("row"), pebble.Sync); err != nil {
+			t.Fatalf("seed prefix %d: %v", kind, err)
+		}
+	}
+
+	if err = store.Validator().DeleteSession(context.Background(), session); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+
+	for _, kind := range namespacedKinds {
+		if rows := countTestPrefixRows(t, store, namespacedPrefix(kind, namespace)); rows != 0 {
+			t.Fatalf("prefix %d kept %d rows after namespace deletion", kind, rows)
+		}
+	}
+}
+
+func countTestPrefixRows(t *testing.T, store *Store, prefix []byte) int {
+	t.Helper()
+
+	lower, upper := prefixBounds(prefix)
+	iter, err := store.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := 0
+	for valid := iter.First(); valid; valid = iter.Next() {
+		rows++
+	}
+	if err = errors.Join(iter.Error(), iter.Close()); err != nil {
+		t.Fatal(err)
+	}
+
+	return rows
+}
+
+// TestStoredNamespaceCollapsesExactlyTheDescriptorOnlyFields states, from the
+// store's side, which parts of a SessionStorageID address rows and which are
+// only descriptor payload. ValidatorIndex and Protocol are payload: two IDs
+// differing only in them are one namespace, one set of candidates, one vote
+// journal.
+//
+// Package validator states the same property for the key its reaper proves
+// liveness on (TestSessionNamespaceKeyCollapsesExactlyTheDescriptorOnlyFields).
+// The two together are what keeps a live session protecting its own storage: a
+// claim keyed more finely than this stops matching the namespace it owns, and
+// the namespace is then deleted with the journal in it. The table enumerates
+// every field, so one added later fails here until it is classified.
+func TestStoredNamespaceCollapsesExactlyTheDescriptorOnlyFields(t *testing.T) {
+	base := testSession(21)
+	baseNamespace, err := namespaceForSession(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, testCase := range []struct {
+		field     string
+		mutate    func(*validator.SessionStorageID)
+		addresses bool
+	}{
+		{"SessionID", func(id *validator.SessionStorageID) { id.SessionID[0] ^= 0xff }, true},
+		{"Shard", func(id *validator.SessionStorageID) { id.Shard = groups.ShardID{Workchain: 0, Shard: math.MinInt64} }, true},
+		{"CatchainSeqno", func(id *validator.SessionStorageID) { id.CatchainSeqno++ }, true},
+		{"IsValidator", func(id *validator.SessionStorageID) {
+			id.IsValidator = false
+			id.ValidatorKeyID = [32]byte{}
+			id.ValidatorIndex = simplex.ObserverIndex
+		}, true},
+		{"ValidatorKeyID", func(id *validator.SessionStorageID) { id.ValidatorKeyID[0] ^= 0xff }, true},
+		{"LocalADNLID", func(id *validator.SessionStorageID) { id.LocalADNLID[0] ^= 0xff }, true},
+		{"ValidatorIndex", func(id *validator.SessionStorageID) { id.ValidatorIndex += 7 }, false},
+		{"Protocol", func(id *validator.SessionStorageID) { id.Protocol.SlotsPerLeaderWindow += 4 }, false},
+	} {
+		mutated := base
+		testCase.mutate(&mutated)
+		namespace, err := namespaceForSession(mutated)
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.field, err)
+		}
+		if changed := namespace != baseNamespace; changed != testCase.addresses {
+			t.Fatalf("%s changed the namespace = %t, want %t", testCase.field, changed, testCase.addresses)
+		}
 	}
 }

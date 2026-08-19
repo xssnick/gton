@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"math"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -68,6 +70,9 @@ func TestLocalAcquisitionValidatesWithoutPreparedCollatorSession(t *testing.T) {
 	if !result.ValidAfter.Equal(want) {
 		t.Fatalf("valid-after = %v, want %v", result.ValidAfter, want)
 	}
+	if result.Successor.BlockRoot == nil || result.Successor.StateUpdate == nil {
+		t.Fatal("the validated transition is unavailable")
+	}
 }
 
 func TestLocalAcquisitionPrefersFullCollatedNeighborProof(t *testing.T) {
@@ -92,6 +97,7 @@ func TestLocalAcquisitionPrefersFullCollatedNeighborProof(t *testing.T) {
 		nil,
 		&verified.collated,
 		false,
+		acquisitionReadImmediate,
 	)
 	if err != nil {
 		t.Fatalf("load full-collated neighbor before partial predecessor: %v", err)
@@ -111,12 +117,131 @@ func TestLocalAcquisitionPrefersFullCollatedNeighborProof(t *testing.T) {
 		nil,
 		&verified.collated,
 		nil,
+		acquisitionReadImmediate,
 	); err != nil {
 		t.Fatalf("load historical frontier from full-collated predecessor: %v", err)
 	}
 }
 
-func TestLocalAcquisitionPrefersCanonicalNeighborToPartialPredecessor(t *testing.T) {
+// A shard is its own neighbor, so the session's own predecessor is always in
+// the expected set — and the state supplied with the session is the same full
+// tree the node store holds. Reading it back out of storage costs a block read,
+// a state read and a second full decode of a tree already in memory, so the
+// supplied state is preferred and the store is never asked.
+//
+// Two neighbors is the shape that arms the warm-up at all, and the store is
+// asked from two independent places: synchronously by the resolution loop, and
+// from goroutines the warm-up never joins. The counting store answers nothing
+// and only records that it was consulted, which settles the loop half — but a
+// counter cannot settle the warm-up half, because loadExpectedNeighbors returns
+// long before those goroutines run. That half is pinned by asserting the
+// selection pendingWarmSources makes, which is the whole of the decision and is
+// synchronous.
+func TestNeighborsPreferSuppliedPredecessorOverStore(t *testing.T) {
+	fixture := newMergePredecessorFixture(t)
+	if fixture.req.Previous2 == nil {
+		t.Fatal("merge fixture has no second predecessor")
+	}
+	first, second := fixture.req.Previous, *fixture.req.Previous2
+
+	store := new(countingNeighborStore)
+	acquisition := &LocalAcquisition{store: store}
+	views := make(map[msgpool.ShardIdent]*localNeighborView)
+	expected := map[neighborShardKey]ton.BlockIDExt{
+		{workchain: first.ID.Workchain, shard: first.ID.Shard}:   first.ID,
+		{workchain: second.ID.Workchain, shard: second.ID.Shard}: second.ID,
+	}
+	keys := make([]neighborShardKey, 0, len(expected))
+	for key := range expected {
+		keys = append(keys, key)
+	}
+	previous := []PreviousBlock{first, second}
+	if warm := acquisition.pendingWarmSources(keys, expected, previous, views, nil); len(warm) != 0 {
+		t.Fatalf("the warm-up starts %d store reads for blocks the session supplied: %+v", len(warm), warm)
+	}
+
+	neighbors, err := acquisition.loadExpectedNeighbors(
+		context.Background(),
+		new(localMasterView),
+		expected,
+		previous,
+		views,
+		nil,
+		true,
+		acquisitionReadImmediate,
+	)
+	if err != nil {
+		t.Fatalf("load neighbors from the supplied predecessors: %v", err)
+	}
+	if reads := store.reads.Load(); reads != 0 {
+		t.Fatalf("the node store was read %d times for blocks the session supplied", reads)
+	}
+	if len(neighbors) != 2 {
+		t.Fatalf("loaded neighbors = %d, want both predecessors", len(neighbors))
+	}
+	for _, id := range []ton.BlockIDExt{first.ID, second.ID} {
+		view := views[blockShardIdent(id)]
+		if view == nil || view.state.OutMsgQueueInfo == nil {
+			t.Fatalf("neighbor view for %d carries no outbound queue", id.SeqNo)
+		}
+		// Never traced, although this collation emits proofs: the block is a
+		// collation predecessor, and BuildFullCollatedProofs skips exactly those.
+		// TestFullCollatedProofsSkipPredecessorNeighbors is what holds that
+		// closed; the cost of getting it wrong is a walk of the whole predecessor
+		// outbound queue to fill a proof nobody reads.
+		if view.proof != nil {
+			t.Fatalf("neighbor view for %d is traced for a proof that is discarded", id.SeqNo)
+		}
+	}
+}
+
+// The reason the predecessor neighbour view is left untraced: its proof is never
+// emitted. This pins the discard at the emitter, so the two facts cannot drift
+// apart — restoring the trace would then be caught as pure waste, and dropping
+// this skip would be caught as a missing proof.
+func TestFullCollatedProofsSkipPredecessorNeighbors(t *testing.T) {
+	fixture := newMergePredecessorFixture(t)
+	if fixture.req.Previous2 == nil {
+		t.Fatal("merge fixture has no second predecessor")
+	}
+	first, second := fixture.req.Previous, *fixture.req.Previous2
+
+	views := make(map[msgpool.ShardIdent]*localNeighborView)
+	neighbors := make([]Neighbor, 0, 2)
+	for _, previous := range []PreviousBlock{first, second} {
+		// Traced on purpose: the emitter must skip these because of which block
+		// they are, not because they happen to carry no builder.
+		view, err := localViewFromPrevious(previous, true, true)
+		if err != nil {
+			t.Fatalf("decode predecessor %d: %v", previous.ID.SeqNo, err)
+		}
+		source := blockShardIdent(previous.ID)
+		views[source] = view
+		neighbors = append(neighbors, localNeighbor(view, source))
+	}
+
+	provider := &localFullProofProvider{views: views}
+	proofs, err := provider.BuildFullCollatedProofs(context.Background(), FullCollatedProofRequest{
+		Previous:  first,
+		Previous2: &second,
+		Neighbors: neighbors,
+	})
+	if err != nil {
+		t.Fatalf("build proofs for a neighbor set of predecessors only: %v", err)
+	}
+	if len(proofs) != 0 {
+		t.Fatalf("emitted %d proofs for neighbors that are all collation predecessors", len(proofs))
+	}
+}
+
+// The other half of the preference, and the reason it is safe to have one at
+// all: a predecessor re-pointed at the candidate's own collated proof carries a
+// state that answers what that candidate reads and stops at a pruned boundary
+// anywhere else. Taking it as a neighbour source would decode an outbound queue
+// off that boundary and reject a valid candidate, so Proven sends it to the
+// node store instead — and this test pins that the flag, not the caller, is
+// what decides.
+func TestNeighborsIgnoreProvenPredecessorAsNeighborSource(t *testing.T) {
 	candidate, err := testBuilder().BuildShard(context.Background(), emptyCandidateRequest(t))
 	if err != nil {
 		t.Fatal(err)
@@ -137,10 +262,11 @@ func TestLocalAcquisitionPrefersCanonicalNeighborToPartialPredecessor(t *testing
 		context.Background(),
 		new(localMasterView),
 		map[neighborShardKey]ton.BlockIDExt{{workchain: id.Workchain, shard: id.Shard}: id},
-		[]PreviousBlock{{ID: id, State: partial}},
+		[]PreviousBlock{{ID: id, State: partial, Proven: true}},
 		nil,
 		nil,
 		false,
+		acquisitionReadImmediate,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -148,6 +274,37 @@ func TestLocalAcquisitionPrefersCanonicalNeighborToPartialPredecessor(t *testing
 	if len(neighbors) != 1 || neighbors[0].OutMsgQueueInfo == nil {
 		t.Fatalf("loaded neighbors = %+v, want canonical full state", neighbors)
 	}
+}
+
+// countingNeighborStore answers no read and counts every one it is asked for.
+type countingNeighborStore struct {
+	reads atomic.Int64
+}
+
+func (s *countingNeighborStore) BlockState(context.Context, ton.BlockIDExt) (*storage.BlockState, error) {
+	s.reads.Add(1)
+
+	return nil, storage.ErrNotFound
+}
+
+func (s *countingNeighborStore) LoadStateCellTree(
+	context.Context,
+	ton.BlockIDExt,
+	[]byte,
+) (*cell.Cell, error) {
+	s.reads.Add(1)
+
+	return nil, storage.ErrNotFound
+}
+
+func (s *countingNeighborStore) BlockRoot(context.Context, ton.BlockIDExt) (*cell.Cell, error) {
+	s.reads.Add(1)
+
+	return nil, storage.ErrNotFound
+}
+
+func (*countingNeighborStore) WaitBlockArtifacts(context.Context, ton.BlockIDExt) error {
+	return storage.ErrNotFound
 }
 
 func TestLocalAcquisitionPublishesResidentMasterchainViewBeforeStorage(t *testing.T) {
@@ -179,6 +336,7 @@ func TestLocalAcquisitionPublishesResidentMasterchainViewBeforeStorage(t *testin
 		context.Background(),
 		fixture.request.Previous.ID,
 		time.Now(),
+		acquisitionReadImmediate,
 	)
 	if err != nil {
 		t.Fatalf("project resident view without stored artifacts: %v", err)
@@ -295,7 +453,13 @@ func TestValidationResolvesCandidateMasterchainReferenceAheadOfCollatorView(t *t
 		RootHash: bytes.Clone(previous.ID.RootHash),
 		FileHash: bytes.Clone(previous.ID.FileHash),
 	}
-	view, err := acquisition.validationMasterReference(context.Background(), base, reference, asOf)
+	view, err := acquisition.validationMasterReference(
+		context.Background(),
+		base,
+		reference,
+		asOf,
+		acquisitionReadImmediate,
+	)
 	if err != nil {
 		t.Fatalf("resolve ahead candidate masterchain reference: %v", err)
 	}
@@ -501,6 +665,15 @@ func (s *localValidationStore) BlockRoot(ctx context.Context, block ton.BlockIDE
 	return nil, storage.ErrNotFound
 }
 
+func (s *localValidationStore) WaitBlockArtifacts(ctx context.Context, block ton.BlockIDExt) error {
+	_, err := s.BlockState(ctx, block)
+	if err == nil && block.SeqNo != 0 {
+		_, err = s.BlockRoot(ctx, block)
+	}
+
+	return err
+}
+
 func localValidationMasterFixture(t *testing.T) (masterBuildFixture, *cell.Cell) {
 	t.Helper()
 	fixture := newMasterBuildFixture(t, false)
@@ -700,6 +873,7 @@ func TestLoadExpectedNeighborsTracesOnlyWhenProofsAreNeeded(t *testing.T) {
 			views,
 			nil,
 			needProofs,
+			acquisitionReadImmediate,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -761,5 +935,119 @@ func TestLocalConfigCacheEvictsOldestBeyondCap(t *testing.T) {
 	}
 	if len(cache.entries) != maxLocalPreparedConfigs {
 		t.Fatalf("repeated store changed the cache size to %d", len(cache.entries))
+	}
+}
+
+// masterViewCacheTestView builds the minimum a cache-level test needs: the id
+// is the whole key, and views are immutable so nothing else is read.
+func masterViewCacheTestView(seqno uint32, fill byte) *localMasterView {
+	root := make([]byte, 32)
+	file := make([]byte, 32)
+	for i := range root {
+		root[i] = fill
+		file[i] = fill ^ 0xff
+	}
+	return &localMasterView{
+		context: MasterchainContext{
+			ID: ton.BlockIDExt{
+				Workchain: masterchainWorkchainID,
+				Shard:     math.MinInt64,
+				SeqNo:     seqno,
+				RootHash:  root,
+				FileHash:  file,
+			},
+		},
+	}
+}
+
+// A session update and a shard candidate's masterchain reference both routinely
+// lag the newest applied block, so the view the resident slot replaces is
+// exactly the one validation asks for next.
+func TestLocalMasterViewCacheServesDemotedResident(t *testing.T) {
+	var cache localMasterViewCache
+	first := masterViewCacheTestView(10, 0x11)
+	second := masterViewCacheTestView(11, 0x22)
+
+	cache.view = first
+	if view, resident := cache.lookup(first.context.ID); view != first || !resident {
+		t.Fatalf("resident lookup = (%p, %v), want (%p, true)", view, resident, first)
+	}
+
+	cache.demoteLocked(cache.view)
+	cache.view = second
+	cache.sweepLocked(second.context.ID.SeqNo)
+
+	view, resident := cache.lookup(first.context.ID)
+	if view != first {
+		t.Fatalf("demoted lookup = %p, want %p", view, first)
+	}
+	if resident {
+		t.Fatal("a demoted view reported itself as resident; its group binding would go unchecked")
+	}
+	if view, resident = cache.lookup(second.context.ID); view != second || !resident {
+		t.Fatalf("new resident lookup = (%p, %v), want (%p, true)", view, resident, second)
+	}
+}
+
+// A block root hash can never name two states, but a lookup must still refuse an
+// id that only agrees on that hash.
+func TestLocalMasterViewCacheRejectsMismatchedID(t *testing.T) {
+	var cache localMasterViewCache
+	view := masterViewCacheTestView(10, 0x33)
+	cache.demoteLocked(view)
+
+	other := view.context.ID
+	other.SeqNo++
+	if got, _ := cache.lookup(other); got != nil {
+		t.Fatal("lookup returned a view for a different block id")
+	}
+}
+
+func TestLocalMasterViewCacheEvictsAndSweeps(t *testing.T) {
+	var cache localMasterViewCache
+	views := make([]*localMasterView, 0, maxLocalMasterViews+2)
+	for i := range maxLocalMasterViews + 2 {
+		view := masterViewCacheTestView(uint32(100+i), byte(i+1))
+		views = append(views, view)
+		cache.demoteLocked(view)
+	}
+	if len(cache.entries) != maxLocalMasterViews || len(cache.order) != maxLocalMasterViews {
+		t.Fatalf("cache holds %d entries / %d ordered keys, want %d of each",
+			len(cache.entries), len(cache.order), maxLocalMasterViews)
+	}
+	for _, evicted := range views[:2] {
+		if got, _ := cache.lookup(evicted.context.ID); got != nil {
+			t.Fatalf("view at seqno %d survived eviction", evicted.context.ID.SeqNo)
+		}
+	}
+
+	// A view that fell further behind than the block cache keeps its blocks is
+	// dropped even though insertion order would have kept it.
+	resident := views[len(views)-1].context.ID.SeqNo + maxLocalMasterViewLag
+	cache.sweepLocked(resident)
+	for _, view := range views {
+		got, _ := cache.lookup(view.context.ID)
+		wantKept := view.context.ID.SeqNo+maxLocalMasterViewLag > resident
+		if (got != nil) != wantKept {
+			t.Fatalf("view at seqno %d kept = %v, want %v", view.context.ID.SeqNo, got != nil, wantKept)
+		}
+	}
+}
+
+// store is the cache-only path: unlike a resident install it must not retire
+// block-cache entries, because those generations bound one masterchain block.
+func TestLocalMasterViewCacheStoreLeavesResidentAlone(t *testing.T) {
+	var cache localMasterViewCache
+	resident := masterViewCacheTestView(20, 0x44)
+	cache.view = resident
+
+	cache.store(masterViewCacheTestView(19, 0x55))
+	if cache.view != resident {
+		t.Fatal("store replaced the resident view")
+	}
+	// Storing the resident id again must not duplicate it into the entry map.
+	cache.store(masterViewCacheTestView(20, 0x44))
+	if len(cache.entries) != 1 {
+		t.Fatalf("entries = %d, want only the non-resident view", len(cache.entries))
 	}
 }

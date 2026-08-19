@@ -545,6 +545,47 @@ func TestSessionSupervisorKeepsObserverBesideValidatorIdentity(t *testing.T) {
 	}
 }
 
+func TestSessionSupervisorDoesNotDuplicateCollatorAsProtocolOneObserver(t *testing.T) {
+	localKey := supervisorTestID(0x28)
+	validatorADNL := supervisorTestID(0xb8)
+	collatorADNL := supervisorTestID(0xb9)
+	keys := &supervisorTestKeys{ids: [][32]byte{localKey}}
+	supervisor := newSessionSupervisor(
+		zerolog.Nop(),
+		keys,
+		newValidatorTestStorage(),
+		newSupervisorTestPreparer().prepare,
+		collatorADNL,
+	)
+	defer supervisor.Close()
+
+	group := supervisorTestGroup(0x38, supervisorTestShard(), localKey)
+	group.Validators[0].ADNL = validatorADNL
+	snapshot := supervisorTestSnapshot(16, []groups.Session{group}, nil)
+	snapshot.Config.NewConsensus.Shard.ProtocolVersion = 1
+	snapshot.PersistentOverlay = []groups.PersistentOverlayMember{
+		{ADNL: validatorADNL, ValidatorKeyIDs: [][32]byte{localKey}},
+		{ADNL: collatorADNL, ValidatorKeyIDs: [][32]byte{localKey}},
+	}
+	snapshot.CollatorsByValidator = []groups.CollatorRegistryEntry{{
+		ValidatorKeyID:  localKey,
+		CollatorADNLIDs: [][32]byte{collatorADNL},
+	}}
+
+	desired, failures := supervisor.desiredSessions(snapshot)
+	if len(failures) != 0 {
+		t.Fatalf("desired sessions failed: %+v", failures)
+	}
+	if len(desired) != 1 {
+		t.Fatalf("collator identity created a redundant protocol-1 observer: %d sessions", len(desired))
+	}
+	for _, session := range desired {
+		if session.config.Identity.Validator == nil || session.config.Identity.ADNLID != validatorADNL {
+			t.Fatalf("remaining identity = %+v, want validator", session.config.Identity)
+		}
+	}
+}
+
 func TestSessionSupervisorOnlyRunsTransportAvailableObservers(t *testing.T) {
 	localKey := supervisorTestID(0x26)
 	availableADNL := supervisorTestID(0xb6)
@@ -575,6 +616,63 @@ func TestSessionSupervisorOnlyRunsTransportAvailableObservers(t *testing.T) {
 		}
 		if !slices.Equal(session.config.OverlayMembers, [][32]byte{availableADNL, unavailableADNL}) {
 			t.Fatalf("complete overlay membership = %x", session.config.OverlayMembers)
+		}
+	}
+}
+
+func TestSessionSupervisorProtocolIdentityAndAllCollatorMatrix(t *testing.T) {
+	localKey := supervisorTestID(0xc1)
+	observerADNL := supervisorTestID(0xc2)
+	rosterCollator := supervisorTestID(0xc3)
+	foreignCollator := supervisorTestID(0xc4)
+	keys := &supervisorTestKeys{ids: [][32]byte{localKey}}
+	supervisor := newSessionSupervisor(
+		zerolog.Nop(),
+		keys,
+		newValidatorTestStorage(),
+		newSupervisorTestPreparer().prepare,
+		observerADNL,
+	)
+	defer supervisor.Close()
+
+	group := supervisorTestGroup(0xc5, supervisorTestShard(), localKey)
+	for protocolVersion := uint8(0); protocolVersion <= simplex.MaxProtocolVersion; protocolVersion++ {
+		snapshot := supervisorTestSnapshot(20+uint32(protocolVersion), []groups.Session{group}, nil)
+		snapshot.Config.NewConsensus.Shard.ProtocolVersion = protocolVersion
+		snapshot.PersistentOverlay = []groups.PersistentOverlayMember{
+			{ADNL: localKey, ValidatorKeyIDs: [][32]byte{localKey}},
+			{ADNL: observerADNL, ValidatorKeyIDs: [][32]byte{localKey}},
+		}
+		snapshot.CollatorsByValidator = []groups.CollatorRegistryEntry{
+			{ValidatorKeyID: localKey, CollatorADNLIDs: [][32]byte{rosterCollator}},
+			{ValidatorKeyID: supervisorTestID(0xcf), CollatorADNLIDs: [][32]byte{foreignCollator}},
+		}
+
+		desired, failures := supervisor.desiredSessions(snapshot)
+		if len(failures) != 0 {
+			t.Fatalf("protocol %d failures = %+v", protocolVersion, failures)
+		}
+		wantSessions := 2
+		if protocolVersion == 0 {
+			wantSessions = 1
+		}
+		if len(desired) != wantSessions {
+			t.Fatalf("protocol %d desired sessions = %d, want %d", protocolVersion, len(desired), wantSessions)
+		}
+		wantAll := [][32]byte{rosterCollator, foreignCollator}
+		for _, session := range desired {
+			if session.config.Protocol.ProtocolVersion != protocolVersion {
+				t.Fatalf("protocol %d projected as %d", protocolVersion, session.config.Protocol.ProtocolVersion)
+			}
+			if !slices.Equal(session.config.AllCollators, wantAll) {
+				t.Fatalf("protocol %d all collators = %x, want %x",
+					protocolVersion, session.config.AllCollators, wantAll)
+			}
+			if len(session.config.CollatorsByValidator) != 1 ||
+				session.config.CollatorsByValidator[0].ValidatorKeyID != localKey {
+				t.Fatalf("protocol %d delegation registry = %+v",
+					protocolVersion, session.config.CollatorsByValidator)
+			}
 		}
 	}
 }
@@ -716,6 +814,16 @@ func TestSessionSupervisorUpdatesParamsAndPinsCriticalRuntime(t *testing.T) {
 }
 
 func TestSessionSupervisorRetriesUnavailableStateWithoutRetiringSession(t *testing.T) {
+	// A full retry cycle of the production constants is what this asserts, so it
+	// spends its second asleep in the supervisor's retry delay rather than
+	// computing, and running it beside its siblings costs almost nothing.
+	//
+	// Its deadlines are upper bounds, so contention is not free here; they are
+	// budgeted for it. One second waits for a preparation that only pushes to a
+	// channel, and three seconds wait for a retry the production constant fires
+	// after one. Nothing here asserts that something has not happened yet, which
+	// is the assertion a late-scheduled goroutine turns into a flake.
+	t.Parallel()
 	localKey := supervisorTestID(0x69)
 	keys := &supervisorTestKeys{ids: [][32]byte{localKey}}
 	sessions := make(chan *supervisorNotReadyUpdateSession, 1)
@@ -774,14 +882,20 @@ func TestSessionSupervisorRejectsAmbiguousAndUnsupportedSessions(t *testing.T) {
 	if len(desired) != 0 || len(failures) != 1 {
 		t.Fatalf("ambiguous group desired/failures = %d/%d", len(desired), len(failures))
 	}
+	if got := failures[0].reason; got != SessionSpecRejectionInvalidSessionSpec {
+		t.Fatalf("ambiguous session rejection reason = %d, want invalid session specification", got)
+	}
 
 	unsupported := supervisorTestSnapshot(41, []groups.Session{
 		supervisorTestGroup(0x74, supervisorTestShard(), firstKey),
 	}, nil)
-	unsupported.Config.NewConsensus.Shard.ProtocolVersion = 2
+	unsupported.Config.NewConsensus.Shard.ProtocolVersion = simplex.MaxProtocolVersion + 1
 	desired, failures = supervisor.desiredSessions(unsupported)
 	if len(desired) != 0 || len(failures) != 1 {
 		t.Fatalf("unsupported group desired/failures = %d/%d", len(desired), len(failures))
+	}
+	if got := failures[0].reason; got != SessionSpecRejectionUnsupportedSimplexProtocol {
+		t.Fatalf("unsupported session rejection reason = %d, want unsupported simplex protocol", got)
 	}
 
 	disabled := supervisorTestSnapshot(42, []groups.Session{ambiguous}, nil)
@@ -793,6 +907,14 @@ func TestSessionSupervisorRejectsAmbiguousAndUnsupportedSessions(t *testing.T) {
 }
 
 func TestSessionSupervisorRetriesPreparationAndIgnoresOlderSnapshots(t *testing.T) {
+	// A full retry cycle of the production constants is what this asserts, so it
+	// spends its second asleep rather than computing.
+	//
+	// Deliberately not parallel. The assertion after the 100 ms sleep is that
+	// the retry has not happened yet, and the deadline it is racing is the
+	// production one second: a test goroutine descheduled for the remaining
+	// 900 ms fails it by arriving late rather than by the supervisor being
+	// wrong.
 	localKey := supervisorTestID(0x81)
 	keys := &supervisorTestKeys{ids: [][32]byte{localKey}}
 	preparer := newSupervisorTestPreparer()
@@ -1067,6 +1189,14 @@ func TestSessionSupervisorStatusPublishesDetailedDeterministicSnapshot(t *testin
 }
 
 func TestSessionSupervisorRetriesFailedRuntimeCloseBeforeReplacement(t *testing.T) {
+	// A full retry cycle of the production constants is what this asserts, so it
+	// spends its second asleep rather than computing.
+	//
+	// Deliberately not parallel. The 500 ms budget below is load-bearing: it has
+	// to expire before the one-second close retry, because the assertions that
+	// follow it are that the close has been attempted exactly once and no
+	// replacement prepared. That is an assertion about something not having
+	// happened yet, and contention satisfies it by arriving late.
 	localKey := supervisorTestID(0xd1)
 	keys := &supervisorTestKeys{ids: [][32]byte{localKey}}
 	failedClose := newSupervisorRetryCloseSession()
@@ -1310,6 +1440,9 @@ func TestSessionSupervisorOmitsMasterchainCollatorRegistry(t *testing.T) {
 		if len(session.config.CollatorsByValidator) != 0 {
 			t.Fatalf("masterchain collator registry = %+v", session.config.CollatorsByValidator)
 		}
+		if !slices.Equal(session.config.AllCollators, [][32]byte{collatorADNL}) {
+			t.Fatalf("masterchain all-collator roster = %x", session.config.AllCollators)
+		}
 	}
 
 	basechain := supervisorTestGroup(0x85, supervisorTestShard(), localKey)
@@ -1327,6 +1460,32 @@ func TestSessionSupervisorOmitsMasterchainCollatorRegistry(t *testing.T) {
 		) {
 			t.Fatalf("basechain collator registry = %+v", session.config.CollatorsByValidator)
 		}
+		if !slices.Equal(session.config.AllCollators, [][32]byte{collatorADNL}) {
+			t.Fatalf("basechain all-collator roster = %x", session.config.AllCollators)
+		}
+	}
+}
+
+func TestSessionConfigChangedObservesTransportRosters(t *testing.T) {
+	previous := SessionConfig{
+		AllCollators:         [][32]byte{{1}},
+		AllCurrentValidators: [][32]byte{{2}},
+	}
+	next := SessionConfig{
+		AllCollators:         [][32]byte{{1}},
+		AllCurrentValidators: [][32]byte{{2}},
+	}
+	if sessionConfigChanged(previous, next) {
+		t.Fatal("equal transport rosters changed the session config")
+	}
+	next.AllCollators = [][32]byte{{2}}
+	if !sessionConfigChanged(previous, next) {
+		t.Fatal("all-collator roster change was ignored")
+	}
+	next = previous
+	next.AllCurrentValidators = [][32]byte{{3}}
+	if !sessionConfigChanged(previous, next) {
+		t.Fatal("current-validator intermediate roster change was ignored")
 	}
 }
 
@@ -1370,7 +1529,7 @@ func TestSessionConfigRoundTripsThroughCollatorSession(t *testing.T) {
 	consensus := groups.SimplexConfig{
 		Version:              2,
 		Flags:                5,
-		ProtocolVersion:      4,
+		ProtocolVersion:      3,
 		UseQUIC:              true,
 		SlotsPerLeaderWindow: 6,
 	}
@@ -1380,6 +1539,7 @@ func TestSessionConfigRoundTripsThroughCollatorSession(t *testing.T) {
 	snapshot.Config.NewConsensus.Shard = &consensus
 	snapshot.Config.MaxBlockSize = 1 << 20
 	snapshot.Config.MaxCollatedDataSize = 1 << 19
+	snapshot.Config.AllCurrentValidators = [][32]byte{validator.ADNL, supervisorTestID(0x43)}
 	snapshot.CollatorsByValidator = []groups.CollatorRegistryEntry{{
 		ValidatorKeyID:  validator.PublicKeyHash,
 		CollatorADNLIDs: [][32]byte{localADNL},
@@ -1396,6 +1556,7 @@ func TestSessionConfigRoundTripsThroughCollatorSession(t *testing.T) {
 		snapshot,
 		group,
 		overlayMembers,
+		groups.AllCollatorADNLIDs(snapshot.CollatorsByValidator),
 		simplex.ObserverIndex,
 		[32]byte{},
 		localADNL,
@@ -1410,11 +1571,14 @@ func TestSessionConfigRoundTripsThroughCollatorSession(t *testing.T) {
 	input, err := observer.runtimeInput(collator.ConsensusObserverSession{
 		Overlay: collator.OverlaySession{
 			Session:                   localCollatorSession(config),
-			Role:                      collator.OverlayRoleObserver,
+			Role:                      collator.OverlayRoleCollator,
 			CollatorsByValidator:      config.CollatorsByValidator,
+			AllCollators:              config.AllCollators,
+			AllCurrentValidators:      config.AllCurrentValidators,
 			AllOverlayNodes:           config.OverlayMembers,
 			MaxBlockSize:              config.CandidateLimits.MaxBlockBytes,
 			MaxCollatedDataSize:       config.CandidateLimits.MaxCollatedDataBytes,
+			BroadcastMode:             collator.CandidateBroadcastPrivateOverlay,
 			ObserversInPrivateOverlay: true,
 		},
 		Update: collator.SessionUpdate{
@@ -1452,5 +1616,12 @@ func TestSessionConfigRoundTripsThroughCollatorSession(t *testing.T) {
 	}
 	if !slices.Equal(got.Validators, config.Validators) {
 		t.Fatalf("round-tripped validators = %+v, want %+v", got.Validators, config.Validators)
+	}
+	if !slices.Equal(got.AllCurrentValidators, config.AllCurrentValidators) {
+		t.Fatalf(
+			"round-tripped current-validator roster = %x, want %x",
+			got.AllCurrentValidators,
+			config.AllCurrentValidators,
+		)
 	}
 }

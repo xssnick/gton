@@ -318,7 +318,7 @@ func (e *Engine) applyVote(idx uint32, v Vote, sig []byte, tolerateConflicts boo
 // 2/3+1 threshold is crossed. Each validator is counted at most once per
 // (slot, kind, candidate), so sums stay below the 2^61-capped total weight.
 func (e *Engine) onVoteApplied(idx uint32, v Vote, slot *poolSlot) {
-	w := e.validators[idx].Weight
+	w := e.validators()[idx].Weight
 	var newWeight uint64
 	switch v.Kind {
 	case VoteNotarize:
@@ -331,8 +331,10 @@ func (e *Engine) onVoteApplied(idx uint32, v Vote, slot *poolSlot) {
 		slot.skipWeight += w
 		newWeight = slot.skipWeight
 	}
-	if newWeight >= e.threshold && !slot.willBe(v.Kind) {
-		e.handleCertificate(e.buildCertificate(slot, v))
+	if newWeight >= e.threshold() && !slot.willBe(v.Kind) {
+		// Attested, not verified — see Engine.seal for the evidence chain that
+		// makes every signature in this certificate already checked.
+		e.handleCertificate(e.seal(e.buildCertificate(slot, v)))
 	}
 }
 
@@ -356,7 +358,8 @@ func (e *Engine) buildCertificate(slot *poolSlot, v Vote) *Certificate {
 // entry point for both network certificates and locally assembled ones; the
 // saving flag makes the persist single-flight per (slot, kind) while the engine
 // keeps serving other inputs.
-func (e *Engine) handleCertificate(cert *Certificate) {
+func (e *Engine) handleCertificate(vc VerifiedCertificate) {
+	cert := vc.Certificate()
 	slot := e.slots.at(cert.Vote.Slot())
 	if slot == nil || !slot.needs(cert.Vote) {
 		return
@@ -365,7 +368,7 @@ func (e *Engine) handleCertificate(cert *Certificate) {
 	*saving = true
 
 	e.journal.SaveCertificate(cert, e.journalDone(func(err error) {
-		e.finishCertificateSave(cert, err)
+		e.finishCertificateSave(vc, err)
 	}))
 }
 
@@ -373,7 +376,8 @@ func (e *Engine) handleCertificate(cert *Certificate) {
 // durable. The pool may have moved on while the write was in flight: a
 // finalization can prune the slot, in which case the certificate is obsolete
 // and dropped, which is why the slot is re-resolved after the write.
-func (e *Engine) finishCertificateSave(cert *Certificate, err error) {
+func (e *Engine) finishCertificateSave(vc VerifiedCertificate, err error) {
+	cert := vc.Certificate()
 	if err != nil && !errors.Is(err, ErrAlreadySaved) {
 		e.fatal(fmt.Errorf("simplex: certificate journal write: %w", err))
 		return
@@ -392,12 +396,13 @@ func (e *Engine) finishCertificateSave(cert *Certificate, err error) {
 		}
 	}
 
-	e.storeSavedCertificate(slot, cert)
+	e.storeSavedCertificate(slot, vc)
 }
 
 // storeSavedCertificate finishes certificate application after it became
 // durable: records it in the slot, gossips it and runs the typed transition.
-func (e *Engine) storeSavedCertificate(slot *poolSlot, cert *Certificate) {
+func (e *Engine) storeSavedCertificate(slot *poolSlot, vc VerifiedCertificate) {
+	cert := vc.Certificate()
 	certSlot, saving := slot.certByKind(cert.Vote.Kind)
 	if *certSlot != nil {
 		e.fatal(fmt.Errorf("simplex: duplicate %s certificate for slot %d", cert.Vote.Kind, cert.Vote.Slot()))
@@ -406,13 +411,27 @@ func (e *Engine) storeSavedCertificate(slot *poolSlot, cert *Certificate) {
 	*certSlot = cert
 	*saving = false
 	e.stats.CertificatesStored++
+	if kind := cert.Vote.Kind; kind < VoteKindCount {
+		e.stats.CertificatesByKind[kind]++
+		e.stats.SignaturesByKind[kind] += uint64(len(cert.Signatures))
+	}
 
-	voters := make([]byte, len(e.validators))
+	voters := make([]byte, len(e.validators()))
 	for i := range voters {
 		voters[i] = '.'
 	}
+	if e.stats.LastSignedSlot == nil {
+		e.stats.LastSignedSlot = make([]uint32, len(voters))
+	}
+	slotNumber := cert.Vote.Slot()
 	for _, s := range cert.Signatures {
 		voters[s.ValidatorIndex] = 'V'
+		// Highest slot this validator has been seen signing, which is what says
+		// a voter has gone quiet before the session stops finalizing.
+		if int(s.ValidatorIndex) < len(e.stats.LastSignedSlot) &&
+			slotNumber > e.stats.LastSignedSlot[s.ValidatorIndex] {
+			e.stats.LastSignedSlot[s.ValidatorIndex] = slotNumber
+		}
 	}
 	e.log.Info().Msgf("obtained certificate for %s: %s", cert.Vote, voters)
 
@@ -423,11 +442,11 @@ func (e *Engine) storeSavedCertificate(slot *poolSlot, cert *Certificate) {
 
 	switch cert.Vote.Kind {
 	case VoteNotarize:
-		e.onNotarCertificate(cert)
+		e.onNotarCertificate(vc)
 	case VoteSkip:
 		e.onSkipCertificate(slot, cert)
 	case VoteFinalize:
-		e.onFinalCertificate(slot, cert)
+		e.onFinalCertificate(slot, vc)
 	}
 	if e.failed() {
 		return
@@ -435,10 +454,10 @@ func (e *Engine) storeSavedCertificate(slot *poolSlot, cert *Certificate) {
 	e.resolveParentWaits()
 }
 
-func (e *Engine) onNotarCertificate(cert *Certificate) {
-	id := cert.Vote.ID
+func (e *Engine) onNotarCertificate(vc VerifiedCertificate) {
+	id := vc.Vote().ID
 
-	e.enqueue(func() { e.hooks.OnNotarized(id, cert) })
+	e.enqueue(func() { e.hooks.OnNotarized(id, vc) })
 	if e.voter != nil {
 		e.enqueue(func() { e.voterNotarizationObserved(id) })
 	}
@@ -472,7 +491,8 @@ func (e *Engine) onSkipCertificate(slot *poolSlot, cert *Certificate) {
 	e.advancePresent()
 }
 
-func (e *Engine) onFinalCertificate(slot *poolSlot, cert *Certificate) {
+func (e *Engine) onFinalCertificate(slot *poolSlot, vc VerifiedCertificate) {
+	cert := vc.Certificate()
 	id := cert.Vote.ID
 
 	// A finalize quorum over a skipped slot (or over two different
@@ -499,8 +519,9 @@ func (e *Engine) onFinalCertificate(slot *poolSlot, cert *Certificate) {
 	e.lastFinalCert = cert
 	e.slots.notifyFinalized(id.Slot)
 	e.stats.SlotsFinalized++
+	e.stats.LastFinalizedAt = e.clock.Now()
 
-	e.enqueue(func() { e.hooks.OnFinalized(id, cert) })
+	e.enqueue(func() { e.hooks.OnFinalized(id, vc) })
 	if e.voter != nil {
 		e.enqueue(func() { e.voterFinalizationObserved(id) })
 	}
@@ -756,7 +777,7 @@ func (e *Engine) stepDrain(now time.Time) {
 	}
 	for d.idx < len(d.msgs) {
 		msg := d.msgs[d.idx]
-		cost := float64(len(msg) * len(e.validators))
+		cost := float64(len(msg) * len(e.validators()))
 		if d.quota < cost {
 			delay := (cost - d.quota) / rate
 			at := d.quotaTime.Add(time.Duration(delay * float64(time.Second)))

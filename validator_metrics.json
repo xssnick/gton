@@ -71,60 +71,994 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "description": "Time until validation has a semantic decision. This excludes the subsequent ValidAfter wait.",
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Stacked mean contribution per completed validation. The white line is mean end-to-end ready time; red is total p95 and is intentionally not stacked.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 55,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "load_candidate"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Load candidate"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#5794F2",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "resolve_parent"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Resolve parent"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#73BF69",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "wait_min_block_interval"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Wait for minimum block interval"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FF9830",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "semantic_validation"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Semantic validation"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#B877D9",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "wait_valid_after"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Wait until ValidAfter"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FADE2A",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total average"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "B",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 3
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FFFFFF",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total p95"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "C",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#F2495C",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
       "id": 5,
-      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
       "targets": [
-        { "expr": "histogram_quantile(0.50, sum(rate(${metric_namespace}_validator_validation_decision_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p50", "refId": "A" },
-        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_validator_validation_decision_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p95", "refId": "B" },
-        { "expr": "histogram_quantile(0.99, sum(rate(${metric_namespace}_validator_validation_decision_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p99", "refId": "C" }
+        {
+          "expr": "sum by (stage) (rate(${metric_namespace}_validator_validation_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\",stage=~\"load_candidate|resolve_parent|wait_min_block_interval|semantic_validation|wait_valid_after\"}[$__rate_interval])) / scalar(sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\"}[$__rate_interval])) / sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\"}[$__rate_interval]))",
+          "legendFormat": "Total average",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\",result=\"success\"}[$__rate_interval])) by (le))",
+          "legendFormat": "Total p95",
+          "refId": "C"
+        }
       ],
-      "title": "Validation decision latency",
+      "title": "Masterchain validation time budget",
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "description": "End-to-end validation time until the vote continuation is released.",
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Stacked mean contribution per completed validation. The white line is mean end-to-end ready time; red is total p95 and is intentionally not stacked.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 55,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "load_candidate"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Load candidate"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#5794F2",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "resolve_parent"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Resolve parent"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#73BF69",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "wait_min_block_interval"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Wait for minimum block interval"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FF9830",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "semantic_validation"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Semantic validation"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#B877D9",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "wait_valid_after"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Wait until ValidAfter"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FADE2A",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total average"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "B",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 3
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FFFFFF",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total p95"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "C",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#F2495C",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
       "id": 6,
-      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
       "targets": [
-        { "expr": "histogram_quantile(0.50, sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p50", "refId": "A" },
-        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p95", "refId": "B" },
-        { "expr": "histogram_quantile(0.99, sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p99", "refId": "C" }
+        {
+          "expr": "sum by (stage) (rate(${metric_namespace}_validator_validation_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\",stage=~\"load_candidate|resolve_parent|wait_min_block_interval|semantic_validation|wait_valid_after\"}[$__rate_interval])) / scalar(sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\"}[$__rate_interval])) / sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\"}[$__rate_interval]))",
+          "legendFormat": "Total average",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\",result=\"success\"}[$__rate_interval])) by (le))",
+          "legendFormat": "Total p95",
+          "refId": "C"
+        }
       ],
-      "title": "Validation ready latency",
+      "title": "Shardchain validation time budget",
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "description": "p95 validation stage latency. Backend is inclusive; core_* panels split its deterministic internals.",
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 13 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Stacked mean contribution per completed validation. wait_inputs is passive event-driven sync waiting and is subtracted from the working stages; total lines cover the enclosing semantic-validation task.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 55,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "restore_state"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Restore state"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#56A64B",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "prepare_master_view"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Prepare masterchain view"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#8AB8FF",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "resolve_chain_inputs"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Resolve chain inputs"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#F2CC0C",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "decode_candidate"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Decode candidate"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#3274D9",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "verify_transition"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Verify state transition"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#B877D9",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "wait_inputs"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Wait for sync inputs"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#F2495C",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total average"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "B",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 3
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FFFFFF",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total p95"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "C",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#F2495C",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
       "id": 7,
-      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
       "targets": [
-        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_validator_validation_stage_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\"}[$__rate_interval])) by (le,chain,stage))", "legendFormat": "{{chain}} / {{stage}}", "refId": "A" }
+        {
+          "expr": "sum by (stage) (rate(${metric_namespace}_validator_validation_semantic_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\",stage=~\"restore_state|prepare_master_view|resolve_chain_inputs|decode_candidate|verify_transition|wait_inputs\"}[$__rate_interval])) / scalar(sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_validator_validation_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\",stage=\"semantic_validation\"}[$__rate_interval])) / sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\"}[$__rate_interval]))",
+          "legendFormat": "Total average",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_validator_validation_stage_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\",stage=\"semantic_validation\"}[$__rate_interval])) by (le))",
+          "legendFormat": "Total p95",
+          "refId": "C"
+        }
       ],
-      "title": "Validation stages p95",
+      "title": "Masterchain semantic validation budget",
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "description": "Backend attempt outcomes and retry causes expose local-state starvation.",
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 12, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "ops" }, "overrides": [] },
-      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 13 },
-      "id": 8,
-      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Stacked mean contribution per completed validation. wait_inputs is passive event-driven sync waiting and is subtracted from the working stages; total lines cover the enclosing semantic-validation task.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 55,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "restore_state"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Restore state"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#56A64B",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "prepare_master_view"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Prepare masterchain view"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#8AB8FF",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "resolve_chain_inputs"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Resolve chain inputs"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#F2CC0C",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "decode_candidate"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Decode candidate"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#3274D9",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "verify_transition"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Verify state transition"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#B877D9",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "wait_inputs"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Wait for sync inputs"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#F2495C",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total average"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "B",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 3
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FFFFFF",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total p95"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "C",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#F2495C",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
       "targets": [
-        { "expr": "sum(rate(${metric_namespace}_validator_validation_attempt_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\"}[$__rate_interval])) by (result)", "legendFormat": "attempt {{result}}", "refId": "A" },
-        { "expr": "sum(rate(${metric_namespace}_validator_validation_retries_total{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\"}[$__rate_interval])) by (reason)", "legendFormat": "retry {{reason}}", "refId": "B" }
+        {
+          "expr": "sum by (stage) (rate(${metric_namespace}_validator_validation_semantic_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\",stage=~\"restore_state|prepare_master_view|resolve_chain_inputs|decode_candidate|verify_transition|wait_inputs\"}[$__rate_interval])) / scalar(sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_validator_validation_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\",stage=\"semantic_validation\"}[$__rate_interval])) / sum(rate(${metric_namespace}_validator_validation_ready_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\"}[$__rate_interval]))",
+          "legendFormat": "Total average",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_validator_validation_stage_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\",stage=\"semantic_validation\"}[$__rate_interval])) by (le))",
+          "legendFormat": "Total p95",
+          "refId": "C"
+        }
       ],
-      "title": "Validation attempts and retries",
+      "title": "Shardchain semantic validation budget",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Outcomes of the single semantic-validation task. Missing inputs suspend that task and appear as wait_inputs in the semantic stack.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 22
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(${metric_namespace}_validator_validation_task_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\"}[$__rate_interval])) by (result)",
+		  "legendFormat": "task {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Validation tasks by result",
       "type": "timeseries"
     },
     {
@@ -155,37 +1089,413 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "description": "Integrated collator build latency, including input acquisition and candidate serialization.",
+      "description": "p50, p95, and p99 masterchain integrated-collator build latency, including input acquisition and candidate serialization.",
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 22 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
       "id": 11,
       "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "expr": "histogram_quantile(0.50, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p50", "refId": "A" },
-        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p95", "refId": "B" },
-        { "expr": "histogram_quantile(0.99, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\",result=\"success\"}[$__rate_interval])) by (le,chain))", "legendFormat": "{{chain}} p99", "refId": "C" }
+        { "expr": "histogram_quantile(0.50, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",result=\"success\"}[$__rate_interval])) by (le))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",result=\"success\"}[$__rate_interval])) by (le))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",result=\"success\"}[$__rate_interval])) by (le))", "legendFormat": "p99", "refId": "C" }
       ],
-      "title": "Integrated collator build latency",
+      "title": "Masterchain collator build latency",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "description": "p95 non-overlapping production stages after the candidate build and inside local acquisition.",
+      "description": "p50, p95, and p99 shardchain integrated-collator build latency, including input acquisition and candidate serialization.",
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 30 },
-      "id": 12,
-      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "id": 20,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_stage_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\"}[$__rate_interval])) by (le,chain,stage))", "legendFormat": "{{chain}} / {{stage}}", "refId": "A" }
+        { "expr": "histogram_quantile(0.50, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",result=\"success\"}[$__rate_interval])) by (le))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",result=\"success\"}[$__rate_interval])) by (le))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",result=\"success\"}[$__rate_interval])) by (le))", "legendFormat": "p99", "refId": "C" }
       ],
-      "title": "Integrated collator stages p95",
+      "title": "Shardchain collator build latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Stacked mean contribution per candidate build. External-message waiting is exclusive and no longer included in candidate assembly. Total p95 is intentionally not stacked.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 55,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "acquire_inputs"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Acquire inputs"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#56A64B",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "assemble_candidate"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Assemble candidate"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#3274D9",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "wait_external_messages"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Wait for external messages"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FF9830",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total average"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "B",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 3
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FFFFFF",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total p95"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "C",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#F2495C",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 38
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (stage) (rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",stage=~\"acquire_inputs|assemble_candidate|wait_external_messages\"}[$__rate_interval])) / scalar(sum(rate(${metric_namespace}_collator_build_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_build_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\"}[$__rate_interval])) / sum(rate(${metric_namespace}_collator_build_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\"}[$__rate_interval]))",
+          "legendFormat": "Total average",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",result=\"success\"}[$__rate_interval])) by (le))",
+          "legendFormat": "Total p95",
+          "refId": "C"
+        }
+      ],
+      "title": "Masterchain collation time budget",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Stacked mean contribution per candidate build. External-message waiting is exclusive and no longer included in candidate assembly. Total p95 is intentionally not stacked.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 55,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "acquire_inputs"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Acquire inputs"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#56A64B",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "assemble_candidate"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Assemble candidate"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#3274D9",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "wait_external_messages"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Wait for external messages"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FF9830",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total average"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "B",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 3
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FFFFFF",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total p95"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "group": "C",
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#F2495C",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 38
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (stage) (rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=~\"acquire_inputs|assemble_candidate|wait_external_messages\"}[$__rate_interval])) / scalar(sum(rate(${metric_namespace}_collator_build_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_build_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\"}[$__rate_interval])) / sum(rate(${metric_namespace}_collator_build_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\"}[$__rate_interval]))",
+          "legendFormat": "Total average",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",result=\"success\"}[$__rate_interval])) by (le))",
+          "legendFormat": "Total p95",
+          "refId": "C"
+        }
+      ],
+      "title": "Shardchain collation time budget",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "$datasource" },
       "description": "Slot-boundary lateness and soft/hard deadline decisions. Any growth here directly threatens candidate delivery.",
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 30 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 47 },
       "id": 13,
       "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
@@ -198,7 +1508,7 @@
       "datasource": { "type": "prometheus", "uid": "$datasource" },
       "description": "Deadline actions and candidate production result rate.",
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 25, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "ops" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 39 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 47 },
       "id": 14,
       "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
@@ -212,7 +1522,7 @@
       "datasource": { "type": "prometheus", "uid": "$datasource" },
       "description": "p95 signed-candidate delivery duration through persistence, state commit, schedule wait, and emission.",
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 39 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 47 },
       "id": 15,
       "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
@@ -225,7 +1535,7 @@
       "datasource": { "type": "prometheus", "uid": "$datasource" },
       "description": "p95 transactions, imported messages, and resulting outbound queue size per produced block.",
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 39 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 55 },
       "id": 16,
       "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
@@ -241,7 +1551,7 @@
       "datasource": { "type": "prometheus", "uid": "$datasource" },
       "description": "Rates of external-phase stop causes, final load classes, and explicit overload causes.",
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 18, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "ops" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 47 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 63 },
       "id": 17,
       "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
@@ -250,6 +1560,78 @@
         { "expr": "sum(rate(${metric_namespace}_collator_overload_total{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=~\"$chain\",reason!=\"none\"}[$__rate_interval])) by (chain,reason)", "legendFormat": "overload {{chain}} / {{reason}}", "refId": "C" }
       ],
       "title": "Integrated candidate pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "Rate of transitions into rejected local validator or observer session specifications. Session IDs and error text are deliberately not labels.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 25, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 71 },
+      "id": 19,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(${metric_namespace}_validator_session_spec_rejections_total{job=~\"$job\",instance=~\"$instance\",chain=~\"$chain\"}[$__rate_interval])) by (chain,role,reason)", "legendFormat": "{{chain}} / {{role}} / {{reason}}", "refId": "A" }
+      ],
+      "title": "Session specification rejections",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "description": "Lazy cell loads by the layer that answered them, cheapest at the bottom. The layers are disjoint, so the stack height is the total load rate and its shape is where the reads are being served. state_window, decoded_cache and record_cache are OBSERVED (a record_cache hit skips the store read but still decodes the record). The three store-read layers are INFERRED from how long the read took, cut at 50us and 400us \u2014 the geometric midpoints between tiers measured on this deployment's disk (26.3us pebble block cache, 90.3us OS page cache, 1.585ms device). Cross-check them against ${metric_namespace}_storage_cell_db_cache_requests_total{result=\"miss\"}, which is pebble's own accounting and needs no inference: if disk climbs while that stays flat, the thresholds have drifted from this hardware and want re-measuring.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 60,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "normal" }
+          },
+          "unit": "ops"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "resident state window" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "decoded cell cache" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "record cache (bytes tier)" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "purple", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "pebble block cache (inferred)" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "OS page cache (inferred)" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "device (inferred)" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 79 },
+      "id": 22,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        { "expr": "sum(rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\",instance=~\"$instance\",layer=\"state_window\"}[$__rate_interval]))", "legendFormat": "resident state window", "refId": "A" },
+        { "expr": "sum(rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\",instance=~\"$instance\",layer=\"decoded_cache\"}[$__rate_interval]))", "legendFormat": "decoded cell cache", "refId": "B" },
+        { "expr": "sum(rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\",instance=~\"$instance\",layer=\"record_cache\"}[$__rate_interval]))", "legendFormat": "record cache (bytes tier)", "refId": "C" },
+        { "expr": "sum(rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\",instance=~\"$instance\",layer=\"block_cache\"}[$__rate_interval]))", "legendFormat": "pebble block cache (inferred)", "refId": "D" },
+        { "expr": "sum(rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\",instance=~\"$instance\",layer=\"page_cache\"}[$__rate_interval]))", "legendFormat": "OS page cache (inferred)", "refId": "E" },
+        { "expr": "sum(rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\",instance=~\"$instance\",layer=\"disk\"}[$__rate_interval]))", "legendFormat": "device (inferred)", "refId": "F" }
+      ],
+      "title": "Lazy cell loads by layer",
       "type": "timeseries"
     }
   ],
@@ -336,6 +1718,6 @@
   "timezone": "browser",
   "title": "GTON Validator Metrics",
   "uid": "gton-validator-metrics",
-  "version": 1,
+  "version": 3,
   "weekStart": ""
 }

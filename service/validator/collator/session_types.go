@@ -32,7 +32,7 @@ type SessionValidator struct {
 	Weight    uint64
 }
 
-// Session contains the immutable inputs needed to authenticate Delegated-v3
+// Session contains the immutable inputs needed to authenticate delegated
 // requests for one consensus session. Activation anchors are deliberately
 // separate: a future session is fully routable and may accept delegations
 // before its exact predecessor set is known.
@@ -212,7 +212,7 @@ const (
 )
 
 // OverlayRole controls whether the local ADNL identity only observes a private
-// consensus overlay or may receive Delegated-v3 collation requests for it.
+// consensus overlay or may receive delegated collation requests for it.
 type OverlayRole uint8
 
 const (
@@ -223,14 +223,18 @@ const (
 // OverlaySession contains the immutable inputs needed to create the private
 // consensus overlay and, when selected, its block-sync broadcast overlay.
 // Session.Validators supplies the canonical roster order, validator public
-// keys, and validator ADNL identities. AllOverlayNodes is the wider persistent
-// membership used by block sync and observer-enabled private overlays. Every
-// slice is immutable after it is passed to ConsensusObserver, so an implementation
-// may retain it without copying.
+// keys, and validator ADNL identities. AllCurrentValidators is the resolved
+// ADNL roster from persistent config parameter 34 and supplies two-step
+// intermediates. AllOverlayNodes is the wider persistent membership used by
+// block sync and observer-enabled private overlays. Every slice is immutable
+// after it is passed to ConsensusObserver, so an implementation may retain it
+// without copying.
 type OverlaySession struct {
 	Session                   Session
 	Role                      OverlayRole
 	CollatorsByValidator      []groups.CollatorRegistryEntry
+	AllCollators              [][32]byte
+	AllCurrentValidators      [][32]byte
 	AllOverlayNodes           [][32]byte
 	MaxBlockSize              uint32
 	MaxCollatedDataSize       uint32

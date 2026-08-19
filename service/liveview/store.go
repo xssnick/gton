@@ -33,6 +33,11 @@ type Options struct {
 	NonFinalEnabled    bool
 	NonFinalCache      int
 	NonFinalCellLoader cell.LazyCellLoader
+	// AcceptedStateCache bounds the states published ahead of their commit by
+	// PublishAcceptedBlockState. Zero and negative both take
+	// DefaultAcceptedStateCache: an uncommitted state is pinned while it is
+	// published, so there is deliberately no way to ask for an unbounded set.
+	AcceptedStateCache int
 	LiveBlockCache     *storage.LiveBlockCache
 	// FragmentBuildWorkers moves the per-block BlockView build (state root
 	// proof, accounts-dict prewarm, and for masterchain blocks the config epoch
@@ -56,6 +61,7 @@ type Store struct {
 	masterchainInfo    liveMasterchainInfo
 	readyMasterSeqno   uint32
 	notify             chan struct{}
+	blockArtifacts     chan struct{}
 	blocks             map[storage.BlockRootHash]*liveBlock
 	metas              map[storage.BlockRootHash]*storage.BlockMeta
 	states             map[liveBlockLookupKey]storage.BlockState
@@ -78,9 +84,15 @@ type Store struct {
 	nonFinalWaiting    map[storage.BlockRootHash]liveNonfinalWaiting
 	nonFinalCellIndex  map[cell.Hash][]liveNonfinalCellIndexEntry
 	nonFinalCellLoader cell.LazyCellLoader
-	blockDataLoad      liveLoadGroup[liveBlockLookupKey, []byte]
-	blockLoad          liveLoadGroup[liveBlockLookupKey, *liveBlockLoadResult]
-	fragmentLoad       liveLoadGroup[liveBlockLookupKey, *BlockView]
+	// acceptedStates holds the blocks this node finalized itself and published
+	// before their commit, with acceptedOrder giving the release order. See
+	// accepted_state.go.
+	acceptedStates    map[storage.BlockRootHash]ton.BlockIDExt
+	acceptedOrder     []storage.BlockRootHash
+	acceptedCacheSize int
+	blockDataLoad     liveLoadGroup[liveBlockLookupKey, []byte]
+	blockLoad         liveLoadGroup[liveBlockLookupKey, *liveBlockLoadResult]
+	fragmentLoad      liveLoadGroup[liveBlockLookupKey, *BlockView]
 
 	fragmentBuildSlots   chan struct{}
 	fragmentMasterSlots  chan struct{}
@@ -99,6 +111,18 @@ type liveBlock struct {
 	// its view was still being built, so a view installed afterwards must not
 	// start filling the per-current caches again.
 	currentCachesReleased bool
+	// acceptedOwner records that this entry was installed by an accepted-state
+	// publication and that nothing else has published the block since. It is the
+	// OWNERSHIP the accepted-state bookkeeping is allowed to act on: releasing an
+	// accepted publication takes the live block with it only while this is true,
+	// because once any other producer has published the same block that producer
+	// owns the entry and dropping it would destroy a publication this bookkeeping
+	// never made. See dropAcceptedStateLocked.
+	//
+	// It is deliberately NOT merged with the previous value in putBlockLocked: an
+	// ordinary publication of a block that had one clears it, which is exactly the
+	// transfer of ownership being recorded.
+	acceptedOwner bool
 }
 
 type liveBlockFlush struct {
@@ -122,6 +146,10 @@ type livePreparedBlockArtifacts struct {
 	proofs          []storage.LiveBlockProofArtifact
 	artifactFlushed bool
 	stateFlushed    bool
+	// accepted marks the one publication this node produced itself and has not
+	// committed anywhere. It becomes liveBlock.acceptedOwner, which is what the
+	// accepted-state bookkeeping is allowed to release.
+	accepted bool
 }
 
 type liveMasterchainInfo struct {
@@ -193,6 +221,7 @@ func New(store Backing, opts ...Options) *Store {
 	live := &Store{
 		backing:            store,
 		notify:             make(chan struct{}),
+		blockArtifacts:     make(chan struct{}),
 		blocks:             map[storage.BlockRootHash]*liveBlock{},
 		metas:              map[storage.BlockRootHash]*storage.BlockMeta{},
 		states:             map[liveBlockLookupKey]storage.BlockState{},
@@ -212,6 +241,8 @@ func New(store Backing, opts ...Options) *Store {
 		nonFinalWaiting:    map[storage.BlockRootHash]liveNonfinalWaiting{},
 		nonFinalCellIndex:  map[cell.Hash][]liveNonfinalCellIndexEntry{},
 		nonFinalCellLoader: nonFinalCellLoader,
+		acceptedStates:     map[storage.BlockRootHash]ton.BlockIDExt{},
+		acceptedCacheSize:  acceptedStateCacheSize(cfg.AcceptedStateCache),
 
 		fragmentBuildSlots:   fragmentBuildSlots,
 		fragmentMasterSlots:  fragmentMasterSlots,

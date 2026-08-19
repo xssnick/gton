@@ -16,7 +16,7 @@ func TestBuildShardWithReadyExternalsDrainsAlreadyAdmittedMessages(t *testing.T)
 	req, pool, stream := readyExternalFixture(t, externalAcceptCode(t), 1)
 	addReadyExternal(t, pool, readyExternalAddress(), 1)
 
-	candidate, err := testBuilder().buildShardWithReadyExternals(
+	candidate, _, err := testBuilder().buildShardWithReadyExternals(
 		t.Context(),
 		req,
 		stream,
@@ -46,7 +46,7 @@ func TestBuildShardWithReadyExternalsConsumesAdmissionsUntilSlotBoundary(t *test
 	}
 	result := make(chan buildResult, 1)
 	go func() {
-		candidate, err := testBuilder().buildShardWithReadyExternals(
+		candidate, _, err := testBuilder().buildShardWithReadyExternals(
 			t.Context(),
 			req,
 			stream,
@@ -87,7 +87,7 @@ func TestBuildShardWithReadyExternalsSharesAttemptBudgetAcrossBatches(t *testing
 		addReadyExternal(t, pool, readyExternalAddress(), i+1)
 	}
 
-	candidate, err := testBuilder().buildShardWithReadyExternals(
+	candidate, _, err := testBuilder().buildShardWithReadyExternals(
 		t.Context(),
 		req,
 		stream,
@@ -124,7 +124,7 @@ func TestBuildMasterWithReadyExternalsUsesOnlyStartSnapshot(t *testing.T) {
 	t.Cleanup(func() { _ = stream.Close() })
 	addReadyExternal(t, pool, dst, 2)
 
-	candidate, err := testBuilder().buildMasterWithReadyExternals(
+	candidate, _, err := testBuilder().buildMasterWithReadyExternals(
 		t.Context(),
 		fixture.request,
 		stream,
@@ -157,7 +157,7 @@ func TestBuildMasterWithReadyExternalsHonorsExternalPhaseDeadline(t *testing.T) 
 	}
 	t.Cleanup(func() { _ = stream.Close() })
 
-	candidate, err := testBuilder().buildMasterWithReadyExternals(
+	candidate, _, err := testBuilder().buildMasterWithReadyExternals(
 		t.Context(),
 		fixture.request,
 		stream,
@@ -188,7 +188,7 @@ func TestBuildShardReadyExternalSizeRetryReplaysFrozenTranscript(t *testing.T) {
 		return stream
 	}
 
-	natural, err := testBuilder().buildShardWithReadyExternals(
+	natural, _, err := testBuilder().buildShardWithReadyExternals(
 		t.Context(),
 		req,
 		openEmptyStream(),
@@ -205,7 +205,7 @@ func TestBuildShardReadyExternalSizeRetryReplaysFrozenTranscript(t *testing.T) {
 	}
 	req.Masterchain.Config.maxBlockBytes = uint32(len(natural.BlockBOC)) - 1
 
-	smaller, err := testBuilder().buildShardWithReadyExternals(
+	smaller, _, err := testBuilder().buildShardWithReadyExternals(
 		t.Context(),
 		req,
 		openEmptyStream(),

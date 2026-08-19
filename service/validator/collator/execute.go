@@ -232,6 +232,25 @@ func (c *collation) processNewMessages(enqueueOnly bool) error {
 		if err := c.ctx.Err(); err != nil {
 			return err
 		}
+		// Parity with collator.cpp:4847-4854, which re-reads the normal limit
+		// class and the soft timeout at the TOP of every heap item — before
+		// extra_out_msgs-- and before the enqueue_only latch, which is why both
+		// checks sit above popMin here. Reading only the c.blockFull FIELD (the
+		// pre-fix behaviour) misses every way the estimate grows without an
+		// immediate delivery: enqueue() charges cells through insert() and
+		// re-proofs the queue root every 64 ops, so a drain could cross the
+		// normal class and keep executing in-block messages the reference would
+		// have enqueued. deliverImmediate's own post-delivery check
+		// (:377-379, the port of collator.cpp:3727-3731) covers only the
+		// delivery path.
+		c.updateCollatedEstimate()
+		if !c.limits.fits(LoadNormal) {
+			c.blockFull = true
+		}
+		if !c.blockFull && c.internalMsgExpired() {
+			c.blockFull = true
+			c.stats.InternalMsgTimeouts++
+		}
 		item := c.new.popMin()
 		c.limits.extraOutMsgs--
 		if c.blockFull || c.haveUnprocessedDispatchQueue {
@@ -312,7 +331,7 @@ func (c *collation) deliverImmediate(
 	internal *tlb.InternalMessage,
 	destination msgpool.AccountPrefix,
 ) error {
-	if err := c.advanceProcessedBound(item.lt, item.hash); err != nil {
+	if err := c.advanceProcessedBound("generated", item.lt, item.hash); err != nil {
 		return err
 	}
 	prepared, err := tvm.PrepareMessage(item.root)
@@ -376,6 +395,13 @@ func (c *collation) deliverImmediate(
 	c.updatePeakLoad()
 	if !c.limits.fits(LoadNormal) {
 		c.blockFull = true
+	} else if c.internalMsgExpired() {
+		// collator.cpp:3732-3736, the second half of process_one_new_message's
+		// "check whether the block is full now" step. Both arms return 3 there,
+		// which latches enqueue_only for the next heap item; setting c.blockFull
+		// is how the loop-top latch above reaches the same state.
+		c.blockFull = true
+		c.stats.InternalMsgTimeouts++
 	}
 	return nil
 }
@@ -473,6 +499,18 @@ func (c *collation) executePrepared(message *tvm.PreparedMessage, afterLT uint64
 	lane, err := c.account(destination)
 	if err != nil {
 		return nil, nil, err
+	}
+	// Parity with collator.cpp:3317-3319, whose own comment at :3398-3399 states
+	// the rule: "transactions processing external messages must have lt larger
+	// than all processed internal messages". Without this floor an external
+	// message always restarts at StartLt+1, so once an immediate delivery or a
+	// queue import has moved the processed bound above StartLt+1, the messages
+	// this transaction generates carry a created_lt BENEATH the bound and
+	// advanceProcessedBound -- the port of collator.cpp:3493-3505 -- rejects
+	// them. The reference gates the clause on `external`: an imported internal
+	// message is deliberately NOT floored.
+	if message.Message().MsgType == tlb.MsgTypeExternalIn {
+		afterLT = max(afterLT, c.lastProcLT)
 	}
 	if emittedLT, ok := c.lastDispatchEmitted[lane.key]; ok {
 		afterLT = max(afterLT, emittedLT)

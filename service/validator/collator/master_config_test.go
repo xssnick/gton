@@ -3,6 +3,7 @@ package collator
 import (
 	"bytes"
 	"math/big"
+	"slices"
 	"strings"
 	"testing"
 
@@ -95,6 +96,57 @@ func TestValidateKnownConfigParameterRejectsUnknownPositive(t *testing.T) {
 	}
 }
 
+func TestValidateValidatorRegistryConfigParameter(t *testing.T) {
+	for _, withNewCodeHash := range []bool{false, true} {
+		parameter := cell.BeginCell().
+			MustStoreUInt(validatorRegistryConfigConstructor, 32).
+			MustStoreUInt(1, 256).
+			MustStoreUInt(10, 32).
+			MustStoreBoolBit(withNewCodeHash)
+		if withNewCodeHash {
+			parameter.MustStoreUInt(2, 256)
+		}
+
+		raw := masterConfigTestRaw(t, 46, parameter.EndCell())
+		if err := validateKnownConfigParameter(raw, 46); err != nil {
+			t.Fatalf("new_code_hash=%v: %v", withNewCodeHash, err)
+		}
+	}
+}
+
+func TestValidateValidatorRegistryConfigParameterRejectsMalformed(t *testing.T) {
+	tests := map[string]*cell.Cell{
+		"constructor": cell.BeginCell().
+			MustStoreUInt(0, 32).
+			MustStoreUInt(1, 256).
+			MustStoreUInt(10, 32).
+			MustStoreBoolBit(false).
+			EndCell(),
+		"missing code hash": cell.BeginCell().
+			MustStoreUInt(validatorRegistryConfigConstructor, 32).
+			MustStoreUInt(1, 256).
+			MustStoreUInt(10, 32).
+			MustStoreBoolBit(true).
+			EndCell(),
+		"trailing data": cell.BeginCell().
+			MustStoreUInt(validatorRegistryConfigConstructor, 32).
+			MustStoreUInt(1, 256).
+			MustStoreUInt(10, 32).
+			MustStoreBoolBit(false).
+			MustStoreBoolBit(true).
+			EndCell(),
+	}
+
+	for name, parameter := range tests {
+		t.Run(name, func(t *testing.T) {
+			raw := masterConfigTestRaw(t, 46, parameter)
+			if err := validateKnownConfigParameter(raw, 46); err == nil {
+				t.Fatal("malformed validator registry parameter was accepted")
+			}
+		})
+	}
+}
+
 // TestValidateKnownConfigParameterAcceptedSet pins the exact set of positive
 // parameter ids the switch recognises. An id missing from it stops the node:
 // validateMasterConfigData runs over the CURRENT config, so one unrecognised
@@ -109,7 +161,7 @@ func TestValidateKnownConfigParameterAcceptedSet(t *testing.T) {
 	for _, id := range []uint32{
 		1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
 		20, 21, 22, 23, 24, 25, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 39, 40,
-		43, 44, 45, 71, 72, 73, 79, 80, 81, 82,
+		43, 44, 45, 46, 71, 72, 73, 79, 80, 81, 82,
 	} {
 		want[id] = struct{}{}
 	}
@@ -136,4 +188,71 @@ func masterConfigTestRaw(t *testing.T, id uint32, parameter *cell.Cell) tlb.Bloc
 		t.Fatal(err)
 	}
 	return tlb.BlockchainConfig{Root: dict.AsCell()}
+}
+
+// TestDeriveMasterConfigTransitionReuseMatchesFreshParse is the differential
+// guard for reusing the predecessor's prepared configuration.
+//
+// The outputs must match because they feed the candidate. The read sets must
+// match too, and that is the less obvious half: on the collation path this
+// function runs under the block's read set, the Merkle update descends only
+// through cells that set recorded, and the collated-size estimate answers
+// membership out of the same record — so reuse is sound exactly while the
+// replayed footprint is the set the skipped parses would have read.
+//
+// This half only bites while a wrong footprint is rejected, which is what
+// TestMasterConfigFootprintMutationsAreDetected keeps true.
+func TestDeriveMasterConfigTransitionReuseMatchesFreshParse(t *testing.T) {
+	fixture := newMasterBuildFixture(t, false)
+
+	fresh, freshReads := masterConfigTransitionReads(t, fixture, nil, nil)
+	reused, reusedReads := masterConfigTransitionReads(t, fixture,
+		fixture.request.Config, fixture.request.Groups.Config)
+
+	// Without this the test would pass vacuously if the gate ever stopped firing.
+	if reused.config != fixture.request.Config || reused.groups != fixture.request.Groups.Config {
+		t.Fatal("the reuse gate did not fire for an unchanged configuration")
+	}
+	if fresh.config == fixture.request.Config {
+		t.Fatal("the fresh branch returned the predecessor's prepared config")
+	}
+
+	if fresh.keyBlock != reused.keyBlock {
+		t.Fatalf("key block flag = %v reused, %v fresh", reused.keyBlock, fresh.keyBlock)
+	}
+	if !bytes.Equal(fresh.params.ConfigAddr, reused.params.ConfigAddr) ||
+		fresh.params.Config.Params.AsCell().HashKey() != reused.params.Config.Params.AsCell().HashKey() {
+		t.Fatal("reused transition installed different configuration parameters")
+	}
+	if fresh.groups.Catchain != reused.groups.Catchain {
+		t.Fatalf("catchain config = %+v reused, %+v fresh", reused.groups.Catchain, fresh.groups.Catchain)
+	}
+	if len(fresh.config.workchains) != len(reused.config.workchains) {
+		t.Fatalf("workchains = %d reused, %d fresh", len(reused.config.workchains), len(fresh.config.workchains))
+	}
+
+	// Set equality, not a count: the recorded set is what the update descends
+	// through and what the size estimate resolves membership against, so any
+	// difference here is a difference in the block the collator produces.
+	if !slices.Equal(freshReads, reusedReads) {
+		t.Fatalf("replaying the footprint recorded %d cells and parsing recorded %d; "+
+			"the two must be the same set or the two paths emit different blocks",
+			len(reusedReads), len(freshReads))
+	}
+
+	// Stripping the footprint must fall back to parsing rather than reuse. This
+	// is what keeps the equality above from passing vacuously the day capture
+	// silently starts returning nil, and it preserves the original measurement:
+	// the parses really do read thousands of cells nothing else on this path
+	// touches.
+	stripped := withFootprint(fixture.request.Config, nil)
+	fallback, fallbackReads := masterConfigTransitionReads(t, fixture, stripped, fixture.request.Groups.Config)
+	if fallback.config == stripped {
+		t.Fatal("a configuration without a footprint was reused on the recording path")
+	}
+	if !slices.Equal(freshReads, fallbackReads) {
+		t.Fatal("the footprint-less fallback did not read what a fresh parse reads")
+	}
+	t.Logf("configuration parse records %d cells, of which %d are the config footprint",
+		len(freshReads), len(fixture.request.Config.footprint.cells))
 }

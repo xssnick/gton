@@ -34,6 +34,7 @@ type groupReplayBlockKey struct {
 type GroupTracker struct {
 	current atomic.Pointer[groups.Tracker]
 	tracker *groups.Tracker
+	ready   chan struct{}
 
 	mu       sync.Mutex
 	buffered map[groupReplayBlockKey]groups.BufferedMasterchainState
@@ -47,6 +48,7 @@ func newGroupTracker(options groups.TrackerOptions) (*GroupTracker, error) {
 
 	return &GroupTracker{
 		tracker:  tracker,
+		ready:    make(chan struct{}),
 		buffered: make(map[groupReplayBlockKey]groups.BufferedMasterchainState),
 	}, nil
 }
@@ -69,6 +71,24 @@ func (h *GroupTracker) Project(previous *groups.Snapshot, input groups.ApplyInpu
 	}
 
 	return tracker.Project(previous, input)
+}
+
+func (h *GroupTracker) WaitProject(
+	ctx context.Context,
+	previous *groups.Snapshot,
+	input groups.ApplyInput,
+) (*groups.Snapshot, error) {
+	tracker := h.current.Load()
+	if tracker == nil {
+		select {
+		case <-h.ready:
+			tracker = h.current.Load()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	return tracker.WaitProject(ctx, previous, input)
 }
 
 // Apply advances the shared tracker after bootstrap.
@@ -108,6 +128,7 @@ func (h *GroupTracker) Bootstrap(
 		return nil, err
 	}
 	h.current.Store(h.tracker)
+	close(h.ready)
 	clear(h.buffered)
 
 	return transitions, nil

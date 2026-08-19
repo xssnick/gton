@@ -139,24 +139,156 @@ type validatorTestStorage struct {
 	mu        sync.Mutex
 	status    StorageStatus
 	statusErr error
-	journals  map[SessionStorageID]*validatorTestJournal
+	journals  map[validatorTestNamespace]*validatorTestJournal
+
+	// namespaces is the durable session index the reaper enumerates, and
+	// deletions is the ordered record of what it removed from it.
+	namespaces  []SessionStorageID
+	deletions   []SessionStorageID
+	sessionsErr error
+	deleteErr   error
+	// undeletable is the per-namespace rejection DeleteSession answers with. The
+	// store has one that no retry clears: a namespace whose summary row is
+	// missing or undecodable is refused for as long as it exists.
+	undeletable map[SessionStorageID]error
+	attempts    int
+	scans       int
 }
 
 func newValidatorTestStorage() *validatorTestStorage {
-	return &validatorTestStorage{journals: make(map[SessionStorageID]*validatorTestJournal)}
+	return &validatorTestStorage{journals: make(map[validatorTestNamespace]*validatorTestJournal)}
+}
+
+// validatorTestNamespace mirrors pebblestore.namespaceForSession by hand: the
+// consensus.dbId hash, plus the two path components the store wraps around it.
+// It is derived here independently of the production key type so a test that
+// keys a journal by it is pinning the reaper against the store's own identity
+// rather than against the reaper's opinion of it.
+type validatorTestNamespace struct {
+	dbID          [32]byte
+	shard         groups.ShardID
+	catchainSeqno uint32
+}
+
+func validatorTestNamespaceOf(id SessionStorageID) validatorTestNamespace {
+	// A store rejects every operation on an ID whose dbId cannot be derived, so
+	// all such IDs collapsing onto one key here is faithful enough for a double.
+	dbID, _ := id.Namespace()
+
+	return validatorTestNamespace{dbID: dbID, shard: id.Shard, catchainSeqno: id.CatchainSeqno}
+}
+
+func (s *validatorTestStorage) Sessions(context.Context) ([]SessionStorageID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.scans++
+	if s.sessionsErr != nil {
+		return nil, s.sessionsErr
+	}
+
+	return append([]SessionStorageID(nil), s.namespaces...), nil
+}
+
+func (s *validatorTestStorage) DeleteSession(_ context.Context, id SessionStorageID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.attempts++
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+	if err := s.undeletable[id]; err != nil {
+		return err
+	}
+	for i, stored := range s.namespaces {
+		if stored != id {
+			continue
+		}
+		s.namespaces = append(s.namespaces[:i], s.namespaces[i+1:]...)
+		s.deletions = append(s.deletions, id)
+		// Deleting a namespace takes its vote journal with it, exactly as
+		// pebblestore.DeleteSession does: it range-deletes the vote prefix and
+		// marks the bound journal handle deleted. Modelling that here is what
+		// makes "the live generation survived a pass" an assertion about the
+		// double-vote record rather than about a bookkeeping slice.
+		if journal := s.journals[validatorTestNamespaceOf(id)]; journal != nil {
+			journal.wipe()
+		}
+		delete(s.journals, validatorTestNamespaceOf(id))
+
+		return nil
+	}
+
+	return storage.ErrNotFound
+}
+
+func (s *validatorTestStorage) setNamespaces(ids ...SessionStorageID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.namespaces = append([]SessionStorageID(nil), ids...)
+}
+
+func (s *validatorTestStorage) failDelete(id SessionStorageID, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.undeletable == nil {
+		s.undeletable = make(map[SessionStorageID]error)
+	}
+	s.undeletable[id] = err
+}
+
+func (s *validatorTestStorage) deleteAttempts() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.attempts
+}
+
+func (s *validatorTestStorage) storedNamespaces() []SessionStorageID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]SessionStorageID(nil), s.namespaces...)
+}
+
+func (s *validatorTestStorage) deletedNamespaces() []SessionStorageID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]SessionStorageID(nil), s.deletions...)
+}
+
+func (s *validatorTestStorage) scanCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.scans
 }
 
 func (s *validatorTestStorage) Journal(id SessionStorageID, _ int) simplex.Journal {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	journal := s.journals[id]
+	namespace := validatorTestNamespaceOf(id)
+	journal := s.journals[namespace]
 	if journal == nil {
 		journal = &validatorTestJournal{}
-		s.journals[id] = journal
+		s.journals[namespace] = journal
 	}
 
 	return journal
+}
+
+// journalFor returns the journal bound to a namespace without creating one, so
+// a test can tell "still there" from "recreated empty".
+func (s *validatorTestStorage) journalFor(id SessionStorageID) *validatorTestJournal {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.journals[validatorTestNamespaceOf(id)]
 }
 
 func (s *validatorTestStorage) Status(context.Context) (StorageStatus, error) {
@@ -166,7 +298,14 @@ func (s *validatorTestStorage) Status(context.Context) (StorageStatus, error) {
 	return cloneStorageStatus(s.status), s.statusErr
 }
 
-type validatorTestJournal struct{}
+// validatorTestJournal is the durable double-vote record. It keeps the votes it
+// was given so a test can assert that a reap pass left them there: an emptied
+// journal is what lets a node vote twice in one slot.
+type validatorTestJournal struct {
+	mu    sync.Mutex
+	votes []simplex.Vote
+	wiped bool
+}
 
 type validatorTestClock struct{}
 
@@ -178,8 +317,25 @@ func (*validatorTestJournal) Bootstrap() (*simplex.BootstrapState, error) {
 	return &simplex.BootstrapState{}, nil
 }
 
-func (*validatorTestJournal) SaveOurVote(_ simplex.Vote, done func(error)) {
+func (j *validatorTestJournal) SaveOurVote(vote simplex.Vote, done func(error)) {
+	j.mu.Lock()
+	j.votes = append(j.votes, vote)
+	j.mu.Unlock()
 	done(nil)
+}
+
+func (j *validatorTestJournal) wipe() {
+	j.mu.Lock()
+	j.votes = nil
+	j.wiped = true
+	j.mu.Unlock()
+}
+
+func (j *validatorTestJournal) recordedVotes() ([]simplex.Vote, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	return append([]simplex.Vote(nil), j.votes...), j.wiped
 }
 
 func (*validatorTestJournal) SaveCertificate(_ *simplex.Certificate, done func(error)) {
@@ -1466,6 +1622,44 @@ func TestStaleBlocksSkipPoolProcessing(t *testing.T) {
 	}
 	if top, err := internals.SourceTop(allShard, allShard); err != nil || top.Seqno != 2 {
 		t.Fatalf("fresh block must seed internals, top=%+v err=%v", top, err)
+	}
+}
+
+func TestConsensusAdmissionWaitsForCurrentSnapshotAndStaysLatched(t *testing.T) {
+	supervisor := newSessionSupervisor(zerolog.Nop(), nil, nil, nil)
+	service := &Service{
+		log:      zerolog.Nop(),
+		opts:     Options{FreshnessWindow: 5 * time.Minute},
+		sessions: supervisor,
+	}
+
+	stale := &groups.Snapshot{
+		MasterchainBlock: ton.BlockIDExt{SeqNo: 10},
+		GenUTime:         uint32(time.Now().Add(-time.Hour).Unix()),
+	}
+	service.reconcileConsensus(stale)
+	if supervisor.hasSnapshot {
+		t.Fatal("stale startup snapshot reached consensus supervisor")
+	}
+
+	fresh := &groups.Snapshot{
+		MasterchainBlock: ton.BlockIDExt{SeqNo: 11},
+		GenUTime:         uint32(time.Now().Unix()),
+	}
+	service.reconcileConsensus(fresh)
+	if !supervisor.hasSnapshot || supervisor.highestSeqno != 11 {
+		t.Fatalf("fresh snapshot not admitted: has=%t seqno=%d", supervisor.hasSnapshot, supervisor.highestSeqno)
+	}
+
+	// The gate is startup-only. C++ does not tear down validator groups merely
+	// because an already participating node experiences transient lag.
+	staleAfterAdmission := &groups.Snapshot{
+		MasterchainBlock: ton.BlockIDExt{SeqNo: 12},
+		GenUTime:         stale.GenUTime,
+	}
+	service.reconcileConsensus(staleAfterAdmission)
+	if supervisor.highestSeqno != 12 {
+		t.Fatalf("latched consensus did not accept newer snapshot: seqno=%d", supervisor.highestSeqno)
 	}
 }
 

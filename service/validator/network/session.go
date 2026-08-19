@@ -3,6 +3,7 @@ package network
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
@@ -48,24 +49,25 @@ type privateOverlayOpener func(
 	p2p.PrivateOverlayCallbacks,
 ) (privateOverlay, error)
 
-// session is one shared private-overlay hub. Validator and standalone observer
-// endpoints may coexist without opening the same overlay ID twice.
+// session owns the physical overlays for exactly one local identity and role.
+// C++ resolves validator/collator/observer precedence before creating a session;
+// the Manager enforces the same boundary instead of merging role runtimes.
 type session struct {
 	manager *Manager
 	id      [32]byte
 
-	controlMu     sync.Mutex
-	specMu        sync.RWMutex
-	effective     sessionSpec
-	specVersion   uint64
-	contributions map[sessionKind]sessionSpec
-	endpoints     map[sessionKind]*sessionEndpoint
+	controlMu   sync.Mutex
+	specMu      sync.RWMutex
+	spec        sessionSpec
+	specVersion uint64
+	consumer    *sessionEndpoint
 
-	handleMu      sync.RWMutex
-	handle        privateOverlay
-	handleContext context.Context
-	handleCancel  context.CancelFunc
-	handleSpec    sessionSpec
+	handleMu        sync.RWMutex
+	consensusHandle privateOverlay
+	blockSyncHandle privateOverlay
+	handleContext   context.Context
+	handleCancel    context.CancelFunc
+	handleSpec      sessionSpec
 }
 
 type sessionEndpoint struct {
@@ -125,7 +127,6 @@ type consensusPeerSenders struct {
 }
 
 type receiverBinding struct {
-	kind     sessionKind
 	receiver validator.SessionReceiver
 	endpoint *sessionEndpoint
 }
@@ -134,14 +135,12 @@ var _ validator.SessionNetwork = (*sessionEndpoint)(nil)
 
 func newSession(manager *Manager, spec sessionSpec) *session {
 	hub := &session{
-		manager:       manager,
-		id:            spec.id,
-		effective:     spec,
-		specVersion:   1,
-		contributions: map[sessionKind]sessionSpec{spec.kind: spec},
-		endpoints:     make(map[sessionKind]*sessionEndpoint, 2),
+		manager:     manager,
+		id:          spec.id,
+		spec:        spec,
+		specVersion: 1,
 	}
-	hub.endpoints[spec.kind] = newSessionEndpoint(hub, spec.kind)
+	hub.consumer = newSessionEndpoint(hub, spec.kind)
 	return hub
 }
 
@@ -156,18 +155,37 @@ func newSessionEndpoint(hub *session, kind sessionKind) *sessionEndpoint {
 	}
 }
 
-func (s *session) callbacks() p2p.PrivateOverlayCallbacks {
-	return p2p.PrivateOverlayCallbacks{
+func (s *session) consensusCallbacks(protocolVersion uint8) p2p.PrivateOverlayCallbacks {
+	callbacks := p2p.PrivateOverlayCallbacks{
 		Message:           s.receiveConsensusMessage,
 		Query:             s.receiveQuery,
 		BroadcastPrecheck: s.precheckCandidate,
 		Broadcast:         s.receiveCandidate,
 	}
+	if protocolVersion == 1 {
+		callbacks.BroadcastPrecheck = s.rejectCandidatePrecheck
+		callbacks.Broadcast = s.rejectCandidate
+	}
+
+	return callbacks
 }
 
-func (s *session) installInitialHandle(handle privateOverlay, spec sessionSpec) {
+func (s *session) blockSyncCallbacks() p2p.PrivateOverlayCallbacks {
+	return p2p.PrivateOverlayCallbacks{
+		BroadcastPrecheck: s.precheckCandidate,
+		Broadcast:         s.receiveCandidate,
+	}
+}
+
+func (s *session) installInitialHandles(
+	consensus privateOverlay,
+	blockSync privateOverlay,
+	spec sessionSpec,
+) {
 	s.handleMu.Lock()
-	s.handle, s.handleContext, s.handleCancel = newHandleLifetime(handle)
+	s.consensusHandle = consensus
+	s.blockSyncHandle = blockSync
+	s.handleContext, s.handleCancel = newHandleLifetime()
 	s.handleSpec = spec
 	s.handleMu.Unlock()
 }
@@ -175,13 +193,18 @@ func (s *session) installInitialHandle(handle privateOverlay, spec sessionSpec) 
 func (s *session) endpoint(kind sessionKind) *sessionEndpoint {
 	s.specMu.RLock()
 	defer s.specMu.RUnlock()
-	return s.endpoints[kind]
+	if s.consumer == nil || s.spec.kind != kind {
+		return nil
+	}
+
+	return s.consumer
 }
 
 func (s *session) signalPeersChanged() {
 	s.specMu.RLock()
-	defer s.specMu.RUnlock()
-	for _, endpoint := range s.endpoints {
+	endpoint := s.consumer
+	s.specMu.RUnlock()
+	if endpoint != nil {
 		endpoint.signalPeersChanged()
 	}
 }
@@ -191,45 +214,16 @@ func (s *session) attach(ctx context.Context, spec sessionSpec) (*sessionEndpoin
 	defer s.controlMu.Unlock()
 
 	s.specMu.RLock()
-	if endpoint := s.endpoints[spec.kind]; endpoint != nil {
-		current := s.contributions[spec.kind]
-		effective := s.effective
-		s.specMu.RUnlock()
-		if current.equal(spec) {
-			if !s.handleMatches(effective) {
-				if err := s.replaceHandle(ctx, effective); err != nil {
-					return nil, err
-				}
-			}
-			return endpoint, nil
-		}
-
+	current := s.spec
+	endpoint := s.consumer
+	s.specMu.RUnlock()
+	if endpoint == nil || current.kind != spec.kind || !current.equal(spec) {
 		return nil, fmt.Errorf("%w: %x", ErrSessionConflict, spec.id)
 	}
-	current := s.effective
-	s.specMu.RUnlock()
-
-	effective, err := mergeSessionSpecs(current, spec, s.manager.localADNLID)
-	if err != nil {
-		return nil, err
-	}
-	endpoint := newSessionEndpoint(s, spec.kind)
-	s.specMu.Lock()
-	s.effective = effective
-	s.specVersion++
-	s.contributions[spec.kind] = spec
-	s.endpoints[spec.kind] = endpoint
-	s.specMu.Unlock()
-	s.signalPeersChanged()
-	if err = s.replaceHandle(ctx, effective); err != nil {
-		// Restore the previously live role after a failed second-role attach.
-		// Without this explicit repair, an optional collator startup failure
-		// would take an already running validator transport offline.
-		restoreErr := s.restoreSpec(current, func() {
-			delete(s.contributions, spec.kind)
-			delete(s.endpoints, spec.kind)
-		})
-		return nil, errors.Join(err, restoreErr)
+	if !s.handlesMatch(current) {
+		if err := s.replaceHandles(ctx, current); err != nil {
+			return nil, err
+		}
 	}
 
 	return endpoint, nil
@@ -240,84 +234,56 @@ func (s *session) update(ctx context.Context, spec sessionSpec) error {
 	defer s.controlMu.Unlock()
 
 	s.specMu.RLock()
-	current, exists := s.contributions[spec.kind]
-	if !exists {
+	current := s.spec
+	if s.consumer == nil || current.kind != spec.kind {
 		s.specMu.RUnlock()
 		return fmt.Errorf("%w: %x", ErrSessionNotFound, spec.id)
 	}
 	if current.equal(spec) {
-		effective := s.effective
 		s.specMu.RUnlock()
-		if !s.handleMatches(effective) {
-			return s.replaceHandle(ctx, effective)
+		if !s.handlesMatch(current) {
+			return s.replaceHandles(ctx, current)
 		}
 		return nil
 	}
-	other, hasOther := s.otherContribution(spec.kind)
-	oldEffective := s.effective
 	s.specMu.RUnlock()
 
-	effective := spec
-	var err error
-	if hasOther {
-		effective, err = mergeSessionSpecs(other, spec, s.manager.localADNLID)
-		if err != nil {
-			return err
-		}
-	}
 	s.specMu.Lock()
-	s.contributions[spec.kind] = spec
-	s.effective = effective
+	s.spec = spec
 	s.specVersion++
 	s.specMu.Unlock()
 	s.signalPeersChanged()
-	if err = s.replaceHandle(ctx, effective); err != nil {
+	if s.handlesMatch(spec) {
+		return nil
+	}
+	if err := s.replaceHandles(ctx, spec); err != nil {
 		// Update is optional control-plane work. Repair the old immutable
 		// snapshot so its already running consumer remains available.
-		restoreErr := s.restoreSpec(oldEffective, func() {
-			s.contributions[spec.kind] = current
-		})
+		restoreErr := s.restoreSpec(current)
 		return errors.Join(err, restoreErr)
 	}
 
 	return nil
 }
 
-func (s *session) detach(ctx context.Context, kind sessionKind) (bool, error) {
+func (s *session) detach(_ context.Context, kind sessionKind) (bool, error) {
 	s.controlMu.Lock()
 	defer s.controlMu.Unlock()
 
 	s.specMu.RLock()
-	endpoint := s.endpoints[kind]
-	empty := len(s.endpoints) == 0
+	endpoint := s.consumer
+	currentKind := s.spec.kind
 	s.specMu.RUnlock()
-	if endpoint == nil {
-		return empty, nil
+	if endpoint == nil || currentKind != kind {
+		return endpoint == nil, nil
 	}
 	endpoint.retire()
 
 	s.specMu.Lock()
-	delete(s.endpoints, kind)
-	delete(s.contributions, kind)
-	if len(s.endpoints) == 0 {
-		s.specMu.Unlock()
-		return true, s.closeHandle()
-	}
-	effective, err := s.deriveEffectiveLocked()
-	if err != nil {
-		s.specMu.Unlock()
-		return false, err
-	}
-	s.effective = effective
-	s.specVersion++
+	s.consumer = nil
 	s.specMu.Unlock()
-	s.signalPeersChanged()
 
-	// A failed reopen cannot be rolled back here: endpoint.retire() above is
-	// irreversible by construction. The hub is left without a handle and is
-	// repaired by the ensureHandle branch of the next Manager.retire call
-	// (manager.go retire), which TestFailedDetachCanRepairRemainingRoleOnRetry pins.
-	return false, s.replaceHandle(ctx, effective)
+	return true, s.closeHandles()
 }
 
 func (s *session) retireAll() error {
@@ -325,109 +291,73 @@ func (s *session) retireAll() error {
 	defer s.controlMu.Unlock()
 
 	s.specMu.RLock()
-	endpoints := make([]*sessionEndpoint, 0, len(s.endpoints))
-	for _, endpoint := range s.endpoints {
-		endpoints = append(endpoints, endpoint)
-	}
+	endpoint := s.consumer
 	s.specMu.RUnlock()
-	for _, endpoint := range endpoints {
+	if endpoint != nil {
 		endpoint.retire()
 	}
 
 	s.specMu.Lock()
-	clear(s.endpoints)
-	clear(s.contributions)
+	s.consumer = nil
 	s.specMu.Unlock()
-	return s.closeHandle()
-}
-
-// deriveEffectiveLocked recomputes the shared overlay spec from the surviving
-// contributions. The caller must hold specMu.
-//
-// Two properties are load-bearing. Contributions are visited in sessionKindOrder
-// and never in map order, because mergeSessionSpecs builds members left-then-right
-// while sessionSpec.equal compares them with slices.Equal: a randomized fold would
-// make handleMatches spuriously false and churn the overlay closed and open. And a
-// lone contribution is returned UNCHANGED rather than merged with itself, because
-// mergeSessionSpecs clears kind, role and signer; receiveCandidate and
-// BroadcastCandidate resolve the certificate signer from the spec, so merge(x, x)
-// would silently stop signing relayed candidates for the one surviving role.
-//
-// With two kinds the fold below is unreachable: detach always leaves exactly one
-// contribution, and attach merges the arriving pair itself in arrival order. It
-// exists so that adding a third sessionKind stays deterministic by construction.
-func (s *session) deriveEffectiveLocked() (sessionSpec, error) {
-	var (
-		effective sessionSpec
-		derived   bool
-	)
-	for _, kind := range sessionKindOrder {
-		contribution, ok := s.contributions[kind]
-		if !ok {
-			continue
-		}
-		if !derived {
-			effective, derived = contribution, true
-			continue
-		}
-		merged, err := mergeSessionSpecs(effective, contribution, s.manager.localADNLID)
-		if err != nil {
-			return sessionSpec{}, err
-		}
-		effective = merged
-	}
-	if !derived {
-		return sessionSpec{}, fmt.Errorf("%w: %x", ErrSessionNotFound, s.id)
-	}
-
-	return effective, nil
+	return s.closeHandles()
 }
 
 // restoreSpec republishes a previously live spec after a failed handle
-// replacement, running restore under the same specMu section that rolls the
-// effective spec back. attach and update are both optional control-plane work on
-// a hub which may already carry a running consumer, so their failure must leave
-// the previous overlay open rather than no overlay at all. detach deliberately
-// does not use this: endpoint.retire() is irreversible.
-func (s *session) restoreSpec(prev sessionSpec, restore func()) error {
+// replacement. An update is optional control-plane work on a running consumer,
+// so failure must leave the previous overlay open rather than no overlay at all.
+func (s *session) restoreSpec(prev sessionSpec) error {
 	s.specMu.Lock()
-	restore()
-	s.effective = prev
+	s.spec = prev
 	s.specVersion++
 	s.specMu.Unlock()
 	s.signalPeersChanged()
 
-	return s.openHandle(prev)
+	return s.openHandles(prev)
 }
 
-func (s *session) otherContribution(kind sessionKind) (sessionSpec, bool) {
-	for candidateKind, contribution := range s.contributions {
-		if candidateKind != kind {
-			return contribution, true
+func (s *session) replaceHandles(ctx context.Context, spec sessionSpec) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.closeHandles(); err != nil {
+		return fmt.Errorf("validator network: close session %x overlays: %w", s.id, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.openHandles(spec)
+}
+
+func (s *session) openHandles(spec sessionSpec) error {
+	var consensus privateOverlay
+	var err error
+	if spec.openConsensus {
+		consensus, err = s.manager.openOverlay(
+			spec.consensusOverlayConfig(),
+			s.consensusCallbacks(spec.protocolVersion),
+		)
+		if err != nil {
+			return fmt.Errorf("validator network: open session %x consensus overlay: %w", s.id, err)
 		}
 	}
-	return sessionSpec{}, false
-}
 
-func (s *session) replaceHandle(ctx context.Context, spec sessionSpec) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	var blockSync privateOverlay
+	if spec.hasBlockSync() {
+		blockSync, err = s.manager.openOverlay(spec.blockSyncOverlayConfig(), s.blockSyncCallbacks())
+		if err != nil {
+			var closeErr error
+			if consensus != nil {
+				closeErr = consensus.Close()
+			}
+			return errors.Join(
+				fmt.Errorf("validator network: open session %x block-sync overlay: %w", s.id, err),
+				closeErr,
+			)
+		}
 	}
-	if err := s.closeHandle(); err != nil {
-		return fmt.Errorf("validator network: close session %x overlay: %w", s.id, err)
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return s.openHandle(spec)
-}
 
-func (s *session) openHandle(spec sessionSpec) error {
-	handle, err := s.manager.openOverlay(spec.overlayConfig(), s.callbacks())
-	if err != nil {
-		return fmt.Errorf("validator network: reopen session %x overlay: %w", s.id, err)
-	}
-	s.installInitialHandle(handle, spec)
+	s.installInitialHandles(consensus, blockSync, spec)
 	return nil
 }
 
@@ -435,19 +365,21 @@ func (s *session) ensureHandle(ctx context.Context) error {
 	s.controlMu.Lock()
 	defer s.controlMu.Unlock()
 	spec := s.currentSpec()
-	if s.handleMatches(spec) {
+	if s.handlesMatch(spec) {
 		return nil
 	}
-	return s.replaceHandle(ctx, spec)
+	return s.replaceHandles(ctx, spec)
 }
 
-func (s *session) handleMatches(spec sessionSpec) bool {
+func (s *session) handlesMatch(spec sessionSpec) bool {
 	s.handleMu.RLock()
 	defer s.handleMu.RUnlock()
-	return s.handle != nil && s.handleSpec.equal(spec)
+	return (s.consensusHandle != nil) == spec.openConsensus &&
+		(s.blockSyncHandle != nil) == spec.hasBlockSync() &&
+		s.handleContext != nil && s.handleSpec.overlayFieldsEqual(spec)
 }
 
-func (s *session) closeHandle() error {
+func (s *session) closeHandles() error {
 	s.handleMu.RLock()
 	cancel := s.handleCancel
 	s.handleMu.RUnlock()
@@ -456,40 +388,47 @@ func (s *session) closeHandle() error {
 	}
 
 	s.handleMu.Lock()
-	defer s.handleMu.Unlock()
-	handle := s.handle
-	s.handle = nil
+	consensus := s.consensusHandle
+	blockSync := s.blockSyncHandle
+	s.consensusHandle = nil
+	s.blockSyncHandle = nil
 	s.handleContext = nil
 	s.handleCancel = nil
 	s.handleSpec = sessionSpec{}
-	if handle == nil {
-		return nil
+	s.handleMu.Unlock()
+
+	var blockSyncErr error
+	if blockSync != nil {
+		blockSyncErr = blockSync.Close()
+	}
+	var consensusErr error
+	if consensus != nil {
+		consensusErr = consensus.Close()
 	}
 
-	return handle.Close()
+	return errors.Join(blockSyncErr, consensusErr)
 }
 
 func (s *session) currentSpec() sessionSpec {
 	s.specMu.RLock()
 	defer s.specMu.RUnlock()
-	return s.effective
+	return s.spec
 }
 
 func (s *session) currentSpecVersion() (sessionSpec, uint64) {
 	s.specMu.RLock()
 	defer s.specMu.RUnlock()
 
-	return s.effective, s.specVersion
+	return s.spec, s.specVersion
 }
 
 func (s *session) contribution(kind sessionKind) (sessionSpec, error) {
 	s.specMu.RLock()
 	defer s.specMu.RUnlock()
-	spec, ok := s.contributions[kind]
-	if !ok {
+	if s.consumer == nil || s.spec.kind != kind {
 		return sessionSpec{}, ErrSessionNotFound
 	}
-	return spec, nil
+	return s.spec, nil
 }
 
 func (e *sessionEndpoint) Start(ctx context.Context, receiver validator.SessionReceiver) error {
@@ -511,7 +450,7 @@ func (e *sessionEndpoint) Start(ctx context.Context, receiver validator.SessionR
 		return err
 	}
 	var producer io.Closer
-	if spec.signer != nil {
+	if spec.protocolVersion >= 2 && spec.signer != nil {
 		producer = e.hub.manager.broadcasts.RegisterPlumtreeProducer()
 	}
 	runCtx, runCancel := context.WithCancel(ctx)
@@ -533,9 +472,11 @@ func (e *sessionEndpoint) Start(ctx context.Context, receiver validator.SessionR
 		peers:    make(map[p2p.PeerID]consensusPeerSender),
 	}
 	senders.reconcile()
-	e.sendWG.Add(candidateSenderWorkerCount)
-	for range candidateSenderWorkerCount {
-		go e.runCandidateSender(runCtx)
+	if spec.canOriginateCandidate() {
+		e.sendWG.Add(candidateSenderWorkerCount)
+		for range candidateSenderWorkerCount {
+			go e.runCandidateSender(runCtx)
+		}
 	}
 	e.callbacksActive = true
 	runDone := e.runDone
@@ -735,6 +676,9 @@ func (s *consensusPeerSenders) reconcile() {
 	if version == s.version {
 		return
 	}
+	if !spec.openConsensus {
+		spec.peers = nil
+	}
 	s.spec = spec
 	s.version = version
 	// spec.peers is members minus the local ID, so filtering it by
@@ -856,8 +800,14 @@ func (e *sessionEndpoint) BroadcastCandidate(
 	// CandidateGenerated independently feeds public relay and the private
 	// transport. Both retain the runtime-owned immutable buffers by reference.
 	e.hub.manager.publishCandidate(spec, artifact)
+	candidateSigner := spec.signer
+	if spec.hasBlockSync() {
+		// Protocol v1 signs block-sync broadcasts with the node ADNL key. A nil
+		// per-send signer selects the private-overlay handle's node signer.
+		candidateSigner = nil
+	}
 	if !e.enqueueCandidate(outboundCandidateMessage{
-		signer: spec.signer,
+		signer: candidateSigner,
 		data:   broadcast.Data,
 		extra:  broadcast.Extra,
 	}) {
@@ -976,24 +926,8 @@ func (e *sessionEndpoint) active() bool {
 	return e.running && !e.retired
 }
 
-// activeBindings returns the callbacks-active endpoints in sessionKindOrder,
-// together with how many of them are live; every caller ranges over
-// bindings[:active]. The array is returned by value and endBindings does not
-// retain its argument, so the backing store stays on the caller's stack instead
-// of costing one heap allocation per inbound consensus message.
-//
-// The validator-before-observer order is protocol-visible: serveCandidate fills
-// its answer from the first binding that holds the requested candidate.
-func (s *session) activeBindings() ([len(sessionKindOrder)]receiverBinding, int) {
-	var bindings [len(sessionKindOrder)]receiverBinding
-	active := 0
-	for _, kind := range sessionKindOrder {
-		if binding, ok := s.activeBinding(kind); ok {
-			bindings[active] = binding
-			active++
-		}
-	}
-	return bindings, active
+func (s *session) activeSessionBinding() (receiverBinding, bool) {
+	return s.activeBinding(s.currentSpec().kind)
 }
 
 func (s *session) activeBinding(kind sessionKind) (receiverBinding, bool) {
@@ -1005,13 +939,7 @@ func (s *session) activeBinding(kind sessionKind) (receiverBinding, bool) {
 	if !ok {
 		return receiverBinding{}, false
 	}
-	return receiverBinding{kind: kind, receiver: receiver, endpoint: endpoint}, true
-}
-
-func endBindings(bindings []receiverBinding) {
-	for _, binding := range bindings {
-		binding.endpoint.endCallback()
-	}
+	return receiverBinding{receiver: receiver, endpoint: endpoint}, true
 }
 
 func (s *session) receiveConsensusMessage(
@@ -1019,11 +947,11 @@ func (s *session) receiveConsensusMessage(
 	source p2p.PeerID,
 	message tl.Serializable,
 ) {
-	bindings, active := s.activeBindings()
-	if active == 0 {
+	binding, ok := s.activeSessionBinding()
+	if !ok {
 		return
 	}
-	defer endBindings(bindings[:active])
+	defer binding.endpoint.endCallback()
 	wire, err := serializedTL(message)
 	if err != nil {
 		s.warn("decode consensus message", err)
@@ -1034,9 +962,7 @@ func (s *session) receiveConsensusMessage(
 	if index, ok := spec.validatorByADNL[source]; ok {
 		sourceValidator = index
 	}
-	for _, binding := range bindings[:active] {
-		binding.receiver.ReceiveConsensusMessage(simplex.PeerID(source), sourceValidator, wire)
-	}
+	binding.receiver.ReceiveConsensusMessage(simplex.PeerID(source), sourceValidator, wire)
 }
 
 func (s *session) receiveQuery(
@@ -1061,48 +987,25 @@ func (s *session) receiveQuery(
 }
 
 func (s *session) serveCandidate(ctx context.Context, source p2p.PeerID, wire []byte) tl.Serializable {
-	bindings, active := s.activeBindings()
-	if active == 0 {
+	binding, ok := s.activeSessionBinding()
+	if !ok {
 		return requestErrorResponse()
 	}
-	defer endBindings(bindings[:active])
+	defer binding.endpoint.endCallback()
 	spec := s.currentSpec()
 	request, err := DecodeCandidateRequest(wire, spec.id, spec.maxReplyBytes)
 	if err != nil {
 		return requestErrorResponse()
 	}
-	var response validator.CandidateResponse
-	for _, binding := range bindings[:active] {
-		candidate, serveErr := binding.receiver.ServeCandidate(ctx, simplex.PeerID(source), request)
-		if serveErr != nil {
-			if errors.Is(serveErr, validator.ErrCandidateUnavailable) {
-				continue
-			}
-			return requestErrorResponse()
-		}
-		if len(response.CandidateWire) == 0 {
-			response.CandidateWire = candidate.CandidateWire
-		}
-		if response.Notarization == nil {
-			response.Notarization = candidate.Notarization
-		}
-		if candidateResponseComplete(request, response) {
-			break
-		}
+	response, err := binding.receiver.ServeCandidate(ctx, simplex.PeerID(source), request)
+	if err != nil && !errors.Is(err, validator.ErrCandidateUnavailable) {
+		return requestErrorResponse()
 	}
 	answer, err := EncodeCandidateResponse(request, response)
 	if err != nil {
 		return requestErrorResponse()
 	}
 	return tl.Raw(answer)
-}
-
-func candidateResponseComplete(
-	request validator.CandidateRequest,
-	response validator.CandidateResponse,
-) bool {
-	return (!request.WantCandidate || len(response.CandidateWire) != 0) &&
-		(!request.WantNotarization || response.Notarization != nil)
 }
 
 func (s *session) servePleaseCollatePrepare(
@@ -1178,29 +1081,39 @@ func (s *session) precheckCandidate(
 	if request.Delivery != p2p.DeliveryTwoStep {
 		return ErrUnsupportedBroadcastMode
 	}
-	extra, err := s.validateCandidateSource(request.Source, request.SourceADNL, request.Extra)
+	extra, err := s.validateCandidateSource(
+		request.Source,
+		request.SourceADNL,
+		request.Extra,
+		request.SignatureChecked,
+	)
 	if err != nil {
 		return err
 	}
-	bindings, active := s.activeBindings()
-	if active == 0 {
+	binding, ok := s.activeSessionBinding()
+	if !ok {
 		return ErrSessionInactive
 	}
-	defer endBindings(bindings[:active])
-	var rejected error
-	accepted := false
-	for _, binding := range bindings[:active] {
-		err = binding.receiver.PrecheckCandidateBroadcast(extra.Slot, request.ID, request.SignatureChecked)
-		if err == nil {
-			accepted = true
-			continue
-		}
-		rejected = errors.Join(rejected, err)
-	}
-	if accepted {
-		return nil
-	}
-	return rejected
+	defer binding.endpoint.endCallback()
+	return binding.receiver.PrecheckCandidateBroadcast(
+		extra.Slot,
+		request.ID,
+		request.SignatureChecked,
+	)
+}
+
+func (s *session) rejectCandidatePrecheck(
+	context.Context,
+	p2p.PrivateOverlayBroadcastPrecheck,
+) error {
+	return ErrUnsupportedBroadcastMode
+}
+
+func (s *session) rejectCandidate(
+	context.Context,
+	p2p.PrivateOverlayBroadcast,
+) p2p.PrivateOverlayBroadcastDisposition {
+	return p2p.PrivateOverlayBroadcastIgnore
 }
 
 func (s *session) receiveCandidate(
@@ -1210,46 +1123,38 @@ func (s *session) receiveCandidate(
 	if broadcast.Delivery != p2p.DeliveryTwoStep {
 		return p2p.PrivateOverlayBroadcastIgnore
 	}
-	extra, err := s.validateCandidateSource(broadcast.Source, broadcast.SourceADNL, broadcast.Extra)
+	extra, err := s.validateCandidateSource(
+		broadcast.Source,
+		broadcast.SourceADNL,
+		broadcast.Extra,
+		true,
+	)
 	if err != nil {
 		return p2p.PrivateOverlayBroadcastIgnore
 	}
-	bindings, active := s.activeBindings()
-	if active == 0 {
+	binding, ok := s.activeSessionBinding()
+	if !ok {
 		return p2p.PrivateOverlayBroadcastRetry
 	}
-	defer endBindings(bindings[:active])
+	defer binding.endpoint.endCallback()
 	wire, err := (simplex.CandidateBroadcast{
 		Data: broadcast.Payload, Extra: broadcast.Extra,
 	}).CandidateWire(extra.Delegation)
 	if err != nil {
 		return p2p.PrivateOverlayBroadcastIgnore
 	}
-	var artifact validator.CandidateArtifact
-	accepted := false
-	for _, binding := range bindings[:active] {
-		received, receiveErr := binding.receiver.ReceiveCandidate(ctx, wire)
-		if receiveErr == nil && !accepted {
-			artifact = received
-			accepted = true
-		}
-	}
-	if !accepted {
+	artifact, err := binding.receiver.ReceiveCandidate(ctx, extra.Slot, wire)
+	if err != nil {
 		return p2p.PrivateOverlayBroadcastIgnore
 	}
-	// The relay must carry the validator contribution, not the effective spec:
-	// mergeSessionSpecs clears the signer whenever a second endpoint attaches to
-	// the same session, and p2p.publishCandidate silently drops the public
-	// plumtree and fast-sync origination when the certificate signer is nil. The
-	// merge equality check guarantees the catchain seqno and the validator set
-	// hash are identical in both contributions, so only the signer differs. A
-	// persistent observer legitimately holds the validator kind with a nil signer,
-	// and a pure standalone-collator hub has no validator contribution at all;
-	// both simply relay without originating, exactly as before.
-	spec, err := s.contribution(sessionKindValidator)
-	if err != nil {
-		spec = s.currentSpec()
+	spec := s.currentSpec()
+	if spec.protocolVersion == 1 {
+		s.manager.cacheCandidate(spec, artifact)
 	}
+	if spec.protocolVersion < 2 {
+		return p2p.PrivateOverlayBroadcastAcceptAndRelay
+	}
+
 	s.manager.publishCandidate(spec, artifact)
 	return p2p.PrivateOverlayBroadcastAcceptAndRelay
 }
@@ -1258,6 +1163,7 @@ func (s *session) validateCandidateSource(
 	source p2p.PeerID,
 	sourceADNL []byte,
 	extraWire []byte,
+	signatureChecked bool,
 ) (*simplex.BroadcastExtra, error) {
 	if len(sourceADNL) != len(p2p.PeerID{}) {
 		return nil, errors.New("validator network: candidate source ADNL has invalid size")
@@ -1271,9 +1177,20 @@ func (s *session) validateCandidateSource(
 	if err != nil {
 		return nil, err
 	}
+	if spec.slotsPerLeaderWindow == 0 || spec.validatorCount == 0 ||
+		len(spec.validatorKeys) != spec.validatorCount {
+		return nil, errors.New("validator network: candidate leader schedule is invalid")
+	}
+	expectedLeader := int(
+		extra.Slot / spec.slotsPerLeaderWindow % uint32(spec.validatorCount),
+	)
 	if extra.Delegation == nil {
-		if _, validatorSource := spec.validatorSource[source]; !validatorSource {
+		validatorIndex, validatorSource := spec.validatorSource[source]
+		if !validatorSource {
 			return nil, errors.New("validator network: non-delegated candidate has a collator source")
+		}
+		if validatorIndex != expectedLeader {
+			return nil, errors.New("validator network: candidate source is not the scheduled leader")
 		}
 		return extra, nil
 	}
@@ -1284,18 +1201,31 @@ func (s *session) validateCandidateSource(
 	if p2p.PeerID(collatorID) != source {
 		return nil, errors.New("validator network: delegated candidate signer differs from delegation")
 	}
+	if signatureChecked {
+		windowStart := extra.Slot - extra.Slot%spec.slotsPerLeaderWindow
+		leaderKey := spec.validatorKeys[expectedLeader]
+		if !simplex.VerifyDelegationSignature(
+			ed25519.PublicKey(leaderKey[:]),
+			spec.id,
+			windowStart,
+			collatorID,
+			extra.Delegation.Signature,
+		) {
+			return nil, errors.New("validator network: delegation signature is not valid")
+		}
+	}
 	return extra, nil
 }
 
 func (s *session) sendMessageRaw(ctx context.Context, peer p2p.PeerID, wire []byte) error {
 	s.handleMu.RLock()
 	defer s.handleMu.RUnlock()
-	if s.handle == nil || s.handleContext == nil {
+	if s.consensusHandle == nil || s.handleContext == nil {
 		return ErrSessionInactive
 	}
 	requestCtx, cancel := contextWithPeerLifetime(ctx, s.handleContext)
 	defer cancel()
-	return s.handle.SendMessageRaw(requestCtx, peer, wire)
+	return s.consensusHandle.SendMessageRaw(requestCtx, peer, wire)
 }
 
 func (s *session) queryRaw(
@@ -1306,12 +1236,12 @@ func (s *session) queryRaw(
 ) ([]byte, error) {
 	s.handleMu.RLock()
 	defer s.handleMu.RUnlock()
-	if s.handle == nil || s.handleContext == nil {
+	if s.consensusHandle == nil || s.handleContext == nil {
 		return nil, ErrSessionInactive
 	}
 	requestCtx, cancel := contextWithPeerLifetime(ctx, s.handleContext)
 	defer cancel()
-	return s.handle.QueryRaw(requestCtx, peer, maxAnswerSize, wire)
+	return s.consensusHandle.QueryRaw(requestCtx, peer, maxAnswerSize, wire)
 }
 
 func (s *session) broadcastTwoStep(
@@ -1322,18 +1252,24 @@ func (s *session) broadcastTwoStep(
 ) error {
 	s.handleMu.RLock()
 	defer s.handleMu.RUnlock()
-	if s.handle == nil || s.handleContext == nil {
+	if s.handleContext == nil {
+		return ErrSessionInactive
+	}
+	handle := s.consensusHandle
+	if s.handleSpec.hasBlockSync() {
+		handle = s.blockSyncHandle
+	}
+	if handle == nil {
 		return ErrSessionInactive
 	}
 	requestCtx, cancel := contextWithPeerLifetime(ctx, s.handleContext)
 	defer cancel()
-	_, err := s.handle.BroadcastTwoStep(requestCtx, signer, data, tl.Raw(extra), 0)
+	_, err := handle.BroadcastTwoStep(requestCtx, signer, data, tl.Raw(extra), 0)
 	return err
 }
 
-func newHandleLifetime(handle privateOverlay) (privateOverlay, context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	return handle, ctx, cancel
+func newHandleLifetime() (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.Background())
 }
 
 func contextWithPeerLifetime(ctx, peer context.Context) (context.Context, context.CancelFunc) {

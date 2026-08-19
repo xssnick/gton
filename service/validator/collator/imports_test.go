@@ -10,6 +10,7 @@ import (
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/tvm"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 	funcsop "github.com/xssnick/tonutils-go/tvm/op/funcs"
 	stackop "github.com/xssnick/tonutils-go/tvm/op/stack"
@@ -397,13 +398,40 @@ func TestBuildCandidateSkipsProcessedInternalMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	if candidate.Stats.Transactions != 0 || candidate.Stats.InternalsImported != 0 ||
-		candidate.Stats.InternalsSkipped != 1 || candidate.Stats.OutQueueSize != 1 {
+		candidate.Stats.InternalsSkipped != 1 || candidate.Stats.OutQueueSize != 0 {
 		t.Fatalf("unexpected skip stats: %+v", candidate.Stats)
 	}
 
+	// This block used to be produced with the entry still queued, and the
+	// assertion here used to read "a skipped message keeps its entry". That was
+	// defect 2 written down as an expectation: the entry's next hop is this very
+	// shard and the predecessor's own frontier covers it, so the shard has
+	// processed it and every validator demands a dequeue descriptor for it in
+	// this block — verifyProcessedLocalDequeue, and verbatim
+	// ValidateQuery::check_neighbor_outbound_message (validate-query.cpp:5283-5289).
+	// The registered neighbour set here is EMPTY, which is what hid it: cleanup
+	// used to return before its mandatory phase whenever the masterchain had
+	// registered nobody, even though the predecessor is always a neighbour of
+	// itself. Skipping is still skipping; the dequeue is not optional.
 	queue := candidateQueueInfo(t, candidate)
-	if count, err := queue.OutQueue.Count(); err != nil || count != 1 {
-		t.Fatalf("outbound queue count = %d, err = %v: a skipped message keeps its entry", count, err)
+	if count, err := queue.OutQueue.Count(); err != nil || count != 0 {
+		t.Fatalf("outbound queue count = %d, err = %v: a processed own-shard entry must be dequeued", count, err)
+	}
+	if candidate.Stats.QueueCleaned != 1 {
+		t.Fatalf("cleaned %d entries, want the one own-shard entry", candidate.Stats.QueueCleaned)
+	}
+	// The verifier is the point of the assertions above: it is the rule, they are
+	// its consequences. NewSemanticVerifier, never the accepting stub, and on a
+	// resident predecessor so that nothing here depends on proof coverage.
+	if err = VerifyShardCandidate(context.Background(), ShardVerificationRequest{
+		Previous:           req.Previous,
+		Masterchain:        req.Masterchain,
+		Neighbors:          req.Neighbors,
+		NeighborShardEndLT: req.NeighborShardEndLT,
+		Semantics:          NewSemanticVerifier(tvm.NewTVM()),
+		Candidate:          candidate,
+	}); err != nil {
+		t.Fatalf("our own validator rejected the candidate: %v", err)
 	}
 	// The bound advances over skipped messages too, so the
 	// record carries the skipped message's canonical (lt, hash).
@@ -763,6 +791,33 @@ func TestBuildCandidateDeliversCascade(t *testing.T) {
 	}
 }
 
+// TestBuildCandidateEnqueuesWhenBlockFull pins the drain's behaviour when the
+// normal limit class is already exhausted when the drain STARTS.
+//
+// THE EXPECTATION IN THIS TEST WAS CHANGED DELIBERATELY, and the old one was
+// produced by a known divergence: before the per-item recheck was ported from
+// collator.cpp:4847-4850, processNewMessages read only the c.blockFull FIELD, so
+// a drain that began with the gas class already over normal — which is this
+// fixture exactly, the external transaction burns 1245 gas against a normal
+// threshold of 1 — still DELIVERED its first message in-block and only enqueued
+// the second. This test asserted that: Transactions 2, ImmediateDelivered 1,
+// EnqueuedMessages 1, one queue entry.
+//
+// The reference enqueues BOTH. collator.cpp:4847-4850 evaluates
+// fits(cl_normal) at the top of the first heap item, before anything is popped,
+// finds it false, sets block_full_, and :4858-4863 then latches enqueue_only for
+// the whole drain. So the numbers below — Transactions 1, ImmediateDelivered 0,
+// EnqueuedMessages 2, two queue entries — are the reference's and the old ones
+// were ours alone.
+//
+// This is also the concrete proof that the recheck is not cosmetic: it changes
+// the transaction set, the descriptor constructors (two msg_export_new$001
+// instead of an msg_import_imm$011/msg_export_imm$010 pair plus one export_new),
+// the outbound queue and the block's end lt, on a shape a real chain reaches.
+// The four pinned mainnet golden hashes are nevertheless unmoved, because those
+// fixtures provably never cross the class mid-drain — see
+// TestGoldenFixturesNeverCrossNormalMidDrain, which asserts that reason rather
+// than the absence of a diff.
 func TestBuildCandidateEnqueuesWhenBlockFull(t *testing.T) {
 	req := emptyCandidateRequest(t)
 	req.Internals = &msgpool.Cut{} // drained queues: immediate delivery allowed
@@ -813,22 +868,24 @@ func TestBuildCandidateEnqueuesWhenBlockFull(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Externals = []ExternalInput{externalInput(t, external)}
-	// The first delivery exhausts the normal gas class: the second message
-	// falls back to the outbound queue.
+	// A normal gas class of 1 unit, which the external transaction's own 1245 gas
+	// exhausts before the drain runs at all. Both generated messages therefore
+	// fall back to the outbound queue.
 	req.Masterchain.Config.basechain.limits.gas = limitThresholds{0, 1, 1 << 40, 1 << 41}
 
 	candidate, err := testBuilder().BuildShard(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if candidate.Stats.Transactions != 2 || candidate.Stats.NewMessages != 2 ||
-		candidate.Stats.ImmediateDelivered != 1 || candidate.Stats.EnqueuedMessages != 1 ||
-		candidate.Stats.OutQueueSize != 1 {
+	// One transaction — the external's own — and both generated messages enqueued.
+	if candidate.Stats.Transactions != 1 || candidate.Stats.NewMessages != 2 ||
+		candidate.Stats.ImmediateDelivered != 0 || candidate.Stats.EnqueuedMessages != 2 ||
+		candidate.Stats.OutQueueSize != 2 {
 		t.Fatalf("unexpected fallback stats: %+v", candidate.Stats)
 	}
 
 	queue := candidateQueueInfo(t, candidate)
-	if count, err := queue.OutQueue.Count(); err != nil || count != 1 {
+	if count, err := queue.OutQueue.Count(); err != nil || count != 2 {
 		t.Fatalf("outbound queue count = %d, err = %v", count, err)
 	}
 }

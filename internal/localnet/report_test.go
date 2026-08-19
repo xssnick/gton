@@ -105,6 +105,20 @@ func TestEvaluateTopologyDoesNotClaimUncorrelatedCPPParity(t *testing.T) {
 	}
 }
 
+func TestEvaluateTopologyMatchesCPPAndGoByBlockID(t *testing.T) {
+	nodes := []NodeConfig{{Name: "go", Kind: "go"}, {Name: "cpp", Kind: "cpp"}}
+	events := []Event{
+		{Node: "cpp", Kind: "block_collated", CandidateHash: "cpp-candidate-id", BlockRootHash: "root", BlockFileHash: "file"},
+		{Node: "go", Kind: "block_collated", CandidateHash: "go-candidate-id"},
+		{Node: "go", Kind: "block_validated", CandidateHash: "different-go-candidate-id", BlockRootHash: "root", BlockFileHash: "file"},
+	}
+
+	coverage := evaluateTopology(events, nodes)
+	if !coverage.CppToGoValidated {
+		t.Fatalf("C++ block identity was not matched to Go validation: %+v", coverage)
+	}
+}
+
 func TestEvaluateTopologyRequiresOrderedCycle(t *testing.T) {
 	left, _ := shard.Child(shard.Root, true)
 	right, _ := shard.Child(shard.Root, false)

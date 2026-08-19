@@ -14,7 +14,6 @@ import (
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
-	"github.com/xssnick/tonutils-go/tvm"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 
 	"github.com/xssnick/gton/service/validator/groups"
@@ -815,15 +814,7 @@ func masterBuildAccounts(
 func masterBuildPrepareConfig(t testing.TB, root *cell.Cell) *Config {
 	t.Helper()
 
-	execution, err := tvm.PrepareBlockchainConfig(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	config, err := PrepareConfig(execution)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return config
+	return testPrepareConfig(t, root)
 }
 
 // masterBuildCatchainLifetimes rewrites config parameter 28 so the masterchain
@@ -1199,7 +1190,7 @@ func assertMasterBuildHistory(
 	if info.Flags&1 == 0 || info.BlockCreateStats == nil {
 		t.Fatal("resulting masterchain state has no creator statistics")
 	}
-	creatorStats, err := parseBlockCreateStats(info.BlockCreateStats)
+	creatorStats, err := openBlockCreateStats(info.BlockCreateStats)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1234,15 +1225,16 @@ func assertMasterBuildCreatorStats(
 ) {
 	t.Helper()
 
-	master := stats.entries[masterCreator]
+	entries := blockCreateStatsTestEntries(t, stats)
+	master := entries[masterCreator]
 	if master.masterchain.total != 1 || master.masterchain.lastUpdated != now || master.shardchain.total != 0 {
 		t.Fatalf("master creator stats = %+v", master)
 	}
-	shard := stats.entries[shardCreator]
+	shard := entries[shardCreator]
 	if shard.shardchain.total != 1 || shard.shardchain.lastUpdated != now || shard.masterchain.total != 0 {
 		t.Fatalf("shard creator stats = %+v", shard)
 	}
-	aggregate := stats.entries[[32]byte{}]
+	aggregate := entries[[32]byte{}]
 	if aggregate.masterchain.total != 1 || aggregate.shardchain.total != 1 ||
 		aggregate.masterchain.lastUpdated != now || aggregate.shardchain.lastUpdated != now {
 		t.Fatalf("aggregate creator stats = %+v", aggregate)

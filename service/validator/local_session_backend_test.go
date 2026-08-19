@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,12 +24,55 @@ import (
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
+// localBackendTestNode models the live view the way the real one behaves for the
+// two properties the backend depends on: a published state is readable
+// immediately and BY REFERENCE, and every publication closes the artifacts
+// signal that a waiting read is parked on.
 type localBackendTestNode struct {
+	mu         sync.Mutex
 	states     map[string]*storage.BlockState
 	stateCells map[string]*cell.Cell
 	blocks     map[string][]byte
 	submitted  []p2p.DownloadedBlock
+	published  []storage.LiveBlockArtifacts
 	blockReads int
+	signal     chan struct{}
+}
+
+func (n *localBackendTestNode) artifactsSignalLocked() chan struct{} {
+	if n.signal == nil {
+		n.signal = make(chan struct{})
+	}
+
+	return n.signal
+}
+
+func (n *localBackendTestNode) BlockArtifactsSignal() <-chan struct{} {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	return n.artifactsSignalLocked()
+}
+
+func (n *localBackendTestNode) PublishAcceptedBlockState(artifacts storage.LiveBlockArtifacts) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.published = append(n.published, artifacts)
+	key := localBackendTestBlockKey(artifacts.Block)
+	if artifacts.State != nil {
+		n.states[key] = artifacts.State
+		if artifacts.State.Cell != nil {
+			n.stateCells[key] = artifacts.State.Cell
+		}
+	}
+	if len(artifacts.BlockData) > 0 {
+		n.blocks[key] = artifacts.BlockData
+	}
+	close(n.artifactsSignalLocked())
+	n.signal = make(chan struct{})
+
+	return nil
 }
 
 type localBackendTestGroups struct {
@@ -46,7 +90,83 @@ func (g localBackendTestGroups) Project(
 	return g.snapshot, nil
 }
 
+func (g localBackendTestGroups) WaitProject(
+	ctx context.Context,
+	previous *groups.Snapshot,
+	input groups.ApplyInput,
+) (*groups.Snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	return g.Project(previous, input)
+}
+
+func TestLocalSessionBackendWaitValidationViewResumesOnPublication(t *testing.T) {
+	backend := &LocalSessionBackend{
+		activation:        &collator.SessionActivation{},
+		validationChanged: make(chan struct{}),
+	}
+	result := make(chan *localValidationView, 1)
+	failure := make(chan error, 1)
+	go func() {
+		view, err := backend.waitValidationView(t.Context())
+		if err != nil {
+			failure <- err
+			return
+		}
+		result <- view
+	}()
+
+	select {
+	case <-result:
+		t.Fatal("validation view was returned before publication")
+	case err := <-failure:
+		t.Fatalf("validation view wait failed before publication: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	backend.controlMu.Lock()
+	backend.publishValidationView()
+	backend.controlMu.Unlock()
+
+	select {
+	case view := <-result:
+		if view == nil {
+			t.Fatal("published validation view is nil")
+		}
+	case err := <-failure:
+		t.Fatalf("validation view wait after publication: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("validation view wait did not resume after publication")
+	}
+}
+
+func TestLocalSessionBackendWaitValidationViewStopsOnClose(t *testing.T) {
+	backend := &LocalSessionBackend{validationChanged: make(chan struct{})}
+	result := make(chan error, 1)
+	go func() {
+		_, err := backend.waitValidationView(t.Context())
+		result <- err
+	}()
+
+	if err := backend.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrLocalSessionBackendClosed) {
+			t.Fatalf("validation view wait error = %v, want closed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("validation view wait did not stop with the backend")
+	}
+}
+
 func (n *localBackendTestNode) BlockData(_ context.Context, id ton.BlockIDExt) ([]byte, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	n.blockReads++
 	data, exists := n.blocks[localBackendTestBlockKey(id)]
 	if !exists {
@@ -65,6 +185,9 @@ func (*localBackendTestNode) BlockProof(
 }
 
 func (n *localBackendTestNode) BlockState(_ context.Context, id ton.BlockIDExt) (*storage.BlockState, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	state, exists := n.states[localBackendTestBlockKey(id)]
 	if !exists {
 		return nil, storage.ErrNotFound
@@ -78,6 +201,9 @@ func (n *localBackendTestNode) LoadStateCellTree(
 	id ton.BlockIDExt,
 	_ []byte,
 ) (*cell.Cell, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	root, exists := n.stateCells[localBackendTestBlockKey(id)]
 	if !exists {
 		return nil, storage.ErrNotFound
@@ -94,6 +220,9 @@ func (*localBackendTestNode) LookupBlockBySeqNo(
 }
 
 func (n *localBackendTestNode) SubmitBlockLocally(block p2p.DownloadedBlock) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	n.submitted = append(n.submitted, block)
 }
 
@@ -484,6 +613,12 @@ func TestLocalSessionBackendLoadsExactOrdinaryAndZeroStateTips(t *testing.T) {
 	if &ordinaryData.Tips[0].BlockBOC[0] != &ordinaryBOC[0] {
 		t.Fatal("ordinary block BOC was copied")
 	}
+	// The loader already decoded and hash-checked this root for its own identity
+	// check; handing it over is what spares every validation a second decode.
+	if ordinaryData.Tips[0].Block == nil ||
+		!bytes.Equal(ordinaryData.Tips[0].Block.Hash(), ordinary.RootHash) {
+		t.Fatalf("ordinary tip block root = %+v", ordinaryData.Tips[0].Block)
+	}
 
 	zeroData, err := backend.LoadChainState(context.Background(), ChainStateRequest{Blocks: []ton.BlockIDExt{zero}})
 	if err != nil {
@@ -491,6 +626,11 @@ func TestLocalSessionBackendLoadsExactOrdinaryAndZeroStateTips(t *testing.T) {
 	}
 	if len(zeroData.Tips) != 1 || zeroData.Tips[0].State != zeroState || zeroData.Tips[0].BlockBOC != nil {
 		t.Fatalf("zero tip = %+v", zeroData.Tips)
+	}
+	// A zerostate has no block cell at all, and newChainState rejects a tip that
+	// claims otherwise.
+	if zeroData.Tips[0].Block != nil {
+		t.Fatal("zerostate tip carries a block root")
 	}
 	if node.blockReads != 1 {
 		t.Fatalf("ordinary/zero block reads = %d, want only the ordinary block read", node.blockReads)
@@ -628,7 +768,7 @@ func TestLocalSessionBackendValidationDoesNotWaitForCollatorUpdate(t *testing.T)
 	}
 	validated := make(chan error, 1)
 	go func() {
-		_, err := backend.ValidateCandidate(context.Background(), &ChainState{}, &CandidateArtifact{})
+		_, err := backend.ValidateCandidate(context.Background(), CandidateValidationRequest{Parent: &ChainState{}, Artifact: &CandidateArtifact{}})
 		validated <- err
 	}()
 	select {
@@ -647,6 +787,68 @@ func TestLocalSessionBackendValidationDoesNotWaitForCollatorUpdate(t *testing.T)
 	view := backend.validation.Load()
 	if view == nil || view.update.MasterchainBlock.SeqNo != next.MasterchainBlock.SeqNo {
 		t.Fatal("committed collator update was not published to candidate validation")
+	}
+}
+
+// The predecessor root a validation hands the collator comes from ChainTip.Block,
+// which every producer of a tip already parsed — the store loader, the applied
+// path and, since the successor of a validated candidate carries its own block
+// root, the speculative path too. Nothing re-decodes BlockBOC here any more, so
+// a tip whose BOC bytes are unreadable still validates, and a tip without a
+// parsed root is a local plumbing fault rather than another decode: skipping the
+// block half of predecessor verification silently is the failure this refuses.
+func TestLocalSessionBackendValidateCandidateDoesNotDecodePredecessorBOC(t *testing.T) {
+	backend, _ := newLocalBackendTestRemoteVotingBackend(t)
+	defer func() {
+		if err := backend.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	// Three predecessors, so the verdict quotes a count only the acquisition
+	// knows: reaching it is what the test is about, and no predecessor of it
+	// counts anything.
+	state := &ChainState{tips: make([]ChainTip, 3)}
+	for i := range state.tips {
+		blockRoot := cell.BeginCell().MustStoreUInt(uint64(0x77+i), 8).EndCell()
+		state.tips[i] = ChainTip{
+			ID: ton.BlockIDExt{
+				Workchain: 0,
+				Shard:     math.MinInt64,
+				SeqNo:     uint32(9 + i),
+				RootHash:  blockRoot.Hash(),
+				FileHash:  bytes.Repeat([]byte{byte(0x81 + i)}, 32),
+			},
+			BlockBOC: []byte{0xde, 0xad, 0xbe, 0xef},
+			Block:    blockRoot,
+			State:    cell.BeginCell().MustStoreUInt(uint64(0x91+i), 8).EndCell(),
+		}
+	}
+
+	_, err := backend.ValidateCandidate(context.Background(), CandidateValidationRequest{Parent: state, Artifact: &CandidateArtifact{}})
+	if err == nil {
+		t.Fatal("a zero candidate was validated")
+	}
+	if strings.Contains(err.Error(), "decode predecessor") {
+		t.Fatalf("predecessor BOC was decoded: %v", err)
+	}
+	if !errors.Is(err, ErrCandidateRejected) || !strings.Contains(err.Error(), "3 predecessors") {
+		t.Fatalf("validation error = %v, want the acquisition verdict on 3 predecessors", err)
+	}
+
+	// Negative control: the acquisition is only reached because the roots were
+	// there. Without one, the call stops before it — loudly, naming the missing
+	// parse, and without decoding anything.
+	state.tips[0].Block = nil
+	_, err = backend.ValidateCandidate(context.Background(), CandidateValidationRequest{Parent: state, Artifact: &CandidateArtifact{}})
+	if err == nil || !strings.Contains(err.Error(), "carries no parsed block") {
+		t.Fatalf("validation without a parsed predecessor root error = %v, want a plumbing failure", err)
+	}
+	if strings.Contains(err.Error(), "decode predecessor") || strings.Contains(err.Error(), "3 predecessors") {
+		t.Fatalf("a tip without a parsed root was decoded or passed on: %v", err)
+	}
+	if errors.Is(err, ErrCandidateRejected) {
+		t.Fatalf("a missing local parse was classified as a candidate rejection: %v", err)
 	}
 }
 
@@ -907,8 +1109,18 @@ func TestLocalSessionBackendActivatesDeferredCollatorAfterChainCatchesUp(t *test
 	if len(producer.activateCalls) != 0 || backend.validation.Load() != nil {
 		t.Fatal("deferred collator was activated before its masterchain view became local")
 	}
-	if _, err = backend.ValidateCandidate(context.Background(), &ChainState{}, &CandidateArtifact{}); !errors.Is(err, ErrBlockNotReady) {
-		t.Fatalf("deferred validation error = %v, want ErrBlockNotReady", err)
+	validated := make(chan error, 1)
+	go func() {
+		_, validationErr := backend.ValidateCandidate(
+			t.Context(),
+			CandidateValidationRequest{Parent: &ChainState{}, Artifact: &CandidateArtifact{}},
+		)
+		validated <- validationErr
+	}()
+	select {
+	case err = <-validated:
+		t.Fatalf("validation returned before the recovered view arrived: %v", err)
+	case <-time.After(20 * time.Millisecond):
 	}
 
 	intermediate := cloneSessionState(initial)
@@ -921,6 +1133,11 @@ func TestLocalSessionBackendActivatesDeferredCollatorAfterChainCatchesUp(t *test
 	if len(producer.updateCalls) != 0 || len(producer.activateCalls) != 0 {
 		t.Fatal("collator was mutated while its recovered masterchain view was still ahead")
 	}
+	select {
+	case err = <-validated:
+		t.Fatalf("validation returned on an intermediate view: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
 
 	if err = backend.UpdateSession(context.Background(), recoveredState); err != nil {
 		t.Fatal(err)
@@ -930,6 +1147,14 @@ func TestLocalSessionBackendActivatesDeferredCollatorAfterChainCatchesUp(t *test
 	}
 	if len(producer.updateCalls) != 1 {
 		t.Fatalf("exact recovered view update attempts = %d, want 1", len(producer.updateCalls))
+	}
+	select {
+	case err = <-validated:
+		if !errors.Is(err, ErrCandidateRejected) {
+			t.Fatalf("validation after recovered view = %v, want candidate rejection", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("validation did not resume after the recovered view arrived")
 	}
 	view := backend.validation.Load()
 	if view == nil || !view.update.Equal(recovered) {
@@ -1064,11 +1289,134 @@ func TestLocalSessionBackendSelfModeActivatesAndRoutesValidatorCandidate(t *test
 		t.Fatal("self route accepted delegated candidate")
 	}
 
-	wrongSignature := delegated
-	wrongSignature.Candidate.Delegation = nil
-	wrongSignature.Candidate.Signature = bytes.Repeat([]byte{0xff}, ed25519.SignatureSize)
-	if err = backend.routeCandidate(context.Background(), wrongSignature); err == nil {
-		t.Fatal("self route accepted candidate signed by another authority")
+	// The self route no longer re-verifies a signature the collator verified the
+	// instant it made it. What it does assert is the one thing that second
+	// verification could establish over the first: that the leader the collator
+	// signed for is the validator this backend is.
+	wrongLeader := delegated
+	wrongLeader.Candidate.Delegation = nil
+	wrongLeader.Candidate.Leader = backend.validator.Index + 1
+	if err = backend.routeCandidate(context.Background(), wrongLeader); err == nil {
+		t.Fatal("self route accepted a candidate that names another leader")
+	}
+}
+
+// TestSelfCandidateSignatureIsStillCheckedBeforeTheNetwork pins the property
+// the removed self-route verification was resting on, on the real path.
+//
+// routeCandidate no longer verifies the signature of a candidate the in-process
+// collator just produced. That is only safe because of what happens after it:
+// windowSubmitter.submit does nothing but validate window order before calling
+// publishCandidate, and publishCandidate's first act is encodeForBroadcast,
+// which verifies the candidate against the codec's own roster and leader
+// schedule — before the broadcast, before the resolver stage, before the
+// durable write and before Simplex is told anything. So the test drives
+// collator → routeCandidate → submit → publishCandidate for real, with a real
+// runtime behind it, and asserts a forged candidate leaves no trace at all.
+//
+// Asserting this against a codec built by hand would pin the codec, not the
+// route, and would keep passing if the route ever gained an irreversible step
+// in front of the check.
+func TestSelfCandidateSignatureIsStillCheckedBeforeTheNetwork(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	network := newRuntimeTestNetwork()
+	runtimeBackend := newRuntimeTestBackend()
+	var broadcasts atomic.Int32
+	network.broadcast = func(context.Context, simplex.CandidateBroadcast, CandidateArtifact) error {
+		broadcasts.Add(1)
+
+		return nil
+	}
+	// A voting runtime, because the self route only exists on one: the local
+	// leader window it opens is what LocalSessionBackend routes into.
+	config, privateKey := runtimeTestConfig(0x62, &runtimeTestJournal{})
+	keyID := config.Validators[0].PublicKeyHash
+	config.Identity = SessionIdentity{
+		ADNLID: keyID,
+		Validator: &ValidatorIdentity{
+			Index:  0,
+			KeyID:  keyID,
+			Signer: runtimeTestSigner{key: privateKey},
+		},
+	}
+	config.OverlayMembers = [][32]byte{keyID}
+	config.StorageID.IsValidator = true
+	config.StorageID.ValidatorKeyID = keyID
+	config.StorageID.LocalADNLID = keyID
+	config.StorageID.ValidatorIndex = 0
+	prepared, err := PrepareSessionRuntime(context.Background(), config, runtimeTestState(), RuntimeOptions{
+		Storage: storage,
+		Network: network,
+		Backend: runtimeBackend,
+		Limits:  CandidateLimits{MaxBlockBytes: 1 << 20, MaxCollatedDataBytes: 1 << 20},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := prepared.(*sessionRuntime)
+
+	runResult := make(chan error, 1)
+	go func() { runResult <- runtime.Run(context.Background(), runtimeTestStart()) }()
+	<-network.started
+	var window LeaderWindow
+	select {
+	case window = <-runtimeBackend.windows:
+	case <-time.After(time.Second):
+		t.Fatal("leader window was not delivered")
+	}
+	if !window.Window.LocalLeader {
+		t.Fatal("the window under test is not a local leader window")
+	}
+
+	// The backend the in-process collator hands its candidates to, wired to the
+	// runtime's own leader window.
+	backend := &LocalSessionBackend{
+		config:    runtime.config,
+		validator: &ValidatorIdentity{Index: window.Window.Leader},
+	}
+	backend.setWindowRoute(window)
+
+	honest := runtimeOrdinaryArtifact(t, runtime.config, privateKey, window.Window.StartSlot, window.Window.Base)
+	routed := collator.CandidateArtifact{
+		SessionID: runtime.config.SessionID,
+		WindowID: collator.WindowID{
+			SessionID: runtime.config.SessionID,
+			StartSlot: window.Window.StartSlot,
+		},
+		Candidate:    honest.Candidate,
+		BlockBOC:     honest.BlockBOC,
+		CollatedData: honest.CollatedData,
+	}
+
+	forged := routed
+	forged.Candidate.Signature = bytes.Repeat([]byte{0xff}, ed25519.SignatureSize)
+	if err = backend.routeCandidate(context.Background(), forged); err == nil {
+		t.Fatal("a forged self candidate was routed to the network")
+	}
+	if got := broadcasts.Load(); got != 0 {
+		t.Fatalf("forged candidate broadcasts = %d, want 0", got)
+	}
+	if got := storage.saveCount(); got != 0 {
+		t.Fatalf("forged candidate durable writes = %d, want 0", got)
+	}
+	if stats := runtime.candidates.cacheStats(); stats.Entries != 0 {
+		t.Fatalf("forged candidate reached the resolver cache: %+v", stats)
+	}
+
+	// The same route, the same window, the honest signature: what stopped the
+	// candidate above was the signature check and not the fixture.
+	if err = backend.routeCandidate(context.Background(), routed); err != nil {
+		t.Fatalf("honestly signed self candidate refused: %v", err)
+	}
+	if got := broadcasts.Load(); got != 1 {
+		t.Fatalf("honest candidate broadcasts = %d, want 1", got)
+	}
+
+	if err = runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-runResult; err != nil {
+		t.Fatal(err)
 	}
 }
 

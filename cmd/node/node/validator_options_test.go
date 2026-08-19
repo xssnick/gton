@@ -11,12 +11,15 @@ import (
 func TestConfigureValidatorDisabled(t *testing.T) {
 	t.Parallel()
 
-	opts, err := configureValidator(nodeconfig.Validator{})
+	opts, err := configureValidator(nodeconfig.Validator{}, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if opts.Enabled {
 		t.Fatal("validator was enabled")
+	}
+	if opts.Runtime.Groups.MaximalVerticalSeqno != 3 {
+		t.Fatalf("maximal vertical seqno = %d, want 3", opts.Runtime.Groups.MaximalVerticalSeqno)
 	}
 }
 
@@ -35,12 +38,15 @@ func TestConfigureValidatorControl(t *testing.T) {
 				Permissions: 15,
 			}},
 		},
-	})
+	}, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !opts.Enabled || !opts.Extension.EnableGroups {
 		t.Fatalf("validator startup options = %+v", opts)
+	}
+	if opts.Runtime.Groups.MaximalVerticalSeqno != 3 {
+		t.Fatalf("maximal vertical seqno = %d, want 3", opts.Runtime.Groups.MaximalVerticalSeqno)
 	}
 	if opts.Extension.Keys != nil {
 		t.Fatal("validator signing keys must be loaded from storage after it is opened")
@@ -74,7 +80,7 @@ func TestConfigureValidatorRejectsInvalidControl(t *testing.T) {
 	}
 
 	for i := range tests {
-		if _, err := configureValidator(tests[i]); err == nil {
+		if _, err := configureValidator(tests[i], 3); err == nil {
 			t.Fatalf("invalid validator control config %d was accepted", i)
 		}
 	}

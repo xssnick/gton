@@ -11,6 +11,8 @@ import (
 
 var errConfigAddressAbsent = errors.New("config address is absent")
 
+const validatorRegistryConfigConstructor = uint64(0x3601163e)
+
 var hardMandatoryConfigParameters = [...]uint32{
 	18, 20, 21, 22, 23, 24, 25, 28, 34,
 }
@@ -215,6 +217,10 @@ func validateKnownConfigParameter(raw tlb.BlockchainConfig, id uint32) (err erro
 		_, err = raw.GetSuspendedAddressList()
 	case tlb.ConfigParamPrecompiledContracts:
 		_, err = raw.GetPrecompiledContractsConfig()
+	case 46:
+		// ConfigParam 46 is not modelled by tonutils yet. Current testnet uses
+		// ValRegistryConfig from crypto/block/block.tlb.
+		err = validateValidatorRegistryConfigParameter(raw)
 	case 71, 72, 73:
 		err = validateOracleBridgeParameter(raw, id)
 	case 79, 80, 81, 82:
@@ -231,6 +237,43 @@ func validateKnownConfigParameter(raw tlb.BlockchainConfig, id uint32) (err erro
 		return fmt.Errorf("unsupported positive parameter")
 	}
 	return err
+}
+
+func validateValidatorRegistryConfigParameter(raw tlb.BlockchainConfig) error {
+	parameter, err := raw.GetParam(46)
+	if err != nil {
+		return err
+	}
+	loader, err := parameter.BeginParse()
+	if err != nil {
+		return err
+	}
+	constructor, err := loader.LoadUInt(32)
+	if err != nil {
+		return err
+	}
+	if constructor != validatorRegistryConfigConstructor {
+		return fmt.Errorf("unsupported validator registry constructor #%08x", constructor)
+	}
+	if _, err = loader.LoadSlice(256); err != nil {
+		return err
+	}
+	if _, err = loader.LoadUInt(32); err != nil {
+		return err
+	}
+	hasNewCodeHash, err := loader.LoadBoolBit()
+	if err != nil {
+		return err
+	}
+	if hasNewCodeHash {
+		if _, err = loader.LoadSlice(256); err != nil {
+			return err
+		}
+	}
+	if loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
+		return fmt.Errorf("validator registry parameter has trailing data")
+	}
+	return nil
 }
 
 func validateOracleBridgeParameter(raw tlb.BlockchainConfig, id uint32) error {

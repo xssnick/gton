@@ -585,7 +585,7 @@ func (c *Controller) requireDelegationSession(ctx context.Context, id [32]byte) 
 		return err
 	}
 	if err := c.requireRunning(); err != nil {
-		// Delegated-v3 queries do not expose whether a session is still being
+		// Delegated-collation queries do not expose whether a session is still being
 		// restored or the controller is stopping. Ingress opens atomically only
 		// after every session in the startup snapshot has reconciled.
 		return ErrNotFound

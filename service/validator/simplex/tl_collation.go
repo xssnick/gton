@@ -10,7 +10,7 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-// Wire types of the collator delegation protocol (protocol_version >= 3):
+// Wire types of the collator delegation protocol:
 // a leader probes with consensus.pleaseCollatePrepare and delegates its
 // window with consensus.pleaseCollate, the collator signs candidates with its
 // own key and attaches consensus.delegation, and candidate containers carry
@@ -34,7 +34,7 @@ const (
 
 	// This constructor is deliberately emitted for non-delegated validator
 	// candidates. Despite its name it remains part of
-	// the live Delegated-v3 wire format.
+	// the live delegation wire format.
 	idBroadcastExtraLegacy = uint32(0x921297fa)
 )
 

@@ -85,6 +85,7 @@ func (f preparedCandidateFixture) prepare(t *testing.T) *PreparedCandidate {
 		f.collatedRoots,
 		sha256.Sum256(f.blockBOC),
 		f.candidate.CollatedFileHash,
+		PayloadCellHint(f.blockBOC, f.collatedData),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -141,6 +142,7 @@ func TestPrepareCandidateAsyncMatchesSynchronousPayload(t *testing.T) {
 		fixture.collatedRoots,
 		sha256.Sum256(fixture.blockBOC),
 		fixture.candidate.CollatedFileHash,
+		PayloadCellHint(fixture.blockBOC, fixture.collatedData),
 	)
 	asyncWire, err := SerializeCandidatePrepared(fixture.candidate, async)
 	if err != nil {

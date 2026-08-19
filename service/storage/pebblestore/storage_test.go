@@ -3808,14 +3808,11 @@ func TestLazyCellLoadMetricsCountDecodedCacheAndPebble(t *testing.T) {
 		t.Fatalf("db status before load: %v", err)
 	}
 	beforeDecoded := lazyCellLoadMetricCount(before.LazyCellLoads, storage.LazyCellLoadLayerDecodedCache)
-	beforePebble := lazyCellLoadMetricCount(before.LazyCellLoads, storage.LazyCellLoadLayerPebble)
-	store.cellCache = newDecodedCellCache(decodedCellCacheConfig{
-		enabled:       true,
-		shards:        DefaultDecodedCellCacheShards,
-		cacheBytes:    store.cellCacheSize,
-		bytesPerEntry: DefaultDecodedCellCacheBytesPerEntry,
-		minEntries:    DefaultDecodedCellCacheMinEntries,
-		maxEntries:    DefaultDecodedCellCacheMaxEntries,
+	beforeStore := lazyCellStoreReadCount(before.LazyCellLoads)
+	store.decodedCells = newDecodedCellCache(decodedCellCacheConfig{
+		enabled: true,
+		shards:  DefaultDecodedCellCacheShards,
+		entries: DefaultDecodedCellCacheEntries,
 	})
 
 	rootHash := root.HashKey(0)
@@ -3830,8 +3827,12 @@ func TestLazyCellLoadMetricsCountDecodedCacheAndPebble(t *testing.T) {
 	if err != nil {
 		t.Fatalf("db status after load: %v", err)
 	}
-	if got := lazyCellLoadMetricCount(after.LazyCellLoads, storage.LazyCellLoadLayerPebble) - beforePebble; got != 1 {
-		t.Fatalf("pebble lazy loads delta = %d, want 1", got)
+	// Summed across the three store-read layers rather than pinned to one of
+	// them: which band a read lands in depends on how long it took, and a test
+	// cannot pin that. What is deterministic — and what this asserts — is that
+	// the load fell through to the store exactly once.
+	if got := lazyCellStoreReadCount(after.LazyCellLoads) - beforeStore; got != 1 {
+		t.Fatalf("store-read lazy loads delta = %d, want 1", got)
 	}
 	if got := lazyCellLoadMetricCount(after.LazyCellLoads, storage.LazyCellLoadLayerDecodedCache) - beforeDecoded; got != 1 {
 		t.Fatalf("decoded cache lazy loads delta = %d, want 1", got)
@@ -4882,6 +4883,14 @@ func TestClosedStoreReturnsError(t *testing.T) {
 	if _, err = store.ArchiveInfo(context.Background(), 1, -1, int64(-1<<63)); err == nil {
 		t.Fatal("expected closed store error")
 	}
+}
+
+// lazyCellStoreReadCount sums the layers that mean "this load reached the cell
+// store", whichever band its duration put it in.
+func lazyCellStoreReadCount(metrics []storage.LazyCellLoadMetric) uint64 {
+	return lazyCellLoadMetricCount(metrics, storage.LazyCellLoadLayerBlockCache) +
+		lazyCellLoadMetricCount(metrics, storage.LazyCellLoadLayerPageCache) +
+		lazyCellLoadMetricCount(metrics, storage.LazyCellLoadLayerDisk)
 }
 
 func lazyCellLoadMetricCount(metrics []storage.LazyCellLoadMetric, layer string) uint64 {

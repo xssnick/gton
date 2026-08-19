@@ -93,6 +93,45 @@ func (id SessionStorageID) Validate() error {
 	return nil
 }
 
+// sessionNamespaceKey is the durable identity one namespace is addressed by:
+// the consensus.dbId hash plus the two path components a store puts around it.
+// It is the only identity a decision about a namespace — is it live, may it be
+// deleted — may be taken on.
+//
+// SessionStorageID is deliberately finer. ValidatorIndex and Protocol are
+// descriptor payload: no namespace derivation reads them, so two IDs differing
+// only in those address the very same rows, including the very same vote
+// journal. A set of SessionStorageID values therefore answers "is this
+// namespace claimed" with a false negative whenever the live descriptor and the
+// desired one disagree about either field — and a false negative there deletes
+// a live journal. sessionNamespaceKeyOf collapses exactly that difference and
+// nothing else, so a claim is never coarser than the namespace either.
+//
+// pebblestore.namespaceForSession is the concrete derivation this mirrors.
+// TestSessionNamespaceKeyCollapsesExactlyTheDescriptorOnlyFields here and
+// TestStoredNamespaceCollapsesExactlyTheDescriptorOnlyFields there state the
+// same classification of every field, so the two cannot drift apart silently.
+type sessionNamespaceKey struct {
+	dbID          [32]byte
+	shard         groups.ShardID
+	catchainSeqno uint32
+}
+
+// sessionNamespaceKeyOf fails exactly when Namespace does, which is exactly
+// when the store refuses to address any row for this ID at all.
+func sessionNamespaceKeyOf(id SessionStorageID) (sessionNamespaceKey, error) {
+	dbID, err := id.Namespace()
+	if err != nil {
+		return sessionNamespaceKey{}, err
+	}
+
+	return sessionNamespaceKey{
+		dbID:          dbID,
+		shard:         id.Shard,
+		catchainSeqno: id.CatchainSeqno,
+	}, nil
+}
+
 // Namespace returns the consensus.dbId boxed-TL SHA-256 hash. Shard and
 // catchain identity are deliberately descriptor fields rather than part of the
 // hash: canonically they live outside dbId, in the containing database path.
@@ -114,11 +153,28 @@ func (id SessionStorageID) Namespace() ([32]byte, error) {
 }
 
 // CandidateRecord is the canonical, opaque candidate wire representation.
-// SaveCandidate snapshots Wire before returning, so callers retain their
-// buffer; the slice returned by Candidate is independently owned by its caller.
+// SaveCandidate borrows Wire until its done callback fires — it does not copy
+// the payload first — so a caller must not mutate the buffer before then; the
+// slice returned by Candidate is independently owned by its caller.
+//
+// ContentHash is the sha256 of Wire. Candidates are stored content-addressed —
+// the id indexes a hash and the hash indexes the wire — so on the way out of
+// Candidate it is the store's own identity for the bytes it just returned, and
+// a reader must not re-derive it by hashing megabytes it did not choose.
+//
+// On the way in to SaveCandidate it is optional, and it is a claim the store
+// takes at face value: zero means "derive it", and anything else is written as
+// the content key and as the index value without being checked against Wire.
+// A caller that supplies it must have taken that digest of these very bytes,
+// because it is the identity two candidates for one slot are compared under —
+// give the store a hash that does not belong to the payload and equivocation
+// stops being detectable. The one production caller, candidateResolver, hands
+// over the hash its admission check took of the same buffer it is handing over,
+// which is also the hash it has already refused a conflicting duplicate under.
 type CandidateRecord struct {
-	ID   simplex.CandidateID
-	Wire []byte
+	ID          simplex.CandidateID
+	Wire        []byte
+	ContentHash [32]byte
 }
 
 // LeaderWindowRecord is durable telemetry for one locally observed leader
@@ -152,6 +208,11 @@ type StoredSessionState struct {
 }
 
 // StoredSession is the status projection of one durable session namespace.
+//
+// LeaderWindows counts how many times this session's leader window advanced.
+// Simplex reports windows in order from one engine goroutine, so that is the
+// number of distinct local leader windows observed; a repeated or stale
+// observation does not count. It is telemetry, and no per-window row backs it.
 type StoredSession struct {
 	ID                      SessionStorageID
 	Candidates              uint64

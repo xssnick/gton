@@ -9,6 +9,25 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
+// LoadStateCellTree below is THE state read, and there is deliberately only one.
+// Every consumer uses it: the lightserver, proof building, the archive importer,
+// sync and download, and — the same call, not a parallel one — collation and
+// validation.
+//
+// There was briefly a second, optional "operation" loader that returned the same
+// cells out of a second decoded cell cache. It is gone. Two things killed it,
+// and both still hold, so a per-consumer state read should not be reintroduced
+// without answering them:
+//
+//   - The collator and the validator must hold the SAME *cell.Cell for a given
+//     parent. ChainState.validatedCandidateState compares tip states by pointer
+//     and silently degrades to a full re-apply per candidate otherwise, so two
+//     consumers cannot be served different materializations of one state.
+//   - It did not route what it appeared to route. A resident state tree's lazy
+//     tips carry the loader that decoded them, so a read that lands on an
+//     already-materialized tree — which in a steady-state node is essentially
+//     every collation and validation read — resolves through that tree's
+//     original loader no matter which entry point asked for it.
 type StateCellTreeImporter interface {
 	ImportStateCellTree(ctx context.Context, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (*cell.Cell, error)
 	ImportStateBOCView(ctx context.Context, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error)

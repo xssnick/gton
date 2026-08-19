@@ -131,7 +131,7 @@ func TestValidationRejectAbstains(t *testing.T) {
 	if err := env.eng.SubmitCandidate(cand); err != nil {
 		t.Fatal(err)
 	}
-	env.completeValidation(cand.ID, errors.New("bad state root"))
+	env.completeValidation(cand.ID, testCandidateRejection{"bad state root"})
 
 	// The store is started on acceptance and runs concurrently with the
 	// validation gate, so a rejected candidate is still persisted: the store is
@@ -144,6 +144,24 @@ func TestValidationRejectAbstains(t *testing.T) {
 	env.clock.advance(env.params.FirstBlockTimeout + env.params.TargetRate + time.Millisecond)
 	env.eng.Advance()
 	requireEqual(t, env.trans.countVotes(VoteSkip), int(env.spw), "window skipped")
+	env.requireNoFatal()
+}
+
+// TestValidationLocalFailureAbstains: inability to validate locally casts no
+// vote and is not evidence that the candidate itself is invalid.
+func TestValidationLocalFailureAbstains(t *testing.T) {
+	env := newTestEnv(t, withLocal(1))
+	env.start()
+
+	cand := env.makeCandidate(0, Genesis(), 0x11)
+	if err := env.eng.SubmitCandidate(cand); err != nil {
+		t.Fatal(err)
+	}
+	env.completeValidation(cand.ID, errors.New("local state is unavailable"))
+
+	requireEqual(t, env.trans.countVotes(VoteNotarize), 0, "no notarize on abstain")
+	requireEqual(t, env.eng.Stats().CandidatesRejected, uint64(0), "reject counter")
+	requireEqual(t, env.eng.Stats().CandidatesAbstained, uint64(1), "abstain counter")
 	env.requireNoFatal()
 }
 
@@ -340,31 +358,31 @@ func TestBadCertificatesRejected(t *testing.T) {
 	id := candID(0, 0x55)
 
 	under := env.buildCert(NotarizeVote(id), 2, 3) // weight 2 < threshold 3
-	if err := env.eng.verifyCertificate(under); err == nil {
+	if _, err := env.eng.verifyCertificate(under); err == nil {
 		t.Fatal("under-quorum certificate must fail")
 	}
 
 	dup := env.buildCert(NotarizeVote(id), 2, 3, 2)
-	if err := env.eng.verifyCertificate(dup); err == nil {
+	if _, err := env.eng.verifyCertificate(dup); err == nil {
 		t.Fatal("duplicate index certificate must fail")
 	}
 
 	oob := env.buildCert(NotarizeVote(id), 1, 2, 3)
 	oob.Signatures[0].ValidatorIndex = 7
-	if err := env.eng.verifyCertificate(oob); err == nil {
+	if _, err := env.eng.verifyCertificate(oob); err == nil {
 		t.Fatal("out-of-bounds index certificate must fail")
 	}
 
 	forged := env.buildCert(NotarizeVote(id), 1, 2, 3)
 	forged.Signatures[0].Signature = make([]byte, 64)
-	if err := env.eng.verifyCertificate(forged); err == nil {
+	if _, err := env.eng.verifyCertificate(forged); err == nil {
 		t.Fatal("forged signature certificate must fail")
 	}
 	env.eng.HandleMessage(peer(6), ObserverIndex, forged.Serialize())
 	requireEqual(t, env.eng.Stats().Bans, uint64(1), "forged cert source banned")
 
 	good := env.buildCert(NotarizeVote(id), 1, 2, 3)
-	if err := env.eng.verifyCertificate(good); err != nil {
+	if _, err := env.eng.verifyCertificate(good); err != nil {
 		t.Fatal(err)
 	}
 	env.requireNoFatal()
@@ -393,7 +411,7 @@ func TestQuorumIsWeighted(t *testing.T) {
 	env.eng = eng
 	env.start()
 
-	requireEqual(t, eng.threshold, uint64(100*2/3+1), "threshold")
+	requireEqual(t, eng.threshold(), uint64(100*2/3+1), "threshold")
 
 	id := candID(0, 0x66)
 	// Validators 1+2+3 = weight 30 < 67: no certificate.

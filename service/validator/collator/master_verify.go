@@ -8,6 +8,7 @@ import (
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 
+	"github.com/xssnick/gton/service/validator/groups"
 	"github.com/xssnick/gton/service/validator/msgpool"
 )
 
@@ -29,6 +30,7 @@ func loadMasterCandidateState(
 	config *Config,
 	previous *tlb.ShardStateUnsplit,
 	candidate *verifiedCandidate,
+	snapshot *groups.Snapshot,
 ) (masterCandidateState, error) {
 	var state masterCandidateState
 	if err := parseExact(&state.previousStats, previous.Stats); err != nil {
@@ -76,6 +78,7 @@ func loadMasterCandidateState(
 	state.config, err = deriveMasterConfigTransition(
 		candidate.state.Accounts.ShardAccounts,
 		&state.previousExtra,
+		masterConfigPredecessor{config: config, groups: predecessorGroupConfig(snapshot, config)},
 	)
 	if err != nil {
 		return masterCandidateState{}, fmt.Errorf("%w: derive resulting masterchain config: %v", ErrInvalidInput, err)
@@ -90,27 +93,30 @@ func loadMasterCandidateState(
 	return state, nil
 }
 
+// verifyMasterDeterministicTransition returns the registry it parsed out of the
+// candidate block's ShardHashes, so the full-collated neighbour check does not
+// parse the same dictionary a second time.
 func verifyMasterDeterministicTransition(
 	req MasterVerificationRequest,
 	previous *tlb.ShardStateUnsplit,
 	candidate *verifiedCandidate,
 	state *masterCandidateState,
-) error {
+) (*ShardRegistry, error) {
 	if err := verifyMasterHeaderAndGroups(req, previous, candidate, state); err != nil {
-		return err
+		return nil, err
 	}
 	registry, tops, err := verifyMasterShardTransition(req, previous, candidate, state)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err = verifyMasterStateInfoTransition(req, previous, candidate, state, tops); err != nil {
-		return err
+		return nil, err
 	}
 	if err = verifyMasterMinRefMCSeqno(candidate, registry); err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return registry, nil
 }
 
 func verifyMasterHeaderAndGroups(
@@ -371,4 +377,21 @@ func verifyMasterMinRefMCSeqno(candidate *verifiedCandidate, registry *ShardRegi
 	}
 
 	return nil
+}
+
+// predecessorGroupConfig returns the snapshot's validator group config only when
+// it demonstrably belongs to the predecessor's configuration root.
+//
+// validateMasterSnapshot runs later than this decode, so the snapshot is still
+// unproven here; comparing its config root hash against the config already bound
+// to the predecessor state is what makes reusing its parse sound. Anything else
+// returns nil and the configuration is parsed from scratch.
+func predecessorGroupConfig(snapshot *groups.Snapshot, config *Config) *groups.Config {
+	if snapshot == nil || snapshot.Config == nil || config == nil || config.execution == nil {
+		return nil
+	}
+	if snapshot.ConfigRootHash != config.execution.Root().HashKey() {
+		return nil
+	}
+	return snapshot.Config
 }

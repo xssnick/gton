@@ -111,7 +111,7 @@ func (s *StateLifecycle) StartPersistentStateSerialization(ctx context.Context, 
 		lease.release()
 		return err
 	}
-	if err = s.stateSerializer.start(ctx, master, scope, s.runAsync, s.afterPersistentStateSerialized, lease.release); err != nil {
+	if err = s.stateSerializer.start(ctx, master, scope, s.runAsync, s.enforcePersistentStateRetentionAfterSerialization, s.afterPersistentStateSerialized, lease.release); err != nil {
 		lease.release()
 		return err
 	}
@@ -181,7 +181,15 @@ func (s *StateLifecycle) durableMasterchainBlock(ctx context.Context, store dura
 	return master, nil
 }
 
-func (s *stateSerializer) start(ctx context.Context, master ton.BlockIDExt, scope PersistentStateSerializationScope, runAsync func(func()), after func(context.Context, ton.BlockIDExt, PersistentStateSerializationScope), done func()) error {
+func (s *stateSerializer) start(
+	ctx context.Context,
+	master ton.BlockIDExt,
+	scope PersistentStateSerializationScope,
+	runAsync func(func()),
+	beforeDone func(context.Context, ton.BlockIDExt, PersistentStateSerializationScope),
+	afterDone func(context.Context, ton.BlockIDExt, PersistentStateSerializationScope),
+	done func(),
+) error {
 	if s.dir == "" {
 		return errStateSerializationDir
 	}
@@ -217,11 +225,14 @@ func (s *stateSerializer) start(ctx context.Context, master ton.BlockIDExt, scop
 			Str("masterchain", storage.FormatBlockRef(master)).
 			Str("scope", scope.String()).
 			Msg("persistent state serialization finished")
+		if beforeDone != nil {
+			beforeDone(runCtx, master, scope)
+		}
 		if done != nil {
 			done()
 		}
-		if after != nil {
-			after(runCtx, master, scope)
+		if afterDone != nil {
+			afterDone(runCtx, master, scope)
 		}
 	})
 	return nil

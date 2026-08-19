@@ -46,6 +46,7 @@ type overlaySpec struct {
 
 	PrivateAllowLegacyBroadcasts    bool
 	PrivateTwoStep                  bool
+	PrivateTwoStepIntermediateIDs   map[PeerID]struct{}
 	PrivateUnauthenticatedBroadcast uint32
 }
 

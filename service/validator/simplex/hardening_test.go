@@ -159,10 +159,18 @@ func TestNewEngineRequiresHooks(t *testing.T) {
 		t.Fatal("validator without hooks must be rejected")
 	}
 
-	legacy := base
-	legacy.ProtocolVersion = 2
-	if _, err := NewEngine(legacy); err == nil {
-		t.Fatal("legacy consensus protocol must be rejected")
+	for protocolVersion := uint8(0); protocolVersion <= MaxProtocolVersion; protocolVersion++ {
+		supported := base
+		supported.ProtocolVersion = protocolVersion
+		if _, err := NewEngine(supported); err != nil {
+			t.Fatalf("protocol version %d: %v", protocolVersion, err)
+		}
+	}
+
+	unsupported := base
+	unsupported.ProtocolVersion = MaxProtocolVersion + 1
+	if _, err := NewEngine(unsupported); err == nil {
+		t.Fatal("unrepresentable consensus protocol must be rejected")
 	}
 
 	observer := base
@@ -384,7 +392,7 @@ func TestCertificateWireIsCanonical(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = env.eng.verifyCertificate(parsed); err != nil {
+	if _, err = env.eng.verifyCertificate(parsed); err != nil {
 		t.Fatalf("dirty padding must still verify: %v", err)
 	}
 	if !bytes.Equal(parsed.Serialize(), canonical) {

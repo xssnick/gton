@@ -291,6 +291,15 @@ func (s *lazyPreviousStore) BlockRoot(ctx context.Context, block ton.BlockIDExt)
 	return s.root, nil
 }
 
+func (s *lazyPreviousStore) WaitBlockArtifacts(ctx context.Context, block ton.BlockIDExt) error {
+	_, err := s.BlockState(ctx, block)
+	if err == nil && block.SeqNo != 0 {
+		_, err = s.BlockRoot(ctx, block)
+	}
+
+	return err
+}
+
 func TestBuildCandidateEmitsFullCollatedStateProof(t *testing.T) {
 	req := advanceCandidateRequest(t, emptyCandidateRequest(t))
 	req.Masterchain.Config.capabilities |= capFullCollatedData
@@ -385,7 +394,7 @@ func TestBuildCollatedRootsIncludesOnlyUsedStorageStats(t *testing.T) {
 	attachFullCollatedTestNeighbors(t, &req)
 	oldRoot := req.Previous.State
 	usage := cell.NewReadSet(oldRoot)
-	estimator := newProofSizeEstimator()
+	estimator := newProofSizeEstimator(0)
 	usage.SetRecordCallback(estimator.addLoadedCell)
 	tracedRoot := usage.Root()
 	if _, err := tracedRoot.BeginParse(); err != nil {
@@ -715,7 +724,7 @@ func TestTrackAccountStorageProofUsesDictionaryReads(t *testing.T) {
 		initialStorageStat: root,
 		storageProof:       builder,
 	}
-	c := &collation{fullCollated: true, collatedProofEstimate: newProofSizeEstimator()}
+	c := &collation{fullCollated: true, collatedProofEstimate: newProofSizeEstimator(0)}
 	if err := c.trackAccountStorageProof(lane); err != nil {
 		t.Fatal(err)
 	}
@@ -853,7 +862,7 @@ func idleLimitStatus() *blockLimitStatus {
 		gas:          thresholds,
 		ltDelta:      thresholds,
 		collatedData: thresholds,
-	}, 1, cell.NewReadSet(nil))
+	}, 1, cell.NewReadSet(nil), 0, 0)
 }
 
 func TestExistingQueueSizeRejectsNonZeroSizeForEmptyQueue(t *testing.T) {
@@ -1093,15 +1102,26 @@ func loadMainnetConfig(tb testing.TB) *Config {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	execution, err := tvm.PrepareBlockchainConfig(root)
+	return testPrepareConfig(tb, root)
+}
+
+// testPrepareConfig is the test-side mirror of localConfigCache.prepare: it
+// captures the footprint of one configuration epoch and parses the tree the
+// capture materialized, so every fixture Config reaches master collation the
+// way a live one does — including the order the two run in.
+func testPrepareConfig(tb testing.TB, root *cell.Cell) *Config {
+	tb.Helper()
+
+	resident, footprint := captureConfigFootprint(root)
+	if footprint == nil {
+		tb.Fatal("configuration footprint was not captured")
+	}
+	parsed, err := parseMasterConfigEpoch(resident)
 	if err != nil {
 		tb.Fatal(err)
 	}
-	config, err := PrepareConfig(execution)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	return config
+	parsed.config.footprint = footprint
+	return parsed.config
 }
 
 func testExtBlkRef(seqno uint32, fill byte) *tlb.ExtBlkRef {

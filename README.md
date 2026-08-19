@@ -246,7 +246,7 @@ Builds a fresh cell database from a serialized state snapshot, catches it up to 
 
 ##### Persistent state cleanup
 
-Deletes expired state snapshot files while keeping recent snapshots and any snapshot still needed by an unfinished migration. This saves disk space without breaking state serving or an in-progress database migration.
+After a successful full serialization, immediately removes snapshot groups beyond `persistent_state_keep_recent`. Background cleanup also removes expired leftovers. A snapshot still needed by an unfinished migration is kept temporarily even when it exceeds the configured limit.
 
 ##### Archive cleanup
 
@@ -318,14 +318,13 @@ Simplified example:
     "cell_total_cache_size": 8589934592,
     "decoded_cell_cache_enabled": true,
     "decoded_cell_cache_shards": 64,
-    "decoded_cell_cache_bytes_per_entry": 16384,
-    "decoded_cell_cache_min_entries": 65536,
-    "decoded_cell_cache_max_entries": 1048576,
+    "decoded_cell_cache_entries": 131072,
+    "cell_record_cache_bytes": 4294967296,
     "cell_shard_memtable_size": 268435456,
     "cell_memtable_stop_writes_threshold": 4,
     "large_boc_shard_read_workers": 2,
     "persistent_state_large_boc_batch_size": 524288,
-    "persistent_state_keep_recent": 2,
+    "persistent_state_keep_recent": 1,
     "state_serialize_one_pass": false,
     "artifact_file_max_open": 512
   },
@@ -401,19 +400,49 @@ Simplified example:
 | Field | Description |
 | --- | --- |
 | `dir` | Pebble storage directory. |
-| `cell_total_cache_size` | Total cache budget for the cell DB, in bytes. Defaults to `8589934592` (8 GiB). |
+| `cell_total_cache_size` | Pebble **block cache** budget for the cell DB, in bytes. Off-heap, opaque to the Go GC. Defaults to `8589934592` (8 GiB). |
 | `decoded_cell_cache_enabled` | Enables the in-process decoded lazy-cell cache. Defaults to `true`. |
-| `decoded_cell_cache_shards` | Number of LRU shards in the decoded lazy-cell cache. Defaults to `64`. |
-| `decoded_cell_cache_bytes_per_entry` | Estimated bytes per decoded cell cache entry used to derive capacity from `cell_total_cache_size`. Defaults to `16384`. |
-| `decoded_cell_cache_min_entries` | Minimum decoded cell cache entries. Defaults to `65536`. |
-| `decoded_cell_cache_max_entries` | Maximum decoded cell cache entries. Defaults to `1048576`. |
+| `decoded_cell_cache_shards` | Number of shards in the decoded lazy-cell cache. Defaults to `64`. Clamped down to the entry count when there are fewer entries than shards. |
+| `decoded_cell_cache_entries` | Capacity of the in-process **decoded** cell cache, in entries. Defaults to `131072`; `0` uses the default. The set-associative table rounds the per-shard budget down to its bucket geometry, so the effective capacity (logged at open) can be slightly below an odd request, never above. **Hard upper bound `1048576` (1 Mi) entries — a larger value is rejected at load and the node does not start.** |
+| `cell_record_cache_bytes` | Arena budget for the encoded cell **record** cache, in bytes — the tier between the decoded cache and the pebble block cache, holding raw celldb records pre-decode. Defaults to `4294967296` (4 GiB) when the field is absent; an explicit `0` disables the tier. Under cgo builds (the deployed binary) the arenas are malloc'd outside the Go GC; under `CGO_ENABLED=0` they fall back to Go-heap noscan bytes, which the GC never scans but which count as live heap for GOGC pacing and GOMEMLIMIT. The derived lookup index adds ~22-25% on top of this budget (both figures are logged at open). Values above `1099511627776` (1 TiB) are rejected as typos; positive dust values are clamped up to the smallest workable ring. |
+| `service_decoded_cell_cache_entries` | Deprecated: former name of `decoded_cell_cache_entries`. Still honoured when the current name is absent, and warned about at startup. |
+| `operation_decoded_cell_cache_entries` | Deprecated and ignored: sized a second decoded cache that no longer exists. Warned about at startup. |
+| `decoded_cell_cache_bytes_per_entry` | Deprecated and ignored: capacity is no longer derived from a byte budget. Warned about at startup. |
+| `decoded_cell_cache_min_entries` | Deprecated and ignored. Warned about at startup. |
+| `decoded_cell_cache_max_entries` | Deprecated and ignored. Warned about at startup. |
 | `cell_shard_memtable_size` | Memtable size for one cell DB shard, in bytes. |
 | `cell_memtable_stop_writes_threshold` | Pebble stop-writes threshold for memtables. |
 | `large_boc_shard_read_workers` | Per-cell-DB-shard parallel readers for large-BOC state serialization loads. Defaults to `2`; `0` uses the default. |
 | `persistent_state_large_boc_batch_size` | Large-BOC serialization batch size for persistent state files, in cells. Defaults to `524288`; `0` uses the default. |
-| `persistent_state_keep_recent` | Number of recent persistent-state groups always retained. Defaults to `2`; `0` also uses the default for compatibility with older configs. Set to `-1` to retain every persistent state and disable persistent-state cleanup, including low-disk emergency pruning. Older groups outside this count are still retained until their protocol TTL expires. |
+| `persistent_state_keep_recent` | Maximum number of recent fully serialized persistent-state groups retained after a successful full serialization. Defaults to `1`; `0` also uses the default for compatibility with older configs. Set to `-1` to retain every persistent state and disable persistent-state cleanup, including low-disk emergency pruning. A group still needed by an unfinished cell-generation migration is retained temporarily even when it exceeds this limit. |
 | `state_serialize_one_pass` | Forces persistent state serialization to use one-pass large-BOC serialization for every state part. Defaults to `false`. |
 | `artifact_file_max_open` | Open-file limit for block/state artifacts. |
+
+**Sizing the two cell caches.** `cell_total_cache_size` and `decoded_cell_cache_entries` are
+independent knobs over different tiers, and raising one does not move the other. `cell_total_cache_size`
+is pebble's block cache: compressed blocks in one off-heap arena, so its cost is bytes and nothing
+else, and below it the OS page cache holds the rest of celldb for free. That is where bulk capacity
+belongs — raise it freely on a large machine.
+
+`decoded_cell_cache_entries` bounds fully decoded `*cell.Cell` trees on the Go heap. Each entry is
+roughly 10 live objects and ~820 B, and **every GC mark cycle scans all of them**, so its cost is paid
+per collection rather than once. Mark cost tracks the object COUNT, which is why the knob is an entry
+count and not a byte budget, and why the default is small relative to the pebble cache. Raising it by
+a factor of eight raises steady-state mark work by about the same factor. Earlier releases derived this
+capacity from `cell_total_cache_size`; that coupling is gone, so a node that raises the pebble cache no
+longer silently multiplies its live object count.
+
+For the same reason the knob has a **hard ceiling of 1048576 entries**, enforced when the config is
+loaded rather than clamped silently: a value above it fails startup with the reason. That ceiling is
+about 10 M live objects and ~820 MiB, and it is the same bound the removed derivation was clamped to —
+when the derivation went away the clamp went with it, which left the knob unbounded above and let a
+config put back exactly the object count the resize had removed. The deprecated alias
+`service_decoded_cell_cache_entries` is checked against the same ceiling when it is the value that wins.
+
+There is one decoded cell cache for the whole process — the lightserver, archive import, sync,
+collation and validation all share it. It is not splittable per consumer: the collator and the
+validator must hold the same `*cell.Cell` for a given parent, because the validator's live-successor
+carry-back compares tip states by pointer, and two caches cannot both supply one object.
 
 ### `metrics`
 

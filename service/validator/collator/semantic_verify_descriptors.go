@@ -323,6 +323,22 @@ func requireCanonicalEnvelopeTag(envelope tlb.MsgEnvelope) error {
 }
 
 func parseSemanticNeighborEnvelope(root *cell.Cell) (*semanticEnvelope, error) {
+	return parseSemanticNeighborEnvelopeLoaded(root, nil)
+}
+
+// parseSemanticNeighborEnvelopeLoaded is parseSemanticNeighborEnvelope with the
+// message cell optionally supplied by the caller. A caller that has already
+// taken the message out of storage passes it here so this parse dereferences
+// nothing: every error it can then raise is about the envelope's or the
+// message's CONTENT, which is the property walkSemanticQueuePrefix's
+// classification rests on.
+//
+// The supplied cell is the envelope's own reference — the caller obtains it by
+// loading that reference and nothing else — and the lazy loader validates each
+// load against the placeholder's hash and depth before returning it
+// (cell.validateLoadedLazyRef), so substituting it cannot change which message
+// is parsed.
+func parseSemanticNeighborEnvelopeLoaded(root, loaded *cell.Cell) (*semanticEnvelope, error) {
 	var envelope tlb.MsgEnvelope
 	if err := parseExact(&envelope, root); err != nil {
 		return nil, err
@@ -333,6 +349,9 @@ func parseSemanticNeighborEnvelope(root *cell.Cell) (*semanticEnvelope, error) {
 	}
 	if err := requireCanonicalEnvelopeTag(envelope); err != nil {
 		return nil, err
+	}
+	if loaded != nil {
+		envelope.Msg = loaded
 	}
 	message, err := envelope.Msg.BeginParse()
 	if err != nil {

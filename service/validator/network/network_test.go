@@ -19,6 +19,7 @@ import (
 func TestConstructorIDsGolden(t *testing.T) {
 	golden := map[string]uint32{
 		"consensus.overlayId":                     0x21298d9c,
+		"consensus.blockSyncOverlayId":            0x9d792212,
 		"consensus.requestError":                  0x832d2574,
 		"consensus.simplex.candidateAndCert":      0xd2462c2c,
 		"consensus.simplex.requestCandidate":      0x543fba6c,
@@ -27,6 +28,7 @@ func TestConstructorIDsGolden(t *testing.T) {
 	}
 	got := map[string]uint32{
 		"consensus.overlayId":                     tl.CRC(schemeConsensusOverlayID),
+		"consensus.blockSyncOverlayId":            tl.CRC(schemeConsensusBlockSyncOverlayID),
 		"consensus.requestError":                  idRequestError,
 		"consensus.simplex.candidateAndCert":      tl.CRC(schemeCandidateAndCert),
 		"consensus.simplex.requestCandidate":      idRequestCandidate,
@@ -38,6 +40,36 @@ func TestConstructorIDsGolden(t *testing.T) {
 		if got[name] != want {
 			t.Errorf("%s constructor = 0x%08x, want 0x%08x", name, got[name], want)
 		}
+	}
+}
+
+func TestBlockSyncOverlayIdentityGolden(t *testing.T) {
+	identity, err := BuildBlockSyncOverlayIdentity(filledID(0x44))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantFull := mustHex(t,
+		"1222799d"+strings.Repeat("44", 32),
+	)
+	wantShort := mustHex(t, "7c94cff70c70163526d071ccbc0f702b8a382561084d1eab22ecfcbc2095a00b")
+	if !bytes.Equal(identity.FullID, wantFull) {
+		t.Fatalf("full block-sync overlay id:\n got %x\nwant %x", identity.FullID, wantFull)
+	}
+	if !bytes.Equal(identity.ShortID[:], wantShort) {
+		t.Fatalf("short block-sync overlay id:\n got %x\nwant %x", identity.ShortID, wantShort)
+	}
+
+	var parsed any
+	rest, err := tl.Parse(&parsed, identity.FullID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("block-sync overlay parse left %d bytes", len(rest))
+	}
+	if _, ok := parsed.(ConsensusBlockSyncOverlayID); !ok {
+		t.Fatalf("block-sync constructor globally resolves to %T", parsed)
 	}
 }
 

@@ -44,15 +44,18 @@ type PreparedCandidate struct {
 	collatedFileHash [32]byte
 }
 
-// PrepareCandidate builds the payload on the calling goroutine.
+// PrepareCandidate builds the payload on the calling goroutine. cellsHint is
+// PayloadCellHint over the two BOCs the caller serialized these roots into; zero
+// leaves the serializer at its default sizing.
 func PrepareCandidate(
 	seqNo uint32,
 	blockRoot *cell.Cell,
 	collatedRoots []*cell.Cell,
 	fileHash [32]byte,
 	collatedFileHash [32]byte,
+	cellsHint int,
 ) (*PreparedCandidate, error) {
-	prepared, build := newPreparedCandidate(seqNo, blockRoot, collatedRoots, fileHash, collatedFileHash)
+	prepared, build := newPreparedCandidate(seqNo, blockRoot, collatedRoots, fileHash, collatedFileHash, cellsHint)
 	build()
 	if prepared.err != nil {
 		return nil, prepared.err
@@ -76,8 +79,9 @@ func PrepareCandidateAsync(
 	collatedRoots []*cell.Cell,
 	fileHash [32]byte,
 	collatedFileHash [32]byte,
+	cellsHint int,
 ) *PreparedCandidate {
-	prepared, build := newPreparedCandidate(seqNo, blockRoot, collatedRoots, fileHash, collatedFileHash)
+	prepared, build := newPreparedCandidate(seqNo, blockRoot, collatedRoots, fileHash, collatedFileHash, cellsHint)
 	go build()
 
 	return prepared
@@ -89,6 +93,7 @@ func newPreparedCandidate(
 	collatedRoots []*cell.Cell,
 	fileHash [32]byte,
 	collatedFileHash [32]byte,
+	cellsHint int,
 ) (*PreparedCandidate, func()) {
 	prepared := &PreparedCandidate{
 		ready:            make(chan struct{}),
@@ -111,7 +116,7 @@ func newPreparedCandidate(
 
 	return prepared, func() {
 		defer close(prepared.ready)
-		prepared.payload, prepared.err = compressCandidatePayload(seqNo, prepared.rootHash[:], roots)
+		prepared.payload, prepared.err = compressCandidatePayload(seqNo, prepared.rootHash[:], roots, cellsHint)
 	}
 }
 

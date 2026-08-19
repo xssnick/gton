@@ -91,10 +91,15 @@ func (c *collation) buildStateAndBlockParts() (blockParts, error) {
 	// shared instead of duplicated, and free of the collation traversal trace.
 	// Both come out of one pass — applying the update separately would rediscover
 	// the source subtree behind every pruned boundary that the pass already knew.
-	stateUpdate, stateRoot, err := c.usage.CreateMerkleUpdateApplied(stateRoot)
+	// The memo the destination walk fills is sized from what the previous block's
+	// walk actually filled, and what this one fills is carried back for the next.
+	// The read set is the wrong ruler for it: it is three times this size and
+	// moves for different reasons.
+	stateUpdate, stateRoot, memoCells, err := c.usage.CreateMerkleUpdateAppliedSized(stateRoot, c.builder.updateMemoHint())
 	if err != nil {
 		return blockParts{}, fmt.Errorf("create shard state update: %w", err)
 	}
+	c.updateMemoCells = memoCells
 
 	inMessages, err := c.inMessages.ToCell()
 	if err != nil {

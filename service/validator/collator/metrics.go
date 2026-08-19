@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/xssnick/gton/service/validator/blockstats"
 )
 
 // MetricsRegistry is the process metrics capability used by the validator
@@ -41,16 +42,51 @@ type CollationStage uint8
 
 const (
 	CollationStageAcquireInputs CollationStage = iota
-	CollationStageCore
-	CollationStageResolveState
-	CollationStageRestore
-	CollationStageSign
-	CollationStagePersist
-	CollationStageCommit
-	CollationStageBroadcastWait
-	CollationStageEmit
+	CollationStageAssembleCandidate
+	CollationStageWaitExternalMessages
+	CollationStageResolveCandidateState
+	CollationStageRestoreCandidate
+	CollationStageSignCandidate
+	CollationStagePersistCandidate
+	CollationStageCommitCandidateState
+	CollationStageWaitBroadcastSlot
+	CollationStageDeliverCandidate
 	collationStageCount
 )
+
+// CollationAlarm is a bounded producer fault that needs an operator rather than
+// a trend line. Both members are conditions this collator can detect about its
+// own output and nothing downstream can: a peer that rejects the resulting
+// block reports the symptom, never the cause, and a slot that produced no block
+// at all reports nothing anywhere.
+type CollationAlarm uint8
+
+const (
+	// CollationAlarmShortCollatedProof is a block that shipped with a collated
+	// proof this node knows does not cover the predecessor-queue scan a
+	// proof-backed validator will run over it. The block is on the wire and is
+	// very likely to be rejected for "augmented dict has special cells in tree
+	// structure", which names the cell and not the reason. See
+	// traceProcessedQueueValidationClosure and Stats.ProcessedScanTraceError.
+	CollationAlarmShortCollatedProof CollationAlarm = iota
+	// CollationAlarmMandatoryDequeueOverflow is a slot lost because the
+	// predecessor's already-processed own-shard queue entries do not fit one
+	// block. The drain cannot be truncated, so no block is produced at all. See
+	// cleanupMandatoryDrain.
+	CollationAlarmMandatoryDequeueOverflow
+	collationAlarmCount
+)
+
+func (a CollationAlarm) String() string {
+	switch a {
+	case CollationAlarmShortCollatedProof:
+		return "short_collated_proof"
+	case CollationAlarmMandatoryDequeueOverflow:
+		return "mandatory_dequeue_overflow"
+	default:
+		return "unknown"
+	}
+}
 
 // CollationResult is a bounded terminal result for builds, productions, and
 // windows. Detailed error strings stay in logs instead of metric labels.
@@ -61,6 +97,13 @@ const (
 	CollationResultError
 	CollationResultCanceled
 	CollationResultDeadline
+	// CollationResultNotReady is a build that stopped because a local input it
+	// needs has not arrived yet. It is not an error: the window producer retries
+	// it on its own schedule and the very next attempt usually succeeds. It has
+	// its own result because it used to be counted as CollationResultError,
+	// where it was 99.7% of everything under that label and made the collator
+	// look like it was failing 39-50% of its builds.
+	CollationResultNotReady
 	collationResultCount
 )
 
@@ -90,6 +133,12 @@ const (
 	DeadlineActionWait DeadlineAction = iota
 	DeadlineActionEmitEmpty
 	DeadlineActionAbort
+	// DeadlineActionWaitNoEmpty is a soft deadline this producer had to keep
+	// waiting through because the session has not finalized for
+	// NoEmptyBlocksOnErrTimeout and an empty block is therefore forbidden. It is
+	// distinguished from an ordinary wait because the two have different causes
+	// and only one of them is about this node's own build being slow.
+	DeadlineActionWaitNoEmpty
 	deadlineActionCount
 )
 
@@ -122,6 +171,7 @@ const (
 	ValidationCoreStageChainInputs
 	ValidationCoreStageDecode
 	ValidationCoreStageTransition
+	ValidationCoreStageWaitInputs
 	validationCoreStageCount
 )
 
@@ -217,9 +267,120 @@ type CollationObserver interface {
 	ObserveCandidateProduction(CandidateProductionObservation)
 	ObserveCollationDeadline(MetricChain, CollationDeadline, DeadlineAction)
 	ObserveCollationRetry(MetricChain, ProductionRetryReason)
+	// ObserveCollationAlarm counts one producer fault an operator has to act on.
+	// It is separate from the terminal build result because neither member is
+	// visible there: a short collated proof rides on a SUCCESSFUL build, and a
+	// mandatory-dequeue overflow is one error among all the others that end a
+	// build.
+	ObserveCollationAlarm(MetricChain, CollationAlarm)
 	ObserveScheduleLateness(MetricChain, ScheduleEvent, time.Duration)
 	AddCollationWindowInflight(MetricChain, int)
 	ObserveCollationWindow(WindowObservation)
+}
+
+// NewBlockStatsObserver records validator-engine-compatible block counters at
+// the same terminal observation point as the optional metrics observer.
+func NewBlockStatsObserver(
+	stats *blockstats.Accumulator,
+	observer CollationObserver,
+) CollationObserver {
+	if stats == nil {
+		return observer
+	}
+
+	return &blockStatsObserver{stats: stats, observer: observer}
+}
+
+type blockStatsObserver struct {
+	stats    *blockstats.Accumulator
+	observer CollationObserver
+}
+
+func (o *blockStatsObserver) AddCollationBuildInflight(chain MetricChain, delta int) {
+	if o.observer != nil {
+		o.observer.AddCollationBuildInflight(chain, delta)
+	}
+}
+
+func (o *blockStatsObserver) ObserveCollationBuild(observation CollationBuildObservation) {
+	switch boundedCollationResult(observation.Result) {
+	case CollationResultSuccess:
+		o.stats.ObserveCollation(observation.Chain == MetricChainMasterchain, true)
+	case CollationResultNotReady:
+		// Not an attempt at all as far as validator-engine's two-valued counter
+		// is concerned: the inputs were not there, the producer retried, and the
+		// attempt that eventually ran is the one this counter should see.
+	default:
+		// validator-engine exposes only ok and error, so every non-successful
+		// terminal build is represented by the error counter.
+		o.stats.ObserveCollation(observation.Chain == MetricChainMasterchain, false)
+	}
+
+	if o.observer != nil {
+		o.observer.ObserveCollationBuild(observation)
+	}
+}
+
+func (o *blockStatsObserver) ObserveCollationStage(observation CollationStageObservation) {
+	if o.observer != nil {
+		o.observer.ObserveCollationStage(observation)
+	}
+}
+
+func (o *blockStatsObserver) ObserveCollationCandidate(observation CandidateObservation) {
+	if o.observer != nil {
+		o.observer.ObserveCollationCandidate(observation)
+	}
+}
+
+func (o *blockStatsObserver) ObserveCandidateProduction(observation CandidateProductionObservation) {
+	if o.observer != nil {
+		o.observer.ObserveCandidateProduction(observation)
+	}
+}
+
+func (o *blockStatsObserver) ObserveCollationDeadline(
+	chain MetricChain,
+	deadline CollationDeadline,
+	action DeadlineAction,
+) {
+	if o.observer != nil {
+		o.observer.ObserveCollationDeadline(chain, deadline, action)
+	}
+}
+
+func (o *blockStatsObserver) ObserveCollationRetry(chain MetricChain, reason ProductionRetryReason) {
+	if o.observer != nil {
+		o.observer.ObserveCollationRetry(chain, reason)
+	}
+}
+
+func (o *blockStatsObserver) ObserveCollationAlarm(chain MetricChain, alarm CollationAlarm) {
+	if o.observer != nil {
+		o.observer.ObserveCollationAlarm(chain, alarm)
+	}
+}
+
+func (o *blockStatsObserver) ObserveScheduleLateness(
+	chain MetricChain,
+	event ScheduleEvent,
+	duration time.Duration,
+) {
+	if o.observer != nil {
+		o.observer.ObserveScheduleLateness(chain, event, duration)
+	}
+}
+
+func (o *blockStatsObserver) AddCollationWindowInflight(chain MetricChain, delta int) {
+	if o.observer != nil {
+		o.observer.AddCollationWindowInflight(chain, delta)
+	}
+}
+
+func (o *blockStatsObserver) ObserveCollationWindow(observation WindowObservation) {
+	if o.observer != nil {
+		o.observer.ObserveCollationWindow(observation)
+	}
 }
 
 // ValidationCoreObserver is the narrow local-acquisition part of validator
@@ -243,13 +404,15 @@ type PrometheusMetrics struct {
 	gasUsed            *prometheus.HistogramVec
 	messages           *prometheus.HistogramVec
 	outQueueMessages   *prometheus.HistogramVec
-	externalWait       *prometheus.HistogramVec
 	externalBatches    *prometheus.HistogramVec
 	externalStops      *prometheus.CounterVec
+	queueCleanupStops  *prometheus.CounterVec
+	queueCleaned       *prometheus.HistogramVec
 	loadClasses        *prometheus.CounterVec
 	overloads          *prometheus.CounterVec
 	deadlineEvents     *prometheus.CounterVec
 	retries            *prometheus.CounterVec
+	alarms             *prometheus.CounterVec
 	scheduleLateness   *prometheus.HistogramVec
 	windowsInflight    *prometheus.GaugeVec
 	windows            *prometheus.CounterVec
@@ -318,10 +481,6 @@ func NewPrometheusMetrics(registry MetricsRegistry) (*PrometheusMetrics, error) 
 			Namespace: namespace, Subsystem: "collator", Name: "candidate_out_queue_messages",
 			Help: "Outbound queue size reported after producing a candidate.", Buckets: counts,
 		}, []string{"mode", "chain"}),
-		externalWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: namespace, Subsystem: "collator", Name: "external_wait_duration_seconds",
-			Help: "Time spent waiting for ready external-message batches during collation.", Buckets: durations,
-		}, []string{"mode", "chain"}),
 		externalBatches: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Subsystem: "collator", Name: "external_batches",
 			Help: "Ready external-message batches consumed by a collation.", Buckets: counts,
@@ -330,6 +489,14 @@ func NewPrometheusMetrics(registry MetricsRegistry) (*PrometheusMetrics, error) 
 			Namespace: namespace, Subsystem: "collator", Name: "external_stop_total",
 			Help: "External-message processing stop reasons.",
 		}, []string{"mode", "chain", "reason"}),
+		queueCleanupStops: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: "collator", Name: "queue_cleanup_stop_total",
+			Help: "Outbound queue cleanup stop reasons.",
+		}, []string{"mode", "chain", "reason"}),
+		queueCleaned: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace, Subsystem: "collator", Name: "candidate_queue_cleaned_messages",
+			Help: "Outbound queue entries dequeued by the cleanup phase.", Buckets: counts,
+		}, []string{"mode", "chain"}),
 		loadClasses: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Subsystem: "collator", Name: "load_class_total",
 			Help: "Produced candidates by final block load class.",
@@ -346,6 +513,10 @@ func NewPrometheusMetrics(registry MetricsRegistry) (*PrometheusMetrics, error) 
 			Namespace: namespace, Subsystem: "collator", Name: "retries_total",
 			Help: "Retried producer windows by bounded failure reason.",
 		}, []string{"mode", "chain", "reason"}),
+		alarms: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: "collator", Name: "alarms_total",
+			Help: "Producer faults an operator must act on: a shipped block with a knowingly short collated proof, or a slot lost because the mandatory own-shard dequeue does not fit.",
+		}, []string{"mode", "chain", "alarm"}),
 		scheduleLateness: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Subsystem: "collator", Name: "schedule_lateness_seconds",
 			Help: "Positive lateness relative to the configured build or broadcast slot boundary.", Buckets: durations,
@@ -367,9 +538,11 @@ func NewPrometheusMetrics(registry MetricsRegistry) (*PrometheusMetrics, error) 
 	if err := registry.RegisterCollector(collectorSet{
 		metrics.builds, metrics.buildsInflight, metrics.buildDuration, metrics.stageDuration,
 		metrics.candidates, metrics.productionDuration, metrics.candidateSize, metrics.transactions,
-		metrics.gasUsed, metrics.messages, metrics.outQueueMessages, metrics.externalWait,
-		metrics.externalBatches, metrics.externalStops, metrics.loadClasses, metrics.overloads,
-		metrics.deadlineEvents, metrics.retries, metrics.scheduleLateness, metrics.windowsInflight,
+		metrics.gasUsed, metrics.messages, metrics.outQueueMessages,
+		metrics.externalBatches, metrics.externalStops, metrics.queueCleanupStops, metrics.queueCleaned,
+		metrics.loadClasses, metrics.overloads,
+		metrics.deadlineEvents, metrics.retries, metrics.alarms,
+		metrics.scheduleLateness, metrics.windowsInflight,
 		metrics.windows, metrics.windowDuration,
 	}); err != nil {
 		return nil, err
@@ -404,13 +577,15 @@ type prometheusObserver struct {
 	gasUsed            [metricChainCount]prometheus.Observer
 	messages           [metricChainCount][candidateOriginCount][2]prometheus.Observer
 	outQueueMessages   [metricChainCount]prometheus.Observer
-	externalWait       [metricChainCount]prometheus.Observer
 	externalBatches    [metricChainCount]prometheus.Observer
 	externalStops      [metricChainCount][5]prometheus.Counter
+	queueCleanupStops  [metricChainCount][cleanupStopReasonCount]prometheus.Counter
+	queueCleaned       [metricChainCount]prometheus.Observer
 	loadClasses        [metricChainCount][6]prometheus.Counter
 	overloads          [metricChainCount][5]prometheus.Counter
 	deadlineEvents     [metricChainCount][collationDeadlineCount][deadlineActionCount]prometheus.Counter
 	retries            [metricChainCount][productionRetryReasonCount]prometheus.Counter
+	alarms             [metricChainCount][collationAlarmCount]prometheus.Counter
 	scheduleLateness   [metricChainCount][scheduleEventCount]prometheus.Observer
 	windowsInflight    [metricChainCount]prometheus.Gauge
 	windows            [metricChainCount][collationResultCount]prometheus.Counter
@@ -429,10 +604,12 @@ func (m *PrometheusMetrics) Observer(mode MetricsMode) CollationObserver {
 	o := &prometheusObserver{}
 	modeLabel := [...]string{"validator", "standalone"}[mode]
 	chains := [...]string{"masterchain", "shardchain"}
-	results := [...]string{"success", "error", "canceled", "deadline"}
+	results := [...]string{"success", "error", "canceled", "deadline", "not_ready"}
 	stages := [...]string{
-		"acquire_inputs", "core", "resolve_state", "restore", "sign",
-		"persist", "commit", "broadcast_wait", "emit",
+		"acquire_inputs", "assemble_candidate", "wait_external_messages",
+		"resolve_candidate_state", "restore_candidate", "sign_candidate",
+		"persist_candidate", "commit_candidate_state", "wait_broadcast_slot",
+		"deliver_candidate",
 	}
 	kinds := [...]string{"block", "empty", "recovered"}
 	origins := [...]string{"collation", "validation"}
@@ -466,11 +643,16 @@ func (m *PrometheusMetrics) Observer(mode MetricsMode) CollationObserver {
 		}
 		o.gasUsed[chain] = m.gasUsed.WithLabelValues(modeLabel, chainLabel)
 		o.outQueueMessages[chain] = m.outQueueMessages.WithLabelValues(modeLabel, chainLabel)
-		o.externalWait[chain] = m.externalWait.WithLabelValues(modeLabel, chainLabel)
 		o.externalBatches[chain] = m.externalBatches.WithLabelValues(modeLabel, chainLabel)
 		for reason, label := range [...]string{"unknown", "ready_drained", "soft_limit", "deadline", "attempt_limit"} {
 			o.externalStops[chain][reason] = m.externalStops.WithLabelValues(modeLabel, chainLabel, label)
 		}
+		for reason := CleanupStopReason(0); reason < cleanupStopReasonCount; reason++ {
+			o.queueCleanupStops[chain][reason] = m.queueCleanupStops.WithLabelValues(
+				modeLabel, chainLabel, reason.String(),
+			)
+		}
+		o.queueCleaned[chain] = m.queueCleaned.WithLabelValues(modeLabel, chainLabel)
 		for class, label := range [...]string{"underload", "normal", "soft", "medium", "hard", "unknown"} {
 			o.loadClasses[chain][class] = m.loadClasses.WithLabelValues(modeLabel, chainLabel, label)
 		}
@@ -478,7 +660,7 @@ func (m *PrometheusMetrics) Observer(mode MetricsMode) CollationObserver {
 			o.overloads[chain][reason] = m.overloads.WithLabelValues(modeLabel, chainLabel, label)
 		}
 		for deadline, deadlineLabel := range [...]string{"soft", "hard"} {
-			for action, actionLabel := range [...]string{"wait", "emit_empty", "abort"} {
+			for action, actionLabel := range [...]string{"wait", "emit_empty", "abort", "wait_no_empty"} {
 				o.deadlineEvents[chain][deadline][action] = m.deadlineEvents.WithLabelValues(
 					modeLabel, chainLabel, deadlineLabel, actionLabel,
 				)
@@ -486,6 +668,9 @@ func (m *PrometheusMetrics) Observer(mode MetricsMode) CollationObserver {
 		}
 		for reason, label := range [...]string{"not_ready", "other"} {
 			o.retries[chain][reason] = m.retries.WithLabelValues(modeLabel, chainLabel, label)
+		}
+		for alarm := CollationAlarm(0); alarm < collationAlarmCount; alarm++ {
+			o.alarms[chain][alarm] = m.alarms.WithLabelValues(modeLabel, chainLabel, alarm.String())
 		}
 		for event, label := range [...]string{"build_start", "broadcast"} {
 			o.scheduleLateness[chain][event] = m.scheduleLateness.WithLabelValues(modeLabel, chainLabel, label)
@@ -511,7 +696,7 @@ func (o *prometheusObserver) ObserveCollationBuild(observation CollationBuildObs
 func (o *prometheusObserver) ObserveCollationStage(observation CollationStageObservation) {
 	stage := observation.Stage
 	if stage >= collationStageCount {
-		stage = CollationStageCore
+		return
 	}
 	o.stageDuration[boundedChain(observation.Chain)][stage].Observe(nonNegativeSeconds(observation.Duration))
 }
@@ -550,9 +735,10 @@ func (o *prometheusObserver) ObserveCollationCandidate(observation CandidateObse
 	stats := observation.Stats
 	o.gasUsed[chain].Observe(float64(stats.GasUsed))
 	o.outQueueMessages[chain].Observe(float64(stats.OutQueueSize))
-	o.externalWait[chain].Observe(nonNegativeSeconds(stats.ExternalWait))
 	o.externalBatches[chain].Observe(float64(stats.ExternalBatches))
 	o.externalStops[chain][boundedExternalStop(stats.ExternalStop)].Inc()
+	o.queueCleanupStops[chain][boundedCleanupStop(stats.QueueCleanupStop)].Inc()
+	o.queueCleaned[chain].Observe(float64(stats.QueueCleaned))
 	o.loadClasses[chain][boundedLoadClass(stats.Load)].Inc()
 	o.overloads[chain][boundedOverload(stats.OverloadReason)].Inc()
 }
@@ -586,6 +772,13 @@ func (o *prometheusObserver) ObserveCollationRetry(chain MetricChain, reason Pro
 		reason = ProductionRetryOther
 	}
 	o.retries[boundedChain(chain)][reason].Inc()
+}
+
+func (o *prometheusObserver) ObserveCollationAlarm(chain MetricChain, alarm CollationAlarm) {
+	if alarm >= collationAlarmCount {
+		return
+	}
+	o.alarms[boundedChain(chain)][alarm].Inc()
 }
 
 func (o *prometheusObserver) ObserveScheduleLateness(
@@ -638,6 +831,16 @@ func boundedExternalStop(reason ExternalStopReason) int {
 		return 0
 	}
 	return int(reason)
+}
+
+// boundedCleanupStop keeps an unexpected reason out of the label space rather
+// than dropping the observation: a budget nobody can see is a budget nobody
+// will ever tune.
+func boundedCleanupStop(reason CleanupStopReason) CleanupStopReason {
+	if reason >= cleanupStopReasonCount {
+		return CleanupStopExhausted
+	}
+	return reason
 }
 
 func boundedLoadClass(class LoadClass) int {
@@ -706,6 +909,9 @@ func (s *Service) observeCandidateProduction(
 func collationResult(err error) CollationResult {
 	if err == nil {
 		return CollationResultSuccess
+	}
+	if errors.Is(err, ErrAcquisitionNotReady) {
+		return CollationResultNotReady
 	}
 	if errors.Is(err, context.Canceled) {
 		return CollationResultCanceled

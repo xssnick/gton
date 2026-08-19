@@ -338,6 +338,7 @@ func (s *StateLifecycle) tryPersistentStateKeyBlock(
 		lease.release()
 		return err
 	}
+	s.enforcePersistentStateRetentionAfterSerialization(ctx, block, PersistentStateSerializationAll)
 	lease.release()
 	s.afterPersistentStateSerialized(ctx, block, PersistentStateSerializationAll)
 	return errServiceMaintenanceRescan

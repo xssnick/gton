@@ -3,6 +3,7 @@ package groups
 import (
 	"bytes"
 	"math/big"
+	"slices"
 	"testing"
 	"time"
 
@@ -110,6 +111,50 @@ func TestResolveCollatorsByValidatorMatchesRegistrySelection(t *testing.T) {
 	if registryTestOverlayCount(overlay, occupiedADNL) != 1 {
 		t.Fatalf("validator ADNL was duplicated by registry: %+v", overlay)
 	}
+}
+
+func TestResolveCollatorsByValidatorFiltersValidatorSigningKeyIDs(t *testing.T) {
+	t.Parallel()
+
+	contract := groupTestBytes(90)
+	first := testValidatorWire{
+		index: 0, key: groupTestBytes(41), adnl: groupTestBytes(1), weight: 1, withADNL: true,
+	}
+	second := testValidatorWire{
+		index: 1, key: groupTestBytes(42), adnl: groupTestBytes(2), weight: 1, withADNL: true,
+	}
+	secondKeyID := registryTestKeyID(t, second.key)
+	validCollator := groupTestBytes(10)
+	storage := registryTestStorage(t, map[[32]byte]*cell.Cell{
+		first.key: registryTestValidator(registryTestEntry(t, secondKeyID, validCollator)),
+	})
+	configRoot := buildTestConfig(t, map[uint32]*cell.Cell{
+		configParamFundamentalContracts: registryTestFundamentalContracts(t, contract),
+		configParamCurrentValidators: buildTestValidatorSet(t, []testValidatorWire{
+			first,
+			second,
+		}, true, 2),
+		configParamValidatorRegistry: registryTestConfig(contract, 2),
+	})
+	state, config := registryTestParsedStateAndConfig(
+		t,
+		registryTestState(
+			t,
+			100,
+			true,
+			false,
+			configRoot,
+			[32]byte{},
+			registryTestAccounts(t, contract, storage),
+		),
+	)
+
+	registry, issue := resolveCollatorsByValidator(state, config)
+	if issue != nil {
+		t.Fatalf("usable registry reported an issue: %v", issue)
+	}
+	want := []CollatorRegistryEntry{registryTestProjection(t, first.key, validCollator)}
+	registryTestRequireEqual(t, registry, want)
 }
 
 func TestResolveCollatorsByValidatorRequiresSpecialActiveContract(t *testing.T) {
@@ -303,6 +348,21 @@ func TestNewTrackerRejectsDuplicateInitialRegistry(t *testing.T) {
 	}})
 	if err == nil {
 		t.Fatal("NewTracker accepted duplicate initial validator registry entry")
+	}
+}
+
+func TestAllCollatorADNLIDsSortsAndDeduplicatesAcrossValidators(t *testing.T) {
+	first := groupTestBytes(0x31)
+	second := groupTestBytes(0x32)
+	third := groupTestBytes(0x33)
+
+	got := AllCollatorADNLIDs([]CollatorRegistryEntry{
+		{ValidatorKeyID: groupTestBytes(1), CollatorADNLIDs: [][32]byte{third, first}},
+		{ValidatorKeyID: groupTestBytes(2), CollatorADNLIDs: [][32]byte{second, first}},
+	})
+	want := [][32]byte{first, second, third}
+	if !slices.Equal(got, want) {
+		t.Fatalf("all collator ADNL IDs = %x, want %x", got, want)
 	}
 }
 

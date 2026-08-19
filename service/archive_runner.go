@@ -63,7 +63,8 @@ type archiveShardTransitions interface {
 	applyArchiveShardBlock(context.Context, ton.BlockIDExt, []*storage.BlockState, PreparedBlock, stateUpdateApplier, *storage.BlockState) (*storage.BlockState, error)
 }
 
-type archiveCheckpointTransitions interface {
+type archiveCurrentTransitions interface {
+	archiveCurrentAdvanced(*storage.CurrentState)
 	archiveCheckpointCommitted(*storage.CurrentState, []storage.StateCheckpointBlock)
 }
 
@@ -91,13 +92,13 @@ type ArchiveRunner struct {
 	syncDiskSpacePath    string
 	minSyncDiskFreeBytes uint64
 
-	bindMu                sync.Mutex
-	isBound               bool
-	isStarted             bool
-	masterTransitions     archiveMasterTransitions
-	shardTransitions      archiveShardTransitions
-	checkpointTransitions archiveCheckpointTransitions
-	syncUntilTransitions  archiveSyncUntilTransitions
+	bindMu               sync.Mutex
+	isBound              bool
+	isStarted            bool
+	masterTransitions    archiveMasterTransitions
+	shardTransitions     archiveShardTransitions
+	currentTransitions   archiveCurrentTransitions
+	syncUntilTransitions archiveSyncUntilTransitions
 
 	runMu sync.Mutex
 }
@@ -151,7 +152,7 @@ func NewArchiveRunner(
 func (a *ArchiveRunner) Bind(
 	master archiveMasterTransitions,
 	shard archiveShardTransitions,
-	checkpoint archiveCheckpointTransitions,
+	current archiveCurrentTransitions,
 	syncUntil archiveSyncUntilTransitions,
 ) error {
 	a.bindMu.Lock()
@@ -163,13 +164,13 @@ func (a *ArchiveRunner) Bind(
 	if a.isBound {
 		return errArchiveRunnerAlreadyBound
 	}
-	if master == nil || shard == nil || checkpoint == nil || syncUntil == nil {
+	if master == nil || shard == nil || current == nil || syncUntil == nil {
 		return errArchiveRunnerNotBound
 	}
 
 	a.masterTransitions = master
 	a.shardTransitions = shard
-	a.checkpointTransitions = checkpoint
+	a.currentTransitions = current
 	a.syncUntilTransitions = syncUntil
 	a.isBound = true
 	return nil
@@ -297,10 +298,27 @@ func (s *SyncCoordinator) applyArchiveMasterBlock(ctx context.Context, current *
 }
 
 func (s *SyncCoordinator) applyArchiveShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, block PreparedBlock, applier stateUpdateApplier, master *storage.BlockState) (*storage.BlockState, error) {
-	return s.applyResolvedShardBlock(ctx, target, previous, block, applier, &blockAppliedObserverMeta{
+	next, err := s.applyResolvedShardBlock(ctx, target, previous, block, applier, &blockAppliedObserverMeta{
 		InclusionMasterRef:   &master.Block,
 		InclusionMasterState: master.Cell,
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	s.publishLiveBlockArtifacts(block, next, liveBlockPublishOptions{availabilityOnly: true})
+	return next, nil
+}
+
+func (s *SyncCoordinator) archiveCurrentAdvanced(current *storage.CurrentState) {
+	snapshot := s.publishLiveCurrentStateChanged(current)
+	if s.liveState == nil {
+		return
+	}
+	if snapshot == nil {
+		snapshot = storage.CloneCurrentState(current)
+	}
+	s.liveState.SetLiveCurrentStateSnapshot(snapshot)
 }
 
 func (s *SyncCoordinator) archiveCheckpointCommitted(current *storage.CurrentState, entries []storage.StateCheckpointBlock) {

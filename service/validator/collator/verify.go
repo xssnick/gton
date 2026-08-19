@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math"
-	"sync"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -29,7 +28,31 @@ type verifiedCandidate struct {
 	inMessages    *tlb.InMsgDescrAugDict
 	outMessages   *tlb.OutMsgDescrAugDict
 	accountBlocks *tlb.ShardAccountBlocksAugDict
-	collated      verifiedCollatedData
+	// accountBlockIndex is every AccountBlock as the structural walk decoded it,
+	// in ascending key order. It is a pointer, not a slice header: both
+	// verifyPrepared*Candidate start with `verified := *prepared`, and a pointer
+	// makes it unambiguous that the copies share one frozen structure. It is
+	// written once, by the structural pass, and read-only from then on; the
+	// candidate's life is its lifetime.
+	accountBlockIndex *accountBlockIndex
+	collated          verifiedCollatedData
+	// stateUpdate is block.StateUpdate with its verdict already decided, and —
+	// on the one path where a plan is replayed — its two update-side walks
+	// recorded once. cell.ValidateMerkleUpdate is never called again for this
+	// candidate: it takes only the update cell, so its verdict is a pure
+	// function of that cell and cannot change with the parent an apply is
+	// measured against.
+	//
+	// It is filled by bindConfig and is therefore nil until the masterchain
+	// config is known. That is deliberate: the walk that decides it is the most
+	// expensive thing here, it is reached only after the size limits have had
+	// their chance to refuse the candidate, and a node that is behind abandons
+	// whole attempts above this point.
+	//
+	// Applying still happens per parent: the source materialization check that
+	// descends the update's source proof against a real tree is exactly what a
+	// narrow parent fails, and the capsule re-runs it on every ApplyTo.
+	stateUpdate *cell.PreparedMerkleUpdate
 	// shape is filled by the semantic replay from walks it performs anyway, so
 	// a caller that wants to report what it validated does not have to walk the
 	// block again. It is written by the replay's single-threaded phases only.
@@ -55,12 +78,12 @@ func VerifyShardCandidate(ctx context.Context, req ShardVerificationRequest) err
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	verified, err := verifyCandidate(ctx, req.Masterchain.Config, req.Candidate)
+	prepared, err := prepareVerificationCandidate(ctx, req.Masterchain.Config, req.Candidate)
 	if err != nil {
 		return err
 	}
 
-	return verifyPreparedShardCandidate(ctx, req, &verified)
+	return verifyPreparedShardCandidate(ctx, req, &prepared.verified)
 }
 
 func verifyPreparedShardCandidate(
@@ -479,12 +502,12 @@ func VerifyMasterCandidate(ctx context.Context, req MasterVerificationRequest) e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	verified, err := verifyCandidate(ctx, req.Config, req.Candidate)
+	prepared, err := prepareVerificationCandidate(ctx, req.Config, req.Candidate)
 	if err != nil {
 		return err
 	}
 
-	return verifyPreparedMasterCandidate(ctx, req, &verified)
+	return verifyPreparedMasterCandidate(ctx, req, &prepared.verified)
 }
 
 func verifyPreparedMasterCandidate(
@@ -532,9 +555,27 @@ func verifyPreparedMasterCandidate(
 		return fmt.Errorf("%w: masterchain state contains a masterchain reference", ErrInvalidInput)
 	}
 
-	previousState, err := verifyPredecessor("master", &previous)
-	if err != nil {
-		return err
+	// The acquisition pipeline runs the identical call on the identical
+	// predecessor while it resolves the masterchain view, and verifyPredecessor
+	// is a pure function of that value. Repeating it here decoded the same
+	// state root and re-walked its accounts prefix a second time per candidate.
+	var previousState *tlb.ShardStateUnsplit
+	if req.previousState == nil {
+		state, stateErr := verifyPredecessor("master", &previous)
+		if stateErr != nil {
+			return stateErr
+		}
+		previousState = &state
+	} else {
+		// A plumbing assertion rather than a substitute for the checks above:
+		// the only legitimate value here is the parse of this very predecessor's
+		// state, and the way to say so is the tree it was parsed from. Comparing
+		// fields instead would accept a state from another fork at the same
+		// sequence number in the same shard, which agrees on all of them.
+		if req.previousState.root != previous.State {
+			return fmt.Errorf("%w: supplied master predecessor state differs from its block id", ErrInvalidInput)
+		}
+		previousState = &req.previousState.state
 	}
 	if previous.ID.Workchain != address.MasterchainID || previous.ID.Shard != math.MinInt64 ||
 		previousState.McStateExtra == nil {
@@ -546,16 +587,16 @@ func verifyPreparedMasterCandidate(
 	if previous.ID.SeqNo == math.MaxUint32 || header.SeqNo != previous.ID.SeqNo+1 {
 		return fmt.Errorf("%w: master candidate sequence number does not follow its predecessor", ErrInvalidInput)
 	}
-	if err = verifyBlockReference(&header.PrevRef.Prev1, &previous, &previousState, "master"); err != nil {
+	if err := verifyBlockReference(&header.PrevRef.Prev1, &previous, previousState, "master"); err != nil {
 		return err
 	}
-	if err = verifyBlockLTDelta(config, header, true); err != nil {
+	if err := verifyBlockLTDelta(config, header, true); err != nil {
 		return err
 	}
-	if err = verifyStateTransition(previous.State, candidate.State, verified.block.StateUpdate); err != nil {
+	if err := verifyStateTransition(previous.State, candidate.State, verified.block.StateUpdate); err != nil {
 		return err
 	}
-	masterState, err := loadMasterCandidateState(config, &previousState, &verified)
+	masterState, err := loadMasterCandidateState(config, previousState, &verified, req.Groups)
 	if err != nil {
 		return err
 	}
@@ -573,15 +614,15 @@ func verifyPreparedMasterCandidate(
 	); err != nil {
 		return err
 	}
-	if err = verifyMasterDeterministicTransition(req, &previousState, &verified, &masterState); err != nil {
+	registry, err := verifyMasterDeterministicTransition(req, previousState, &verified, &masterState)
+	if err != nil {
 		return err
 	}
 	if verified.collated.full {
-		registry, registryErr := ParseShardRegistry(masterState.nextExtra.ShardHashes)
-		if registryErr != nil {
-			return registryErr
-		}
-		if err = verifyFullMasterNeighborSet(previous, &previousState, registry, req.Neighbors); err != nil {
+		// registry is the block's own ShardHashes. verifyMasterExtras above has
+		// already proven it equal to the resulting state's by root hash, which is
+		// what makes it the registry the neighbour set must be projected out of.
+		if err = verifyFullMasterNeighborSet(previous, previousState, registry, req.Neighbors); err != nil {
 			return err
 		}
 		if err = verifyCollatedNeighborStates(&verified.collated, req.Neighbors); err != nil {
@@ -604,8 +645,15 @@ func verifyPreparedMasterCandidate(
 		NeighborShardEndLT: req.NeighborShardEndLT,
 		prepared: &preparedCandidateTransition{
 			candidate:     &verified,
-			previous:      &previousState,
+			previous:      previousState,
 			minimumBurned: masterState.minimumBurned,
+			// The replay decodes the same predecessor statistics and block info
+			// again for its execution context and for the public library check.
+			// loadMasterCandidateState runs strictly before this call and
+			// nothing writes those two fields afterwards, so the decoded values
+			// are handed over instead of being re-derived twice more.
+			previousStats: &masterState.previousStats,
+			previousInfo:  &masterState.previousInfo,
 		},
 	}); err != nil {
 		return fmt.Errorf("verify candidate semantic transition: %w", err)
@@ -618,215 +666,18 @@ func verifyPreparedMasterCandidate(
 	return nil
 }
 
+// verifyCandidate is the self-contained half of verification for a caller that
+// holds the successor state already — the exported entry points, the
+// benchmarks and the tests. The session path never comes here: it builds the
+// same capsule across two stages, around the master-view resolution that stands
+// between the candidate bytes and the config every check below needs.
 func verifyCandidate(ctx context.Context, config *Config, candidate *Candidate) (verifiedCandidate, error) {
-	return verifyCandidateWith(ctx, config, candidate, nil)
-}
-
-// verifyCandidateWith accepts collated data the caller has already decoded.
-// Production decodes it before this call because the candidate state is built
-// on top of the predecessor it proves, and decoding a proof of a few hundred
-// kilobytes twice per candidate is not free. A nil value keeps the original
-// behaviour of decoding it here.
-func verifyCandidateWith(
-	ctx context.Context,
-	config *Config,
-	candidate *Candidate,
-	collated *verifiedCollatedData,
-) (verifiedCandidate, error) {
-	if config == nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: candidate verification config is absent", ErrInvalidInput)
-	}
-	if candidate == nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: candidate is absent", ErrInvalidInput)
-	}
-	if candidate.State == nil || candidate.StateUpdate == nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: candidate state or state update is absent", ErrInvalidInput)
-	}
-	if len(candidate.ID.RootHash) != 32 || len(candidate.ID.FileHash) != 32 {
-		return verifiedCandidate{}, fmt.Errorf("%w: candidate id hashes must be 256 bits", ErrInvalidInput)
-	}
-	if uint64(len(candidate.BlockBOC)) > uint64(config.maxBlockBytes) {
-		return verifiedCandidate{}, fmt.Errorf(
-			"%w: candidate block is %d bytes, limit is %d",
-			ErrSizeLimit, len(candidate.BlockBOC), config.maxBlockBytes,
-		)
-	}
-	if uint64(len(candidate.CollatedData)) > uint64(config.maxCollatedBytes) {
-		return verifiedCandidate{}, fmt.Errorf(
-			"%w: candidate collated data is %d bytes, limit is %d",
-			ErrSizeLimit, len(candidate.CollatedData), config.maxCollatedBytes,
-		)
-	}
-
-	fileHash := sha256.Sum256(candidate.BlockBOC)
-	if !bytes.Equal(candidate.ID.FileHash, fileHash[:]) {
-		return verifiedCandidate{}, fmt.Errorf("%w: candidate block file hash mismatch", ErrInvalidInput)
-	}
-	root, err := cell.FromBOC(candidate.BlockBOC)
+	prepared, err := prepareVerificationCandidate(ctx, config, candidate)
 	if err != nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: decode candidate block boc: %v", ErrInvalidInput, err)
-	}
-	if err = ctx.Err(); err != nil {
-		return verifiedCandidate{}, err
-	}
-	if !bytes.Equal(candidate.ID.RootHash, root.Hash()) {
-		return verifiedCandidate{}, fmt.Errorf("%w: candidate block root hash mismatch", ErrInvalidInput)
-	}
-
-	var block tlb.Block
-	if err = parseExact(&block, root); err != nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: decode candidate block: %v", ErrInvalidInput, err)
-	}
-	if err = verifyExactBlockParts(root, &block); err != nil {
-		return verifiedCandidate{}, err
-	}
-	if err = verifyHeaderAndID(&block.BlockInfo, candidate); err != nil {
-		return verifiedCandidate{}, err
-	}
-	if block.Extra == nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: candidate block extra is absent", ErrInvalidInput)
-	}
-	var zeroSeed [32]byte
-	if len(block.Extra.RandSeed) != 32 || bytes.Equal(block.Extra.RandSeed, zeroSeed[:]) {
-		return verifiedCandidate{}, fmt.Errorf("%w: candidate random seed is zero or malformed", ErrInvalidInput)
-	}
-	if len(block.Extra.CreatedBy) != 32 || !bytes.Equal(block.Extra.CreatedBy, candidate.CreatedBy[:]) {
-		return verifiedCandidate{}, fmt.Errorf("%w: candidate creator differs from block extra", ErrInvalidInput)
-	}
-	// The two expensive halves of this phase are independent read walks over
-	// disjoint subtrees: verifyBlockDictionaries walks the block extra and
-	// ValidateMerkleUpdate walks the state update. They overlap for the same
-	// reason finish() overlaps its two serialization tails — BOC parsing has
-	// already computed every cell hash, which is what makes concurrent read
-	// walks safe, so switching this decode to a lazy BOC would break it.
-	//
-	// Both units always run to completion and their errors are reported in the
-	// order the serial code produced them, so the rejection reason a candidate
-	// gets does not depend on which walk finished first. The cost is that a
-	// candidate rejected by one unit now also pays for the other.
-	var (
-		merkleErr error
-		merkle    sync.WaitGroup
-	)
-	merkle.Add(1)
-	go func() {
-		defer merkle.Done()
-		merkleErr = cell.ValidateMerkleUpdate(block.StateUpdate)
-	}()
-
-	dictionaries, dictionariesErr := verifyBlockDictionaries(block.Extra, config.globalVersion)
-
-	var (
-		flow    tlb.ValueFlow
-		flowErr error
-	)
-	if flowErr = parseExact(&flow, block.ValueFlow); flowErr != nil {
-		flowErr = fmt.Errorf("%w: decode candidate value flow: %v", ErrInvalidInput, flowErr)
-	} else if flowErr = flow.Validate(); flowErr != nil {
-		flowErr = fmt.Errorf("%w: invalid candidate value flow: %v", ErrInvalidInput, flowErr)
-	}
-	var updateErr error
-	if block.StateUpdate.HashKeyAt(0) != candidate.StateUpdate.HashKeyAt(0) {
-		updateErr = fmt.Errorf("%w: candidate state update differs from block", ErrInvalidInput)
-	}
-	merkle.Wait()
-
-	switch {
-	case dictionariesErr != nil:
-		return verifiedCandidate{}, dictionariesErr
-	case flowErr != nil:
-		return verifiedCandidate{}, flowErr
-	case updateErr != nil:
-		return verifiedCandidate{}, updateErr
-	case merkleErr != nil:
-		return verifiedCandidate{}, fmt.Errorf("%w: invalid candidate state update: %v", ErrInvalidInput, merkleErr)
-	}
-	if err = ctx.Err(); err != nil {
-		return verifiedCandidate{}, err
-	}
-	newStateProof, err := block.StateUpdate.PeekRef(1)
-	if err != nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: load candidate state update target: %v", ErrInvalidInput, err)
-	}
-	if newStateProof.HashKeyAt(0) != candidate.State.HashKeyAt(0) {
-		return verifiedCandidate{}, fmt.Errorf("%w: candidate state hash differs from state update", ErrInvalidInput)
-	}
-
-	var state tlb.ShardStateUnsplit
-	if err = parseExact(&state, candidate.State); err != nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: decode candidate state: %v", ErrInvalidInput, err)
-	}
-	var stats tlb.ShardStateStats
-	if err = parseExact(&stats, state.Stats); err != nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: decode candidate state statistics: %v", ErrInvalidInput, err)
-	}
-	if !stats.TotalValidatorFees.ExtraCurrencies.IsEmpty() {
-		return verifiedCandidate{}, fmt.Errorf("%w: candidate validator fees contain extra currencies", ErrInvalidInput)
-	}
-	var queue tlb.OutMsgQueueInfo
-	if err = parseExact(&queue, state.OutMsgQueueInfo); err != nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: decode candidate outbound queue: %v", ErrInvalidInput, err)
-	}
-	// Only ProcInfo is walked: it holds a handful of records and
-	// minProcessedMCSeqno consumes it before the semantic phase runs. The out
-	// queue and the dispatch queue are rebuilt from the predecessor and pinned
-	// by root cell in verifyQueueRoots, which is stronger than a structural
-	// walk because it also fixes the node labelling; walking them here would be
-	// O(entire queue) against a candidate state that is never pruned.
-	if queue.OutQueue == nil || queue.ProcInfo == nil || !queue.ProcInfo.ValidateAll() ||
-		(queue.Extra != nil && queue.Extra.DispatchQueue == nil) {
-		return verifiedCandidate{}, fmt.Errorf("%w: invalid candidate outbound queue dictionaries", ErrInvalidInput)
-	}
-	if err = verifyOutQueueSizePresence(config, &queue); err != nil {
-		return verifiedCandidate{}, err
-	}
-	accountsRoot, err := candidate.State.PeekRef(1)
-	if err != nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: load candidate accounts: %v", ErrInvalidInput, err)
-	}
-	var accounts tlb.ShardAccountsAugDict
-	if err = parseExact(&accounts, accountsRoot); err != nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: decode candidate accounts: %v", ErrInvalidInput, err)
-	}
-	// The accounts dictionary is not walked here. verifyAccounts rebuilds it
-	// from the predecessor with one update per account block and compares the
-	// resulting root cell, so every node of the candidate tree is pinned to a
-	// canonically built one. A walk would be O(all accounts in the shard) plus
-	// a DepthBalanceInfo recomputation per node, against a state that is never
-	// pruned.
-	if accounts.AugmentedDictionary == nil {
-		return verifiedCandidate{}, fmt.Errorf("%w: invalid candidate accounts dictionary", ErrInvalidInput)
-	}
-	if err = verifyAccountsShardPrefix(state.ShardIdent, &accounts); err != nil {
-		return verifiedCandidate{}, err
-	}
-	if err = verifyStateHeader(&block, &state, candidate); err != nil {
-		return verifiedCandidate{}, err
-	}
-	if err = ctx.Err(); err != nil {
-		return verifiedCandidate{}, err
-	}
-	var collatedData verifiedCollatedData
-	if collated != nil {
-		collatedData = *collated
-		if collatedData.genUtimeMS/1000 != uint64(block.BlockInfo.GenUtime) {
-			return verifiedCandidate{}, fmt.Errorf("%w: supplied collated data belongs to another block", ErrInvalidInput)
-		}
-	} else if collatedData, err = verifyCollatedData(candidate, block.BlockInfo.GenUtime); err != nil {
 		return verifiedCandidate{}, err
 	}
 
-	return verifiedCandidate{
-		block:         block,
-		flow:          flow,
-		state:         state,
-		inMessages:    dictionaries.inMessages,
-		outMessages:   dictionaries.outMessages,
-		accountBlocks: dictionaries.accountBlocks,
-		stats:         stats,
-		queue:         queue,
-		collated:      collatedData,
-	}, nil
+	return prepared.verified, nil
 }
 
 func verifyExactBlockParts(root *cell.Cell, block *tlb.Block) error {
@@ -1424,9 +1275,18 @@ func equalCell(left, right *cell.Cell) bool {
 }
 
 func verifyCollatedData(candidate *Candidate, genUtime uint32) (verifiedCollatedData, error) {
-	hash := sha256.Sum256(candidate.CollatedData)
-	if hash != candidate.CollatedFileHash {
-		return verifiedCollatedData{}, fmt.Errorf("%w: candidate collated data file hash mismatch", ErrInvalidInput)
+	// Skipped only for a candidate whose CollatedFileHash is where these bytes'
+	// digest came from, or was compared against it a moment ago: a wire-decoded
+	// candidate, whose codec derived the hash from the payload and folded it
+	// into the signed candidate id, and one this node produced or resumed. The
+	// reference never re-derives this digest at all — validate-query.cpp reads
+	// collated_file_hash for statistics and re-verifies only the block file
+	// hash, which candidate_prepared_validation.go still checks on every path.
+	if !candidate.digested {
+		hash := sha256.Sum256(candidate.CollatedData)
+		if hash != candidate.CollatedFileHash {
+			return verifiedCollatedData{}, fmt.Errorf("%w: candidate collated data file hash mismatch", ErrInvalidInput)
+		}
 	}
 	roots, err := cell.FromBOCMultiRoot(candidate.CollatedData)
 	if err != nil {
@@ -1731,6 +1591,10 @@ type blockDictionaries struct {
 	inMessages    *tlb.InMsgDescrAugDict
 	outMessages   *tlb.OutMsgDescrAugDict
 	accountBlocks *tlb.ShardAccountBlocksAugDict
+	// accountBlockIndex is what the account-block walk decoded, carried to the
+	// semantic passes exactly like the three dictionaries above and for the same
+	// reason: the walk had to decode every entry anyway.
+	accountBlockIndex *accountBlockIndex
 }
 
 func verifyBlockDictionaries(extra *tlb.BlockExtra, globalVersion uint32) (blockDictionaries, error) {
@@ -1742,15 +1606,16 @@ func verifyBlockDictionaries(extra *tlb.BlockExtra, globalVersion uint32) (block
 	if err != nil {
 		return blockDictionaries{}, fmt.Errorf("%w: invalid outbound message descriptors: %v", ErrInvalidInput, err)
 	}
-	accountBlocks, err := verifyAccountBlocks(extra.ShardAccountBlocks)
+	accountBlocks, accountBlockIndex, err := verifyAccountBlocks(extra.ShardAccountBlocks)
 	if err != nil {
 		return blockDictionaries{}, fmt.Errorf("%w: invalid account blocks: %v", ErrInvalidInput, err)
 	}
 
 	return blockDictionaries{
-		inMessages:    inMessages,
-		outMessages:   outMessages,
-		accountBlocks: accountBlocks,
+		inMessages:        inMessages,
+		outMessages:       outMessages,
+		accountBlocks:     accountBlocks,
+		accountBlockIndex: accountBlockIndex,
 	}, nil
 }
 
@@ -1814,41 +1679,37 @@ func loadOutMsgDescriptors(root *cell.Cell, globalVersion uint32) (*tlb.OutMsgDe
 	return dict, nil
 }
 
-func verifyAccountBlocks(root *cell.Cell) (*tlb.ShardAccountBlocksAugDict, error) {
+func verifyAccountBlocks(root *cell.Cell) (*tlb.ShardAccountBlocksAugDict, *accountBlockIndex, error) {
 	var blocks tlb.ShardAccountBlocks
 	if err := parseExact(&blocks, root); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if blocks.Accounts == nil {
-		return nil, fmt.Errorf("account block dictionary is absent")
+		return nil, nil, fmt.Errorf("account block dictionary is absent")
 	}
+	// ValidateAll is a check, not a parse: it re-derives every node's labelling
+	// and augmentation bottom-up. That is the proof the trie is a well-formed
+	// 256-bit Patricia, which is what makes the walk below strictly ascending
+	// and a binary search over its result equivalent to a keyed descent.
 	if !blocks.Accounts.ValidateAll() {
-		return nil, fmt.Errorf("account block dictionary augmentation is invalid")
+		return nil, nil, fmt.Errorf("account block dictionary augmentation is invalid")
 	}
-	// Only the transaction augmentation is checked here. decodeAccountLanes
-	// re-decodes every account block, matches Addr against the dictionary key
-	// and rejects trailing data, and replayAccount parses the state update as an
-	// exact tlb.HashUpdate; the transaction augmentation is the one thing the
-	// replay never recomputes, and the value-flow pass depends on it.
-	iterator, err := blocks.Accounts.IteratorExtra(false, false)
+	// Only the transaction augmentation is checked here; the address match, the
+	// exactness of the entry and the state update are the semantic replay's, and
+	// they stay there so a malformed candidate is still rejected by the pass and
+	// with the message it is rejected by today. What this walk no longer throws
+	// away is the decode itself: reaching Transactions requires a full
+	// AccountBlock, so the entry, its exactness verdict and its HashUpdate are
+	// recorded in accountBlockIndex and the precheck and the lanes consume them
+	// instead of decoding the same cell twice more. The augmentation is still
+	// the one thing the replay never recomputes, and the value-flow pass still
+	// depends on it.
+	index, err := buildAccountBlockIndex(blocks.Accounts)
 	if err != nil {
-		return nil, err
-	}
-	for iterator.Next() {
-		value := iterator.View().Value
-		var accountBlock tlb.AccountBlock
-		if err = tlb.LoadFromCell(&accountBlock, &value); err != nil {
-			return nil, err
-		}
-		if err = verifyAccountTransactions(&accountBlock); err != nil {
-			return nil, err
-		}
-	}
-	if err = iterator.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return blocks.Accounts, nil
+	return blocks.Accounts, index, nil
 }
 
 func verifyAccountTransactions(accountBlock *tlb.AccountBlock) error {

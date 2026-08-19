@@ -107,14 +107,21 @@ type SessionConfig struct {
 	ValidatorSetHash uint32
 	Validators       []groups.Validator
 	OverlayMembers   [][32]byte
+	// AllCurrentValidators is the resolved ADNL roster from persistent config
+	// parameter 34. It is the only two-step intermediate allow-set.
+	AllCurrentValidators [][32]byte
 	// CollatorsByValidator is the config-46 authorization set filtered to this
 	// shard roster. OverlayMembers is deliberately wider and includes observers
 	// which may receive direct traffic but must not originate candidates.
 	CollatorsByValidator []groups.CollatorRegistryEntry
-	ShardPrefixLen       uint32
-	Protocol             SessionProtocol
-	CandidateLimits      CandidateLimits
-	Identity             SessionIdentity
+	// AllCollators is the complete config-46 collator identity set. Unlike the
+	// delegation registry above, transport membership is not shard-roster
+	// filtered in the reference implementation.
+	AllCollators    [][32]byte
+	ShardPrefixLen  uint32
+	Protocol        SessionProtocol
+	CandidateLimits CandidateLimits
+	Identity        SessionIdentity
 	// StorageID is the durable identity compared during reconciliation.
 	// Journal is its bound handle and is deliberately not interface-compared.
 	StorageID SessionStorageID
@@ -149,6 +156,7 @@ type sessionSupervisor struct {
 	keys    SigningKeys
 	storage ValidatorStorage
 	prepare SessionPreparer
+	metrics ValidationObserver
 	// observerADNLIDs is the transport inventory supplied by composition. The
 	// signing keyring may be associated with more persistent identities than
 	// this process can actually bind.
@@ -250,8 +258,50 @@ type sessionPrepareResult struct {
 }
 
 type sessionSpecError struct {
-	id  [32]byte
-	err error
+	id     [32]byte
+	chain  collator.MetricChain
+	role   SessionSpecRole
+	reason SessionSpecRejectionReason
+	err    error
+}
+
+type sessionSpecRejectionKey struct {
+	id   [32]byte
+	role SessionSpecRole
+}
+
+type sessionSpecRejectionError struct {
+	reason SessionSpecRejectionReason
+	err    error
+}
+
+func (e *sessionSpecRejectionError) Error() string {
+	return e.err.Error()
+}
+
+func (e *sessionSpecRejectionError) Unwrap() error {
+	return e.err
+}
+
+func sessionSpecErrorf(reason SessionSpecRejectionReason, format string, args ...any) error {
+	return &sessionSpecRejectionError{reason: reason, err: fmt.Errorf(format, args...)}
+}
+
+func newSessionSpecError(group groups.Session, role SessionSpecRole, err error) sessionSpecError {
+	reason := SessionSpecRejectionInvalidSessionSpec
+	var rejection *sessionSpecRejectionError
+	if errors.As(err, &rejection) {
+		reason = rejection.reason
+	}
+
+	chain := collator.MetricChainShardchain
+	if group.Shard.IsMasterchain() {
+		chain = collator.MetricChainMasterchain
+	}
+
+	return sessionSpecError{
+		id: group.ID, chain: chain, role: role, reason: reason, err: err,
+	}
 }
 
 func newSessionSupervisor(
@@ -362,6 +412,8 @@ func (s *sessionSupervisor) run(ctx context.Context) {
 	managed := make(map[sessionActorID]*managedConsensusSession)
 	preparing := make(map[sessionActorID]*sessionPreparation)
 	retryAt := make(map[sessionActorID]sessionRetry)
+	specRejections := make(map[sessionSpecRejectionKey]struct{})
+	reaper := newSessionReaper(s.storage, &s.log)
 	var prepareWG sync.WaitGroup
 	defer func() {
 		s.mu.Lock()
@@ -395,26 +447,47 @@ func (s *sessionSupervisor) run(ctx context.Context) {
 				nextDesired, specErrors := s.desiredSessions(snapshot)
 				s.pinCriticalSessionProtocols(desired, nextDesired)
 				s.bindSessionJournals(desired, nextDesired)
+				specRejections = s.observeSessionSpecRejections(specRejections, specErrors)
 				for i := range specErrors {
 					item := &specErrors[i]
 					s.log.Error().Err(item.err).Hex("session_id", item.id[:]).Msg("validator session specification rejected")
 				}
 				retainSessionRetryDeadlines(desired, nextDesired, retryAt)
 				desired = nextDesired
-				s.reconcileDesired(ctx, desired, managed, preparing, retryAt, &prepareWG)
+				s.reconcileDesired(ctx, desired, managed, preparing, retryAt, &prepareWG, reaper)
 			}
 		case result := <-s.sessionResults:
 			s.handleRunResult(result, desired, managed, retryAt)
 		case result := <-s.prepareResults:
 			s.handlePrepareResult(ctx, result, desired, managed, preparing, retryAt)
-			s.reconcileDesired(ctx, desired, managed, preparing, retryAt, &prepareWG)
+			s.reconcileDesired(ctx, desired, managed, preparing, retryAt, &prepareWG, reaper)
 		case <-retryC:
-			s.reconcileDesired(ctx, desired, managed, preparing, retryAt, &prepareWG)
+			s.reconcileDesired(ctx, desired, managed, preparing, retryAt, &prepareWG, reaper)
 		}
 
 		retryC = resetSessionRetryTimer(retryTimer, desired, managed, preparing, retryAt)
 		s.publishRuntimeStatus(desired, managed, preparing, retryAt)
 	}
+}
+
+func (s *sessionSupervisor) observeSessionSpecRejections(
+	previous map[sessionSpecRejectionKey]struct{},
+	failures []sessionSpecError,
+) map[sessionSpecRejectionKey]struct{} {
+	current := make(map[sessionSpecRejectionKey]struct{}, len(failures))
+	for i := range failures {
+		failure := &failures[i]
+		key := sessionSpecRejectionKey{id: failure.id, role: failure.role}
+		current[key] = struct{}{}
+		if _, rejected := previous[key]; rejected || s.metrics == nil {
+			continue
+		}
+		s.metrics.ObserveSessionSpecRejection(SessionSpecRejectionObservation{
+			Chain: failure.chain, Role: failure.role, Reason: failure.reason,
+		})
+	}
+
+	return current
 }
 
 // pinCriticalSessionProtocols follows the group lifetime: critical config 30
@@ -590,12 +663,13 @@ func (s *sessionSupervisor) desiredSessions(snapshot *groups.Snapshot) (map[sess
 		localKeys,
 		s.observerADNLIDs,
 	)
+	allCollators := groups.AllCollatorADNLIDs(snapshot.CollatorsByValidator)
 
 	var failures []sessionSpecError
 	add := func(group groups.Session, active bool) {
 		localIndex, keyID, err := matchLocalValidator(group, localKeys)
 		if err != nil {
-			failures = append(failures, sessionSpecError{id: group.ID, err: err})
+			failures = append(failures, newSessionSpecError(group, SessionSpecRoleValidator, err))
 			return
 		}
 		var localValidatorADNL [32]byte
@@ -605,13 +679,14 @@ func (s *sessionSupervisor) desiredSessions(snapshot *groups.Snapshot) (map[sess
 				snapshot,
 				group,
 				overlayMembers,
+				allCollators,
 				localIndex,
 				keyID,
 				localValidatorADNL,
 				active,
 			)
 			if err != nil {
-				failures = append(failures, sessionSpecError{id: group.ID, err: err})
+				failures = append(failures, newSessionSpecError(group, SessionSpecRoleValidator, err))
 				return
 			}
 			desired[sessionActorID{
@@ -621,8 +696,33 @@ func (s *sessionSupervisor) desiredSessions(snapshot *groups.Snapshot) (map[sess
 			}] = session
 		}
 
+		if snapshot.Config == nil {
+			if len(localObserverIDs) != 0 {
+				failures = append(failures, newSessionSpecError(
+					group,
+					SessionSpecRoleObserver,
+					sessionSpecErrorf(
+						SessionSpecRejectionMissingBlockchainConfig,
+						"validator session %x has no blockchain config",
+						group.ID,
+					),
+				))
+			}
+			return
+		}
+		consensus := snapshot.Config.NewConsensus.Shard
+		if group.Shard.IsMasterchain() {
+			consensus = snapshot.Config.NewConsensus.Masterchain
+		}
+		// Protocol 0 has no pure non-validator identity. Protocol 1 keeps the
+		// identity for its block-sync observer even though it does not join the
+		// private consensus overlay.
+		if consensus == nil || !consensus.SupportedProtocol() || consensus.ProtocolVersion == 0 {
+			return
+		}
+
 		for _, observerID := range localObserverIDs {
-			if observerID == localValidatorADNL {
+			if observerID == localValidatorADNL || slices.Contains(allCollators, observerID) {
 				continue
 			}
 
@@ -630,13 +730,14 @@ func (s *sessionSupervisor) desiredSessions(snapshot *groups.Snapshot) (map[sess
 				snapshot,
 				group,
 				overlayMembers,
+				allCollators,
 				simplex.ObserverIndex,
 				[32]byte{},
 				observerID,
 				active,
 			)
 			if err != nil {
-				failures = append(failures, sessionSpecError{id: group.ID, err: err})
+				failures = append(failures, newSessionSpecError(group, SessionSpecRoleObserver, err))
 				return
 			}
 			desired[sessionActorID{
@@ -661,13 +762,18 @@ func (s *sessionSupervisor) buildDesiredSession(
 	snapshot *groups.Snapshot,
 	group groups.Session,
 	overlayMembers [][32]byte,
+	allCollators [][32]byte,
 	localIndex int,
 	keyID [32]byte,
 	localADNLID [32]byte,
 	active bool,
 ) (desiredSession, error) {
 	if snapshot.Config == nil {
-		return desiredSession{}, fmt.Errorf("validator session %x has no blockchain config", group.ID)
+		return desiredSession{}, sessionSpecErrorf(
+			SessionSpecRejectionMissingBlockchainConfig,
+			"validator session %x has no blockchain config",
+			group.ID,
+		)
 	}
 
 	consensus := snapshot.Config.NewConsensus.Shard
@@ -675,11 +781,16 @@ func (s *sessionSupervisor) buildDesiredSession(
 		consensus = snapshot.Config.NewConsensus.Masterchain
 	}
 	if consensus == nil {
-		return desiredSession{}, fmt.Errorf("validator session %x has no simplex config", group.ID)
+		return desiredSession{}, sessionSpecErrorf(
+			SessionSpecRejectionMissingSimplexConfig,
+			"validator session %x has no simplex config",
+			group.ID,
+		)
 	}
 	if !consensus.SupportedProtocol() {
-		return desiredSession{}, fmt.Errorf(
-			"validator session %x requires simplex config v2 protocol version 3 or newer, got config v%d protocol version %d",
+		return desiredSession{}, sessionSpecErrorf(
+			SessionSpecRejectionUnsupportedSimplexProtocol,
+			"validator session %x has unsupported simplex config v%d protocol version %d",
 			group.ID,
 			consensus.Version,
 			consensus.ProtocolVersion,
@@ -687,7 +798,12 @@ func (s *sessionSupervisor) buildDesiredSession(
 	}
 	shardPrefixLen, err := group.Shard.PrefixBits()
 	if err != nil {
-		return desiredSession{}, fmt.Errorf("validator session %x shard: %w", group.ID, err)
+		return desiredSession{}, sessionSpecErrorf(
+			SessionSpecRejectionInvalidSessionSpec,
+			"validator session %x shard: %w",
+			group.ID,
+			err,
+		)
 	}
 
 	identity := SessionIdentity{ADNLID: localADNLID}
@@ -726,7 +842,9 @@ func (s *sessionSupervisor) buildDesiredSession(
 			ValidatorSetHash:     group.ValidatorSetHash,
 			Validators:           group.Validators,
 			OverlayMembers:       overlayMembers,
+			AllCurrentValidators: snapshot.Config.AllCurrentValidators,
 			CollatorsByValidator: collatorsByValidator,
+			AllCollators:         allCollators,
 			ShardPrefixLen:       shardPrefixLen,
 			Protocol:             protocol,
 			CandidateLimits: CandidateLimits{
@@ -806,7 +924,8 @@ func matchLocalValidator(group groups.Session, localKeys map[[32]byte]struct{}) 
 			continue
 		}
 		if localIndex >= 0 {
-			return -1, [32]byte{}, fmt.Errorf(
+			return -1, [32]byte{}, sessionSpecErrorf(
+				SessionSpecRejectionInvalidSessionSpec,
 				"validator session %x contains multiple local signing keys at indexes %d and %d",
 				group.ID,
 				localIndex,
@@ -837,6 +956,7 @@ func (s *sessionSupervisor) reconcileDesired(
 	preparing map[sessionActorID]*sessionPreparation,
 	retryAt map[sessionActorID]sessionRetry,
 	prepareWG *sync.WaitGroup,
+	reaper *sessionReaper,
 ) {
 	now := time.Now()
 	for _, id := range sortedManagedSessionIDs(managed) {
@@ -932,6 +1052,67 @@ func (s *sessionSupervisor) reconcileDesired(
 
 		s.startPreparation(ctx, id, next, preparing, prepareWG)
 	}
+
+	// Last, so a namespace this pass has just superseded is already torn down
+	// and out of the claimed set. A session that failed to close keeps its
+	// claim and is reconsidered on a later pass.
+	claimed, err := claimedNamespaces(desired, managed, preparing)
+	if err != nil {
+		// An unkeyable claim is a claim of unknown extent, and reaping under
+		// one risks the outcome this whole subsystem exists to prevent. Defer
+		// the pass instead; the namespaces it would have freed are bounded and
+		// wait for the next one.
+		reaper.fail(now, err, "key live validator namespaces")
+
+		return
+	}
+	reaper.reap(ctx, desired, claimed, now)
+}
+
+// claimedNamespaces is every durable namespace a live actor still owns, keyed
+// the way the store addresses its rows. A prepared-but-not-running session owns
+// one, and so does a managed session whose Close failed and is waiting on
+// closeRetryAt.
+//
+// The key is the namespace and not the descriptor on purpose: SessionStorageID
+// carries two fields no namespace derivation reads — ValidatorIndex and
+// Protocol — and both are rebuilt from the current masterchain config on every
+// reconciliation while the stored descriptor keeps the value the session was
+// opened with. Keyed by the descriptor, a live session whose config-29/30 has
+// since changed does not match its own stored namespace, and the reaper deletes
+// the vote journal out from under it.
+func claimedNamespaces(
+	desired map[sessionActorID]desiredSession,
+	managed map[sessionActorID]*managedConsensusSession,
+	preparing map[sessionActorID]*sessionPreparation,
+) (map[sessionNamespaceKey]struct{}, error) {
+	claimed := make(map[sessionNamespaceKey]struct{}, len(desired)+len(managed)+len(preparing))
+	claim := func(id SessionStorageID) error {
+		key, err := sessionNamespaceKeyOf(id)
+		if err != nil {
+			return err
+		}
+		claimed[key] = struct{}{}
+
+		return nil
+	}
+	for _, session := range desired {
+		if err := claim(session.config.StorageID); err != nil {
+			return nil, err
+		}
+	}
+	for _, session := range managed {
+		if err := claim(session.desired.config.StorageID); err != nil {
+			return nil, err
+		}
+	}
+	for _, preparation := range preparing {
+		if err := claim(preparation.desired.config.StorageID); err != nil {
+			return nil, err
+		}
+	}
+
+	return claimed, nil
 }
 
 func (s *sessionSupervisor) startPreparation(
@@ -1178,6 +1359,8 @@ func sessionConfigChanged(previous, next SessionConfig) bool {
 		previous.CandidateLimits != next.CandidateLimits ||
 		!slices.Equal(previous.Validators, next.Validators) ||
 		!slices.Equal(previous.OverlayMembers, next.OverlayMembers) ||
+		!slices.Equal(previous.AllCurrentValidators, next.AllCurrentValidators) ||
+		!slices.Equal(previous.AllCollators, next.AllCollators) ||
 		!slices.EqualFunc(previous.CollatorsByValidator, next.CollatorsByValidator, collatorRegistryEntryEqual)
 }
 

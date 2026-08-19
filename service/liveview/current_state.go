@@ -47,6 +47,9 @@ func (s *Store) loadStoredCurrentState(ctx context.Context) (*storage.CurrentSta
 			stateFlushed:    true,
 		}, nil)
 	}
+	if len(blocks) > 0 {
+		s.signalBlockArtifactsLocked()
+	}
 
 	next := storage.CloneCurrentState(loaded)
 	s.releaseRetiredCurrentCachesLocked(s.current, next)
@@ -57,6 +60,7 @@ func (s *Store) loadStoredCurrentState(ctx context.Context) (*storage.CurrentSta
 	if s.nonFinalEnabled {
 		s.cleanupNonfinalPendingLocked()
 	}
+	s.cleanupAcceptedStatesLocked()
 	ready := s.updateReadyMasterSeqnoLocked()
 	if nextSeqno > prevSeqno || ready {
 		close(s.notify)
@@ -154,8 +158,18 @@ func (s *Store) SetLiveCurrentStateSnapshot(next *storage.CurrentState) {
 	if s.nonFinalEnabled {
 		s.cleanupNonfinalPendingLocked()
 	}
+	s.cleanupAcceptedStatesLocked()
 	nextSeqno := currentMasterchainSeqno(s.current)
 	ready := s.updateReadyMasterSeqnoLocked()
+	// Every installer of a block state raises the artifacts edge, and this one
+	// installs states too: publishPendingCurrentLocked remembers the state of every
+	// block the adopted snapshot names. A block whose state becomes readable only
+	// through the current snapshot therefore used to raise no edge at all, and an
+	// edge-triggered reader — loadChainTip — waited blind for its 30 s backstop
+	// instead of for the publication it was waiting on. Raised unconditionally, as
+	// in every other installer: a signal that is not about the reader's own block
+	// costs it one extra read, while a missing one costs it the backstop.
+	s.signalBlockArtifactsLocked()
 	if published || ready || nextSeqno > prevSeqno || currentMasterchainSeqno(next) > prevSeqno {
 		close(s.notify)
 		s.notify = make(chan struct{})
