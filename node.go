@@ -373,12 +373,27 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 	}
 	liveStore := liveview.New(store, liveViewOptions)
 	tvmInstance := tvm.NewTVM()
+	accountPrewarmerLogger := baseLogger.With().Str("component", "account_prewarmer").Logger()
+	accountPrewarmer, err := service.NewAccountPrewarmer(
+		accountPrewarmerLogger,
+		store,
+		liveStore,
+		service.AccountPrewarmerOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("initialize account prewarmer: %w", err)
+	}
+	if err = accountPrewarmer.Start(ctx); err != nil {
+		return fmt.Errorf("start account prewarmer: %w", err)
+	}
+	defer accountPrewarmer.Close()
 
 	externalMessageLogger := baseLogger.With().Str("component", "external_message").Logger()
 	externalMessageChecker, err := externalmsg.NewChecker(externalmsg.Options{
-		Logger: &externalMessageLogger,
-		Store:  liveStore,
-		TVM:    tvmInstance,
+		Logger:    &externalMessageLogger,
+		Store:     liveStore,
+		TVM:       tvmInstance,
+		Prewarmer: accountPrewarmer,
 	})
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to initialize external message checker")
@@ -425,14 +440,17 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 		metricsCapability = runtimeMetrics
 	}
 	extensionNode := hooks.Node{
-		Network:         externalMessages,
-		PrivateOverlays: node.PrivateOverlays(),
-		BlockBroadcasts: node.BlockBroadcasts(),
-		Store:           liveStore,
-		TVM:             tvmInstance,
-		Logger:          extensionLogger,
-		Metrics:         metricsCapability,
-		Commands:        commandRegistry,
+		Network:                externalMessages,
+		MasterchainHead:        node,
+		PrivateOverlays:        node.PrivateOverlays(),
+		BlockBroadcasts:        node.BlockBroadcasts(),
+		Store:                  liveStore,
+		AccountPrewarmer:       accountPrewarmer,
+		AccountPrewarmCapacity: accountPrewarmer.PrewarmCapacity(),
+		TVM:                    tvmInstance,
+		Logger:                 extensionLogger,
+		Metrics:                metricsCapability,
+		Commands:               commandRegistry,
 	}
 	extension, err := extensionFromFactory(extensionFactory, extensionNode)
 	if err != nil {

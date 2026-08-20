@@ -3,6 +3,7 @@ package validator
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -20,13 +21,12 @@ const (
 	// index on every reconciliation.
 	sessionReapRetryDelay = time.Minute
 	// sessionReapMaxDeleteAttempts bounds how many passes one namespace may fail
-	// to delete before the reaper stops offering it. DeleteSession refuses a
-	// namespace whose summary row is missing or undecodable, and no later pass
-	// will make that row appear, so an unbounded retry would hold this lineage's
-	// watermark down forever and rescan the whole index once per backoff for as
-	// long as the node runs. Giving up leaks those bytes — reported at Error
-	// with the namespace named, so it is a leak an operator can see and remove,
-	// rather than the silent unbounded one this reaper exists to end.
+	// to delete after storage has explicitly classified the error as permanent.
+	// An untyped I/O error is never counted: a temporary write-path failure must
+	// not turn into a permanent leak merely because three maintenance passes met
+	// it. Giving up a classified poison namespace leaks those bytes — reported at
+	// Error with the namespace named, so an operator can remove them — rather
+	// than holding the lineage watermark down and rescanning it forever.
 	sessionReapMaxDeleteAttempts = 3
 )
 
@@ -96,6 +96,15 @@ type sessionReaper struct {
 	storage ValidatorStorage
 	log     *zerolog.Logger
 
+	workerOnce   sync.Once
+	workerMu     sync.Mutex
+	workerCancel context.CancelFunc
+	workerDone   chan struct{}
+	activePass   *sessionReapPass
+	passBarrier  uint64
+	pending      *sessionReapRequest
+	wake         chan struct{}
+
 	// watermark is the highest desired catchain seqno a completed pass has
 	// already reaped for a lineage. It keeps the namespace scan to once per
 	// rotation instead of once per reconciliation.
@@ -108,6 +117,27 @@ type sessionReaper struct {
 	retryAt        time.Time
 }
 
+type sessionReapRequest struct {
+	highest map[reapLineage]uint32
+	claimed map[sessionNamespaceKey]struct{}
+	now     time.Time
+	err     error
+	what    string
+	barrier uint64
+}
+
+type sessionReapPass struct {
+	cancel context.CancelFunc
+}
+
+// permanentSessionDeleteError is the storage boundary for errors which a retry
+// cannot change. Untyped I/O errors are deliberately transient: classifying an
+// error by its text is how a shared pass deadline used to turn healthy tail
+// namespaces into permanent leaks.
+type permanentSessionDeleteError interface {
+	PermanentSessionDelete() bool
+}
+
 func newSessionReaper(storage ValidatorStorage, log *zerolog.Logger) *sessionReaper {
 	return &sessionReaper{
 		storage:        storage,
@@ -115,19 +145,14 @@ func newSessionReaper(storage ValidatorStorage, log *zerolog.Logger) *sessionRea
 		watermark:      make(map[reapLineage]uint32),
 		deleteFailures: make(map[sessionNamespaceKey]int),
 		abandoned:      make(map[sessionNamespaceKey]struct{}),
+		wake:           make(chan struct{}, 1),
 	}
 }
 
-// reap runs at most one namespace pass. desired supplies the supersede proof;
-// claimed is every namespace a live actor still owns, which is never deleted
-// even when a newer generation exists, because a session that has not finished
-// closing is still writing.
-//
-// claimed is keyed by the namespace, not by the descriptor: liveness has to be
-// proven on the same identity the rows are addressed by, or a namespace whose
-// stored descriptor differs from the desired one in a field no derivation reads
-// looks unclaimed and its live vote journal is deleted.
-func (r *sessionReaper) reap(
+// schedule publishes the newest complete reconciliation snapshot to one owned
+// maintenance worker. It does no storage I/O and therefore never blocks the
+// supervisor actor behind the reaper's five-second pass deadline.
+func (r *sessionReaper) schedule(
 	ctx context.Context,
 	desired map[sessionActorID]desiredSession,
 	claimed map[sessionNamespaceKey]struct{},
@@ -136,11 +161,143 @@ func (r *sessionReaper) reap(
 	if r == nil || r.storage == nil || ctx.Err() != nil {
 		return
 	}
+
+	r.startWorker(ctx)
+	r.publish(sessionReapRequest{
+		highest: highestDesiredSeqnos(desired),
+		claimed: cloneSessionNamespaceSet(claimed),
+		now:     now,
+	}, false)
+}
+
+// scheduleFailure serializes bookkeeping with the same worker as reap passes.
+// In particular, it cannot race retryAt while a storage call is outstanding.
+func (r *sessionReaper) scheduleFailure(ctx context.Context, now time.Time, err error, what string) {
+	if r == nil || ctx.Err() != nil {
+		return
+	}
+
+	r.startWorker(ctx)
+	r.publish(sessionReapRequest{now: now, err: err, what: what}, true)
+}
+
+func (r *sessionReaper) startWorker(ctx context.Context) {
+	r.workerOnce.Do(func() {
+		workerCtx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+
+		r.workerMu.Lock()
+		r.workerCancel = cancel
+		r.workerDone = done
+		r.workerMu.Unlock()
+
+		go r.run(workerCtx, done)
+	})
+}
+
+func (r *sessionReaper) publish(request sessionReapRequest, cancelActive bool) {
+	r.workerMu.Lock()
+	if cancelActive {
+		r.passBarrier++
+	}
+	request.barrier = r.passBarrier
+	r.pending = &request
+	var cancel context.CancelFunc
+	if cancelActive && r.activePass != nil {
+		cancel = r.activePass.cancel
+	}
+	r.workerMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (r *sessionReaper) run(ctx context.Context, done chan struct{}) {
+	defer close(done)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.wake:
+		}
+
+		for {
+			r.workerMu.Lock()
+			request := r.pending
+			r.pending = nil
+			r.workerMu.Unlock()
+			if request == nil {
+				break
+			}
+			if request.err != nil {
+				r.fail(request.now, request.err, request.what)
+
+				continue
+			}
+
+			passCtx, cancel := context.WithCancel(ctx)
+			pass := &sessionReapPass{cancel: cancel}
+			r.workerMu.Lock()
+			r.activePass = pass
+			cancelImmediately := request.barrier != r.passBarrier
+			r.workerMu.Unlock()
+			if cancelImmediately {
+				cancel()
+			}
+
+			r.reapHighest(passCtx, request.highest, request.claimed, request.now)
+			cancel()
+			r.workerMu.Lock()
+			if r.activePass == pass {
+				r.activePass = nil
+			}
+			r.workerMu.Unlock()
+		}
+	}
+}
+
+func (r *sessionReaper) close() {
+	if r == nil {
+		return
+	}
+
+	r.workerMu.Lock()
+	cancel := r.workerCancel
+	done := r.workerDone
+	r.workerMu.Unlock()
+	if cancel == nil {
+		return
+	}
+
+	cancel()
+	<-done
+}
+
+func cloneSessionNamespaceSet(source map[sessionNamespaceKey]struct{}) map[sessionNamespaceKey]struct{} {
+	result := make(map[sessionNamespaceKey]struct{}, len(source))
+	for key := range source {
+		result[key] = struct{}{}
+	}
+
+	return result
+}
+
+func (r *sessionReaper) reapHighest(
+	ctx context.Context,
+	highest map[reapLineage]uint32,
+	claimed map[sessionNamespaceKey]struct{},
+	now time.Time,
+) {
 	if !r.retryAt.IsZero() && now.Before(r.retryAt) {
 		return
 	}
 
-	highest := highestDesiredSeqnos(desired)
 	if !r.hasNewGeneration(highest) {
 		return
 	}
@@ -162,7 +319,13 @@ func (r *sessionReaper) reap(
 	// catchain generation for the next rotation to unblock it.
 	blocked := make(map[reapLineage]struct{})
 	deferred := false
+	completed := true
 	for _, id := range stored {
+		if passCtx.Err() != nil {
+			completed = false
+
+			break
+		}
 		if !supersededByGeneration(id, highest) {
 			continue
 		}
@@ -194,8 +357,20 @@ func (r *sessionReaper) reap(
 
 				continue
 			}
-			if r.recordDeleteFailure(key, id, err) {
+			if passCtx.Err() != nil || errors.Is(err, context.Canceled) ||
+				errors.Is(err, context.DeadlineExceeded) {
+				completed = false
+				r.warnNamespace(id, err, "delete superseded validator namespace")
+
+				break
+			}
+			if isPermanentSessionDeleteError(err) {
+				if r.recordDeleteFailure(key, id, err) {
+					blocked[lineageOf(id)] = struct{}{}
+				}
+			} else {
 				blocked[lineageOf(id)] = struct{}{}
+				r.warnNamespace(id, err, "delete superseded validator namespace")
 			}
 			deferred = true
 
@@ -218,12 +393,23 @@ func (r *sessionReaper) reap(
 	} else {
 		r.retryAt = time.Time{}
 	}
+	if !completed {
+		r.deferPass(now)
+
+		return
+	}
 	for lineage, seqno := range highest {
 		if _, incomplete := blocked[lineage]; incomplete {
 			continue
 		}
 		r.watermark[lineage] = seqno
 	}
+}
+
+func isPermanentSessionDeleteError(err error) bool {
+	var permanent permanentSessionDeleteError
+
+	return errors.As(err, &permanent) && permanent.PermanentSessionDelete()
 }
 
 // recordDeleteFailure counts one namespace's failure and reports whether it is

@@ -18,6 +18,34 @@ import (
 //
 // Regenerate only from a run whose output was reviewed on purpose.
 //
+// All eight values were re-pinned on 2026-08-20, and the two halves moved for
+// different reasons.
+//
+// The BLOCK values carry the change that returned own-shard queue cleanup to the
+// reference block-full/time gates and replaced the mandatory drain with the
+// claimed-prefix pass (cleanup.go). The previous implementation dequeued stale
+// local entries even when ProcessedInfo made no claim for them; the corrected
+// one dequeues exactly the claimed prefix. Against the values that stood before
+// that change the arms land at -0 / -0 / -81 / -81 bytes: repeat=1 resident is
+// byte-identical, repeat=1 store-shaped is the same length with different
+// content, and both repeat=3 arms shrink by 81. The transaction set and
+// payload-hint behavior are unchanged on every arm.
+//
+// An intermediate revision of the same change pinned these four at +697 / +697 /
+// +9175 / +9175 instead. Those numbers were NOT the semantics: the claimed-prefix
+// pass ran its discovery walk before create_shard_state, so the walk's read set
+// widened the state update's OLD side with cells the reference collator never
+// puts there, growing with the own-shard queue prefix rather than with the work
+// the pass found. The walk is now taken under ReadSet.IgnoreReads and the
+// post-update traceProcessedQueueValidationClosure — which replays the identical
+// walk — is what carries that region into the collated proof.
+//
+// The COLLATED values moved by exactly -261 bytes on all four arms, the same
+// decrease the full_collated_golden_test.go fixture shows, so one fixed
+// structure left the shipped proof rather than anything queue-proportional. It
+// accompanies the cleanup change; that much is measured, the structure itself
+// was not isolated.
+//
 // PROVENANCE OF THE repeat=3 VALUES. They were re-pinned on 2026-08-17 after a
 // known divergence was closed, and the values they replaced were produced BY
 // that divergence:
@@ -56,9 +84,9 @@ import (
 // be removed without replacing the update builder's hash-keyed pruning — see
 // TestMainnetHeavyStopsWhereTheReferenceStops for the term-by-term account.
 //
-// The repeat=1 arms did not move: they never reach a limit, and the oracle
-// confirms 345/345 transactions with an empty set difference in both
-// directions, on both predecessor shapes.
+// During that estimator-only change the repeat=1 arms did not move: they never
+// reach a limit, and the oracle confirms 345/345 transactions with an empty set
+// difference in both directions, on both predecessor shapes.
 //
 // The BYTES here remain self-validated. The reference's own block differs from
 // ours in gen_software, rand_seed and Merkle-update pruning shape, so no
@@ -79,22 +107,22 @@ func payloadHintArms() []payloadHintArm {
 		{
 			"resident repeat=1", 1, false,
 			424977, "726bd7970581d9916c1405a1a337b5c877e1fc0ba4adbe1dfe874f6e2ae6ea41",
-			334013, "4159ffc1d457459ad33d905eb5f6819f12c8da558cad80b101c3a95567ae5a54",
+			333752, "8477744ac9ab1b0de653d2c6b638fccbf428b0ed936a9b448309b2a9fd06bfa0",
 		},
 		{
 			"store-shaped repeat=1", 1, true,
-			446619, "cc094895cee364e387a9c484527ce8383d58cc8e5349622856e871ba36a17d5c",
-			332586, "24ff26a89be45b2cf325ae9a055a90f92e257e9568c341cac80d9dca973ded80",
+			446619, "3a3d3502b593811a8b0cdbf3e932fb96b769ed6a01ca789f88d69fb2204ed51c",
+			332325, "200345126757bce36e99953590b6840c8877b78f2d33cff5903b5ceb3d2f290d",
 		},
 		{
 			"resident repeat=3", 3, false,
-			667523, "4f7aa861096081ef65665646f87b6fb20dad21b4ccf22454d40a85e9ff4e91ed",
-			421534, "fd27f9facd71b180db7c0691b856f9d755955a484be8bf8455226f56b855cd30",
+			667442, "2a2290a6e36d8145c9da6efa58c6d1736988c1820d92c4ad1c870a7e4e21dc6d",
+			421273, "008f13c15f1300375f5d6671d47863688aee25e76008541fac5c1f967c16309d",
 		},
 		{
 			"store-shaped repeat=3", 3, true,
-			689165, "d6b960ce67e0496e308010d8a865ce64ac304a946a4c5a8a8ed39c574a52aebe",
-			420107, "7470db5948a4d75d6edd124bb541803359a12504277df7b569492389ec58a5cc",
+			689084, "dfa9382adcc1ecf68fbbb8277c3b5c3fd3e584b1e305ad343ae6fea98cea839b",
+			419846, "3270aade3dc8066dcfdcc7f039686d0ce12edfdfd95a766211a508d0b5d2a5bb",
 		},
 	}
 }
@@ -123,6 +151,11 @@ func TestL3HintOnMainnetFixture(t *testing.T) {
 
 			blockSum := sha256.Sum256(candidate.BlockBOC)
 			collatedSum := sha256.Sum256(candidate.CollatedData)
+			// Logged before the checks so one -v run regenerates every arm,
+			// instead of the first mismatch hiding the three behind it.
+			t.Logf("%s: block %d bytes %s, collated %d bytes %s",
+				arm.name, len(candidate.BlockBOC), hex.EncodeToString(blockSum[:]),
+				len(candidate.CollatedData), hex.EncodeToString(collatedSum[:]))
 			if len(candidate.BlockBOC) != arm.blockBytes ||
 				hex.EncodeToString(blockSum[:]) != arm.blockSum {
 				t.Fatalf("%s: block is %d bytes %s, want the recorded %d bytes %s",

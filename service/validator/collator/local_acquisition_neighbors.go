@@ -231,7 +231,10 @@ func (a *LocalAcquisition) acquireShardMessages(
 		cut:        cut,
 		neighbors:  neighbors,
 		shardEndLT: endLT,
-		proofs:     &localFullProofProvider{views: views},
+		proofs: &localFullProofProvider{
+			proofViews:   views,
+			messageViews: messageViews,
+		},
 	}, nil
 }
 
@@ -409,7 +412,10 @@ func (a *LocalAcquisition) acquireMasterMessages(
 		cut:        cut,
 		neighbors:  neighbors,
 		shardEndLT: endLT,
-		proofs:     &localFullProofProvider{views: views},
+		proofs: &localFullProofProvider{
+			proofViews:   views,
+			messageViews: views,
+		},
 	}, nil
 }
 
@@ -1103,7 +1109,15 @@ func blockShardIdent(id ton.BlockIDExt) msgpool.ShardIdent {
 }
 
 type localFullProofProvider struct {
-	views map[msgpool.ShardIdent]*localNeighborView
+	// proofViews remain pinned to the masterchain neighbor registry: their
+	// block and state proofs authenticate the descriptors serialized into the
+	// candidate. messageViews are the effective queue sources after C++
+	// add_trivial_neighbor semantics replace a stale self descriptor with the
+	// exact predecessor. Keeping the two ownership sets distinct prevents a
+	// queue scan from widening a registered proof the validator never uses for
+	// inbound replay.
+	proofViews   map[msgpool.ShardIdent]*localNeighborView
+	messageViews map[msgpool.ShardIdent]*localNeighborView
 }
 
 func (p *localFullProofProvider) BuildFullCollatedProofs(
@@ -1111,7 +1125,7 @@ func (p *localFullProofProvider) BuildFullCollatedProofs(
 	request FullCollatedProofRequest,
 ) ([]*cell.Cell, error) {
 	if request.QueueScan != nil {
-		if err := traceInternalCut(*request.QueueScan, request.Internals, p.views); err != nil {
+		if err := traceInternalCut(*request.QueueScan, request.Internals, p.messageViews); err != nil {
 			return nil, err
 		}
 	}
@@ -1145,7 +1159,7 @@ func (p *localFullProofProvider) BuildFullCollatedProofs(
 		if key == previousKey || hasPrevious2 && key == previous2Key {
 			continue
 		}
-		view := p.views[neighbor.Shard]
+		view := p.proofViews[neighbor.Shard]
 		if view == nil || view.proof == nil || !view.previous.ID.Equals(&neighbor.Block) {
 			return nil, fmt.Errorf("%w: proof view for neighbor %d is unavailable", ErrAcquisitionNotReady, i)
 		}

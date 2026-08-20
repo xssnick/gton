@@ -123,7 +123,7 @@ func (b *descriptorBatch) flush(dict *cell.AugmentedDictionary) error {
 	if len(b.pending) == 0 {
 		return nil
 	}
-	if err := dict.SetMany(b.pending); err != nil {
+	if err := dict.SetMany(b.pending, collationParallelism); err != nil {
 		if hash, found := b.duplicateMessage(dict); found {
 			return fmt.Errorf("%w: duplicate message descriptor %x", ErrInvalidInput, hash)
 		}

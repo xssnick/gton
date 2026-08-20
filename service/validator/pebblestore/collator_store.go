@@ -105,7 +105,8 @@ func (s *CollatorStore) SaveSession(
 	sessionID := ownedRecord.Session.ID
 
 	request := writeRequest{
-		sizeHint: len(value),
+		sizeHint:   len(value),
+		durability: restartRecoverable,
 		apply: func(batch *pebble.Batch) error {
 			key := collatorSessionKey(sessionID)
 			storedValue, err := getBatchCopy(batch, key)
@@ -229,7 +230,7 @@ func (s *CollatorStore) Sessions(ctx context.Context) ([]collator.SessionRecord,
 }
 
 // SaveCandidate stores one anti-equivocation marker atomically. Both authority
-// modes bind to the durable current session boundary. A delegated marker also
+// modes bind to the persisted current session boundary. A delegated marker also
 // carries and verifies the leader authorization.
 func (s *CollatorStore) SaveCandidate(record collator.CandidateRecord, done func(error)) {
 	if !validCandidateAuthority(record.Authority) {
@@ -256,7 +257,8 @@ func (s *CollatorStore) SaveCandidate(record collator.CandidateRecord, done func
 	}
 
 	s.submitSessionAsync(record.WindowID.SessionID, writeRequest{
-		sizeHint: len(value),
+		sizeHint:   len(value),
+		durability: restartRecoverable,
 		apply: func(batch *pebble.Batch) error {
 			session, err := collatorSessionFromBatch(batch, record.WindowID.SessionID)
 			if err != nil {
@@ -376,7 +378,7 @@ func validateCandidateSessionBoundary(
 	return leader, nil
 }
 
-// validateCandidateWindowAuthority makes the first marker choose one durable
+// validateCandidateWindowAuthority makes the first marker choose one persisted
 // authority for the whole window. Later slots may only extend that exact
 // authority, which prevents a restart or mode change from mixing self and
 // delegated signatures under the same consensus window.

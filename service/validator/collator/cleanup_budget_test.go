@@ -344,6 +344,14 @@ func TestQueueCleanupBudgetIsDerivedFromTheBuildStartInstant(t *testing.T) {
 // the one that failed. Every consumer of this fixture is a
 // cleanup/proof-closure test and every one of them needs it.
 func staleOwnQueueRequest(t *testing.T, stale int) ShardRequest {
+	return staleOwnQueueRequestWithClaim(t, stale, true)
+}
+
+func staleOwnQueueIdleRequest(t *testing.T, stale int) ShardRequest {
+	return staleOwnQueueRequestWithClaim(t, stale, false)
+}
+
+func staleOwnQueueRequestWithClaim(t *testing.T, stale int, withClaim bool) ShardRequest {
 	t.Helper()
 
 	req := emptyCandidateRequest(t)
@@ -351,7 +359,11 @@ func staleOwnQueueRequest(t *testing.T, stale int) ShardRequest {
 	startLT := requestStartLT(t, req)
 	fee := tlb.FromNanoTONU(100_000)
 
-	receivers := make([]*address.Address, stale+1)
+	receiverCount := stale
+	if withClaim {
+		receiverCount++
+	}
+	receivers := make([]*address.Address, receiverCount)
 	contracts := make([]activeContract, 0, len(receivers))
 	for i := range receivers {
 		receivers[i] = address.NewAddress(0, 0, bytes.Repeat([]byte{byte(0x40 + i)}, 32))
@@ -390,13 +402,20 @@ func staleOwnQueueRequest(t *testing.T, stale int) ShardRequest {
 		state.OutMsgQueueInfo = rewritten
 	})
 
-	fresh, freshEnqueued := queuedInternal(t, source, receivers[stale], startLT-1,
-		req.Header.GenUtime-1, fee, fee, 96,
-		msgpool.ShardIdent{Workchain: 0, Shard: msgpool.ShardAll})
-	req.Previous.State = stateWithQueueMessage(t, req.Previous.State, fresh.Key, freshEnqueued)
-	req.Internals = &msgpool.Cut{Messages: []*msgpool.InternalMessage{fresh}}
+	queueSize := uint64(stale)
+	if withClaim {
+		fresh, freshEnqueued := queuedInternal(t, source, receivers[stale], startLT-1,
+			req.Header.GenUtime-1, fee, fee, 96,
+			msgpool.ShardIdent{Workchain: 0, Shard: msgpool.ShardAll})
+		req.Previous.State = stateWithQueueMessage(t, req.Previous.State, fresh.Key, freshEnqueued)
+		req.Internals = &msgpool.Cut{Messages: []*msgpool.InternalMessage{fresh}}
+		queueSize++
+	} else {
+		// An incomplete empty cut leaves ProcessedInfo byte-identical. Both Go
+		// and C++ validators then return before scanning any source queue.
+		req.Internals = &msgpool.Cut{More: true}
+	}
 
-	queueSize := uint64(stale + 1)
 	req.Previous.OutQueueSize = &queueSize
 	// The registered set is the predecessor's own shard plus the masterchain,
 	// which is what capFullCollatedData demands: collated data must carry a proof
@@ -454,9 +473,11 @@ func bindZerostatePredecessor(t *testing.T, req *ShardRequest) {
 	}
 }
 
-// TestQueueCleanupBudgetNeverTruncatesTheOwnShardHalf is the one bound that is
-// not a bound: an expired budget may leave a neighbor's entries queued, but
-// never one of our own that we have already processed.
+// TestQueueCleanupCompletesTheClaimedOwnShardPrefixAfterBudget separates the
+// reference-budget pass from the exact validity obligation. An expired budget
+// stops every queue part, including the predecessor. Once imports advance
+// ProcessedInfo, the post-claim pass must still close the old-covered entries
+// inside that exact prefix.
 //
 // Before the own-shard half was lifted out of the budgeted round-robin the
 // expired arm dequeued nothing, and the block it produced was rejected by a
@@ -465,7 +486,7 @@ func bindZerostatePredecessor(t *testing.T, req *ShardRequest) {
 // dequeue descriptor". C++ rejects the same block in the same words
 // (validate-query.cpp:5283-5289). The budget is the only variable between the
 // two arms below.
-func TestQueueCleanupBudgetNeverTruncatesTheOwnShardHalf(t *testing.T) {
+func TestQueueCleanupCompletesTheClaimedOwnShardPrefixAfterBudget(t *testing.T) {
 	const stale = 6
 
 	for _, arm := range []struct {
@@ -506,6 +527,85 @@ func TestQueueCleanupBudgetNeverTruncatesTheOwnShardHalf(t *testing.T) {
 				t.Fatalf("collated data is %d bytes, i.e. the bare marker: "+
 					"capFullCollatedData is not in effect", len(candidate.CollatedData))
 			}
+		})
+	}
+}
+
+// TestQueueCleanupIdleNoClaimRespectsBudgetAndHardLimit covers the converse:
+// old-covered local entries outside any newly claimed prefix are not mandatory.
+// Even with cleanup already out of time (or the block already full) and a
+// deliberately impossible hard ceiling, the idle block leaves them queued and
+// remains valid once the test restores the real limits for final serialization.
+func TestQueueCleanupIdleNoClaimRespectsBudgetAndHardLimit(t *testing.T) {
+	const stale = 6
+
+	for _, arm := range []struct {
+		name      string
+		blockFull bool
+		stop      CleanupStopReason
+	}{
+		{name: "expired budget", stop: CleanupStopBudget},
+		{name: "block already full", blockFull: true, stop: CleanupStopBlockFull},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			req := staleOwnQueueIdleRequest(t, stale)
+			c, err := testBuilder().prepare(context.Background(), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = c.limits.addProof(c.outQueue.RootCell()); err != nil {
+				t.Fatal(err)
+			}
+			if err = c.limits.addProof(c.dispatchQueue.RootCell()); err != nil {
+				t.Fatal(err)
+			}
+
+			realLimits := c.limits.limits
+			entry := c.limits.estimatedBytes()
+			c.limits.limits.bytes = limitThresholds{entry, entry, entry, entry}
+			c.blockFull = arm.blockFull
+			if !arm.blockFull {
+				c.req.queueCleanupUntil = time.Now().Add(-time.Hour)
+			}
+			if err = c.cleanupOutQueue(); err != nil {
+				t.Fatalf("idle cleanup under %s and a hard ceiling: %v", arm.name, err)
+			}
+			if c.stats.QueueCleaned != 0 || c.queueSize != stale {
+				t.Fatalf("idle cleanup removed %d entries and left %d, want zero removed and %d left",
+					c.stats.QueueCleaned, c.queueSize, stale)
+			}
+			if c.stats.QueueCleanupStop != arm.stop {
+				t.Fatalf("cleanup stop = %v, want %v", c.stats.QueueCleanupStop, arm.stop)
+			}
+
+			// The tiny ceiling exists only to prove cleanup does not invoke a
+			// blanket mandatory drain. Restore protocol limits before constructing
+			// the block.
+			c.limits.limits = realLimits
+			if err = c.processDispatchQueue(); err != nil {
+				t.Fatal(err)
+			}
+			if err = c.processInternals(); err != nil {
+				t.Fatal(err)
+			}
+			if err = c.processExternals(); err != nil {
+				t.Fatal(err)
+			}
+			if err = c.processNewMessages(c.blockFull || c.haveUnprocessedDispatchQueue || req.internalsIncomplete()); err != nil {
+				t.Fatal(err)
+			}
+			candidate, err := c.finishShard()
+			if err != nil {
+				t.Fatalf("finish idle block: %v", err)
+			}
+			if c.processedClaimed {
+				t.Fatal("idle incomplete cut unexpectedly advanced ProcessedInfo")
+			}
+			if candidate.Stats.OutQueueSize != stale {
+				t.Fatalf("idle block queue size = %d, want %d stale entries preserved",
+					candidate.Stats.OutQueueSize, stale)
+			}
+			verifyBudgetedCandidate(t, req, candidate)
 		})
 	}
 }
@@ -594,29 +694,18 @@ func TestMandatoryDequeueOverflowFailsTheCollation(t *testing.T) {
 			len(control.CollatedData))
 	}
 
-	c, err := testBuilder().prepare(context.Background(), staleOwnQueueRequest(t, stale))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = c.limits.addProof(c.outQueue.RootCell()); err != nil {
-		t.Fatal(err)
-	}
-	if err = c.limits.addProof(c.dispatchQueue.RootCell()); err != nil {
-		t.Fatal(err)
-	}
-	// A hard byte ceiling one byte above where the drain starts. Cleanup is the
-	// first phase of a shard collation, so nothing but the drain can be blamed
-	// for crossing it.
+	c := claimedDrainFixture(t, stale)
+	// A hard byte ceiling one byte above where the claimed-prefix pass starts.
 	entry := c.limits.estimatedBytes()
 	c.limits.limits.bytes = limitThresholds{entry, entry, entry, entry + 1}
 
-	err = c.cleanupOutQueue()
+	err = c.cleanupClaimedLocalDequeues()
 	if !errors.Is(err, ErrMandatoryDequeueOverflow) {
-		t.Fatalf("cleanup error = %v, want ErrMandatoryDequeueOverflow", err)
+		t.Fatalf("claimed-prefix cleanup error = %v, want ErrMandatoryDequeueOverflow", err)
 	}
 	// The message is the operator's only view of a slot that produced nothing,
 	// so it has to carry the axis and the progress, not just the verdict.
-	for _, want := range []string{"estimated block bytes", "dequeued 1 already-processed own-shard entries"} {
+	for _, want := range []string{"estimated block bytes", "dequeued 1 already-processed entries inside the claimed prefix"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q does not report %q", err, want)
 		}
@@ -628,12 +717,11 @@ func TestMandatoryDequeueOverflowFailsTheCollation(t *testing.T) {
 	t.Logf("collation refused to ship: %v", err)
 }
 
-// mandatoryDrainFixture prepares a collation over the stale fixture and returns
-// it with the predecessor's own cleanup part, the one cleanupOutQueue drains
-// outside every discretionary bound. Driving the drain directly is what lets
-// the tests below put the byte ceiling exactly where they want it relative to
-// the work, which is not expressible through a whole build.
-func mandatoryDrainFixture(t *testing.T, stale int) (*collation, *cleanupPart) {
+// claimedDrainFixture stops the reference cleanup pass before its first entry,
+// then stages the exact ProcessedInfo claim that makes the old-covered prefix
+// mandatory. Driving that post-claim pass directly lets the tests put the hard
+// byte ceiling exactly around its work.
+func claimedDrainFixture(t *testing.T, stale int) *collation {
 	t.Helper()
 
 	c, err := testBuilder().prepare(context.Background(), staleOwnQueueRequest(t, stale))
@@ -646,23 +734,45 @@ func mandatoryDrainFixture(t *testing.T, stale int) (*collation, *cleanupPart) {
 	if err = c.limits.addProof(c.dispatchQueue.RootCell()); err != nil {
 		t.Fatal(err)
 	}
-	neighbors, err := c.effectiveNeighbors()
-	if err != nil {
+	c.req.queueCleanupUntil = time.Now().Add(-time.Hour)
+	if err = c.cleanupOutQueue(); err != nil {
 		t.Fatal(err)
 	}
-	for i := range neighbors {
-		if neighbors[i].Shard != c.shard {
-			continue
-		}
-		stream, streamErr := c.neighborQueueStream(neighbors[i].Shard)
-		if streamErr != nil {
-			t.Fatal(streamErr)
-		}
-		return c, &cleanupPart{neighbor: neighbors[i], stream: stream}
+	if c.stats.QueueCleaned != 0 {
+		t.Fatalf("expired reference cleanup removed %d entries before the claimed-prefix test", c.stats.QueueCleaned)
 	}
-	t.Fatal("the effective neighbour set carries no predecessor part, so there is no mandatory drain")
+	c.processedClaimed = true
+	c.processedClaim = semanticMessageBound{
+		lt:   c.header.StartLt,
+		hash: processedInfinityHash,
+	}
+	return c
+}
 
-	return nil, nil
+func TestClaimedLocalCleanupStopsAtTheClaimedPrefix(t *testing.T) {
+	const (
+		stale  = 6
+		inside = 3
+	)
+
+	c := claimedDrainFixture(t, stale)
+	// stale entries are at StartLt-100, -99, ...; infinity hash includes all
+	// three entries through StartLt-98 and excludes the rest by lt.
+	c.processedClaim = semanticMessageBound{
+		lt:   c.header.StartLt - 98,
+		hash: processedInfinityHash,
+	}
+	if err := c.cleanupClaimedLocalDequeues(); err != nil {
+		t.Fatal(err)
+	}
+	if c.stats.QueueCleaned != inside {
+		t.Fatalf("claimed-prefix cleanup removed %d entries, want exactly %d", c.stats.QueueCleaned, inside)
+	}
+	// The fixture also carries one fresh, not-old-processed entry.
+	wantQueue := uint64(stale + 1 - inside)
+	if c.queueSize != wantQueue {
+		t.Fatalf("claimed-prefix cleanup left %d entries, want %d", c.queueSize, wantQueue)
+	}
 }
 
 // TestMandatoryDequeueOverflowBoundary pins the two things
@@ -686,9 +796,9 @@ func TestMandatoryDequeueOverflowBoundary(t *testing.T) {
 	const stale = 6
 
 	// What a completed drain actually costs, measured rather than guessed.
-	measured, local := mandatoryDrainFixture(t, stale)
+	measured := claimedDrainFixture(t, stale)
 	entry := measured.limits.estimatedBytes()
-	if err := measured.cleanupMandatoryDrain(local); err != nil {
+	if err := measured.cleanupClaimedLocalDequeues(); err != nil {
 		t.Fatalf("drain under the fixture's own limits: %v", err)
 	}
 	if measured.stats.QueueCleaned != stale {
@@ -711,10 +821,10 @@ func TestMandatoryDequeueOverflowBoundary(t *testing.T) {
 		{name: "exactly at the completed drain", hard: peak, fail: true},
 	} {
 		t.Run(arm.name, func(t *testing.T) {
-			c, part := mandatoryDrainFixture(t, stale)
+			c := claimedDrainFixture(t, stale)
 			c.limits.limits.bytes = limitThresholds{arm.hard, arm.hard, arm.hard, arm.hard}
 
-			err := c.cleanupMandatoryDrain(part)
+			err := c.cleanupClaimedLocalDequeues()
 			if arm.fail {
 				if !errors.Is(err, ErrMandatoryDequeueOverflow) {
 					t.Fatalf("drain error = %v, want ErrMandatoryDequeueOverflow at the boundary", err)
@@ -741,15 +851,15 @@ func TestMandatoryDequeueOverflowBoundary(t *testing.T) {
 	// refuse after it, naming the one dequeue it made. A check moved ahead of
 	// the step reports zero.
 	t.Run("already over before the drain", func(t *testing.T) {
-		c, part := mandatoryDrainFixture(t, stale)
+		c := claimedDrainFixture(t, stale)
 		below := c.limits.estimatedBytes() - 1
 		c.limits.limits.bytes = limitThresholds{below, below, below, below}
 
-		err := c.cleanupMandatoryDrain(part)
+		err := c.cleanupClaimedLocalDequeues()
 		if !errors.Is(err, ErrMandatoryDequeueOverflow) {
 			t.Fatalf("drain error = %v, want ErrMandatoryDequeueOverflow", err)
 		}
-		if !strings.Contains(err.Error(), "dequeued 1 already-processed own-shard entries") {
+		if !strings.Contains(err.Error(), "dequeued 1 already-processed entries inside the claimed prefix") {
 			t.Fatalf("error %q does not report the dequeue it made before refusing", err)
 		}
 		if c.stats.QueueCleaned != 1 {
@@ -761,11 +871,11 @@ func TestMandatoryDequeueOverflowBoundary(t *testing.T) {
 	// frontier covers none of the queue, so the mandatory half is empty and the
 	// overflow it never caused must not be reported.
 	t.Run("already over with an empty drain", func(t *testing.T) {
-		c, part := mandatoryDrainFixture(t, 0)
+		c := claimedDrainFixture(t, 0)
 		below := c.limits.estimatedBytes() - 1
 		c.limits.limits.bytes = limitThresholds{below, below, below, below}
 
-		if err := c.cleanupMandatoryDrain(part); err != nil {
+		if err := c.cleanupClaimedLocalDequeues(); err != nil {
 			t.Fatalf("an empty mandatory drain refused a block it did not grow: %v", err)
 		}
 		if c.stats.QueueCleaned != 0 {

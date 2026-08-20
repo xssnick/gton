@@ -21,7 +21,7 @@ import (
 // wait, the state resolve, the block interval and a whole validation.
 //
 // This asserts the overlap. The property it must not have cost —
-// no emission before the marker is durable — is pinned separately and
+// no emission before the marker reaches Pebble — is pinned separately and
 // unchanged by TestRuntimeSelfCandidateMarkerPrecedesEmission.
 func TestCandidateMarkerCommitOverlapsTheStateCommit(t *testing.T) {
 	baseStorage := newRuntimeMemoryStorage()
@@ -84,7 +84,7 @@ func TestCandidateMarkerCommitOverlapsTheStateCommit(t *testing.T) {
 	}
 	select {
 	case artifact := <-emitted:
-		t.Fatalf("candidate emitted while its marker was not durable: %+v", artifact)
+		t.Fatalf("candidate emitted before its marker reached Pebble: %+v", artifact)
 	default:
 	}
 

@@ -358,10 +358,7 @@ func TestBroadcastPipelineObserverCapturesHotPathStages(t *testing.T) {
 	})
 
 	downloaded := testShardBroadcastDownloadedBlock(t, 206, 0x206)
-	candidate := tonnodeapi.NewBlockCandidateBroadcast{
-		ID:   downloaded.ID,
-		Data: downloaded.BlockBOC,
-	}
+	candidate := testNonTLBBlockCandidateBroadcast(206, 0x206)
 	if err := sub.handleOverlayBroadcast(nil, candidate, DeliveryTwoStep, true, sourceID); !errors.Is(err, overlay.ErrBroadcastRejected) {
 		t.Fatalf("handle candidate broadcast error = %v, want broadcast rejected", err)
 	}
@@ -855,7 +852,7 @@ func TestCustomTwoStepBroadcastSkipsSameOverlayRebroadcastButKeepsFanoutPayload(
 }
 
 func TestBlockCandidateDecodeFailureDropsBeforeRebroadcast(t *testing.T) {
-	raw := testShardBroadcastDownloadedBlock(t, 208, 0x208)
+	raw := testNonTLBBlockCandidateBroadcast(208, 0x208)
 	tests := []struct {
 		name string
 		kind string
@@ -864,10 +861,7 @@ func TestBlockCandidateDecodeFailureDropsBeforeRebroadcast(t *testing.T) {
 		{
 			name: "raw_parse_failure",
 			kind: "tonNode.newBlockCandidateBroadcast",
-			msg: tonnodeapi.NewBlockCandidateBroadcast{
-				ID:   raw.ID,
-				Data: raw.BlockBOC,
-			},
+			msg:  raw,
 		},
 		{
 			name: "compressed_decode_failure",
@@ -930,6 +924,16 @@ func TestBlockCandidateDecodeFailureDropsBeforeRebroadcast(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testNonTLBBlockCandidateBroadcast(seqno uint32, payload uint64) tonnodeapi.NewBlockCandidateBroadcast {
+	root := cell.BeginCell().MustStoreUInt(payload, 16).EndCell()
+	data := root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
+	id := testBlockID(0, topShard, seqno)
+	id.RootHash = root.Hash()
+	id.FileHash = hashSimpleBroadcastPayload(data)
+
+	return tonnodeapi.NewBlockCandidateBroadcast{ID: id, Data: data}
 }
 
 func TestCustomOverlayDropsIHRBroadcast(t *testing.T) {

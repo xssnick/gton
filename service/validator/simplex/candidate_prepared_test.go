@@ -176,6 +176,9 @@ func TestPreparedCandidateRejectsAnotherCandidate(t *testing.T) {
 	otherFileHash := sha256.Sum256(otherBOC)
 
 	for name, mutate := range map[string]func(*Candidate){
+		"sequence number": func(c *Candidate) {
+			c.Block.SeqNo++
+		},
 		"root hash": func(c *Candidate) {
 			c.Block.RootHash = bytes.Clone(otherRoot.Hash())
 		},

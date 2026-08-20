@@ -483,6 +483,12 @@ func (b *LocalSessionBackend) ValidateCandidate(
 	// and hands the result back, so nothing is announced, no goroutine starts
 	// and the same tree is not walked twice.
 	pending := request.successor
+	var blockRoot *cell.Cell
+	var collatedRoots []*cell.Cell
+	if artifact.validationRoots != nil {
+		blockRoot = artifact.validationRoots.block
+		collatedRoots = artifact.validationRoots.collated
+	}
 	result, err := b.acquisition.ValidateCandidate(ctx, collator.ValidationRequest{
 		Session:            view.session,
 		Update:             view.update,
@@ -491,6 +497,8 @@ func (b *LocalSessionBackend) ValidateCandidate(
 		BlockBOC:           artifact.BlockBOC,
 		CollatedData:       artifact.CollatedData,
 		Digested:           artifact.digested,
+		BlockRoot:          blockRoot,
+		CollatedRoots:      collatedRoots,
 		AnnounceTransition: pending.announce,
 	})
 	if err != nil {

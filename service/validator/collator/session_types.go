@@ -111,19 +111,20 @@ type SessionRecord struct {
 	Update     SessionUpdate
 }
 
-// WindowID binds each durable candidate marker to its consensus leader window.
+// WindowID binds each candidate marker to its consensus leader window.
 // A session cannot have two different windows beginning at the same slot.
 type WindowID struct {
 	SessionID [32]byte
 	StartSlot uint32
 }
 
-// CandidateRecord is the durable proof that the selected self or delegated
-// authority signed one candidate for one slot. It deliberately carries no
-// block or collated payload: those megabytes are already written per slot by
-// the consensus side, and the only
-// thing durability has to guarantee here is that a restarted producer can never
-// sign a second, different candidate for a slot it already broadcast.
+// CandidateRecord remembers that the selected self or delegated authority
+// signed one candidate for one slot. It deliberately carries no block or
+// collated payload: those megabytes are already written per slot by consensus.
+// The Pebble implementation writes this marker with NoSync. An ordinary restart
+// keeps it and prevents a second signature; an abrupt machine failure may lose
+// the latest marker, which is an accepted tradeoff for keeping fsync out of the
+// block path.
 //
 // Re-emitting the exact bytes of an already signed slot therefore only works
 // while the artifact is still in memory, which covers every in-process retry.

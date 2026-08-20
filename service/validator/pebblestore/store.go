@@ -36,19 +36,19 @@ const (
 	// node produce a CONFLICTING record — a safety violation. These are fsynced,
 	// and the caller waits for the fsync, which is the whole point.
 	durableCommitment durabilityClass = iota
-	// recoverablePayload is bulk content that a restart may lose without any
-	// change in what this node is allowed to do, because the network holds it:
-	// today, exactly the candidate wire. It commits with pebble.NoSync, so its
-	// callback fires once the write is in the write-ahead log rather than after the
-	// log has been fsynced.
+	// restartRecoverable is state that a restart may lose without changing what
+	// this node is allowed to sign. The network or a durable consensus record can
+	// reconstruct it; losing it costs replay, re-fetching, or telemetry only. The
+	// collator marker is the explicit accepted exception to that rule. This class
+	// commits with pebble.NoSync, so its callback fires once the write is in the
+	// write-ahead log rather than after the log has been fsynced.
 	//
-	// A failed commit stays FATAL. Only the wait goes away — see the store-error
-	// handling in commitRequests and simplex/types.go:392.
-	recoverablePayload
+	// Error reporting is unchanged. Only the stable-media wait goes away.
+	restartRecoverable
 )
 
 func (c durabilityClass) writeOptions() *pebble.WriteOptions {
-	if c == recoverablePayload {
+	if c == restartRecoverable {
 		return pebble.NoSync
 	}
 
@@ -91,7 +91,8 @@ func rejectRequest(err error) error {
 	return &requestError{err: err}
 }
 
-// Store is one physical Pebble database and its global durable writer.
+// Store owns the physical Pebble metadata database, candidate packs and their
+// global writer.
 type Store struct {
 	db    *pebble.DB
 	cache *pebble.Cache
@@ -116,7 +117,8 @@ type Store struct {
 
 // ValidatorStore is the stable validator persistence view of a Store.
 type ValidatorStore struct {
-	store *Store
+	store          *Store
+	candidatePacks *candidatePackStore
 
 	namespaceMu sync.Mutex
 	deleting    map[storageNamespace]struct{}
@@ -152,11 +154,10 @@ func (s *Store) Validator() *ValidatorStore {
 // one fsync, so separating the two workloads is not free and must be measured
 // before it is done.
 //
-// The collator's candidate record is a signed MARKER, not a payload — it fences a
-// window against a second, conflicting candidate — so it is a durableCommitment and
-// shares the fsync of whatever consensus writes it batches with. The one write in
-// this database that is not fsynced is the validator's candidate wire; see
-// ValidatorStore.SaveCandidate and durabilityClass.
+// Restart-recoverable writes share this queue too. In particular the collator
+// candidate marker is intentionally NoSync: an abrupt machine failure can lose
+// the fence and permit another candidate for an already expired slot, a risk the
+// operator accepts to keep the block path independent of disk fsync latency.
 func (s *Store) Collator() *CollatorStore {
 	return s.collator
 }
@@ -192,7 +193,7 @@ func (s *Store) Close() error {
 	s.callbackWG.Wait()
 
 	s.readMu.Lock()
-	err := s.db.Close()
+	err := errors.Join(s.validator.candidatePacks.close(), s.db.Close())
 	s.cache.Unref()
 	s.readMu.Unlock()
 
@@ -296,7 +297,8 @@ func (s *ValidatorStore) submitSessionAndWait(
 ) error {
 	result := make(chan error, 1)
 	err := s.submitSession(namespace, writeRequest{
-		apply: apply,
+		apply:      apply,
+		durability: restartRecoverable,
 		done: func(err error) {
 			result <- err
 		},

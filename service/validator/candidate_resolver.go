@@ -72,9 +72,10 @@ type candidateResolver struct {
 	// certificates verifies notarizations peers send us and seals them. It is
 	// held for the session so the roster digest and the quorum threshold are
 	// derived once rather than per certificate.
-	certificates *simplex.CertificateVerifier
-	peerCount    int
-	maxReply     uint32
+	certificates       *simplex.CertificateVerifier
+	peerCount          int
+	maxReply           uint32
+	validateCandidates bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -125,7 +126,11 @@ type candidateEntry struct {
 	// asks this field and nothing else.
 	durable   bool
 	candidate *CandidateArtifact
-	wire      []byte
+	// validationRoots is an at-most-once handoff from network decode to the
+	// semantic validator. It is kept outside candidate so every other resolver
+	// consumer sees and retains only the canonical bytes.
+	validationRoots *candidateValidationRoots
+	wire            []byte
 	// wireHash is the canonical wire identity, kept after the payload itself is
 	// released. It is the same sha256 the store indexes the candidate by, and it
 	// is what keeps a conflicting duplicate detectable once the bytes are gone.
@@ -156,12 +161,10 @@ type candidateEntry struct {
 //
 // A load or a store flight is left to itself: each is bounded by one storage
 // operation and each is installing or writing out the very bytes this would
-// drop. A resolve flight deliberately is not. It runs until the session closes
-// if no notarization certificate ever arrives, so honouring it would exempt an
-// entry from release forever — and a wait for a certificate is not a claim on
-// the payload. The certificate is a separate field, and resolveInner holds no
-// pointer to the bytes across that wait; it re-reads the durable copy when it
-// finally has both parts.
+// drop. A resolve flight is not a claim on the payload either. It has its own
+// waiter/owner lifetime, and resolveInner holds no pointer to the bytes while
+// waiting for a certificate; it re-reads the durable copy when it finally has
+// both parts.
 func (e *candidateEntry) releasable(slot uint32, watermark uint32) bool {
 	return e.candidate != nil && slot < watermark &&
 		!e.candidate.Candidate.Empty &&
@@ -172,6 +175,16 @@ type resolverFlight struct {
 	done   chan struct{}
 	cancel context.CancelFunc
 	err    error
+	// waiters are active resolve callers and owners are the subset performing a
+	// finalization/recovery operation. Ownership keeps an incidental caller from
+	// cancelling shared work, but it never exempts that work from expires: a node
+	// which sees final certificates without their payloads must not accumulate one
+	// session-lifetime retry loop per finalized slot.
+	waiters  int
+	owners   int
+	finished bool
+	expires  time.Time
+	timer    *time.Timer
 	// result is what this flight produced, captured under the same lock that
 	// completed it. Waiters must not re-read the entry afterwards: the
 	// finalization sweep can release its payload in between. A load flight fills
@@ -198,17 +211,18 @@ type candidateRequestWindow struct {
 }
 
 type candidateResolverOptions struct {
-	Session    SessionStorageID
-	SessionID  [32]byte
-	Storage    ValidatorStorage
-	Provider   CandidateProvider
-	Codec      *candidateCodec
-	Validators []simplex.Validator
-	PeerCount  int
-	Limits     CandidateLimits
-	Params     simplex.Params
-	Stored     StoredSessionState
-	Bootstrap  simplex.ValidatedBootstrap
+	Session            SessionStorageID
+	SessionID          [32]byte
+	Storage            ValidatorStorage
+	Provider           CandidateProvider
+	Codec              *candidateCodec
+	Validators         []simplex.Validator
+	PeerCount          int
+	ValidateCandidates bool
+	Limits             CandidateLimits
+	Params             simplex.Params
+	Stored             StoredSessionState
+	Bootstrap          simplex.ValidatedBootstrap
 }
 
 func newCandidateResolver(options candidateResolverOptions) (*candidateResolver, error) {
@@ -226,20 +240,21 @@ func newCandidateResolver(options candidateResolverOptions) (*candidateResolver,
 
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &candidateResolver{
-		session:      options.Session,
-		sessionID:    options.SessionID,
-		storage:      options.Storage,
-		provider:     options.Provider,
-		codec:        options.Codec,
-		certificates: certificates,
-		peerCount:    options.PeerCount,
-		maxReply:     uint32(maxReply),
-		ctx:          ctx,
-		cancel:       cancel,
-		params:       options.Params,
-		budget:       defaultRetentionBudget(options.Session.Shard.IsMasterchain()),
-		entries:      make(map[simplex.CandidateID]*candidateEntry, len(options.Stored.CandidateIDs)),
-		retained:     make(map[simplex.CandidateID]*candidateEntry),
+		session:            options.Session,
+		sessionID:          options.SessionID,
+		storage:            options.Storage,
+		provider:           options.Provider,
+		codec:              options.Codec,
+		certificates:       certificates,
+		peerCount:          options.PeerCount,
+		maxReply:           uint32(maxReply),
+		validateCandidates: options.ValidateCandidates,
+		ctx:                ctx,
+		cancel:             cancel,
+		params:             options.Params,
+		budget:             defaultRetentionBudget(options.Session.Shard.IsMasterchain()),
+		entries:            make(map[simplex.CandidateID]*candidateEntry, len(options.Stored.CandidateIDs)),
+		retained:           make(map[simplex.CandidateID]*candidateEntry),
 	}
 	// The durable index is the whole truth a restarted session starts with: the
 	// candidates below are in the store, and nothing about this process not
@@ -297,7 +312,7 @@ func (r *candidateResolver) observeNotarization(id simplex.CandidateID, certific
 	r.mu.Lock()
 	entry := r.entry(id)
 	entry.notarization = certificate
-	r.completeResolveLocked(entry)
+	r.completeResolveLocked(id, entry)
 	r.mu.Unlock()
 }
 
@@ -318,7 +333,7 @@ func (r *candidateResolver) stage(artifact *CandidateArtifact, wire []byte) erro
 		return ErrCandidateConflict
 	}
 	if entry.candidate != nil {
-		r.completeResolveLocked(entry)
+		r.completeResolveLocked(id, entry)
 
 		return nil
 	}
@@ -330,7 +345,7 @@ func (r *candidateResolver) stage(artifact *CandidateArtifact, wire []byte) erro
 		return nil
 	}
 	r.attachPayloadLocked(id, entry, artifact, wire, hash)
-	r.completeResolveLocked(entry)
+	r.completeResolveLocked(id, entry)
 
 	return nil
 }
@@ -346,7 +361,20 @@ func (r *candidateResolver) attachPayloadLocked(
 	wire []byte,
 	hash [32]byte,
 ) {
+	// Both capsules retain parsed DAGs. Resolver state needs only the canonical
+	// bytes, so every retention route strips them in one place. A voting runtime
+	// keeps the validation capsule separately until the first validation claims
+	// it; an observer discards it immediately.
 	entry.candidate = artifact
+	if artifact.preparedBlock != nil || artifact.validationRoots != nil {
+		retained := *artifact
+		retained.preparedBlock = nil
+		retained.validationRoots = nil
+		entry.candidate = &retained
+	}
+	if r.validateCandidates {
+		entry.validationRoots = artifact.validationRoots
+	}
 	entry.wire = wire
 	entry.wireHash = hash
 	entry.hasWireHash = true
@@ -389,6 +417,7 @@ func (r *candidateResolver) releasePayloadLocked(id simplex.CandidateID, entry *
 		r.cache.Candidates--
 		r.cache.Bytes -= candidatePayloadBytes(entry.candidate, entry.wire)
 		entry.candidate = nil
+		entry.validationRoots = nil
 		entry.wire = nil
 	}
 	delete(r.retained, id)
@@ -405,7 +434,7 @@ func candidatePayloadBytes(artifact *CandidateArtifact, wire []byte) int64 {
 // from memory, but nothing about it is lost: the bytes are durable, and its own
 // loop finishes from storage. Cancelling the peer request it has outstanding is
 // what makes it do so now instead of after that request times out.
-func (r *candidateResolver) completeResolveLocked(entry *candidateEntry) {
+func (r *candidateResolver) completeResolveLocked(id simplex.CandidateID, entry *candidateEntry) {
 	flight := entry.resolve
 	if flight == nil || entry.notarization.IsZero() {
 		return
@@ -419,11 +448,110 @@ func (r *candidateResolver) completeResolveLocked(entry *candidateEntry) {
 		return
 	}
 
-	entry.resolve = nil
-	flight.err = nil
-	flight.result = CandidateResolution{Candidate: entry.candidate, Notarization: entry.notarization}
+	r.finishResolveLocked(
+		id,
+		entry,
+		flight,
+		CandidateResolution{Candidate: entry.candidate, Notarization: entry.notarization},
+		nil,
+	)
+}
+
+func (r *candidateResolver) finishResolveLocked(
+	id simplex.CandidateID,
+	entry *candidateEntry,
+	flight *resolverFlight,
+	result CandidateResolution,
+	err error,
+) {
+	if flight.finished {
+		return
+	}
+
+	flight.finished = true
+	flight.err = err
+	flight.result = result
+	if flight.timer != nil {
+		flight.timer.Stop()
+		flight.timer = nil
+	}
+	if flight.request != nil {
+		flight.request()
+		flight.request = nil
+	}
+	if entry.resolve == flight {
+		entry.resolve = nil
+	}
 	close(flight.done)
 	flight.cancel()
+}
+
+func (r *candidateResolver) armResolveExpiryLocked(id simplex.CandidateID, flight *resolverFlight) {
+	if flight.expires.IsZero() {
+		flight.expires = time.Now().Add(resolverFlightTTL(r.params, r.session.Protocol.SlotsPerLeaderWindow))
+	}
+	delay := time.Until(flight.expires)
+	if delay <= 0 {
+		delay = time.Nanosecond
+	}
+	flight.timer = time.AfterFunc(delay, func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		flight.timer = nil
+		entry := r.entries[id]
+		if entry == nil || entry.resolve != flight || flight.finished {
+			return
+		}
+
+		r.finishResolveLocked(id, entry, flight, CandidateResolution{}, context.DeadlineExceeded)
+	})
+}
+
+func (r *candidateResolver) releaseResolveWaiter(
+	id simplex.CandidateID,
+	flight *resolverFlight,
+	owned bool,
+) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if flight.waiters > 0 {
+		flight.waiters--
+	}
+	if owned && flight.owners > 0 {
+		flight.owners--
+	}
+	entry := r.entries[id]
+	if entry == nil || entry.resolve != flight || flight.finished {
+		return
+	}
+	if flight.waiters == 0 {
+		r.finishResolveLocked(id, entry, flight, CandidateResolution{}, context.Canceled)
+
+		return
+	}
+}
+
+func resolverFlightTTL(params simplex.Params, slotsPerLeaderWindow uint32) time.Duration {
+	windows := max(uint64(params.MaxLeaderWindowDesync), 1)
+	slots := windows * uint64(max(slotsPerLeaderWindow, 1))
+	if windows != 0 && slots/windows != uint64(max(slotsPerLeaderWindow, 1)) {
+		return time.Duration(math.MaxInt64)
+	}
+	if params.TargetRate <= 0 || slots > uint64(math.MaxInt64)/uint64(params.TargetRate) {
+		return time.Duration(math.MaxInt64)
+	}
+
+	ttl := time.Duration(slots) * params.TargetRate
+	if ttl < params.CandidateResolveTimeoutCap {
+		ttl = params.CandidateResolveTimeoutCap
+	}
+	if ttl <= 0 {
+		return time.Second
+	}
+
+	return ttl
 }
 
 func (w *candidateRequestWindow) allow(now time.Time, limit uint32) bool {
@@ -740,6 +868,18 @@ func (r *candidateResolver) candidate(
 		return nil, ErrCandidateUnavailable
 	}
 
+	r.mu.Lock()
+	entry := r.entries[id]
+	roots := entry.validationRoots
+	entry.validationRoots = nil
+	r.mu.Unlock()
+	if roots != nil {
+		prepared := *artifact
+		prepared.validationRoots = roots
+
+		return &prepared, nil
+	}
+
 	return artifact, nil
 }
 
@@ -931,6 +1071,25 @@ func (r *candidateResolver) loadStoredWire(
 }
 
 func (r *candidateResolver) resolve(ctx context.Context, id simplex.CandidateID) (CandidateResolution, error) {
+	return r.resolveWithOwnership(ctx, id, false)
+}
+
+// resolveFinalization keeps a flight alive while durable consensus recovery or
+// finalization owns it. Incidental validation callers may leave without
+// cancelling that work; the resolver epoch deadline still bounds the owner so
+// missing payloads cannot retain a peer-retry loop for the whole session.
+func (r *candidateResolver) resolveFinalization(
+	ctx context.Context,
+	id simplex.CandidateID,
+) (CandidateResolution, error) {
+	return r.resolveWithOwnership(ctx, id, true)
+}
+
+func (r *candidateResolver) resolveWithOwnership(
+	ctx context.Context,
+	id simplex.CandidateID,
+	owned bool,
+) (CandidateResolution, error) {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -945,14 +1104,36 @@ func (r *candidateResolver) resolve(ctx context.Context, id simplex.CandidateID)
 		return result, nil
 	}
 	flight := entry.resolve
+	if flight != nil {
+		select {
+		case <-flight.done:
+			result, err := flight.result, flight.err
+			r.mu.Unlock()
+			if err != nil {
+				return CandidateResolution{}, err
+			}
+			if result.Candidate == nil || result.Notarization.IsZero() {
+				return CandidateResolution{}, ErrCandidateUnavailable
+			}
+
+			return result, nil
+		default:
+		}
+	}
 	if flight == nil {
 		flightCtx, cancel := context.WithCancel(r.ctx)
 		flight = &resolverFlight{done: make(chan struct{}), cancel: cancel}
 		entry.resolve = flight
+		r.armResolveExpiryLocked(id, flight)
 		r.wg.Add(1)
 		go r.resolveLoop(flightCtx, id, flight)
 	}
+	flight.waiters++
+	if owned {
+		flight.owners++
+	}
 	r.mu.Unlock()
+	defer r.releaseResolveWaiter(id, flight, owned)
 
 	select {
 	case <-ctx.Done():
@@ -981,11 +1162,7 @@ func (r *candidateResolver) resolveLoop(
 	r.mu.Lock()
 	entry := r.entry(id)
 	if entry.resolve == flight {
-		flight.err = err
-		flight.result = result
-		entry.resolve = nil
-		close(flight.done)
-		flight.cancel()
+		r.finishResolveLocked(id, entry, flight, result, err)
 	}
 	r.mu.Unlock()
 }
@@ -1252,7 +1429,7 @@ func (r *candidateResolver) loadDurableCandidate(id simplex.CandidateID) (*Candi
 		r.attachPayloadLocked(id, entry, artifact, record.Wire, record.ContentHash)
 	}
 	r.markDurableLocked(entry)
-	r.completeResolveLocked(entry)
+	r.completeResolveLocked(id, entry)
 
 	return entry.candidate, nil
 }
@@ -1335,7 +1512,7 @@ func (r *candidateResolver) mergeResponse(request CandidateRequest, response Can
 	if !notarization.IsZero() && entry.notarization.IsZero() {
 		entry.notarization = notarization
 	}
-	r.completeResolveLocked(entry)
+	r.completeResolveLocked(request.ID, entry)
 	r.mu.Unlock()
 
 	return nil

@@ -32,16 +32,22 @@ type Store interface {
 	BlockFragments(ctx context.Context, block ton.BlockIDExt) (*liveview.BlockView, error)
 }
 
+type AccountPrewarmer interface {
+	EnqueueRoot(cell.Hash) bool
+}
+
 type Options struct {
-	Logger *zerolog.Logger
-	Store  Store
-	TVM    *tvm.TVM
+	Logger    *zerolog.Logger
+	Store     Store
+	TVM       *tvm.TVM
+	Prewarmer AccountPrewarmer
 }
 
 type Checker struct {
-	log   zerolog.Logger
-	store Store
-	tvm   *tvm.TVM
+	log       zerolog.Logger
+	store     Store
+	tvm       *tvm.TVM
+	prewarmer AccountPrewarmer
 
 	mu       sync.Mutex
 	contexts map[blockContextKey]*list.Element
@@ -83,11 +89,12 @@ func NewChecker(opts Options) (*Checker, error) {
 	}
 
 	return &Checker{
-		log:      log,
-		store:    opts.Store,
-		tvm:      machine,
-		contexts: map[blockContextKey]*list.Element{},
-		order:    list.New(),
+		log:       log,
+		store:     opts.Store,
+		tvm:       machine,
+		prewarmer: opts.Prewarmer,
+		contexts:  map[blockContextKey]*list.Element{},
+		order:     list.New(),
 	}, nil
 }
 
@@ -144,6 +151,9 @@ func (c *Checker) Check(ctx context.Context, data []byte, msgCell *cell.Cell, ms
 	}
 	if !accepted {
 		return CheckResult{}, ErrRejected
+	}
+	if c.prewarmer != nil {
+		c.prewarmer.EnqueueRoot(shardAccount.Account.HashKey())
 	}
 	return CheckResult{
 		Root:    msgCell,

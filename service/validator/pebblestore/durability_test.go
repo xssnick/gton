@@ -15,34 +15,34 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
-// THE CLASSIFICATION, enumerated. Every write in this store is a commitment — a
-// record whose purpose is to constrain this node's future behaviour — except the
-// candidate wire, which is bulk content the network holds copies of.
-//
-// Why that line and not another: losing a commitment across a restart lets this
-// node produce a CONFLICTING one, which is a safety violation and not a slow
-// resync. Losing the candidate wire costs a re-fetch and nothing else, because the
-// candidate is broadcast before it is stored and notarization requires 2/3 of
-// weight to have voted, which requires those 2/3 to have stored it — so a
-// notarized candidate is held by at least 2/3 of the network, and a candidate only
-// we hold cannot be notarized.
+// THE CLASSIFICATION, enumerated. Own votes, delegation authorizations and key
+// material constrain what this node may sign after restart and remain synced.
+// Network-recoverable data and progress cursors use NoSync; losing their latest
+// WAL or candidate-pack tail costs replay or re-fetching. The collator
+// candidate marker is the one explicit exception: losing it can permit a
+// second candidate for an expired slot, a risk accepted to remove fsync from
+// the block path.
 //
 // This test is the gate on that line. The zero value of durabilityClass is already
 // the strict one, so nothing becomes unsynced by omission; what this adds is that
 // nothing becomes unsynced by a one-word edit either. A new relaxed write has to be
 // added to the list below, next to a justification of the same form.
 func TestDurabilityClassificationIsExplicit(t *testing.T) {
-	// Keys are RECEIVER-QUALIFIED, and that is the whole point of the change that
-	// introduced this comment. Under a bare function name
-	// ValidatorStore.SaveCandidate (session.go, recoverablePayload) and
-	// CollatorStore.SaveCandidate (collator_store.go, commitment by omission)
-	// collide on "SaveCandidate", so the single guard against a wrong class was
-	// blind on the single colliding pair: an allowlist entry written for one of
-	// them would have silently authorized an unsynced write added to the other.
-	// See TestDurabilitySitesAreReceiverQualified.
+	// Keys are receiver-qualified because ValidatorStore.SaveCandidate and
+	// CollatorStore.SaveCandidate collide under a bare function name even though
+	// their recovery justifications differ.
 	relaxed := map[string]string{
 		"ValidatorStore.SaveCandidate": "the candidate wire: broadcast before it is stored, and held by the " +
 			"2/3 of weight whose votes notarization requires",
+		"CollatorStore.SaveCandidate": "the accepted risk that an abrupt failure may lose the latest " +
+			"expired-slot anti-equivocation marker",
+		"CollatorStore.SaveSession":         "session configuration and progress are reconstructed by the controller",
+		"ValidatorStore.MarkFinalized":      "the authenticated final certificate is replayed or re-fetched",
+		"ValidatorStore.RecordLeaderWindow": "leader-window history is telemetry only",
+		"ValidatorStore.submitSessionAndWait": "an empty session descriptor is recreated before bootstrap; " +
+			"later synced consensus records also flush it",
+		"journal.SaveCertificate":             "a quorum certificate is authenticated network evidence and is re-fetched",
+		"journal.SaveFirstNonAnnouncedWindow": "the pool cursor only suppresses duplicate window notification",
 	}
 
 	named := namedDurabilitySites(t)
@@ -53,15 +53,13 @@ func TestDurabilityClassificationIsExplicit(t *testing.T) {
 		switch named[site] {
 		case "durableCommitment":
 			// Naming the strict class is always allowed; it is also the default.
-		case "recoverablePayload":
+		case "restartRecoverable":
 			if _, allowed := relaxed[site]; !allowed {
 				t.Errorf(
 					"%s commits WITHOUT an fsync and is not in this test's list. A record whose "+
-						"purpose is to constrain this node's future behaviour — anything it has "+
-						"signed, voted, notarized, finalized or authorized — must stay synced: a "+
-						"restart that forgets one can produce a conflicting record, which is a "+
-						"safety violation, not a slow resync. If this write really is recoverable "+
-						"bulk content, say why here.",
+						"purpose is to constrain a future local signature must stay synced. If the "+
+						"write is reconstructed by network evidence or deliberately accepts crash "+
+						"loss, document that recovery contract here.",
 					site,
 				)
 			}
@@ -297,8 +295,8 @@ func TestWriterPartitionsBatchesByDurabilityClass(t *testing.T) {
 	for _, req := range []writeRequest{
 		request(durableCommitment, "c1"),
 		request(durableCommitment, "c2"),
-		request(recoverablePayload, "p1"),
-		request(recoverablePayload, "p2"),
+		request(restartRecoverable, "p1"),
+		request(restartRecoverable, "p2"),
 		request(durableCommitment, "c3"),
 	} {
 		store.queue <- req
@@ -313,7 +311,7 @@ func TestWriterPartitionsBatchesByDurabilityClass(t *testing.T) {
 	batches := grouping.batches()
 	want := []observedBatch{
 		{class: durableCommitment, count: 2},
-		{class: recoverablePayload, count: 2},
+		{class: restartRecoverable, count: 2},
 		{class: durableCommitment, count: 1},
 	}
 	if len(batches) != len(want) {
@@ -334,15 +332,14 @@ func TestWriterPartitionsBatchesByDurabilityClass(t *testing.T) {
 	}
 }
 
-// And the same question asked over a run of writes, through the writer: a stream of
-// candidate wires costs strictly fewer fsyncs than the same stream of commitments.
+// And the same question asked over a run of writes, through the writer: a stream
+// of recoverable Pebble records costs strictly fewer fsyncs than commitments.
 //
 // Not zero, and that is worth stating precisely. pebble.NoSync removes the fsync the
 // COMMIT waits for; it does not stop the log from being flushed when it rotates, and
-// a 760 KB record fills a log quickly. Measured here, twenty 760 KB payload commits
-// cost about half the fsyncs of twenty synced ones, and the latency the payload
-// commit waits for drops by an order of magnitude — see the split measurement.
-func TestCandidateWritesCostFewerFsyncsThanCommitments(t *testing.T) {
+// a large record fills a log quickly. Validator candidate wires no longer take
+// this path: only their compact pointers enter Pebble.
+func TestRecoverablePebbleWritesCostFewerFsyncsThanCommitments(t *testing.T) {
 	const rounds = 20
 
 	run := func(class durabilityClass) int64 {
@@ -384,13 +381,12 @@ func TestCandidateWritesCostFewerFsyncsThanCommitments(t *testing.T) {
 		return syncs
 	}
 
-	payload := run(recoverablePayload)
+	payload := run(restartRecoverable)
 	commitment := run(durableCommitment)
 	t.Logf("fsyncs over %d 760 KB writes: payload=%d commitment=%d", rounds, payload, commitment)
 	if payload >= commitment {
 		t.Errorf(
-			"the candidate class cost %d fsyncs against the commitment class %d: the notarize "+
-				"vote is still waiting for the disk",
+			"the recoverable class cost %d fsyncs against the commitment class %d",
 			payload,
 			commitment,
 		)
@@ -413,8 +409,8 @@ func TestDurabilityClassWriteOptions(t *testing.T) {
 	if durableCommitment.writeOptions() != pebble.Sync {
 		t.Error("a commitment is not fsynced")
 	}
-	if recoverablePayload.writeOptions() != pebble.NoSync {
-		t.Error("a recoverable payload waits for an fsync")
+	if restartRecoverable.writeOptions() != pebble.NoSync {
+		t.Error("a restart-recoverable write waits for an fsync")
 	}
 	// The zero value is the strict one: a write that says nothing is synced.
 	var unset durabilityClass
@@ -427,29 +423,20 @@ func TestDurabilityClassWriteOptions(t *testing.T) {
 // above builds. It pins two things a bare function name cannot express:
 //
 //  1. the two SaveCandidate methods appear as two distinct sites, and
-//  2. the one on CollatorStore is a COMMITMENT — it names no class, so it is not
-//     in the map at all, and the allowlist entry that exempts
-//     ValidatorStore.SaveCandidate does not reach it.
+//  2. both sites are independently classified and allowlisted.
 //
-// Keyed by bare name the second property was unverifiable: the two collapsed
-// into one entry, so an unsynced write introduced in CollatorStore.SaveCandidate
-// would have been covered by the existing "SaveCandidate" exemption and the
-// guard would still have reported PASS. Those two writes are in different
-// durability classes — a candidate wire the network already holds against a
-// record that constrains this node's future behaviour — which is the one pair
-// where getting it wrong is a safety violation rather than a slow resync.
+// Keyed by bare name the two justifications collapse and the guard becomes
+// unable to prove that both decisions were intentional.
 func TestDurabilitySitesAreReceiverQualified(t *testing.T) {
 	named := namedDurabilitySites(t)
 
-	if class, found := named["ValidatorStore.SaveCandidate"]; !found || class != "recoverablePayload" {
-		t.Fatalf("ValidatorStore.SaveCandidate = %q (found=%v), want recoverablePayload: the "+
+	if class, found := named["ValidatorStore.SaveCandidate"]; !found || class != "restartRecoverable" {
+		t.Fatalf("ValidatorStore.SaveCandidate = %q (found=%v), want restartRecoverable: the "+
 			"receiver-qualified key is not reaching the site the allowlist exempts", class, found)
 	}
-	if class, found := named["CollatorStore.SaveCandidate"]; found {
-		t.Fatalf("CollatorStore.SaveCandidate now names durability %q. It was a commitment by "+
-			"omission, and it is NOT covered by the ValidatorStore exemption: classify it "+
-			"deliberately and, if it really is recoverable, add its own allowlist entry with the "+
-			"reason", class)
+	if class, found := named["CollatorStore.SaveCandidate"]; !found || class != "restartRecoverable" {
+		t.Fatalf("CollatorStore.SaveCandidate = %q (found=%v), want restartRecoverable: the "+
+			"accepted marker-loss policy is no longer explicit", class, found)
 	}
 	if _, found := named["SaveCandidate"]; found {
 		t.Fatal("a bare \"SaveCandidate\" key is back in the walk: the two stores' methods collide " +

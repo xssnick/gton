@@ -45,12 +45,18 @@ type customRLDPBroadcastPeer struct {
 	transport *overlay.RLDPOverlayWrapper
 }
 
+var _ overlay.PreparedBroadcastPeer = customRLDPBroadcastPeer{}
+
 func (p customRLDPBroadcastPeer) ID() []byte {
 	return p.id[:]
 }
 
 func (p customRLDPBroadcastPeer) SendCustomMessage(ctx context.Context, req tl.Serializable) error {
 	return p.transport.SendCustomMessage(ctx, req)
+}
+
+func (p customRLDPBroadcastPeer) SendPreparedCustomMessage(ctx context.Context, body []byte) error {
+	return p.transport.SendPreparedCustomMessage(ctx, body)
 }
 
 func (s *overlaySubscription) twoStepCandidates(sourcePeerID PeerID) []*overlayPeer {

@@ -341,6 +341,7 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 			}
 		}()
 		validatorOpts.Extension.Runtime = validatorRuntime
+		validatorOpts.Extension.CandidateCaptureDir = filepath.Join(validatorDir, "failed-candidates")
 
 		activeKeyIDs := validatorKeys.KeyIDs()
 		validatorKeyIDs := make([]string, len(activeKeyIDs))
@@ -431,13 +432,14 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 			Msg("configured standalone collator")
 
 		standaloneCollator = &standaloneCollatorComposition{
-			runtime:            collatorRuntime,
-			validatorStorage:   collatorStore.Validator(),
-			collatorStorage:    collatorStore.Collator(),
-			keys:               collationIdentity.keys,
-			keyID:              collationIdentity.keyID,
-			allowedValidators:  policy.allowed,
-			allowAllValidators: policy.allowAll,
+			runtime:             collatorRuntime,
+			validatorStorage:    collatorStore.Validator(),
+			collatorStorage:     collatorStore.Collator(),
+			keys:                collationIdentity.keys,
+			keyID:               collationIdentity.keyID,
+			allowedValidators:   policy.allowed,
+			allowAllValidators:  policy.allowAll,
+			candidateCaptureDir: filepath.Join(collatorDir, "failed-candidates"),
 		}
 	}
 

@@ -25,6 +25,25 @@ import (
 
 type runtimeTestJournal struct{}
 
+type runtimeTestLogBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *runtimeTestLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buffer.Write(p)
+}
+
+func (b *runtimeTestLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buffer.String()
+}
+
 func (*runtimeTestJournal) Bootstrap() (*simplex.BootstrapState, error) {
 	return &simplex.BootstrapState{}, nil
 }
@@ -612,7 +631,8 @@ func TestMasterchainRecoveryFinalizationsAreVerifiedAndOrdered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0].Certificate() != first || got[1].Certificate() != second {
+	if len(got) != 2 || !runtimeCertificatesEqual(got[0].Certificate(), first) ||
+		!runtimeCertificatesEqual(got[1].Certificate(), second) {
 		t.Fatalf("recovery finalizations are not in slot order: %+v", got)
 	}
 	// The replay set is sealed, and sealed against this session and roster:
@@ -655,6 +675,23 @@ func TestMasterchainRecoveryFinalizationsAreVerifiedAndOrdered(t *testing.T) {
 	); err == nil {
 		t.Fatal("forged recovery final certificate was accepted")
 	}
+}
+
+func runtimeCertificatesEqual(left, right *simplex.Certificate) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if left.Vote != right.Vote || len(left.Signatures) != len(right.Signatures) {
+		return false
+	}
+	for i := range left.Signatures {
+		if left.Signatures[i].ValidatorIndex != right.Signatures[i].ValidatorIndex ||
+			!bytes.Equal(left.Signatures[i].Signature, right.Signatures[i].Signature) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func runtimeTestBootstrap(
@@ -2211,7 +2248,7 @@ func TestLeaderWindowSubmitterContinuesAfterBroadcastFailure(t *testing.T) {
 	}
 	backend := newRuntimeTestBackend()
 	config, privateKey := runtimeTestConfig(0x53, &runtimeTestJournal{})
-	var logOutput bytes.Buffer
+	var logOutput runtimeTestLogBuffer
 	logger := zerolog.New(&logOutput)
 	session, err := PrepareSessionRuntime(context.Background(), config, runtimeTestState(), RuntimeOptions{
 		Storage: storage,
@@ -2945,7 +2982,7 @@ func TestLeaderWindowSubmitterSurvivesDurableWriteFailure(t *testing.T) {
 	if config.Identity.Validator != nil {
 		t.Fatal("this test needs the observer composition, which has no voter")
 	}
-	var logOutput bytes.Buffer
+	var logOutput runtimeTestLogBuffer
 	logger := zerolog.New(&logOutput)
 	session, err := PrepareSessionRuntime(context.Background(), config, runtimeTestState(), RuntimeOptions{
 		Storage: storage,

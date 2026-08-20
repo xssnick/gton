@@ -56,7 +56,10 @@ func preparedRouteCandidate(t *testing.T, session Session, slot uint32, createdB
 	built.BlockBOC = blockBOC
 	built.CollatedData = collatedData
 	built.CollatedFileHash = collatedFileHash
+	built.State = cell.BeginCell().MustStoreUInt(uint64(slot)+0x57a7e, 64).EndCell()
+	built.StateUpdate = cell.BeginCell().MustStoreUInt(uint64(slot)+0xadd, 64).EndCell()
 	built.prepared = prepared
+	built.provenance = newCandidateProvenance(built, blockRoot)
 
 	return built
 }
@@ -127,7 +130,7 @@ func TestSignArtifactCarriesPreparedForBothAuthorities(t *testing.T) {
 // holding a compressed payload for the life of the window and then rebuilding
 // it from the BOCs anyway.
 //
-// The two hash checks artifactFromRecord runs against the durable marker are
+// The two hash checks artifactFromRecord runs against the persisted marker are
 // exactly the binding a serializer would otherwise re-derive, so this is the
 // one replay site where reusing the capsule is proven right where it is used.
 func TestArtifactFromRecordKeepsRememberedPreparedPayload(t *testing.T) {

@@ -37,7 +37,7 @@ func TestPrometheusCollationObserverExportsBoundedMetrics(t *testing.T) {
 		Chain: MetricChainShardchain, Result: CollationResultSuccess, Duration: 25 * time.Millisecond,
 	})
 	observer.ObserveCollationStage(CollationStageObservation{
-		Chain: MetricChainShardchain, Stage: CollationStageAssembleCandidate, Duration: 20 * time.Millisecond,
+		Chain: MetricChainShardchain, Stage: CollationStagePrepareState, Duration: 20 * time.Millisecond,
 	})
 	observer.ObserveCollationStage(CollationStageObservation{
 		Chain: MetricChainShardchain, Stage: CollationStageWaitExternalMessages, Duration: 5 * time.Millisecond,
@@ -112,10 +112,21 @@ func TestPrometheusCollationObserverExportsBoundedMetrics(t *testing.T) {
 				"would be invisible on :8085", alarm)
 		}
 	}
-	if !metricFamilyHasLabels(byName["gton_collator_stage_duration_seconds"], map[string]string{
-		"mode": "standalone", "chain": "shardchain", "stage": "assemble_candidate",
-	}) {
-		t.Fatal("candidate assembly stage was not exported")
+	for _, stage := range []string{
+		"prepare_state",
+		"cleanup_out_queue",
+		"execute_internal_messages",
+		"execute_external_messages",
+		"finalize_accounts",
+		"build_state_update",
+		"serialize_candidate",
+		"finalize_candidate",
+	} {
+		if !metricFamilyHasLabels(byName["gton_collator_stage_duration_seconds"], map[string]string{
+			"mode": "standalone", "chain": "shardchain", "stage": stage,
+		}) {
+			t.Fatalf("candidate assembly stage %q was not exported", stage)
+		}
 	}
 	if !metricFamilyHasLabels(byName["gton_collator_stage_duration_seconds"], map[string]string{
 		"mode": "standalone", "chain": "shardchain", "stage": "wait_external_messages",
@@ -158,14 +169,33 @@ func TestBlockStatsCollationObserverCountsTerminalBuilds(t *testing.T) {
 	}
 }
 
-func TestCandidateAssemblyMetricsExcludeExternalWait(t *testing.T) {
+func TestCandidateAssemblyMetricsExportExclusiveBreakdown(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metrics, err := NewPrometheusMetrics(collatorMetricsTestRegistry{registry: registry})
 	if err != nil {
 		t.Fatal(err)
 	}
 	acquisition := LocalAcquisition{collationObserver: metrics.Observer(MetricsModeValidator)}
-	acquisition.observeCandidateAssembly(MetricChainShardchain, 2*time.Second, time.Second)
+	var durations candidateAssemblyDurations
+	want := []struct {
+		stage CollationStage
+		label string
+		value time.Duration
+	}{
+		{CollationStagePrepareState, "prepare_state", 10 * time.Millisecond},
+		{CollationStageCleanupOutQueue, "cleanup_out_queue", 20 * time.Millisecond},
+		{CollationStageExecuteInternalMessages, "execute_internal_messages", 30 * time.Millisecond},
+		{CollationStageExecuteExternalMessages, "execute_external_messages", 40 * time.Millisecond},
+		{CollationStageFinalizeAccounts, "finalize_accounts", 50 * time.Millisecond},
+		{CollationStageBuildStateUpdate, "build_state_update", 60 * time.Millisecond},
+		{CollationStageSerializeCandidate, "serialize_candidate", 70 * time.Millisecond},
+		{CollationStageFinalizeCandidate, "finalize_candidate", 80 * time.Millisecond},
+		{CollationStageWaitExternalMessages, "wait_external_messages", 90 * time.Millisecond},
+	}
+	for _, stage := range want[:len(want)-1] {
+		durations[stage.stage] = stage.value
+	}
+	acquisition.observeCandidateAssembly(MetricChainShardchain, &durations, want[len(want)-1].value)
 
 	families, err := registry.Gather()
 	if err != nil {
@@ -176,17 +206,22 @@ func TestCandidateAssemblyMetricsExcludeExternalWait(t *testing.T) {
 		byName[family.GetName()] = family
 	}
 
-	for _, stage := range []string{"assemble_candidate", "wait_external_messages"} {
+	for _, stage := range want {
 		sum, found := histogramSumWithLabels(
 			byName["gton_collator_stage_duration_seconds"],
-			map[string]string{"mode": "validator", "chain": "shardchain", "stage": stage},
+			map[string]string{"mode": "validator", "chain": "shardchain", "stage": stage.label},
 		)
 		if !found {
-			t.Fatalf("stage %q was not exported", stage)
+			t.Fatalf("stage %q was not exported", stage.label)
 		}
-		if sum != 1 {
-			t.Fatalf("stage %q duration = %v seconds, want 1", stage, sum)
+		if wantSeconds := stage.value.Seconds(); sum != wantSeconds {
+			t.Fatalf("stage %q duration = %v seconds, want %v", stage.label, sum, wantSeconds)
 		}
+	}
+	if metricFamilyHasLabels(byName["gton_collator_stage_duration_seconds"], map[string]string{
+		"mode": "validator", "chain": "shardchain", "stage": "assemble_candidate",
+	}) {
+		t.Fatal("removed aggregate candidate assembly stage was still exported")
 	}
 }
 
@@ -213,7 +248,7 @@ func BenchmarkCollationMetricsDisabledStageBoundary(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		started := service.metricStageStarted()
-		service.observeMetricStage(MetricChainShardchain, CollationStageAssembleCandidate, started)
+		service.observeMetricStage(MetricChainShardchain, CollationStagePrepareState, started)
 	}
 }
 
@@ -225,7 +260,7 @@ func BenchmarkCollationMetricsEnabledObservation(b *testing.B) {
 	}
 	observer := metrics.Observer(MetricsModeValidator)
 	observation := CollationStageObservation{
-		Chain: MetricChainShardchain, Stage: CollationStageAssembleCandidate, Duration: 10 * time.Millisecond,
+		Chain: MetricChainShardchain, Stage: CollationStagePrepareState, Duration: 10 * time.Millisecond,
 	}
 
 	b.ReportAllocs()
@@ -297,6 +332,23 @@ func TestPrometheusObserverSeparatesCollatedAndValidatedCandidates(t *testing.T)
 			t.Fatalf("%s%v observed %v, want %v", want.family, want.labels, sum, want.sum)
 		}
 	}
+	for _, want := range []struct {
+		family string
+		labels map[string]string
+		value  float64
+	}{
+		{"gton_collator_candidate_latest_transactions", map[string]string{"chain": "shardchain"}, 7},
+		{"gton_collator_candidate_latest_messages", map[string]string{"chain": "shardchain", "kind": "external"}, 2},
+		{"gton_collator_candidate_latest_messages", map[string]string{"chain": "shardchain", "kind": "internal"}, 3},
+	} {
+		value, found := gaugeValueWithLabels(byName[want.family], want.labels)
+		if !found {
+			t.Fatalf("%s has no series for %v", want.family, want.labels)
+		}
+		if value != want.value {
+			t.Fatalf("%s%v = %v, want %v; validation must not overwrite the latest produced candidate", want.family, want.labels, value, want.value)
+		}
+	}
 
 	// Gas is metered by the producer and cannot be recovered from a block, and
 	// the candidate counter measures this node's own output. A validated block
@@ -320,6 +372,32 @@ func TestPrometheusObserverSeparatesCollatedAndValidatedCandidates(t *testing.T)
 	if candidates != 1 {
 		t.Fatalf("candidates_total counted %v candidates, want only the one this node produced", candidates)
 	}
+
+	observer.ObserveCollationCandidate(CandidateObservation{
+		Chain:  MetricChainShardchain,
+		Origin: CandidateOriginCollation,
+		Kind:   CandidateKindEmpty,
+	})
+	families, err = registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		byName[family.GetName()] = family
+	}
+	for _, metric := range []struct {
+		family string
+		labels map[string]string
+	}{
+		{"gton_collator_candidate_latest_transactions", map[string]string{"chain": "shardchain"}},
+		{"gton_collator_candidate_latest_messages", map[string]string{"chain": "shardchain", "kind": "external"}},
+		{"gton_collator_candidate_latest_messages", map[string]string{"chain": "shardchain", "kind": "internal"}},
+	} {
+		value, found := gaugeValueWithLabels(byName[metric.family], metric.labels)
+		if !found || value != 0 {
+			t.Fatalf("%s%v = %v, found %v; empty candidate must reset it", metric.family, metric.labels, value, found)
+		}
+	}
 }
 
 func histogramSumWithLabels(family *dto.MetricFamily, labels map[string]string) (float64, bool) {
@@ -335,6 +413,24 @@ func histogramSumWithLabels(family *dto.MetricFamily, labels map[string]string) 
 		}
 		if matched == len(labels) {
 			return metric.GetHistogram().GetSampleSum(), true
+		}
+	}
+	return 0, false
+}
+
+func gaugeValueWithLabels(family *dto.MetricFamily, labels map[string]string) (float64, bool) {
+	if family == nil {
+		return 0, false
+	}
+	for _, metric := range family.Metric {
+		matched := 0
+		for _, pair := range metric.Label {
+			if value, ok := labels[pair.GetName()]; ok && value == pair.GetValue() {
+				matched++
+			}
+		}
+		if matched == len(labels) {
+			return metric.GetGauge().GetValue(), true
 		}
 	}
 	return 0, false

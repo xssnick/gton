@@ -25,6 +25,7 @@ var collationPhases = []string{
 	"externals",
 	"new-messages",
 	"processed-info",
+	"claimed-local-cleanup",
 	"finish-accounts",
 	"finish",
 }
@@ -130,6 +131,7 @@ func collateWithPhases(tb testing.TB, builder *Builder, req ShardRequest, timer 
 		return c.processNewMessages(c.blockFull || c.haveUnprocessedDispatchQueue || req.internalsIncomplete())
 	})
 	timer.run(tb, "processed-info", c.updateProcessedInfo)
+	timer.run(tb, "claimed-local-cleanup", c.cleanupClaimedLocalDequeues)
 	timer.run(tb, "finish-accounts", c.finishAccounts)
 
 	var candidate *Candidate

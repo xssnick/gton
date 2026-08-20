@@ -39,11 +39,16 @@ type Options struct {
 	// Runtime owns the group tracker and message pool shared with an in-process
 	// local collator. The composition root closes it after all extensions stop.
 	Runtime *Runtime
-	// FreshnessWindow gates block bookkeeping and initial consensus admission
-	// by generation time. Historical catch-up blocks do not start sessions;
-	// once a current snapshot admits consensus, transient lag never stops it.
-	// 0 means 5m, negative processes and admits every block.
+	// FreshnessWindow gates block bookkeeping by generation time. Historical
+	// catch-up blocks do not update the message pool inline. 0 means 5m,
+	// negative processes every block.
 	FreshnessWindow time.Duration
+	// ConsensusCatchupThreshold is the maximum masterchain age that admits
+	// consensus immediately. An older head is admitted only after it settles and
+	// the node knows no newer signed masterchain block. The gate is startup-only:
+	// transient lag never stops an already admitted session. 0 means 80s,
+	// negative disables the gate.
+	ConsensusCatchupThreshold time.Duration
 	// HeadSettleDelay arms the pool from an old chain head: a stale block
 	// unsuperseded for this long is processed anyway — a halted chain
 	// leaves an old block at the head, and the restarted collator still
@@ -83,6 +88,10 @@ type Options struct {
 	// ShardTops retains verified shard descriptors for local masterchain
 	// collation. Supplying it also enables the optional node observer hook.
 	ShardTops *collator.ShardTopInbox
+	// CandidateCaptureDir is the directory under the node data dir where a
+	// candidate refused with a TVM/semantic replay error is dumped for offline
+	// replay. Empty disables capture.
+	CandidateCaptureDir string
 }
 
 // New returns an extension factory with explicit options.
@@ -91,6 +100,9 @@ func New(opts Options) hooks.ExtensionFactory {
 		resolved := opts
 		if resolved.FreshnessWindow == 0 {
 			resolved.FreshnessWindow = 5 * time.Minute
+		}
+		if resolved.ConsensusCatchupThreshold == 0 {
+			resolved.ConsensusCatchupThreshold = 80 * time.Second
 		}
 		if resolved.HeadSettleDelay < 0 {
 			return nil, fmt.Errorf("validator: head settle delay must not be negative")
@@ -136,6 +148,7 @@ func New(opts Options) hooks.ExtensionFactory {
 			tracker:          resolved.Runtime.Groups,
 			localCollator:    resolved.LocalCollator,
 			masterchainViews: resolved.MasterchainViews,
+			masterchainHead:  n.MasterchainHead,
 			pending:          map[msgpool.ShardIdent]pendingHead{},
 			processing:       map[msgpool.ShardIdent]*sourceProcessing{},
 			hooksIdle:        make(chan struct{}),
@@ -216,6 +229,7 @@ type Service struct {
 	sessions         *sessionSupervisor
 	localCollator    collator.Collator
 	masterchainViews collator.MasterchainViewPublisher
+	masterchainHead  hooks.MasterchainHead
 
 	runCtx context.Context
 	cancel context.CancelFunc
@@ -252,6 +266,16 @@ type Service struct {
 	// catch-up; after admission it keeps them alive through transient lag.
 	consensusAdmitted atomic.Bool
 	consensusDeferred atomic.Bool
+
+	consensusMu      sync.Mutex
+	consensusPending *pendingConsensusSnapshot
+	consensusStartMu sync.Mutex
+	consensusStarted bool
+}
+
+type pendingConsensusSnapshot struct {
+	snapshot *groups.Snapshot
+	at       time.Time
 }
 
 // pendingHead is one deferred stale-head candidate.
@@ -322,10 +346,9 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 	// A recovered local collator activates durable sessions against the exact
-	// validator-group snapshot. Bootstrap that snapshot first: on a restart the
-	// collator may already have an active window in its own storage, while the
-	// tracker has not yet replayed the current masterchain state.
-	if startErr == nil && !deferredGroups {
+	// validator-group snapshot. Bootstrap and admit that snapshot first; during
+	// catch-up, starting the collator here would recover an obsolete window.
+	if startErr == nil && !deferredGroups && s.consensusReadyToStart() {
 		startErr = s.startConsensusServices()
 	}
 	if startErr == nil {
@@ -391,6 +414,11 @@ func (s *Service) Start(ctx context.Context) error {
 }
 
 func (s *Service) startConsensusServices() error {
+	s.consensusStartMu.Lock()
+	defer s.consensusStartMu.Unlock()
+	if s.consensusStarted {
+		return nil
+	}
 	if err := s.runCtx.Err(); err != nil {
 		return err
 	}
@@ -405,8 +433,13 @@ func (s *Service) startConsensusServices() error {
 	if s.sessions != nil {
 		s.sessions.Start(s.runCtx)
 	}
+	s.consensusStarted = true
 
 	return nil
+}
+
+func (s *Service) consensusReadyToStart() bool {
+	return s.sessions == nil || s.consensusAdmitted.Load()
 }
 
 func (s *Service) awaitGroupTracker() {
@@ -422,17 +455,21 @@ func (s *Service) awaitGroupTracker() {
 
 		err := s.initializeGroupTracker(s.runCtx)
 		if err == nil {
-			if err = s.startConsensusServices(); err != nil {
-				if !errors.Is(err, context.Canceled) {
-					s.log.Error().Err(err).Msg("validator consensus services did not start")
+			if s.consensusReadyToStart() {
+				if err = s.startConsensusServices(); err != nil {
+					if !errors.Is(err, context.Canceled) {
+						s.log.Error().Err(err).Msg("validator consensus services did not start")
+					}
+					s.cancel()
+
+					return
 				}
-				s.cancel()
 
-				return
+				s.log.Info().Bool("consensus_sessions", s.sessions != nil).
+					Msg("validator current state became available, consensus services started")
+			} else {
+				s.log.Info().Msg("validator group snapshot became available, consensus admission pending")
 			}
-
-			s.log.Info().Bool("consensus_sessions", s.sessions != nil).
-				Msg("validator current state became available, consensus services started")
 
 			return
 		}
@@ -592,11 +629,22 @@ func (s *Service) OnBlockApplied(ctx context.Context, ev hooks.BlockAppliedEvent
 				return fmt.Errorf("reconcile internal-message destinations: %w", err)
 			}
 		}
-		s.reconcileConsensus(result.Snapshot)
+		if s.reconcileConsensus(result.Snapshot) && s.isStarted() {
+			if err = s.startConsensusServices(); err != nil {
+				return fmt.Errorf("start validator consensus services: %w", err)
+			}
+		}
 	}
 
 	s.processAppliedBlock(ev)
 	return nil
+}
+
+func (s *Service) isStarted() bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	return s.started && !s.closed
 }
 
 // processAppliedBlock runs the pool bookkeeping synchronously on the apply
@@ -779,31 +827,103 @@ func (s *Service) reconcileInitialGroupSnapshot(snapshot *groups.Snapshot) error
 	return nil
 }
 
-func (s *Service) reconcileConsensus(snapshot *groups.Snapshot) {
+func (s *Service) reconcileConsensus(snapshot *groups.Snapshot) bool {
 	if s.sessions == nil {
-		return
+		return false
 	}
-	if !s.consensusAdmitted.Load() && s.opts.FreshnessWindow >= 0 {
-		generatedAt := time.Unix(int64(snapshot.GenUTime), 0)
-		lag := time.Since(generatedAt)
-		if snapshot.GenUTime == 0 || lag > s.opts.FreshnessWindow {
-			if s.consensusDeferred.CompareAndSwap(false, true) {
-				s.log.Warn().
-					Uint32("masterchain_seqno", snapshot.MasterchainBlock.SeqNo).
-					Dur("masterchain_lag", lag).
-					Msg("deferring consensus sessions while node catches up")
-			}
+	if s.consensusAdmitted.Load() {
+		s.sessions.Reconcile(snapshot)
 
-			return
-		}
+		return false
 	}
-	if s.consensusAdmitted.CompareAndSwap(false, true) && s.consensusDeferred.Load() {
+
+	now := time.Now()
+	generatedAt := time.Unix(int64(snapshot.GenUTime), 0)
+	lag := now.Sub(generatedAt)
+	if s.opts.ConsensusCatchupThreshold >= 0 &&
+		(snapshot.GenUTime == 0 || lag > s.opts.ConsensusCatchupThreshold) {
+		s.consensusMu.Lock()
+		if !s.consensusAdmitted.Load() && (s.consensusPending == nil ||
+			s.consensusPending.snapshot.MasterchainBlock.SeqNo <= snapshot.MasterchainBlock.SeqNo) {
+			s.consensusPending = &pendingConsensusSnapshot{snapshot: snapshot, at: now}
+		}
+		s.consensusMu.Unlock()
+
+		if s.consensusDeferred.CompareAndSwap(false, true) {
+			s.log.Warn().
+				Uint32("masterchain_seqno", snapshot.MasterchainBlock.SeqNo).
+				Dur("masterchain_lag", lag).
+				Msg("deferring consensus services while node catches up")
+		}
+
+		return false
+	}
+
+	return s.admitConsensus(snapshot)
+}
+
+func (s *Service) admitConsensus(snapshot *groups.Snapshot) bool {
+	if !s.consensusAdmitted.CompareAndSwap(false, true) {
+		s.sessions.Reconcile(snapshot)
+
+		return false
+	}
+
+	s.consensusMu.Lock()
+	s.consensusPending = nil
+	s.consensusMu.Unlock()
+	if s.consensusDeferred.Load() {
 		s.log.Info().
 			Uint32("masterchain_seqno", snapshot.MasterchainBlock.SeqNo).
 			Msg("node caught up, admitting consensus sessions")
 	}
 
 	s.sessions.Reconcile(snapshot)
+
+	return true
+}
+
+// processSettledConsensus admits an old head only when it stayed unchanged and
+// the node knows no newer signed masterchain block. This is the halted-network
+// escape hatch: wall-clock age alone never proves that the local node is behind.
+func (s *Service) processSettledConsensus() error {
+	if s.sessions == nil || s.consensusAdmitted.Load() {
+		return nil
+	}
+
+	now := time.Now()
+	s.consensusMu.Lock()
+	pending := s.consensusPending
+	if pending == nil || now.Sub(pending.at) < s.opts.HeadSettleDelay {
+		s.consensusMu.Unlock()
+
+		return nil
+	}
+	s.consensusMu.Unlock()
+
+	if s.masterchainHead != nil {
+		known, err := s.masterchainHead.SeenMasterchainBlock()
+		if err == nil {
+			if known.SeqNo > pending.snapshot.MasterchainBlock.SeqNo {
+				return nil
+			}
+		} else if !errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("read signed masterchain head: %w", err)
+		}
+	}
+
+	s.consensusMu.Lock()
+	unchanged := s.consensusPending == pending && !s.consensusAdmitted.Load()
+	s.consensusMu.Unlock()
+	if !unchanged || !s.admitConsensus(pending.snapshot) {
+		return nil
+	}
+
+	s.log.Warn().
+		Uint32("masterchain_seqno", pending.snapshot.MasterchainBlock.SeqNo).
+		Msg("old masterchain head settled with no newer signed head; starting consensus for a halted network")
+
+	return s.startConsensusServices()
 }
 
 func (s *Service) reconcileInternals(snapshot *groups.Snapshot) error {
@@ -872,6 +992,14 @@ func (s *Service) loop() {
 			return
 		case <-settle.C:
 			s.processSettledHeads()
+			if err := s.processSettledConsensus(); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					s.log.Error().Err(err).Msg("validator consensus services did not start")
+				}
+				s.cancel()
+
+				return
+			}
 		case <-statsC:
 			st := s.pool.Stats()
 			s.log.Debug().

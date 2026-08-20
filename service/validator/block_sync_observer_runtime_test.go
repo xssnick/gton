@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/validator/groups"
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
@@ -28,6 +29,22 @@ func blockSyncObserverTestConfig(
 	}
 
 	return config, privateKey
+}
+
+func blockSyncObserverQuorumTestConfig(t testing.TB, id byte, count int) SessionConfig {
+	t.Helper()
+
+	config, _ := blockSyncObserverTestConfig(t, id)
+	config.Validators = make([]groups.Validator, count)
+	for i := range count {
+		seed := bytes.Repeat([]byte{id + byte(i) + 1}, ed25519.SeedSize)
+		publicKey := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
+		copy(config.Validators[i].PublicKey[:], publicKey)
+		config.Validators[i].PublicKeyHash = simplex.KeyNodeIDShort(publicKey)
+		config.Validators[i].Weight = 1
+	}
+
+	return config
 }
 
 func waitBlockSyncObserverResult[T any](t testing.TB, result <-chan T) T {
@@ -137,6 +154,12 @@ func TestBlockSyncObserverRuntimeLifecycle(t *testing.T) {
 		}
 		if err = waitBlockSyncObserverResult(t, returned); err != nil {
 			t.Fatalf("run after close = %v, want nil", err)
+		}
+		if err = runtime.PrecheckCandidateBroadcast(0, [32]byte{1}, false); !errors.Is(
+			err,
+			ErrSessionRuntimeClosed,
+		) {
+			t.Fatalf("precheck after close error = %v, want ErrSessionRuntimeClosed", err)
 		}
 		if err = runtime.Close(); err != nil {
 			t.Fatal(err)
@@ -269,8 +292,34 @@ func TestBlockSyncObserverRuntimeAuthenticatesCandidateWithoutPublishing(t *test
 	if _, err = runtime.ReceiveCandidate(context.Background(), artifact.Candidate.ID.Slot, forgedWire); err == nil {
 		t.Fatal("forged candidate was accepted")
 	}
-	if err = runtime.PrecheckCandidateBroadcast(^uint32(0), [32]byte{0xff}, false); err != nil {
-		t.Fatalf("transport-authorized candidate failed observer precheck: %v", err)
+	firstBroadcast := [32]byte{0x11}
+	if err = runtime.PrecheckCandidateBroadcast(1, firstBroadcast, false); err != nil {
+		t.Fatalf("first provisional admission: %v", err)
+	}
+	if err = runtime.PrecheckCandidateBroadcast(1, firstBroadcast, false); err != nil {
+		t.Fatalf("idempotent unsigned precheck: %v", err)
+	}
+	if err = runtime.PrecheckCandidateBroadcast(1, [32]byte{0x12}, false); err != nil {
+		t.Fatalf("unsigned conflict poisoned the slot before authentication: %v", err)
+	}
+	if err = runtime.PrecheckCandidateBroadcast(1, firstBroadcast, true); err != nil {
+		t.Fatalf("authenticated phase of the admitted broadcast: %v", err)
+	}
+	if err = runtime.PrecheckCandidateBroadcast(1, [32]byte{0x12}, true); err == nil {
+		t.Fatal("conflicting authenticated broadcast was admitted for one slot")
+	}
+	if err = runtime.PrecheckCandidateBroadcast(1, firstBroadcast, true); err == nil {
+		t.Fatal("authenticated duplicate was admitted twice")
+	}
+	if err = runtime.PrecheckCandidateBroadcast(^uint32(0), [32]byte{0xff}, false); err == nil {
+		t.Fatal("far-future candidate passed the quorum-anchored observer horizon")
+	}
+
+	state := runtimeTestState()
+	finalized := *artifact.Candidate.Block.Copy()
+	state.FinalizedBlock = &finalized
+	if err = runtime.Update(context.Background(), state); err != nil {
+		t.Fatal(err)
 	}
 	if _, err = runtime.ServeCandidate(
 		context.Background(),
@@ -287,5 +336,83 @@ func TestBlockSyncObserverRuntimeAuthenticatesCandidateWithoutPublishing(t *test
 	}
 	if broadcasts := network.candidateBroadcasts(); len(broadcasts) != 0 {
 		t.Fatalf("observer emitted %d candidate broadcasts", len(broadcasts))
+	}
+}
+
+func TestBlockSyncObserverBootstrapRequiresQuorumProgress(t *testing.T) {
+	config := blockSyncObserverQuorumTestConfig(t, 0xb5, 4)
+	network := newRuntimeTestNetwork()
+	runtime, err := PrepareBlockSyncObserverRuntime(
+		context.Background(),
+		config,
+		network,
+		config.CandidateLimits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startup := make(chan error, 1)
+	returned := make(chan error, 1)
+	go func() {
+		returned <- runtime.runWithStartup(context.Background(), SessionStart{}, startup)
+	}()
+	if err = waitBlockSyncObserverResult(t, startup); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if closeErr := runtime.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
+		if runErr := waitBlockSyncObserverResult(t, returned); runErr != nil {
+			t.Errorf("run after cleanup = %v", runErr)
+		}
+	})
+
+	far := ^uint32(0)
+	for runtime.expectedLeader(far) != 0 {
+		far -= config.Protocol.SlotsPerLeaderWindow
+	}
+	if err = runtime.PrecheckCandidateBroadcast(far, [32]byte{0xf0}, false); err != nil {
+		t.Fatalf("unsigned bootstrap outlier: %v", err)
+	}
+	if err = runtime.PrecheckCandidateBroadcast(far, [32]byte{0xf0}, true); err != nil {
+		t.Fatalf("authenticated bootstrap outlier: %v", err)
+	}
+	runtime.lifecycleMu.Lock()
+	anchored := runtime.clockSet
+	runtime.lifecycleMu.Unlock()
+	if anchored {
+		t.Fatal("one authenticated leader established the observer clock")
+	}
+
+	// The first outlier must not reject the real session progress. Two more
+	// independently scheduled leaders bring the observed weight to 3-of-4; the
+	// weighted median is then an honest in-range slot rather than the outlier.
+	for i, slot := range []uint32{
+		config.Protocol.SlotsPerLeaderWindow,
+		2 * config.Protocol.SlotsPerLeaderWindow,
+	} {
+		id := [32]byte{byte(i + 1)}
+		if err = runtime.PrecheckCandidateBroadcast(slot, id, false); err != nil {
+			t.Fatalf("legitimate bootstrap slot %d before signature: %v", slot, err)
+		}
+		if err = runtime.PrecheckCandidateBroadcast(slot, id, true); err != nil {
+			t.Fatalf("legitimate bootstrap slot %d after signature: %v", slot, err)
+		}
+	}
+
+	runtime.lifecycleMu.Lock()
+	anchored = runtime.clockSet
+	anchor := runtime.clockSlot
+	_, retainedOutlier := runtime.admissions[far]
+	runtime.lifecycleMu.Unlock()
+	if !anchored || anchor != 2*config.Protocol.SlotsPerLeaderWindow {
+		t.Fatalf("quorum clock = %d (set=%v), want weighted median %d", anchor, anchored, 2*config.Protocol.SlotsPerLeaderWindow)
+	}
+	if retainedOutlier {
+		t.Fatal("bootstrap outlier survived quorum horizon pruning")
+	}
+	if err = runtime.PrecheckCandidateBroadcast(far, [32]byte{0xf1}, false); err == nil {
+		t.Fatal("far-future candidate passed the quorum-authenticated horizon")
 	}
 }

@@ -302,6 +302,79 @@ func TestInternalFromEnvelopeMatchesFullDecode(t *testing.T) {
 	}
 }
 
+func TestInternalFromEnvelopePreservesDestinationAccount(t *testing.T) {
+	source := deltaAddr(0, 0x11)
+	standard := deltaAddr(-1, 0x22)
+	anycast := deltaAnycastAddr(0, 0x44, 13, []byte{0xab, 0xc8})
+	variable := deltaVarAddr(0x2000, 0x66)
+
+	var standardAccount [32]byte
+	for index := range standardAccount {
+		standardAccount[index] = 0x22
+	}
+	var anycastAccount [32]byte
+	for index := range anycastAccount {
+		anycastAccount[index] = 0x44
+	}
+	anycastAccount[0] = 0xab
+	anycastAccount[1] = 0xcc
+
+	cases := []struct {
+		name        string
+		destination *address.Address
+		workchain   int32
+		account     [32]byte
+		prewarmable bool
+		hop         AccountPrefix
+	}{
+		{
+			name:        "standard",
+			destination: standard,
+			workchain:   -1,
+			account:     standardAccount,
+			prewarmable: true,
+			hop:         AccountPrefix{Workchain: -1, Prefix: 0x2222222222222222},
+		},
+		{
+			name:        "anycast",
+			destination: anycast,
+			workchain:   0,
+			account:     anycastAccount,
+			prewarmable: true,
+			hop:         AccountPrefix{Workchain: 0, Prefix: 0xabcc444444444444},
+		},
+		{
+			name:        "variable remains routable",
+			destination: variable,
+			workchain:   0x2000,
+			prewarmable: false,
+			hop:         AccountPrefix{Workchain: 0x2000, Prefix: 0x6666666666666666},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envelope := deltaEnvelope(t, deltaInternalMsg(t, source, tc.destination, 100), regularNext(96))
+			got, err := internalFromEnvelope(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.DestinationWorkchain != tc.workchain {
+				t.Fatalf("destination workchain = %d, want %d", got.DestinationWorkchain, tc.workchain)
+			}
+			if got.DestinationAccount != tc.account {
+				t.Fatalf("destination account = %x, want %x", got.DestinationAccount, tc.account)
+			}
+			if got.DestinationPrewarmable != tc.prewarmable {
+				t.Fatalf("destination prewarmable = %t, want %t", got.DestinationPrewarmable, tc.prewarmable)
+			}
+			if got.Key.NextHop() != tc.hop {
+				t.Fatalf("next hop = %+v, want %+v", got.Key.NextHop(), tc.hop)
+			}
+		})
+	}
+}
+
 func transitImport(t *testing.T, oldEnv, newEnv *cell.Cell) *cell.Cell {
 	t.Helper()
 	return cell.BeginCell().

@@ -539,6 +539,71 @@ func TestEffectiveShardMessageViewsUsesContinuedMergePredecessor(t *testing.T) {
 	}
 }
 
+func TestLocalFullProofProviderDoesNotTraceReplacedRegisteredSelfQueue(t *testing.T) {
+	request := emptyCandidateRequest(t)
+	target := blockShardIdent(request.Previous.ID)
+	message, enqueued := queuedInternalWithReferencedBody(
+		t,
+		address.NewAddress(0, 0, bytes.Repeat([]byte{0x41}, 32)),
+		address.NewAddress(0, 0xff, bytes.Repeat([]byte{0x42}, 32)),
+		requestStartLT(t, request)-10,
+		request.Header.GenUtime-1,
+		tlb.FromNanoTONU(100_000),
+		tlb.FromNanoTONU(100_000),
+		96,
+		target,
+	)
+	message.SourceSeqno = 0
+
+	registeredPrevious := request.Previous
+	registeredPrevious.ID = testBlockID(target.Workchain, int64(target.Shard), 0, 0x51)
+	registeredPrevious.State = stateWithQueueMessage(t, registeredPrevious.State, message.Key, enqueued)
+	registeredView, err := localViewFromPrevious(registeredPrevious, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, read := registeredView.proof.ReadSet().Contains(message.Root.HashKey()); read {
+		t.Fatal("registered self queue message was read before the queue scan")
+	}
+	beforeProof, err := registeredView.proof.CreateProof()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registered := map[msgpool.ShardIdent]*localNeighborView{target: registeredView}
+	effective := effectiveShardMessageViews(target, []PreviousBlock{request.Previous}, registered)
+	if effective[target] == nil || effective[target].proof != nil ||
+		!effective[target].previous.ID.Equals(&request.Previous.ID) {
+		t.Fatal("self message source was not replaced with the exact predecessor")
+	}
+
+	provider := &localFullProofProvider{
+		proofViews:   registered,
+		messageViews: effective,
+	}
+	proofs, err := provider.BuildFullCollatedProofs(context.Background(), FullCollatedProofRequest{
+		Previous:  request.Previous,
+		Neighbors: []Neighbor{localNeighbor(registeredView, target)},
+		QueueScan: &FullCollatedQueueScan{
+			Target: target,
+			LT:     message.EnqueuedLT,
+			Hash:   processedInfinityHash,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(proofs) != 1 {
+		t.Fatalf("registered zerostate proofs = %d, want 1", len(proofs))
+	}
+	// Emitting the registered state proof is still required, but the effective
+	// predecessor owns the inbound scan. Therefore queue scanning must not add a
+	// single cell to the registered proof.
+	if !bytes.Equal(proofs[0].ToBOC(), beforeProof.ToBOC()) {
+		t.Fatal("proof provider widened the stale registered self-state proof with queue scan reads")
+	}
+}
+
 func TestContinuedMergeCutReadsMergedPredecessorQueue(t *testing.T) {
 	request := emptyCandidateRequest(t)
 	target := blockShardIdent(request.Previous.ID)
@@ -1842,7 +1907,7 @@ func TestLocalFullProofProviderUsesStateProofForZerostateNeighbor(t *testing.T) 
 		SeqNo:     0,
 		RootHash:  bytes.Clone(root.Hash()),
 	}
-	provider := &localFullProofProvider{views: map[msgpool.ShardIdent]*localNeighborView{
+	provider := &localFullProofProvider{proofViews: map[msgpool.ShardIdent]*localNeighborView{
 		blockShardIdent(id): {
 			previous: PreviousBlock{ID: id, State: root},
 			proof:    cell.NewMerkleProofBuilder(root),

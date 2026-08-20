@@ -42,7 +42,14 @@ type CollationStage uint8
 
 const (
 	CollationStageAcquireInputs CollationStage = iota
-	CollationStageAssembleCandidate
+	CollationStagePrepareState
+	CollationStageCleanupOutQueue
+	CollationStageExecuteInternalMessages
+	CollationStageExecuteExternalMessages
+	CollationStageFinalizeAccounts
+	CollationStageBuildStateUpdate
+	CollationStageSerializeCandidate
+	CollationStageFinalizeCandidate
 	CollationStageWaitExternalMessages
 	CollationStageResolveCandidateState
 	CollationStageRestoreCandidate
@@ -51,6 +58,16 @@ const (
 	CollationStageCommitCandidateState
 	CollationStageWaitBroadcastSlot
 	CollationStageDeliverCandidate
+	// The five below subdivide what the single build_state_update span used to
+	// cover: the finish work between account finalization and candidate
+	// serialization. They are exclusive spans like every other stage, so the
+	// per-stage sum still adds up to the build; build_state_update itself now
+	// means exactly the state serialization plus the Merkle update.
+	CollationStageProcessedInfo
+	CollationStageClaimedLocalCleanup
+	CollationStageFlushBatches
+	CollationStageValidationClosure
+	CollationStageSerializeBlock
 	collationStageCount
 )
 
@@ -185,6 +202,53 @@ type CollationStageObservation struct {
 	Chain    MetricChain
 	Stage    CollationStage
 	Duration time.Duration
+}
+
+var candidateAssemblyStages = [...]CollationStage{
+	CollationStagePrepareState,
+	CollationStageCleanupOutQueue,
+	CollationStageExecuteInternalMessages,
+	CollationStageExecuteExternalMessages,
+	CollationStageFinalizeAccounts,
+	CollationStageProcessedInfo,
+	CollationStageClaimedLocalCleanup,
+	CollationStageFlushBatches,
+	CollationStageBuildStateUpdate,
+	CollationStageValidationClosure,
+	CollationStageSerializeBlock,
+	CollationStageSerializeCandidate,
+	CollationStageFinalizeCandidate,
+}
+
+// candidateAssemblyDurations accumulates the exclusive wall-clock stages of
+// every serialized-size attempt belonging to one build. It is installed only
+// when a runtime observer exists, so deterministic builds and tests pay no
+// clock reads.
+type candidateAssemblyDurations [collationStageCount]time.Duration
+
+type candidateAssemblyStageTimer struct {
+	durations *candidateAssemblyDurations
+	stage     CollationStage
+	started   time.Time
+}
+
+func (d *candidateAssemblyDurations) start(stage CollationStage) candidateAssemblyStageTimer {
+	if d == nil {
+		return candidateAssemblyStageTimer{}
+	}
+
+	return candidateAssemblyStageTimer{durations: d, stage: stage, started: time.Now()}
+}
+
+// stop is idempotent so finish can leave one deferred stop guarding every
+// error return while moving the same timer through successive stages.
+func (t *candidateAssemblyStageTimer) stop() {
+	if t.durations == nil {
+		return
+	}
+
+	t.durations[t.stage] += time.Since(t.started)
+	t.durations = nil
 }
 
 // CandidateOrigin separates a candidate this node built from one it only
@@ -401,8 +465,10 @@ type PrometheusMetrics struct {
 	productionDuration *prometheus.HistogramVec
 	candidateSize      *prometheus.HistogramVec
 	transactions       *prometheus.HistogramVec
+	latestTransactions *prometheus.GaugeVec
 	gasUsed            *prometheus.HistogramVec
 	messages           *prometheus.HistogramVec
+	latestMessages     *prometheus.GaugeVec
 	outQueueMessages   *prometheus.HistogramVec
 	externalBatches    *prometheus.HistogramVec
 	externalStops      *prometheus.CounterVec
@@ -468,6 +534,10 @@ func NewPrometheusMetrics(registry MetricsRegistry) (*PrometheusMetrics, error) 
 			Help:    "Transactions in a non-empty candidate, by whether this node produced or checked the block.",
 			Buckets: counts,
 		}, []string{"mode", "chain", "origin"}),
+		latestTransactions: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: "collator", Name: "candidate_latest_transactions",
+			Help: "Transactions in the latest candidate produced by this process.",
+		}, []string{"mode", "chain"}),
 		gasUsed: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Subsystem: "collator", Name: "candidate_gas_used",
 			Help: "Gas used by a produced non-empty candidate.", Buckets: prometheus.ExponentialBuckets(1_000, 4, 13),
@@ -477,6 +547,10 @@ func NewPrometheusMetrics(registry MetricsRegistry) (*PrometheusMetrics, error) 
 			Help:    "External and imported internal messages in a candidate, by whether this node produced or checked the block.",
 			Buckets: counts,
 		}, []string{"mode", "chain", "origin", "kind"}),
+		latestMessages: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: "collator", Name: "candidate_latest_messages",
+			Help: "External and imported internal messages in the latest candidate produced by this process.",
+		}, []string{"mode", "chain", "kind"}),
 		outQueueMessages: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Subsystem: "collator", Name: "candidate_out_queue_messages",
 			Help: "Outbound queue size reported after producing a candidate.", Buckets: counts,
@@ -519,7 +593,7 @@ func NewPrometheusMetrics(registry MetricsRegistry) (*PrometheusMetrics, error) 
 		}, []string{"mode", "chain", "alarm"}),
 		scheduleLateness: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Subsystem: "collator", Name: "schedule_lateness_seconds",
-			Help: "Positive lateness relative to the configured build or broadcast slot boundary.", Buckets: durations,
+			Help: "Positive lateness at masterchain or continuation shard build starts and any broadcast slot boundary.", Buckets: durations,
 		}, []string{"mode", "chain", "event"}),
 		windowsInflight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace, Subsystem: "collator", Name: "windows_inflight",
@@ -538,7 +612,8 @@ func NewPrometheusMetrics(registry MetricsRegistry) (*PrometheusMetrics, error) 
 	if err := registry.RegisterCollector(collectorSet{
 		metrics.builds, metrics.buildsInflight, metrics.buildDuration, metrics.stageDuration,
 		metrics.candidates, metrics.productionDuration, metrics.candidateSize, metrics.transactions,
-		metrics.gasUsed, metrics.messages, metrics.outQueueMessages,
+		metrics.latestTransactions, metrics.gasUsed, metrics.messages, metrics.latestMessages,
+		metrics.outQueueMessages,
 		metrics.externalBatches, metrics.externalStops, metrics.queueCleanupStops, metrics.queueCleaned,
 		metrics.loadClasses, metrics.overloads,
 		metrics.deadlineEvents, metrics.retries, metrics.alarms,
@@ -574,8 +649,10 @@ type prometheusObserver struct {
 	productionDuration [metricChainCount][candidateKindCount][collationResultCount]prometheus.Observer
 	candidateSize      [metricChainCount][candidateOriginCount][2]prometheus.Observer
 	transactions       [metricChainCount][candidateOriginCount]prometheus.Observer
+	latestTransactions [metricChainCount]prometheus.Gauge
 	gasUsed            [metricChainCount]prometheus.Observer
 	messages           [metricChainCount][candidateOriginCount][2]prometheus.Observer
+	latestMessages     [metricChainCount][2]prometheus.Gauge
 	outQueueMessages   [metricChainCount]prometheus.Observer
 	externalBatches    [metricChainCount]prometheus.Observer
 	externalStops      [metricChainCount][5]prometheus.Counter
@@ -606,10 +683,15 @@ func (m *PrometheusMetrics) Observer(mode MetricsMode) CollationObserver {
 	chains := [...]string{"masterchain", "shardchain"}
 	results := [...]string{"success", "error", "canceled", "deadline", "not_ready"}
 	stages := [...]string{
-		"acquire_inputs", "assemble_candidate", "wait_external_messages",
+		"acquire_inputs", "prepare_state", "cleanup_out_queue",
+		"execute_internal_messages", "execute_external_messages",
+		"finalize_accounts", "build_state_update", "serialize_candidate",
+		"finalize_candidate", "wait_external_messages",
 		"resolve_candidate_state", "restore_candidate", "sign_candidate",
 		"persist_candidate", "commit_candidate_state", "wait_broadcast_slot",
 		"deliver_candidate",
+		"processed_info", "claimed_local_cleanup", "flush_batches",
+		"validation_closure", "serialize_block",
 	}
 	kinds := [...]string{"block", "empty", "recovered"}
 	origins := [...]string{"collation", "validation"}
@@ -641,6 +723,9 @@ func (m *PrometheusMetrics) Observer(mode MetricsMode) CollationObserver {
 			o.messages[chain][origin][0] = m.messages.WithLabelValues(modeLabel, chainLabel, originLabel, "external")
 			o.messages[chain][origin][1] = m.messages.WithLabelValues(modeLabel, chainLabel, originLabel, "internal")
 		}
+		o.latestTransactions[chain] = m.latestTransactions.WithLabelValues(modeLabel, chainLabel)
+		o.latestMessages[chain][0] = m.latestMessages.WithLabelValues(modeLabel, chainLabel, "external")
+		o.latestMessages[chain][1] = m.latestMessages.WithLabelValues(modeLabel, chainLabel, "internal")
 		o.gasUsed[chain] = m.gasUsed.WithLabelValues(modeLabel, chainLabel)
 		o.outQueueMessages[chain] = m.outQueueMessages.WithLabelValues(modeLabel, chainLabel)
 		o.externalBatches[chain] = m.externalBatches.WithLabelValues(modeLabel, chainLabel)
@@ -715,6 +800,10 @@ func (o *prometheusObserver) ObserveCollationCandidate(observation CandidateObse
 		// Counts candidates this node produced. A validated block was produced
 		// by someone else and would double-count the network's block rate.
 		o.candidates[chain][kind].Inc()
+		shape := observation.Shape
+		o.latestTransactions[chain].Set(float64(shape.Transactions))
+		o.latestMessages[chain][0].Set(float64(shape.ExternalMessages))
+		o.latestMessages[chain][1].Set(float64(shape.InternalMessages))
 	}
 	o.candidateSize[chain][origin][0].Observe(float64(max(observation.BlockBytes, 0)))
 	o.candidateSize[chain][origin][1].Observe(float64(max(observation.CollatedBytes, 0)))

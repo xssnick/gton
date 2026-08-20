@@ -3,6 +3,8 @@ package simplex
 import (
 	"bytes"
 	"crypto/ed25519"
+	"runtime"
+	"sync"
 	"testing"
 )
 
@@ -33,7 +35,8 @@ func TestVerifyCertificateWithoutEngine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sealed.Certificate() != certificate || sealed.Vote() != vote {
+	carried := sealed.Certificate()
+	if carried == certificate || !certificatesEqual(carried, certificate) || sealed.Vote() != vote {
 		t.Fatal("verified certificate does not carry the certificate it verified")
 	}
 	binding, err := NewCertificateBinding(sessionID, validators)
@@ -52,6 +55,106 @@ func TestVerifyCertificateWithoutEngine(t *testing.T) {
 	}
 	if _, err = VerifyCertificate(sessionID, validators, nil); err == nil {
 		t.Fatal("nil certificate passed standalone verification")
+	}
+}
+
+func TestCertificateVerifierOwnsValidatorRoster(t *testing.T) {
+	sessionID := [32]byte{0xa1}
+	validators, keys := testValidators(4)
+	verifier, err := NewCertificateVerifier(sessionID, validators)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalBinding := verifier.Binding()
+
+	attacker := testKey(99)
+	validators[0].Weight = 100
+	validators[0].PublicKey = bytes.Clone(attacker.Public().(ed25519.PublicKey))
+	copy(validators[1].PublicKey, attacker.Public().(ed25519.PublicKey))
+
+	vote := NotarizeVote(CandidateID{Slot: 11, Hash: [32]byte{0x71}})
+	forged := &Certificate{
+		Vote: vote,
+		Signatures: []VoteSignature{{
+			ValidatorIndex: 0,
+			Signature:      ed25519.Sign(attacker, DataToSign(sessionID, VoteBytes(vote))),
+		}},
+	}
+	if _, err = verifier.Verify(forged); err == nil {
+		t.Fatal("one attacker signature passed after mutating the verifier source roster")
+	}
+	if verifier.Binding() != originalBinding {
+		t.Fatal("source roster mutation changed the verifier binding")
+	}
+
+	legitimate := testCertificateFor(t, validators, keys, vote)
+	if _, err = verifier.Verify(legitimate); err != nil {
+		t.Fatalf("source roster mutation corrupted the verifier-owned snapshot: %v", err)
+	}
+}
+
+func TestCertificateVerifierRosterSnapshotIsRaceIndependent(t *testing.T) {
+	sessionID := [32]byte{0xa1}
+	validators, keys := testValidators(4)
+	verifier, err := NewCertificateVerifier(sessionID, validators)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vote := FinalizeVote(CandidateID{Slot: 12, Hash: [32]byte{0x82}})
+	certificate := testCertificateFor(t, validators, keys, vote)
+
+	start := make(chan struct{})
+	var mutations sync.WaitGroup
+	mutations.Add(1)
+	go func() {
+		defer mutations.Done()
+		<-start
+		for range 10_000 {
+			validators[0].Weight++
+			validators[0].PublicKey[0] ^= 0xff
+			runtime.Gosched()
+		}
+	}()
+	close(start)
+
+	for range 200 {
+		if _, err = verifier.Verify(certificate); err != nil {
+			t.Fatalf("verification observed a concurrent source roster mutation: %v", err)
+		}
+	}
+	mutations.Wait()
+}
+
+func TestVerifiedCertificateOwnsAndDoesNotExposeCertificate(t *testing.T) {
+	sessionID := [32]byte{0xa1}
+	validators, keys := testValidators(4)
+	vote := NotarizeVote(CandidateID{Slot: 13, Hash: [32]byte{0x93}})
+	certificate := testCertificateFor(t, validators, keys, vote)
+	expected := cloneCertificate(certificate)
+
+	sealed, err := VerifyCertificate(sessionID, validators, certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	certificate.Vote = SkipVote(99)
+	certificate.Signatures[0].ValidatorIndex = 3
+	certificate.Signatures[0].Signature[0] ^= 0xff
+
+	exposed := sealed.Certificate()
+	exposed.Vote = SkipVote(100)
+	exposed.Signatures[1].ValidatorIndex = 3
+	exposed.Signatures[1].Signature[0] ^= 0xff
+
+	carried := sealed.Certificate()
+	if carried == certificate || carried == exposed || !certificatesEqual(carried, expected) {
+		t.Fatal("input or accessor mutation changed the sealed certificate")
+	}
+	if sealed.Vote() != vote {
+		t.Fatalf("sealed vote = %s, want %s", sealed.Vote(), vote)
+	}
+	if _, err = VerifyCertificate(sessionID, validators, carried); err != nil {
+		t.Fatalf("sealed certificate no longer verifies: %v", err)
 	}
 }
 

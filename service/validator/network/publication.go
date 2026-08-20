@@ -111,10 +111,30 @@ func (m *Manager) cacheCandidate(spec sessionSpec, artifact validator.CandidateA
 	if artifact.Candidate.Empty {
 		return
 	}
-	if m.broadcasts.TryCacheCandidate(p2p.TrustedBlockCandidate{
-		Block:    artifact.Candidate.Block,
-		BlockBOC: artifact.BlockBOC,
-	}) {
+	prepared := artifact.PreparedBlockCandidate()
+	var trusted p2p.TrustedBlockCandidate
+	var err error
+	if prepared != nil {
+		trusted, err = p2p.NewTrustedBlockCandidate(prepared)
+	} else {
+		// Custom SessionReceiver implementations cannot manufacture the private
+		// codec capsule. Preserve their Protocol-1 route with the old fully
+		// verified worker path; only the built-in decoder takes the prepared fast
+		// path.
+		trusted, err = p2p.NewTrustedRawBlockCandidate(
+			artifact.Candidate.Block,
+			artifact.BlockBOC,
+		)
+	}
+	if err != nil {
+		m.log.Warn().
+			Err(err).
+			Hex("session_id", spec.id[:]).
+			Str("publication", "candidate_cache").
+			Msg("dropping invalid trusted candidate")
+		return
+	}
+	if m.broadcasts.TryCacheCandidate(trusted) {
 		return
 	}
 

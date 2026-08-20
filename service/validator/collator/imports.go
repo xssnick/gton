@@ -179,6 +179,7 @@ func (c *collation) importInternal(msg *msgpool.InternalMessage, records []tlb.P
 	if err = c.ctx.Err(); err != nil {
 		return err
 	}
+	c.prewarmGeneratedOutputs(result)
 
 	in, err := descriptorFee(0b100, 3, msg.EnvelopeCell, result.TransactionCell, env.FwdFeeRemaining) // msg_import_fin$100
 	if err != nil {

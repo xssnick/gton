@@ -438,6 +438,74 @@ func DecodeCellRecord(hash []byte, data []byte) (*CellRecord, error) {
 	return decodeCellRecord(hash, data, true)
 }
 
+// DecodeCellRecordRefHashes extracts the hashes used to load the direct
+// references of an encoded cell record into refs and returns their count. It
+// validates the released record framing but does not materialize CellRecord or
+// *cell.Cell values, so storage prefetch walks can stay allocation-free per
+// visited cell. Entries at and above the returned count are left unchanged.
+func DecodeCellRecordRefHashes(data []byte, refs *[4]cell.Hash) (int, error) {
+	if len(data) < 2 {
+		return 0, fmt.Errorf("cell record payload too small")
+	}
+
+	storedD1 := data[0]
+	compactRefs := storedD1&encodedCellRecordCompactRefsFlag != 0
+	refsCount := int(storedD1 & 7)
+	if refsCount > len(refs) {
+		return 0, fmt.Errorf("invalid cell refs count %d", refsCount)
+	}
+
+	pos := 2
+	dataLen := int(data[1]/2 + data[1]%2)
+	if len(data)-pos < dataLen {
+		return 0, fmt.Errorf("cell record payload truncated")
+	}
+	pos += dataLen
+
+	var slowRefs byte
+	if compactRefs && refsCount > 0 {
+		if pos >= len(data) {
+			return 0, fmt.Errorf("cell record compact ref layout truncated")
+		}
+		slowRefs = data[pos]
+		pos++
+		if slowRefs&^byte((1<<uint(refsCount))-1) != 0 {
+			return 0, fmt.Errorf("cell record compact ref layout has invalid slow refs mask %d", slowRefs)
+		}
+	}
+
+	for i := 0; i < refsCount; i++ {
+		if compactRefs && slowRefs&(1<<uint(i)) == 0 {
+			if len(data)-pos < encodedCellRecordHashSize+encodedCellRecordDepthSize {
+				return 0, fmt.Errorf("cell record compact ref metadata truncated")
+			}
+			copy(refs[i][:], data[pos:pos+encodedCellRecordHashSize])
+			pos += encodedCellRecordHashSize + encodedCellRecordDepthSize
+			continue
+		}
+
+		if pos >= len(data) {
+			return 0, fmt.Errorf("cell record ref metadata truncated")
+		}
+		levelMask := data[pos]
+		pos++
+
+		hashesCount := CellRefHashesCount(levelMask)
+		hashesLen := hashesCount * encodedCellRecordHashSize
+		depthsLen := hashesCount * encodedCellRecordDepthSize
+		if len(data)-pos < hashesLen+depthsLen {
+			return 0, fmt.Errorf("cell record ref metadata truncated")
+		}
+		copy(refs[i][:], data[pos+hashesLen-encodedCellRecordHashSize:pos+hashesLen])
+		pos += hashesLen + depthsLen
+	}
+
+	if pos != len(data) {
+		return 0, fmt.Errorf("cell record payload has %d trailing bytes", len(data)-pos)
+	}
+	return refsCount, nil
+}
+
 func PrepareEncodedCellRecordFromCellMetadata(cl *cell.Cell, meta cell.Metadata) (EncodedCellRecord, error) {
 	return prepareEncodedCellRecordFromCellMetadata(cl, meta, func(size int) []byte {
 		return make([]byte, size)

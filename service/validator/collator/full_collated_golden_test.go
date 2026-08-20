@@ -38,9 +38,31 @@ import (
 const (
 	fullCollatedGoldenBlockBytes    = 270276
 	fullCollatedGoldenBlockSum      = "b4817ecd423702cf2ba6207ad06d068d4934f5b262a3b6208b0607de3dc0cdec"
-	fullCollatedGoldenCollatedBytes = 136298
-	fullCollatedGoldenCollatedSum   = "65f1547faa3b4a93ea4e7d3ed9df1319dbdee977d39c113ed9411d08db47518d"
+	fullCollatedGoldenCollatedBytes = 136037
+	fullCollatedGoldenCollatedSum   = "c4136c39914349f77a56b6dd729ad1087646ebaae9a0754963ede25c4c7a4912"
 )
+
+// PROVENANCE. Own-shard queue cleanup was returned to the reference
+// block-full/time gates and the mandatory drain was replaced by the
+// claimed-prefix pass (cleanup.go). On THIS fixture that semantic change moves
+// no dequeue, so the block above is byte-identical to what the collator
+// produced before it — the pre-existing 270276 / b4817ecd… still stands and is
+// deliberately not a new value.
+//
+// An intermediate revision of that change did re-pin the block, to 270973 /
+// 6c7c4b19…, and the note beside it attributed the +697 bytes to retained stale
+// queue entries. That was wrong twice over and is recorded here so the number is
+// not resurrected: the pass dequeues nothing on this fixture, and the 697 bytes
+// were the discovery walk's read set widening the state update's OLD side,
+// because the walk ran before create_shard_state. It is now taken under
+// ReadSet.IgnoreReads, which is what restores the value above.
+//
+// The COLLATED golden did move, 136298 / 65f1547f… -> the value above, a
+// decrease of 261 bytes. The same 261-byte decrease appears on all four
+// payload_hint_mainnet_test.go arms, whose predecessors and traffic differ, so
+// what left the shipped proof is one fixed structure rather than anything that
+// scales with the queue. It accompanies the cleanup change; that much is
+// measured, the exact structure was not isolated.
 
 // fullCollatedMainnetRequest is the shared input. The capability is set on the
 // caller's own Config copy, never on the cached one, which is why the cache key

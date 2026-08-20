@@ -171,9 +171,8 @@ func replayOnlyEnvelopeAndMessage(t *testing.T, entry tiedQueueEntry) (cell.Hash
 //     block with nothing recorded, so the refusal below is the fault and not
 //     the store-shaped parent;
 //   - the same entry corrupted instead of refused — the msg_envelope_v2 tag the
-//     validator's parse rejects — still ships, with the reason recorded, which
-//     is the behaviour the swallow exists for. If a change ever made the two
-//     agree, one of these two arms fails whichever way it went.
+//     validator's parse rejects — also stops the build, but keeps its content
+//     verdict in the returned error rather than masquerading as a store fault.
 func TestProcessedQueueTraceRefusesToShipOnAStorageFaultBelowTheLeaf(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -205,6 +204,10 @@ func TestProcessedQueueTraceRefusesToShipOnAStorageFaultBelowTheLeaf(t *testing.
 			}
 			if !errors.Is(err, errInjectedStorageFault) {
 				t.Fatalf("build error = %v, want the injected storage fault", err)
+			}
+			var verdict semanticQueueEntryVerdict
+			if errors.As(err, &verdict) {
+				t.Fatalf("storage fault was classified as a content verdict: %v", err)
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("build error = %v, want it raised by %q", err, tc.want)
@@ -241,20 +244,26 @@ func TestProcessedQueueTraceRefusesToShipOnAStorageFaultBelowTheLeaf(t *testing.
 	})
 
 	// Control 2: the same entry rejected by the validator-side parse instead of
-	// refused by the store. This one must still ship.
+	// refused by the store. Shipping it would knowingly spend the rest of the
+	// pipeline on a candidate every validator rejects.
 	t.Run("content verdict on the same entry", func(t *testing.T) {
 		req, _ := replayOnlyQueueRequest(t, true)
 		lazifier := newFaultingLazifier()
 		req.Previous.State = lazifier.root(t, req.Previous.State)
 
-		candidate, err := testBuilder().BuildShard(context.Background(), req)
-		if err != nil {
-			t.Fatalf("a verdict on a predecessor entry killed the collation: %v", err)
+		_, err := testBuilder().BuildShard(context.Background(), req)
+		if err == nil {
+			t.Fatal("a semantic-invalid predecessor entry shipped the block")
 		}
-		if !strings.Contains(candidate.Stats.ProcessedScanTraceError, "v2 tag without emitted lt or metadata") {
-			t.Fatalf("recorded reason does not name the entry: %q", candidate.Stats.ProcessedScanTraceError)
+		if !errors.Is(err, ErrInvalidInput) ||
+			!strings.Contains(err.Error(), "v2 tag without emitted lt or metadata") {
+			t.Fatalf("content verdict error = %v", err)
 		}
-		t.Logf("content verdict on the same entry still ships: %s", candidate.Stats.ProcessedScanTraceError)
+		var verdict semanticQueueEntryVerdict
+		if !errors.As(err, &verdict) {
+			t.Fatalf("content failure lost its semantic verdict classification: %v", err)
+		}
+		t.Logf("content verdict stopped collation: %v", err)
 	})
 }
 

@@ -523,16 +523,30 @@ func newLocalValidatorFactory(
 		if err != nil {
 			return nil, fmt.Errorf("validator composition: create shard top inbox: %w", err)
 		}
+		semantics := core.NewSemanticVerifier(node.TVM)
+		{
+			recomputeLog := node.Logger.With().Str("component", "validator").Logger()
+			semantics.SetStorageStatRecomputeObserver(func(chain core.MetricChain, account [32]byte) {
+				if validationObserver != nil {
+					validationObserver.AddStorageStatRecompute(chain)
+				}
+				recomputeLog.Warn().
+					Hex("account", account[:]).
+					Msg("candidate storage-stat proof fell short of the replay walk; stat recomputed from state")
+			})
+		}
 		acquisition, err := core.NewLocalAcquisition(core.LocalAcquisitionOptions{
-			Builder:            core.NewBuilder(node.TVM, core.SupportedSoftware()),
-			Logger:             node.Logger.With().Str("component", "validator").Logger(),
-			CollationObserver:  collationObserver,
-			ValidationObserver: validationObserver,
-			Store:              collatorStore,
-			Groups:             composition.runtime.Groups,
-			Messages:           composition.runtime.Messages,
-			ShardTops:          shardTops,
-			Semantics:          core.NewSemanticVerifier(node.TVM),
+			Builder:                core.NewBuilder(node.TVM, core.SupportedSoftware()),
+			Logger:                 node.Logger.With().Str("component", "validator").Logger(),
+			CollationObserver:      collationObserver,
+			ValidationObserver:     validationObserver,
+			Store:                  collatorStore,
+			Groups:                 composition.runtime.Groups,
+			Messages:               composition.runtime.Messages,
+			ShardTops:              shardTops,
+			Semantics:              semantics,
+			AccountPrewarmer:       node.AccountPrewarmer,
+			AccountPrewarmCapacity: node.AccountPrewarmCapacity,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("validator composition: create local acquisition: %w", err)
@@ -625,12 +639,13 @@ func newLocalValidatorFactory(
 			}
 
 			session, prepareErr := validator.PrepareSessionRuntime(ctx, config, initial, validator.RuntimeOptions{
-				Storage:  composition.options.Storage,
-				Network:  sessionNetwork,
-				Backend:  backend,
-				Limits:   config.CandidateLimits,
-				Observer: validationObserver,
-				Logger:   &log,
+				Storage:    composition.options.Storage,
+				Network:    sessionNetwork,
+				Backend:    backend,
+				Limits:     config.CandidateLimits,
+				Observer:   validationObserver,
+				Logger:     &log,
+				CaptureDir: composition.options.CandidateCaptureDir,
 			})
 			if prepareErr != nil {
 				collatorErr := closeValidatorSessionCollator(production.ownedCollator)
@@ -660,13 +675,14 @@ func newLocalValidatorFactory(
 }
 
 type standaloneCollatorComposition struct {
-	runtime            *validator.Runtime
-	validatorStorage   validator.ValidatorStorage
-	collatorStorage    core.CollatorStorage
-	keys               core.SigningKeys
-	keyID              [32]byte
-	allowedValidators  map[[32]byte]struct{}
-	allowAllValidators bool
+	runtime             *validator.Runtime
+	validatorStorage    validator.ValidatorStorage
+	collatorStorage     core.CollatorStorage
+	keys                core.SigningKeys
+	keyID               [32]byte
+	allowedValidators   map[[32]byte]struct{}
+	allowAllValidators  bool
+	candidateCaptureDir string
 }
 
 func newStandaloneCollatorFactory(
@@ -689,15 +705,26 @@ func newStandaloneCollatorFactory(
 		if err != nil {
 			return nil, fmt.Errorf("collator composition: create shard top inbox: %w", err)
 		}
+		semantics := core.NewSemanticVerifier(node.TVM)
+		{
+			recomputeLog := node.Logger.With().Str("component", "collator").Logger()
+			semantics.SetStorageStatRecomputeObserver(func(_ core.MetricChain, account [32]byte) {
+				recomputeLog.Warn().
+					Hex("account", account[:]).
+					Msg("candidate storage-stat proof fell short of the replay walk; stat recomputed from state")
+			})
+		}
 		acquisition, err := core.NewLocalAcquisition(core.LocalAcquisitionOptions{
-			Builder:           core.NewBuilder(node.TVM, core.SupportedSoftware()),
-			Logger:            node.Logger.With().Str("component", "collator").Logger(),
-			CollationObserver: collationObserver,
-			Store:             collatorStore,
-			Groups:            composition.runtime.Groups,
-			Messages:          composition.runtime.Messages,
-			ShardTops:         shardTops,
-			Semantics:         core.NewSemanticVerifier(node.TVM),
+			Builder:                core.NewBuilder(node.TVM, core.SupportedSoftware()),
+			Logger:                 node.Logger.With().Str("component", "collator").Logger(),
+			CollationObserver:      collationObserver,
+			Store:                  collatorStore,
+			Groups:                 composition.runtime.Groups,
+			Messages:               composition.runtime.Messages,
+			ShardTops:              shardTops,
+			Semantics:              semantics,
+			AccountPrewarmer:       node.AccountPrewarmer,
+			AccountPrewarmCapacity: node.AccountPrewarmCapacity,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("collator composition: create local acquisition: %w", err)
@@ -705,13 +732,14 @@ func newStandaloneCollatorFactory(
 
 		log := node.Logger.With().Str("component", "collator").Logger()
 		observer, err := validator.NewConsensusObserver(validator.ConsensusObserverOptions{
-			Network:   network,
-			Storage:   composition.validatorStorage,
-			Node:      localNode,
-			Groups:    composition.runtime.Groups,
-			Publisher: network,
-			ShardTops: shardTops,
-			Logger:    log,
+			Network:    network,
+			Storage:    composition.validatorStorage,
+			Node:       localNode,
+			Groups:     composition.runtime.Groups,
+			Publisher:  network,
+			ShardTops:  shardTops,
+			Logger:     log,
+			CaptureDir: composition.candidateCaptureDir,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("collator composition: create consensus observer: %w", err)

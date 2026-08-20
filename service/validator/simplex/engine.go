@@ -67,7 +67,7 @@ type Stats struct {
 // session.
 //
 // The engine is deliberately single-threaded and I/O-free except for the
-// injected Journal (asynchronous durable writes), Transport (fire-and-forget
+// injected Journal (asynchronous persistence), Transport (fire-and-forget
 // sends), candidate services and event sink. It is NOT safe for concurrent
 // use: every method must be called from one goroutine. Runner provides that
 // loop for production; deterministic tests drive the engine directly.
@@ -125,7 +125,6 @@ type Engine struct {
 	skipRuns                sortedU32
 	// Candidates whose parent chain has not resolved yet.
 	parentWaits           []*Candidate
-	windowAnnounces       []windowAnnounce
 	suppressCertBroadcast bool
 	seenBroadcasts        map[uint32][32]byte
 	bans                  map[PeerID]time.Time
@@ -322,21 +321,21 @@ func (e *Engine) Start() error {
 	// A caller that had to read the journal to build this engine hands the
 	// state it read over already verified. Re-reading it here is two point
 	// reads against a journal that caches its bootstrap and invalidates the
-	// cache on every write, so the same state comes back as the same value —
-	// and verifying that state again would pay a quorum of ed25519
-	// verifications per saved certificate for nothing. Anything else, including
-	// a state that grew since, is verified here as before.
+	// cache on every write. Matching the contents against the owned snapshot
+	// avoids paying a second quorum of ed25519 verifications per saved
+	// certificate without retaining the journal's mutable pointer as identity.
+	// Anything else, including a state that grew since, is verified here.
 	//
 	// The binding comparison is what makes "already verified" mean verified for
-	// *this* session and roster: pointer identity alone would accept a state
-	// validated against someone else's.
-	if e.bootstrap.State() != bs || e.bootstrap.Binding() != e.binding() {
+	// *this* session and roster rather than for some other engine.
+	if !e.bootstrap.matches(bs) || e.bootstrap.Binding() != e.binding() {
 		validated, validateErr := ValidateBootstrap(e.sessionID(), e.validators(), bs)
 		if validateErr != nil {
 			return validateErr
 		}
 		e.bootstrap = validated
 	}
+	bs = e.bootstrap.stateSnapshot()
 	e.firstNonAnnouncedWindow = bs.FirstNonAnnouncedWindow
 
 	if e.voter != nil {
@@ -349,7 +348,8 @@ func (e *Engine) Start() error {
 	// Certificates first, without re-gossip; downstream notifications
 	// (OnNotarized/OnFinalized) are re-emitted and must be consumed
 	// idempotently.
-	for _, cert := range bs.Certificates {
+	for _, verified := range e.bootstrap.sealed {
+		cert := verified.certificate()
 		slot := e.slots.at(cert.Vote.Slot())
 		if slot == nil {
 			continue
@@ -360,7 +360,7 @@ func (e *Engine) Start() error {
 		// Every certificate here was verified against this engine's session id
 		// and roster, either by the bootstrap the caller handed us (binding
 		// checked above) or by the ValidateBootstrap just run.
-		e.storeSavedCertificate(slot, e.seal(cert))
+		e.storeSavedCertificate(slot, verified)
 		if e.fatalErr != nil {
 			return e.fatalErr
 		}
@@ -402,12 +402,11 @@ func (e *Engine) Start() error {
 	return e.fatalErr
 }
 
-// Stop halts the engine; all further inputs are ignored. Journal writes are
-// synchronous, so there is nothing to flush.
+// Stop halts the engine; all further inputs and late journal completions are
+// ignored. The storage owner drains accepted writes during shutdown.
 func (e *Engine) Stop() {
 	e.stopped = true
 	e.parentWaits = nil
-	e.windowAnnounces = nil
 	e.drain = nil
 	e.pending = nil
 	e.pendingVerify = nil

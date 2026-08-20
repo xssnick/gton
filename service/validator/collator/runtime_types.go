@@ -110,9 +110,14 @@ type CandidateArtifact struct {
 	// Candidate.CollatedFileHash are the sha256 of BlockBOC and CollatedData as
 	// they stand here. It is set where that has just been established — by the
 	// builder that took both digests of these buffers, or by the resume path
-	// that compared them against the durable marker — and it is unexported so
+	// that compared them against the persisted marker — and it is unexported so
 	// an artifact assembled outside this package cannot assert it.
 	digested bool
+
+	// blockRoot and collatedRoots are a borrowed, validation-call-scoped handoff
+	// from the network decoder. They never leave prepareValidationCandidate.
+	blockRoot     *cell.Cell
+	collatedRoots []*cell.Cell
 }
 
 // Prepared is the broadcast payload this candidate was built with, or nil for

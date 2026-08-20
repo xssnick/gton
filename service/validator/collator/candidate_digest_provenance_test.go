@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 
+	"github.com/xssnick/gton/service/validator/msgpool"
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
@@ -34,6 +36,41 @@ func TestBuildStampsItsOwnDigests(t *testing.T) {
 	}
 }
 
+func TestClonePipelineCandidateOwnsMutableFields(t *testing.T) {
+	storageHash := cell.Hash{0x51}
+	source := &Candidate{
+		ID: ton.BlockIDExt{
+			RootHash: []byte{0x11},
+			FileHash: []byte{0x12},
+		},
+		BlockBOC:     []byte{0x21},
+		CollatedData: []byte{0x22},
+		StorageStats: AccountStorageStats{
+			storageHash: cell.BeginCell().EndCell(),
+		},
+		Externals: []msgpool.ExternalFeedback{{Outcome: msgpool.ExternalIncluded}},
+	}
+
+	owned := clonePipelineCandidate(source)
+	source.ID.RootHash[0] = 0xa1
+	source.ID.FileHash[0] = 0xa2
+	source.BlockBOC[0] = 0xa3
+	source.CollatedData[0] = 0xa4
+	delete(source.StorageStats, storageHash)
+	source.Externals[0].Outcome = msgpool.ExternalInvalid
+
+	if owned.ID.RootHash[0] != 0x11 || owned.ID.FileHash[0] != 0x12 ||
+		owned.BlockBOC[0] != 0x21 || owned.CollatedData[0] != 0x22 {
+		t.Fatal("owned pipeline candidate aliases mutable block payload fields")
+	}
+	if owned.StorageStats[storageHash] == nil {
+		t.Fatal("owned pipeline candidate aliases storage stats map")
+	}
+	if owned.Externals[0].Outcome != msgpool.ExternalIncluded {
+		t.Fatal("owned pipeline candidate aliases external feedback slice")
+	}
+}
+
 // TestVerifyCollatedDataChecksTheDigestWithoutProvenance is the F7 gate from
 // both sides. Without provenance the digest is taken and a mismatch is refused
 // — that is the exported entry point and every caller that assembled a
@@ -54,13 +91,13 @@ func TestVerifyCollatedDataChecksTheDigestWithoutProvenance(t *testing.T) {
 
 	const mismatch = "collated data file hash mismatch"
 	foreign := &Candidate{CollatedData: collatedData, CollatedFileHash: sha256.Sum256(collatedData)}
-	if _, err = verifyCollatedData(foreign, 0); err != nil && strings.Contains(err.Error(), mismatch) {
+	if _, err = verifyCollatedData(foreign, nil, 0); err != nil && strings.Contains(err.Error(), mismatch) {
 		t.Fatalf("an honest digest was reported as a mismatch: %v", err)
 	}
 
 	tampered := *foreign
 	tampered.CollatedFileHash[0] ^= 1
-	if _, err = verifyCollatedData(&tampered, 0); err == nil || !strings.Contains(err.Error(), mismatch) {
+	if _, err = verifyCollatedData(&tampered, nil, 0); err == nil || !strings.Contains(err.Error(), mismatch) {
 		t.Fatalf("collated digest mismatch without provenance = %v, want a rejection", err)
 	}
 
@@ -71,18 +108,16 @@ func TestVerifyCollatedDataChecksTheDigestWithoutProvenance(t *testing.T) {
 	// unexported.
 	claimed := tampered
 	claimed.digested = true
-	if _, err = verifyCollatedData(&claimed, 0); err != nil && strings.Contains(err.Error(), mismatch) {
+	if _, err = verifyCollatedData(&claimed, nil, 0); err != nil && strings.Contains(err.Error(), mismatch) {
 		t.Fatalf("a provenance-carrying candidate re-derived its collated digest: %v", err)
 	}
 }
 
-// TestSignArtifactHashesOnlyWhatItDidNotBuild is the F5 gate. A Pipeline
-// supplied from outside this package hands over hashes that are a claim, and
-// signing an id derived from a wrong claim burns the whole leader window, so
-// there both digests are re-derived. Our own builder's are not: the reference
-// producer takes the collator's hashes exactly as they come out of
-// collator.cpp:6445-6450 and re-derives neither.
-func TestSignArtifactHashesOnlyWhatItDidNotBuild(t *testing.T) {
+// TestSignArtifactRehashesAcrossThePublicPipelineBoundary pins the ownership
+// boundary: an external Pipeline decorator can retain every private capsule by
+// returning the canonical Candidate pointer after mutating its exported bytes.
+// The unexported digested bit therefore cannot suppress either hash here.
+func TestSignArtifactRehashesAcrossThePublicPipelineBoundary(t *testing.T) {
 	fixture := newRuntimeFixture(t, 1, 1, nil, nil, nil)
 	defer fixture.close(t)
 
@@ -112,13 +147,47 @@ func TestSignArtifactHashesOnlyWhatItDidNotBuild(t *testing.T) {
 		t.Fatal("a foreign candidate was signed with a file hash that does not match its block")
 	}
 
-	// Same tampering, now on a candidate that claims this package digested it.
-	// Neither hash is recomputed, so neither mismatch is seen.
+	// Same tampering with every private provenance marker preserved must still
+	// fail: this is exactly what a Pipeline decorator can return.
 	ours := *built
 	ours.digested = true
 	ours.CollatedFileHash[0] ^= 1
-	if _, err := fixture.service.signArtifact(session, window, 0, simplex.Genesis(), &ours); err != nil {
-		t.Fatalf("our own candidate was re-hashed on the way to its signature: %v", err)
+	if _, err := fixture.service.signArtifact(session, window, 0, simplex.Genesis(), &ours); err == nil {
+		t.Fatal("a mutated canonical candidate bypassed the public Pipeline digest boundary")
+	}
+
+	// Cell-backed fields and commit metadata are not part of the signed wire.
+	// A genuinely foreign candidate has no seal and takes the replay path, but
+	// mutating a canonical result must be rejected before it can poison local
+	// lineage, queue hints, storage caches or external-message completion.
+	swappedState := preparedRouteCandidate(t, session, 0, session.Validators[0].PublicKey)
+	swappedState.State = cell.BeginCell().MustStoreUInt(0x5a7e, 32).EndCell()
+	if _, err := fixture.service.signArtifact(
+		session, window, 0, simplex.Genesis(), swappedState,
+	); err == nil {
+		t.Fatal("a canonical candidate with a swapped successor state was signed")
+	}
+
+	mutations := map[string]func(*Candidate){
+		"sequence":   func(candidate *Candidate) { candidate.ID.SeqNo++ },
+		"queue size": func(candidate *Candidate) { candidate.Stats.OutQueueSize++ },
+		"storage stats": func(candidate *Candidate) {
+			candidate.StorageStats = AccountStorageStats{
+				cell.Hash{0x51}: cell.BeginCell().EndCell(),
+			}
+		},
+		"external feedback": func(candidate *Candidate) {
+			candidate.Externals = append(candidate.Externals, msgpool.ExternalFeedback{})
+		},
+	}
+	for name, mutate := range mutations {
+		candidate := preparedRouteCandidate(t, session, 0, session.Validators[0].PublicKey)
+		mutate(candidate)
+		if _, err := fixture.service.signArtifact(
+			session, window, 0, simplex.Genesis(), candidate,
+		); err == nil {
+			t.Fatalf("canonical candidate with mutated %s was signed", name)
+		}
 	}
 }
 

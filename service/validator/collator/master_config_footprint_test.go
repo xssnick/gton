@@ -253,6 +253,59 @@ func TestPrepareConfigMaterializesBeforeParsing(t *testing.T) {
 	}
 }
 
+func TestProofBackedConfigCannotPopulateEpochCache(t *testing.T) {
+	root := loadMainnetConfig(t).execution.Root()
+	usage := cell.NewReadSet(root)
+	if _, err := parseMasterConfigEpoch(usage.Root()); err != nil {
+		t.Fatal(err)
+	}
+	read := make(map[cell.Hash]struct{}, len(usage.Hashes()))
+	for _, hash := range usage.Hashes() {
+		read[hash] = struct{}{}
+	}
+	proof, err := root.CreateHashUsageProof(func(hash cell.Hash) bool {
+		_, ok := read[hash]
+		return ok
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrow, err := cell.UnwrapProofVirtualized(proof, root.Hash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !narrow.IsVirtualized() {
+		t.Fatal("configuration proof did not produce a virtualized root")
+	}
+
+	cache := localConfigCache{entries: make(map[cell.Hash]localPreparedConfig)}
+	proofPrepared, err := cache.prepare(narrow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proofPrepared.execution.Root() != narrow {
+		t.Fatal("proof-backed preparation did not stay bound to its validation root")
+	}
+	if len(cache.entries) != 0 {
+		t.Fatal("proof-backed configuration poisoned the epoch cache")
+	}
+
+	resident, err := cache.prepare(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resident.execution.Root().IsVirtualized() || len(cache.entries) != 1 {
+		t.Fatal("resident configuration was not published into the epoch cache")
+	}
+	reused, err := cache.prepare(narrow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused.execution != resident.execution {
+		t.Fatal("authenticated proof root did not reuse the resident epoch context")
+	}
+}
+
 // TestMasterConfigFootprintMutationsAreDetected is the gate.
 //
 // It is a read-set comparison and not a byte comparison because the bytes this

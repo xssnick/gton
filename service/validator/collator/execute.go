@@ -26,31 +26,80 @@ type accountLane struct {
 	// storageProof traces every read of the account's storage-stat dictionary
 	// for the whole collation; the proof the block carries is created from it at
 	// the end, once all of the account's transactions have run.
+	//
+	// It is shared with every other account that starts from the same initial
+	// dictionary, and is owned by collation.accountStorageProofs rather than by
+	// the lane — see sharedAccountStorageProof.
 	storageProof *cell.MerkleProofBuilder
-	// initialStorageProof is that proof as it stood after the first transaction.
-	// It only seeds the collated size estimate — the emitted proof is a superset
-	// of it, see trackAccountStorageProof.
+	// initialStorageProof is that proof as it stood after the first transaction
+	// that used the dictionary. It only seeds the collated size estimate — the
+	// emitted proof is a superset of it, see trackAccountStorageProof.
 	initialStorageProof *cell.Cell
 	transactions        *tlb.AccountTransactionsAugDict
 	key                 [32]byte
 	originallyExists    bool
-	// written records that the account has already been put into the accounts
-	// dictionary once, ahead of finishAccounts, to feed the size estimate.
-	// writtenHash is what was put there, so the final pass can skip an account
-	// whose state never moved again.
-	written     bool
-	writtenHash cell.Hash
-	// writtenState is the account this lane held when the early write rendered
-	// it. current only ever moves in commitExecution, so an unmoved pointer is
-	// proof that re-rendering the entry would reproduce the cell the early
-	// write already put in the dictionary — which finishAccounts would then
-	// throw away. Comparing the pointer is free; rendering it again costs a
-	// ShardAccount serialization and its hashes, once per touched account.
-	writtenState *tvm.PreparedAccount
+	// accountPath is the predecessor ShardAccounts spine loaded for this key.
+	// Its cells are charged to the block estimate only after the account changes.
+	accountPath      []*cell.Cell
+	estimateRecorded bool
 	// keyCell is the account's 256-bit dictionary key. Both dictionaries the
 	// account lands in take the same key and cells are immutable, so it is
 	// built once instead of once per use.
 	keyCell *cell.Cell
+}
+
+// accountStorageProof is the collation-wide record of one initial storage-stat
+// dictionary: the single traced builder every account bound to that dictionary
+// reads through, and how much of its serialized proof the collated size estimate
+// has already been charged for.
+type accountStorageProof struct {
+	builder *cell.MerkleProofBuilder
+	// charged is the size, in serialized bytes, of the proof this dictionary was
+	// last charged to collatedFixedEstimate for. Accounts that bind the same
+	// dictionary later charge only the growth their own reads added, because
+	// buildCollatedRoots emits one proof for all of them.
+	charged uint64
+}
+
+// accountPathRecorder observes only the ShardAccounts lookup. The trace is
+// removed from the returned value before the account itself is decoded, so the
+// recorded cells are the Patricia spine rather than the account payload that
+// addTransaction already charges exactly.
+type accountPathRecorder struct {
+	trace *cell.Trace
+	path  []*cell.Cell
+}
+
+func newAccountPathRecorder() *accountPathRecorder {
+	r := &accountPathRecorder{path: make([]*cell.Cell, 0, 24)}
+	r.trace = cell.NewTraceForListener(r)
+	return r
+}
+
+func (r *accountPathRecorder) OnLoad(loaded *cell.Cell) {
+	r.path = append(r.path, loaded)
+}
+
+func (*accountPathRecorder) OnCreate() {}
+
+func (r *accountPathRecorder) ChildTrace(int) *cell.Trace {
+	return r.trace
+}
+
+func (*accountPathRecorder) PendingError() error {
+	return nil
+}
+
+func (c *collation) prepareAccountPathRecorder() {
+	c.accountPathRecorder = newAccountPathRecorder()
+	for i := range c.accountSources {
+		if c.accountSources[i].accounts == nil {
+			continue
+		}
+		c.accountSources[i].accounts = &tlb.ShardAccountsAugDict{
+			AugmentedDictionary: c.accountSources[i].accounts.Copy().SetTrace(c.accountPathRecorder.trace),
+		}
+	}
 }
 
 // laneKey returns the account's dictionary key cell, building it on first use.
@@ -141,6 +190,8 @@ func (c *collation) processExternalBatch(
 	externals []ExternalInput,
 	deadline time.Time,
 ) (externalBatchResult, error) {
+	c.prewarmExternalInputs(externals)
+
 	for i, external := range externals {
 		c.updateCollatedEstimate()
 		if !c.limits.fits(LoadSoft) {
@@ -206,6 +257,7 @@ func (c *collation) processExternalBatch(
 			c.recordExternal(external.Ref, msgpool.ExternalNotAccepted)
 			continue
 		}
+		c.prewarmGeneratedOutputs(result)
 		in, err := descriptor(0b000, 3, root, result.TransactionCell) // msg_import_ext$000
 		if err != nil {
 			return externalBatchResult{}, err
@@ -315,6 +367,7 @@ func (c *collation) processNewMessages(enqueueOnly bool) error {
 			}
 			continue
 		}
+		c.prewarmImmediateAccount(internal.DstAddr)
 		if err = c.deliverImmediate(&item, internal, destination); err != nil {
 			return err
 		}
@@ -345,6 +398,7 @@ func (c *collation) deliverImmediate(
 	if err = c.ctx.Err(); err != nil {
 		return err
 	}
+	c.prewarmGeneratedOutputs(result)
 
 	var envelopeCell, in *cell.Cell
 	if item.dispatchEnvelope != nil {
@@ -592,16 +646,9 @@ func (c *collation) commitExecution(
 	if err = c.limits.addTransaction(result.NextAccount.ShardAccount().Account, result.TransactionCell, result.EndLT, gas); err != nil {
 		return err
 	}
-	if err = c.updateAccountEstimate(lane); err != nil {
-		return err
-	}
+	c.updateAccountEstimate(lane)
 	if c.limits.transactions%accountEstimateSampleInterval == 0 {
-		if err = c.flushAccountEstimate(); err != nil {
-			return err
-		}
-		if err = c.limits.addProof(c.accounts.RootCell()); err != nil {
-			return err
-		}
+		c.limits.commitAccountPaths()
 	}
 
 	if !currencyZero(result.Burned) {
@@ -623,7 +670,7 @@ func (c *collation) account(addr *address.Address) (*accountLane, error) {
 	}
 
 	keyCell := cell.BeginCell().MustStoreSlice(key[:], 256).EndCell()
-	value, err := c.loadPredecessorAccount(key, keyCell)
+	value, accountPath, err := c.loadPredecessorAccount(key, keyCell)
 	originallyExists := true
 	var shardAccount tlb.ShardAccount
 	if isMissingKey(err) {
@@ -671,7 +718,7 @@ func (c *collation) account(addr *address.Address) (*accountLane, error) {
 	initialStorageStat := storageStat
 	var storageProof *cell.MerkleProofBuilder
 	if storageStat != nil && c.fullCollated {
-		storageProof = cell.NewMerkleProofBuilder(storageStat)
+		storageProof = c.sharedAccountStorageProof(storageStat)
 		storageStat = storageProof.Root()
 	}
 
@@ -685,12 +732,60 @@ func (c *collation) account(addr *address.Address) (*accountLane, error) {
 		storageStat:        storageStat,
 		initialStorageStat: initialStorageStat,
 		storageProof:       storageProof,
+		accountPath:        accountPath,
 	}
 	c.lanes[key] = lane
 	return lane, nil
 }
 
-func (c *collation) loadPredecessorAccount(key [32]byte, keyCell *cell.Cell) (*cell.Slice, error) {
+// sharedAccountStorageProof returns the traced proof builder for an initial
+// storage-stat dictionary, creating it on first use.
+//
+// The builder is keyed by the dictionary, not by the account, because the wire
+// format is: collated data carries at most one account_storage_dict_proof per
+// dictionary hash (verifyCollatedRoots rejects a second root with the same
+// virtual hash as a duplicate), and a verifier binds it to every account whose
+// state commits to that hash. Two accounts can commit to the same hash whenever
+// their code and data trees are identical — the dictionary is a function of the
+// account storage cell's references, and the address is not among them — and
+// each of them then replays its own update walk against that one proof. So the
+// proof has to cover the union of their reads, and one shared recorder is what
+// makes that true by construction: both accounts read through this builder's
+// traced root, so every node either of them touches is in the read set, whatever
+// order the lanes ran in. Per-account recorders cannot be reconciled at emit
+// time — only one of them can be shipped, and the others' branches would reach
+// the verifier pruned. A C++ validator meeting a pruned branch here does not
+// abstain, it votes to reject.
+//
+// This mirrors collator-impl.h's account_storage_dicts_, which maps a dict hash
+// to one MerkleProofBuilder for exactly this reason.
+//
+// No lock, and the reason is the map's reachability rather than the build's:
+// every access is on the execution goroutine. This constructor is reached only
+// from account(), and the one other site that touches the map —
+// trackAccountStorageProof's charged-bytes update (build.go:1386) — is reached
+// only from commitExecution. A build does fork twice, at traceValidationClosure
+// (proof_closure.go, five concurrent passes) and at the block/collated
+// serialization split, but both begin after the last lane has run and neither
+// reaches either site.
+func (c *collation) sharedAccountStorageProof(stat *cell.Cell) *cell.MerkleProofBuilder {
+	hash := stat.HashKey()
+	if shared := c.accountStorageProofs[hash]; shared != nil {
+		return shared.builder
+	}
+	if c.accountStorageProofs == nil {
+		c.accountStorageProofs = make(map[cell.Hash]*accountStorageProof)
+	}
+	builder := cell.NewMerkleProofBuilder(stat)
+	c.accountStorageProofs[hash] = &accountStorageProof{builder: builder}
+
+	return builder
+}
+
+func (c *collation) loadPredecessorAccount(
+	key [32]byte,
+	keyCell *cell.Cell,
+) (*cell.Slice, []*cell.Cell, error) {
 	prefix := binary.BigEndian.Uint64(key[:8])
 	for _, source := range c.accountSources {
 		if source.accounts == nil {
@@ -704,60 +799,40 @@ func (c *collation) loadPredecessorAccount(key [32]byte, keyCell *cell.Cell) (*c
 			continue
 		}
 
-		return source.accounts.LoadValue(keyCell)
+		recorder := c.accountPathRecorder
+		recorder.path = recorder.path[:0]
+		value, err := source.accounts.LoadValue(keyCell)
+		if value != nil {
+			value.SetTrace(value.Trace().WithoutTrace(recorder.trace))
+		}
+		return value, slices.Clone(recorder.path), err
 	}
 
-	return nil, fmt.Errorf("%w: account %x is outside predecessor shards", ErrInvalidInput, key)
+	return nil, nil, fmt.Errorf("%w: account %x is outside predecessor shards", ErrInvalidInput, key)
 }
 
-// accountEstimateSampleInterval is how many transactions pass between reads of
-// the account-size estimate. The interval is a local pacing choice, not a
-// protocol one: nothing outside collation replays this estimate, and sampling
-// more often only inflates it, because the storage stat keeps every
-// intermediate version of the dictionary nodes it walks.
+// accountEstimateSampleInterval preserves the reference estimator's pacing
+// without materializing intermediate ShardAccounts roots. Each window owns a
+// path union; common ancestors touched in a later window represent the new
+// versions the old SetMany-based estimator counted again.
 const accountEstimateSampleInterval = 16
 
-// updateAccountEstimate records an account for the size estimate. The write is
-// deferred: the estimate is only read once per accountEstimateSampleInterval
-// transactions, so the accounts touched in between are applied together, as one
-// descent instead of one per account.
-func (c *collation) updateAccountEstimate(lane *accountLane) error {
-	if lane.written {
-		return nil
+// updateAccountEstimate adds the predecessor Patricia spine once, when the
+// account first changes. Transaction and account payload cells are already
+// charged by addTransaction; rebuilding ShardAccounts used to be necessary
+// only to discover this path cost.
+func (c *collation) updateAccountEstimate(lane *accountLane) {
+	if lane.estimateRecorded {
+		return
 	}
 	if lane.original.Account.HashKey() == lane.current.ShardAccount().Account.HashKey() {
-		return nil
+		return
 	}
 
-	// The entry is rendered now, not at flush time: the estimate has always used
-	// the account as it stood after its first transaction, and later
-	// transactions on the same account never revised it.
-	entry, deleted, err := accountDictionaryEntry(lane)
-	if err != nil {
-		return err
-	}
-	lane.written = true
-	lane.writtenState = lane.current
-	if deleted {
-		return c.accounts.Delete(entry.Key)
-	}
-	if entry.Value == nil {
-		return nil
-	}
-	lane.writtenHash = entry.Value.HashKey()
-	c.pendingEstimate = append(c.pendingEstimate, entry)
-	return nil
-}
-
-func (c *collation) flushAccountEstimate() error {
-	if len(c.pendingEstimate) == 0 {
-		return nil
-	}
-	if err := c.accounts.SetMany(c.pendingEstimate); err != nil {
-		return fmt.Errorf("%w: account dictionary update did not apply: %v", ErrInvalidInput, err)
-	}
-	c.pendingEstimate = c.pendingEstimate[:0]
-	return nil
+	lane.estimateRecorded = true
+	state := lane.current.State()
+	deleted := !state.IsValid || state.Status == tlb.AccountStatusNonExist
+	c.limits.addAccountPath(lane.accountPath, lane.originallyExists, deleted, lane.original.Account)
 }
 
 // registerOutputs queues the transaction outputs for the new-message phase.
@@ -868,50 +943,36 @@ func (c *collation) registerQueueOp() error {
 // way up, so the nodes near the root — the root's balance total above all —
 // would be rebuilt once per account instead of once per block.
 //
-// Most accounts are already in place: the size estimate put each one there when
-// it first changed, and an account that never ran a second transaction still
-// holds exactly that state. Those are skipped here rather than rewritten.
+// The size estimator never mutates accounts, so this is the only bulk update of
+// the dictionary during a collation.
 func (c *collation) finishAccounts() error {
-	if err := c.flushAccountEstimate(); err != nil {
-		return err
-	}
-	if err := c.traceDispatchValidationClosure(); err != nil {
-		return err
-	}
 	accounts := make([]cell.AugmentedEntry, 0, len(c.lanes))
+	accountPaths := make([][]*cell.Cell, 0, len(c.lanes))
+	accountDeletes := make([]*cell.Cell, 0)
 	blocks := make([]cell.AugmentedEntry, 0, len(c.lanes))
 	for _, lane := range c.lanes {
+		if len(lane.accountPath) != 0 {
+			// Paths from every lookup are useful, including a lane which did not
+			// produce a transaction: it can already contain an untouched sibling
+			// root another lane's update would otherwise load again.
+			accountPaths = append(accountPaths, lane.accountPath)
+		}
 		if lane.transactions == nil {
 			continue
 		}
-		// An account whose state has not moved since the early write renders to
-		// exactly the cell already in the dictionary, and every branch below
-		// then discards it. Skip the rendering, not just its result.
-		if !lane.written || lane.writtenState != lane.current {
-			entry, deleted, err := accountDictionaryEntry(lane)
-			if err != nil {
-				return err
-			}
-			switch {
-			case deleted:
-				if lane.written {
-					// The early write already removed it.
-					break
-				}
-				// Destroyed accounts are rare and shrink the tree, which the
-				// bulk write does not model; they keep the one-by-one path.
-				if err = c.accounts.Delete(entry.Key); err != nil {
-					return err
-				}
-			case entry.Value == nil:
-			case lane.written && lane.writtenHash == entry.Value.HashKey():
-				// Unchanged since the early write.
-			default:
-				if lane.written {
-					entry.Mode = cell.DictSetModeReplace
-				}
-				accounts = append(accounts, entry)
-			}
+		entry, deleted, err := accountDictionaryEntry(lane)
+		if err != nil {
+			return err
+		}
+		switch {
+		case deleted:
+			// Destroyed accounts are rare and shrink the tree, which the
+			// bulk write does not model; they keep the one-by-one path. Apply
+			// them after the batch so a delete cannot compress a label and make
+			// the batch's already-loaded predecessor paths stale.
+			accountDeletes = append(accountDeletes, entry.Key)
+		case entry.Value != nil:
+			accounts = append(accounts, entry)
 		}
 
 		stateUpdate, err := tlb.ToCell(tlb.HashUpdate{
@@ -944,76 +1005,32 @@ func (c *collation) finishAccounts() error {
 		}
 	}
 
-	if err := c.accounts.SetMany(accounts); err != nil {
+	if c.fullCollated && c.master == nil && len(accountDeletes) == 0 {
+		diff, err := c.accounts.SetManyWithLoadedPathsAndDiff(
+			accounts,
+			accountPaths,
+			collationParallelism,
+		)
+		if err != nil {
+			return fmt.Errorf("%w: account dictionary update did not apply: %v", ErrInvalidInput, err)
+		}
+		c.accountMutationDiff = diff
+	} else if err := c.accounts.SetManyWithLoadedPaths(
+		accounts,
+		accountPaths,
+		collationParallelism,
+	); err != nil {
 		return fmt.Errorf("%w: account dictionary update did not apply: %v", ErrInvalidInput, err)
+	}
+	for _, key := range accountDeletes {
+		if err := c.accounts.Delete(key); err != nil {
+			return fmt.Errorf("%w: account dictionary delete did not apply: %v", ErrInvalidInput, err)
+		}
 	}
 	// Add mode makes SetMany reject a repeated account, which is the duplicate
 	// account block check the per-entry insert used to make.
-	if err := c.accountBlocks.SetMany(blocks); err != nil {
+	if err := c.accountBlocks.SetMany(blocks, collationParallelism); err != nil {
 		return fmt.Errorf("%w: account block insert did not apply: %v", ErrInvalidInput, err)
-	}
-	return nil
-}
-
-func (c *collation) traceDispatchValidationClosure() error {
-	if err := c.oldDispatchQueue.ScanDiff(c.dispatchQueue.AugmentedDictionary, true, func(
-		keyCell *cell.Cell,
-		oldValueExtra, newValueExtra *cell.Slice,
-	) error {
-		keyLoader, err := keyCell.BeginParse()
-		if err != nil {
-			return fmt.Errorf("%w: load dispatch diff key: %v", ErrInvalidInput, err)
-		}
-		var accountID [32]byte
-		if err = keyLoader.LoadSliceInto(accountID[:], 256); err != nil {
-			return fmt.Errorf("%w: decode dispatch diff key: %v", ErrInvalidInput, err)
-		}
-		var oldAccount *tlb.AccountDispatchQueue
-		if oldValueExtra != nil {
-			var traced bool
-			oldAccount, traced = c.oldDispatchAccounts[accountID]
-			if !traced {
-				oldAccount, err = c.loadPredecessorDispatchAccount(accountID)
-				if err != nil {
-					return fmt.Errorf("%w: decode predecessor dispatch account: %v", ErrInvalidInput, err)
-				}
-			}
-			if _, _, err = oldAccount.Messages.LoadMax(); err != nil {
-				return fmt.Errorf("%w: load predecessor dispatch account maximum: %v", ErrInvalidInput, err)
-			}
-		}
-		if newValueExtra != nil {
-			newAccount, err := dispatchDiffAccount(newValueExtra)
-			if err != nil {
-				return fmt.Errorf("%w: decode candidate dispatch account: %v", ErrInvalidInput, err)
-			}
-			minimum, _, err := newAccount.Messages.LoadMin()
-			if err != nil {
-				return fmt.Errorf("%w: load candidate dispatch account minimum: %v", ErrInvalidInput, err)
-			}
-			// Mutating the nested dictionary rebuilds its Patricia path. Trace the
-			// same minimum through the immutable predecessor view so a reused leaf
-			// is retained in the previous-state proof.
-			if oldAccount != nil {
-				_, oldErr := oldAccount.Messages.LoadValue(minimum)
-				if oldErr != nil && !isMissingKey(oldErr) {
-					return fmt.Errorf("%w: load candidate dispatch account minimum from predecessor: %v", ErrInvalidInput, oldErr)
-				}
-			}
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	for accountID, lane := range c.lanes {
-		if lane.transactions == nil {
-			continue
-		}
-		_, err := c.loadPredecessorDispatchValue(accountID)
-		if err != nil && !isMissingKey(err) {
-			return fmt.Errorf("%w: lookup transaction account %x in predecessor dispatch queue: %v", ErrInvalidInput, accountID, err)
-		}
 	}
 	return nil
 }

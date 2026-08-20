@@ -558,6 +558,106 @@ func (s *Store) LazyCellLoader() cell.LazyCellLoader {
 	return s.activeCellLoader
 }
 
+const cellRecordWarmScratchInitialCells = 1024
+
+type cellRecordWarmScratch struct {
+	stack []cell.Hash
+	seen  map[cell.Hash]struct{}
+	raw   []byte
+	refs  [4]cell.Hash
+}
+
+var cellRecordWarmScratchPool = sync.Pool{
+	New: func() any {
+		return &cellRecordWarmScratch{
+			stack: make([]cell.Hash, 0, cellRecordWarmScratchInitialCells),
+			seen:  make(map[cell.Hash]struct{}, cellRecordWarmScratchInitialCells),
+			raw:   make([]byte, 0, 512),
+		}
+	},
+}
+
+// WarmCellRecords recursively brings the encoded records reachable from root
+// into the record, Pebble block and OS caches without decoding or inserting a
+// cell into decodedCells. A decoded-cache hit still walks its reference hashes:
+// the hit refreshes the entry's CLOCK bit, but a resident parent does not imply
+// that its independently cached children are resident too.
+func (s *Store) WarmCellRecords(ctx context.Context, root cell.Hash) error {
+	cells, err := s.acquireActiveCellStore(ctx)
+	if err != nil {
+		return err
+	}
+	defer cells.release()
+
+	scratch := cellRecordWarmScratchPool.Get().(*cellRecordWarmScratch)
+	defer func() {
+		scratch.stack = scratch.stack[:0]
+		clear(scratch.seen)
+		scratch.raw = scratch.raw[:0]
+		cellRecordWarmScratchPool.Put(scratch)
+	}()
+
+	scratch.stack = append(scratch.stack, root)
+	iterations := 0
+	for len(scratch.stack) > 0 {
+		if iterations&0xff == 0 {
+			if err = ctx.Err(); err != nil {
+				return err
+			}
+		}
+		iterations++
+
+		last := len(scratch.stack) - 1
+		hash := scratch.stack[last]
+		scratch.stack = scratch.stack[:last]
+		if _, ok := scratch.seen[hash]; ok {
+			continue
+		}
+		scratch.seen[hash] = struct{}{}
+
+		loaded, cacheErr := s.decodedCells.getHash(activeCellCacheNamespace, hash)
+		if cacheErr == nil {
+			for i := int(loaded.RefsNum()) - 1; i >= 0; i-- {
+				scratch.stack = append(scratch.stack, loaded.MustRefHashAt(i))
+			}
+			continue
+		}
+		if !errors.Is(cacheErr, storage.ErrNotFound) {
+			return cacheErr
+		}
+
+		raw := s.recordCache.get(hash[:], scratch.raw)
+		if raw == nil {
+			storeRaw, closer, readErr := cells.get(hash[:])
+			if readErr != nil {
+				return fmt.Errorf("warm cell record %x: %w", hash, readErr)
+			}
+
+			refsCount, decodeErr := storage.DecodeCellRecordRefHashes(storeRaw, &scratch.refs)
+			if decodeErr != nil {
+				_ = closer.Close()
+				return fmt.Errorf("decode warm cell record %x refs: %w", hash, decodeErr)
+			}
+			s.recordCache.put(hash[:], storeRaw)
+			_ = closer.Close()
+			for i := refsCount - 1; i >= 0; i-- {
+				scratch.stack = append(scratch.stack, scratch.refs[i])
+			}
+			continue
+		}
+
+		scratch.raw = raw
+		refsCount, err := storage.DecodeCellRecordRefHashes(raw, &scratch.refs)
+		if err != nil {
+			return fmt.Errorf("decode cached warm cell record %x refs: %w", hash, err)
+		}
+		for i := refsCount - 1; i >= 0; i-- {
+			scratch.stack = append(scratch.stack, scratch.refs[i])
+		}
+	}
+	return nil
+}
+
 // newLazyCellLoaderForGeneration builds a loader for a NON-ACTIVE generation.
 // Its single caller is generation_cells.go, the retired- and
 // migrating-generation read surface used by cleanup, migration and the operator
@@ -620,14 +720,122 @@ func (s *Store) cachedCellLoader(
 	}
 
 	return func(hash cell.Hash) (*cell.Cell, error) {
-		// getHash reports storage.ErrNotFound and nothing else, so any error here
-		// is a plain miss.
-		if loaded, err := cache.getHash(cacheNamespace, hash); err == nil {
-			s.lazyCellLoads.observeDecodedCache(hash[0])
+		return s.loadDecodedCell(context.Background(), cache, cacheNamespace, hash[:], func(context.Context) (*cell.Cell, error) {
+			return loadMiss(hash)
+		})
+	}
+}
+
+type decodedCellLoadFlight struct {
+	done            chan struct{}
+	leaderCancelled bool
+	loaded          *cell.Cell
+	err             error
+}
+
+// decodedCellLoadGroup coalesces one cold (namespace, hash) load. The caller
+// that creates a flight performs the load synchronously; followers wait on its
+// result and may cancel independently. Keeping the leader synchronous preserves
+// I/O backpressure and avoids a goroutine/context allocation for every unique
+// cold cell in a collation.
+type decodedCellLoadGroup struct {
+	mu      sync.Mutex
+	flights map[decodedCellCacheKey]*decodedCellLoadFlight
+}
+
+func (g *decodedCellLoadGroup) do(
+	ctx context.Context,
+	key decodedCellCacheKey,
+	load func(context.Context) (*cell.Cell, error),
+) (*cell.Cell, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		g.mu.Lock()
+		flight := g.flights[key]
+		if flight != nil {
+			g.mu.Unlock()
+
+			select {
+			case <-flight.done:
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if flight.leaderCancelled {
+					// Re-enter so one live follower becomes the next synchronous
+					// leader and the rest coalesce behind it. This can repeat I/O only
+					// on the rare cancellation edge and keeps every normal unique miss
+					// free of shared-context and cancellation-watcher allocations.
+					continue
+				}
+
+				return flight.loaded, flight.err
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if g.flights == nil {
+			g.flights = make(map[decodedCellCacheKey]*decodedCellLoadFlight)
+		}
+		flight = &decodedCellLoadFlight{done: make(chan struct{})}
+		g.flights[key] = flight
+		g.mu.Unlock()
+
+		loaded, err := load(ctx)
+		g.mu.Lock()
+		flight.loaded = loaded
+		flight.err = err
+		ctxErr := ctx.Err()
+		flight.leaderCancelled = ctxErr != nil && errors.Is(err, ctxErr)
+		if g.flights[key] == flight {
+			delete(g.flights, key)
+		}
+		close(flight.done)
+		g.mu.Unlock()
+
+		return loaded, err
+	}
+}
+
+// loadDecodedCell is the single cold-miss gate shared by direct state loads and
+// lazy child resolution. The cache is checked both before and inside the
+// flight: a winner may publish between those points, and consulting it again
+// avoids starting I/O after the answer already became resident.
+func (s *Store) loadDecodedCell(
+	ctx context.Context,
+	cache *decodedCellCache,
+	cacheNamespace uint64,
+	hash []byte,
+	loadMiss func(context.Context) (*cell.Cell, error),
+) (*cell.Cell, error) {
+	if cache == nil {
+		return loadMiss(ctx)
+	}
+
+	key := newDecodedCellCacheKey(cacheNamespace, hash)
+	if loaded, err := cache.getKey(key); err == nil {
+		s.lazyCellLoads.observeDecodedCache(key.hash[0])
+		return loaded, nil
+	}
+
+	return s.decodedCellLoads.do(ctx, key, func(loadCtx context.Context) (*cell.Cell, error) {
+		if loaded, cacheErr := cache.getKey(key); cacheErr == nil {
+			s.lazyCellLoads.observeDecodedCache(key.hash[0])
 			return loaded, nil
 		}
-		return loadMiss(hash)
-	}
+
+		loaded, loadErr := loadMiss(loadCtx)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if err := loadCtx.Err(); err != nil {
+			return nil, err
+		}
+
+		return cache.set(cacheNamespace, key.hash[:], loaded), nil
+	})
 }
 
 func (s *Store) loadLazyCellFromGeneration(
@@ -640,16 +848,9 @@ func (s *Store) loadLazyCellFromGeneration(
 		return nil, fmt.Errorf("cell generation is zero")
 	}
 
-	loaded, err := s.decodedCells.get(generation, hash)
-	if err == nil {
-		s.lazyCellLoads.observeDecodedCache(hash[0])
-		return loaded, nil
-	}
-	if !errors.Is(err, storage.ErrNotFound) {
-		return nil, err
-	}
-
-	return s.loadLazyCellMissFromGeneration(ctx, generation, hash, loader)
+	return s.loadDecodedCell(ctx, s.decodedCells, generation, hash, func(loadCtx context.Context) (*cell.Cell, error) {
+		return s.loadLazyCellMissFromGeneration(loadCtx, generation, hash, loader)
+	})
 }
 
 // loadLazyCellMissFromGeneration is the non-active-generation twin of
@@ -659,15 +860,34 @@ func (s *Store) loadLazyCellFromGeneration(
 // byte-identical when migration or cleanup reads it under another generation —
 // sharing the tier is what makes a generation swap start warm instead of cold.
 func (s *Store) loadLazyCellMissFromGeneration(ctx context.Context, generation uint64, hash []byte, loader cell.LazyCellLoader) (*cell.Cell, error) {
+	return s.loadLazyCellRecordThrough(ctx, hash, loader, func(loadCtx context.Context) (*cellStore, error) {
+		return s.acquireCellStore(loadCtx, generation)
+	})
+}
+
+// loadLazyCellRecordThrough is the body both cold paths share: the record tier
+// first, then the celldb generation `acquire` opens, filling the record cache
+// from the raw bytes on the way past. The two callers differ only in which
+// generation they open and which loader the decoded cell's child placeholders
+// resolve through, which is exactly what the two parameters carry.
+//
+// acquire is a callback rather than an opened store because a record-cache hit
+// must not open one at all: on a warm store that is the overwhelming majority
+// of calls, and acquiring costs a generation-lock round trip apiece.
+func (s *Store) loadLazyCellRecordThrough(
+	ctx context.Context,
+	hash []byte,
+	loader cell.LazyCellLoader,
+	acquire func(context.Context) (*cellStore, error),
+) (*cell.Cell, error) {
 	if loaded, hit, err := s.decodeFromRecordCache(hash, loader); hit {
 		if err != nil {
 			return nil, err
 		}
-		s.decodedCells.set(generation, hash, loaded)
 		return loaded, nil
 	}
 
-	cells, err := s.acquireCellStore(ctx, generation)
+	cells, err := acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -683,12 +903,14 @@ func (s *Store) loadLazyCellMissFromGeneration(ctx context.Context, generation u
 	// Timed around the store read alone: the decode below costs the same at
 	// every layer, so including it would blur the bands it is meant to separate.
 	s.lazyCellLoads.observeStoreRead(hash[0], time.Since(readStarted))
+	// The raw record bytes are in hand exactly here and nowhere cheaper: the
+	// arena insert is a copy of them, made before the closer returns them to
+	// pebble.
 	s.recordCache.put(hash, raw)
 	loaded, err := storage.DecodeLazyCellRecordTrusted(hash, raw, loader)
 	if err != nil {
 		return nil, fmt.Errorf("create lazy cell %x: %w", hash, err)
 	}
-	s.decodedCells.set(generation, hash, loaded)
 	return loaded, nil
 }
 
@@ -730,21 +952,15 @@ func (s *Store) decodeFromRecordCache(hash []byte, loader cell.LazyCellLoader) (
 }
 
 func (s *Store) loadActiveLazyCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
-	loaded, err := s.decodedCells.get(activeCellCacheNamespace, hash)
-	if err == nil {
-		s.lazyCellLoads.observeDecodedCache(hash[0])
-		return loaded, nil
-	}
-	if !errors.Is(err, storage.ErrNotFound) {
-		return nil, err
-	}
-
-	return s.loadActiveLazyCellThrough(ctx, hash)
+	return s.loadDecodedCell(ctx, s.decodedCells, activeCellCacheNamespace, hash, func(loadCtx context.Context) (*cell.Cell, error) {
+		return s.loadActiveLazyCellThrough(loadCtx, hash)
+	})
 }
 
-// loadActiveLazyCellThrough decodes one cell record from celldb and files it in
-// the decoded cell cache, with s.activeCellLoader as what the decoded cell's
-// child placeholders will resolve through.
+// loadActiveLazyCellThrough decodes one cell record from celldb for the active
+// generation, with s.activeCellLoader as what the decoded cell's child
+// placeholders will resolve through. Filing the result in the decoded cell
+// cache is loadDecodedCell's job, not this function's.
 //
 // A note on sizing, since this is where the cache is filled. This used to carry
 // a "cold vs resident" pair of distinct-cell counts per collation, presented as
@@ -758,38 +974,5 @@ func (s *Store) loadActiveLazyCell(ctx context.Context, hash []byte) (*cell.Cell
 // cell count per slot is needed again, measure it on ONE named arm and say
 // which.
 func (s *Store) loadActiveLazyCellThrough(ctx context.Context, hash []byte) (*cell.Cell, error) {
-	if loaded, hit, err := s.decodeFromRecordCache(hash, s.activeCellLoader); hit {
-		if err != nil {
-			return nil, err
-		}
-		s.decodedCells.set(activeCellCacheNamespace, hash, loaded)
-		return loaded, nil
-	}
-
-	cells, err := s.acquireActiveCellStore(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer cells.release()
-
-	readStarted := time.Now()
-	raw, closer, err := cells.get(hash)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = closer.Close() }()
-
-	// Timed around the store read alone: the decode below costs the same at
-	// every layer, so including it would blur the bands it is meant to separate.
-	s.lazyCellLoads.observeStoreRead(hash[0], time.Since(readStarted))
-	// The raw record bytes are in hand exactly here and nowhere cheaper: the
-	// arena insert is a copy of them, made before the closer returns them to
-	// pebble.
-	s.recordCache.put(hash, raw)
-	loaded, err := storage.DecodeLazyCellRecordTrusted(hash, raw, s.activeCellLoader)
-	if err != nil {
-		return nil, fmt.Errorf("create lazy cell %x: %w", hash, err)
-	}
-	s.decodedCells.set(activeCellCacheNamespace, hash, loaded)
-	return loaded, nil
+	return s.loadLazyCellRecordThrough(ctx, hash, s.activeCellLoader, s.acquireActiveCellStore)
 }

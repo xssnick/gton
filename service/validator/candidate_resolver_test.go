@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	corestorage "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/gton/service/validator/simplex"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 type retryCandidateProvider struct {
@@ -127,7 +129,10 @@ func newRestoredResolverForTest(
 
 func TestCandidateResolverSingleflightBackoffAndCallerCancellation(t *testing.T) {
 	storage := newRuntimeTestStorage()
-	provider := &retryCandidateProvider{called: make(chan struct{}, 8)}
+	provider := &retryCandidateProvider{
+		called:   make(chan struct{}, 8),
+		finished: make(chan struct{}, 8),
+	}
 	params := simplex.DefaultParams()
 	params.CandidateResolveTimeout = 20 * time.Millisecond
 	params.CandidateResolveTimeoutMultiplier = 2
@@ -157,7 +162,12 @@ func TestCandidateResolverSingleflightBackoffAndCallerCancellation(t *testing.T)
 			t.Fatalf("resolve error = %v, want caller cancellation", err)
 		}
 	}
-	resolver.close()
+	select {
+	case <-provider.finished:
+	case <-time.After(time.Second):
+		t.Fatal("the shared peer request outlived every caller")
+	}
+	waitForCandidateResolveFlight(t, resolver, id, nil)
 
 	deadlines, requests, maxActive := provider.snapshot()
 	if maxActive != 1 {
@@ -178,6 +188,151 @@ func TestCandidateResolverSingleflightBackoffAndCallerCancellation(t *testing.T)
 			t.Fatalf("request %d maximum reply = %d, want %d", i, requests[i].MaximumReplyBytes, 3<<20)
 		}
 	}
+	resolver.close()
+}
+
+func TestCandidateResolverExpiresUnownedFlight(t *testing.T) {
+	provider := &retryCandidateProvider{
+		called:   make(chan struct{}, 1),
+		finished: make(chan struct{}, 1),
+	}
+	params := simplex.DefaultParams()
+	params.TargetRate = time.Millisecond
+	params.MaxLeaderWindowDesync = 1
+	params.CandidateResolveTimeout = time.Second
+	params.CandidateResolveTimeoutCap = 15 * time.Millisecond
+	resolver := newResolverForTest(newRuntimeTestStorage(), provider, 2, params)
+	defer resolver.close()
+
+	id := simplex.CandidateID{Slot: 17, Hash: [32]byte{0x17}}
+	started := time.Now()
+	_, err := resolver.resolve(context.Background(), id)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired resolve error = %v, want context deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("unowned flight lived for %v", elapsed)
+	}
+	select {
+	case <-provider.finished:
+	case <-time.After(time.Second):
+		t.Fatal("expired flight left its peer request running")
+	}
+	waitForCandidateResolveFlight(t, resolver, id, nil)
+}
+
+func TestCandidateResolverFinalizationSharesFiniteFlight(t *testing.T) {
+	provider := &retryCandidateProvider{
+		called:   make(chan struct{}, 2),
+		finished: make(chan struct{}, 2),
+	}
+	params := simplex.DefaultParams()
+	params.TargetRate = time.Millisecond
+	params.MaxLeaderWindowDesync = 1
+	params.CandidateResolveTimeout = time.Second
+	params.CandidateResolveTimeoutCap = 40 * time.Millisecond
+	resolver := newResolverForTest(newRuntimeTestStorage(), provider, 2, params)
+	defer resolver.close()
+
+	id := simplex.CandidateID{Slot: 23, Hash: [32]byte{0x23}}
+	ownedResult := make(chan error, 1)
+	go func() {
+		_, err := resolver.resolveFinalization(context.Background(), id)
+		ownedResult <- err
+	}()
+	select {
+	case <-provider.called:
+	case <-time.After(time.Second):
+		resolver.close()
+		t.Fatal("owned resolve did not start")
+	}
+
+	callerCtx, callerCancel := context.WithCancel(context.Background())
+	callerResult := make(chan error, 1)
+	go func() {
+		_, err := resolver.resolve(callerCtx, id)
+		callerResult <- err
+	}()
+	waitForCandidateResolveOwnership(t, resolver, id, 2, 1)
+	callerCancel()
+	if err := <-callerResult; !errors.Is(err, context.Canceled) {
+		resolver.close()
+		t.Fatalf("ordinary waiter error = %v, want context cancellation", err)
+	}
+	select {
+	case <-provider.finished:
+		t.Fatal("ordinary waiter cancellation stopped finalization-owned work")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	select {
+	case err := <-ownedResult:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("owned resolve epoch error = %v, want context deadline", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("finalization-owned flight outlived its finite epoch")
+	}
+	select {
+	case <-provider.finished:
+	case <-time.After(time.Second):
+		t.Fatal("expired finalization flight left its peer request running")
+	}
+	waitForCandidateResolveFlight(t, resolver, id, nil)
+}
+
+func waitForCandidateResolveFlight(
+	t testing.TB,
+	resolver *candidateResolver,
+	id simplex.CandidateID,
+	want *resolverFlight,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		resolver.mu.Lock()
+		entry := resolver.entries[id]
+		var got *resolverFlight
+		if entry != nil {
+			got = entry.resolve
+		}
+		resolver.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("resolve flight = %p, want %p", got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForCandidateResolveOwnership(
+	t testing.TB,
+	resolver *candidateResolver,
+	id simplex.CandidateID,
+	waiters int,
+	owners int,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		resolver.mu.Lock()
+		entry := resolver.entries[id]
+		if entry != nil && entry.resolve != nil &&
+			entry.resolve.waiters == waiters && entry.resolve.owners == owners {
+			resolver.mu.Unlock()
+
+			return
+		}
+		resolver.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatalf("resolve ownership did not reach waiters=%d owners=%d", waiters, owners)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestCandidateResolverOneNodeRequiresLocalData(t *testing.T) {
@@ -193,6 +348,121 @@ func TestCandidateResolverOneNodeRequiresLocalData(t *testing.T) {
 	deadlines, _, _ := provider.snapshot()
 	if len(deadlines) != 0 {
 		t.Fatalf("one-node resolver made %d network requests", len(deadlines))
+	}
+}
+
+func TestCandidateResolverHandsParsedDAGToOneValidation(t *testing.T) {
+	resolver := newResolverForTest(
+		newRuntimeTestStorage(),
+		&retryCandidateProvider{called: make(chan struct{}, 1)},
+		1,
+		simplex.DefaultParams(),
+	)
+	t.Cleanup(resolver.close)
+	resolver.validateCandidates = true
+
+	root := cell.BeginCell().MustStoreUInt(0xb10c, 32).EndCell()
+	collated := cell.BeginCell().MustStoreUInt(0xc011, 16).EndCell()
+	prepared, err := corestorage.PrepareBlockCandidate(0, -1<<63, 7, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := simplex.CandidateID{Slot: 7, Hash: [32]byte{0x77}}
+	artifact := &CandidateArtifact{
+		Candidate:     simplex.Candidate{ID: id, Block: prepared.ID()},
+		BlockBOC:      prepared.BlockBOC(),
+		preparedBlock: prepared,
+		validationRoots: &candidateValidationRoots{
+			block:    root,
+			collated: []*cell.Cell{collated},
+		},
+	}
+	if err = resolver.stage(artifact, []byte{0x77}); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver.mu.Lock()
+	entry := resolver.entries[id]
+	retained := entry.candidate
+	handoff := entry.validationRoots
+	resolver.mu.Unlock()
+	if artifact.preparedBlock == nil {
+		t.Fatal("staging consumed the caller's prepared cache artifact")
+	}
+	if retained == artifact || retained.preparedBlock != nil {
+		t.Fatal("resolver retained the ephemeral prepared block DAG")
+	}
+	if retained.validationRoots != nil || handoff != artifact.validationRoots {
+		t.Fatal("resolver did not separate the one-shot validation DAG from retained bytes")
+	}
+
+	const readers = 8
+	results := make(chan *CandidateArtifact, readers)
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for range readers {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			candidate, loadErr := resolver.candidate(t.Context(), id)
+			if loadErr != nil {
+				t.Errorf("load candidate: %v", loadErr)
+				return
+			}
+			results <- candidate
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+
+	claimed := 0
+	for candidate := range results {
+		if candidate.validationRoots == nil {
+			continue
+		}
+		claimed++
+		if candidate.validationRoots.block != root || candidate.validationRoots.collated[0] != collated {
+			t.Fatal("validation received cells from another parse")
+		}
+	}
+	if claimed != 1 {
+		t.Fatalf("parsed DAG was claimed %d times, want exactly once", claimed)
+	}
+
+	resolver.mu.Lock()
+	defer resolver.mu.Unlock()
+	if resolver.entries[id].validationRoots != nil || resolver.entries[id].candidate.validationRoots != nil {
+		t.Fatal("resolver retained parsed DAG after the first validation claimed it")
+	}
+}
+
+func TestCandidateResolverObserverDropsParsedDAG(t *testing.T) {
+	resolver := newResolverForTest(
+		newRuntimeTestStorage(),
+		&retryCandidateProvider{called: make(chan struct{}, 1)},
+		1,
+		simplex.DefaultParams(),
+	)
+	t.Cleanup(resolver.close)
+
+	id := simplex.CandidateID{Slot: 8, Hash: [32]byte{0x78}}
+	artifact := &CandidateArtifact{
+		Candidate: simplex.Candidate{ID: id},
+		validationRoots: &candidateValidationRoots{
+			block: cell.BeginCell().EndCell(),
+		},
+	}
+	if err := resolver.stage(artifact, []byte{0x78}); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver.mu.Lock()
+	defer resolver.mu.Unlock()
+	entry := resolver.entries[id]
+	if entry.validationRoots != nil || entry.candidate.validationRoots != nil {
+		t.Fatal("non-voting resolver retained a validation DAG")
 	}
 }
 
@@ -828,7 +1098,7 @@ func TestCandidateResolverResolveSurvivesReleaseAfterFlight(t *testing.T) {
 	entry := resolver.entries[id]
 	entry.notarization = certificate
 	entry.resolve = flight
-	resolver.completeResolveLocked(entry)
+	resolver.completeResolveLocked(id, entry)
 	entry.resolve = flight
 	resolver.releasePayloadLocked(id, entry)
 	resolver.mu.Unlock()
@@ -843,10 +1113,9 @@ func TestCandidateResolverResolveSurvivesReleaseAfterFlight(t *testing.T) {
 }
 
 // A resolve that has the candidate and only lacks its notarization certificate
-// runs until the session closes. Nothing about that wait is a claim on the
-// payload — the certificate is a separate field — so the finalization sweep
-// must still be able to release the bytes, and the flight must still complete
-// from the durable copy afterwards.
+// does not claim the payload. The certificate is a separate field, so the
+// finalization sweep must still be able to release the bytes, and the flight
+// must still complete from the durable copy afterwards.
 func TestCandidateResolverReleasesPayloadUnderAResolveWaitingForItsCertificate(t *testing.T) {
 	storage := newRuntimeTestStorage()
 	provider := &retryCandidateProvider{

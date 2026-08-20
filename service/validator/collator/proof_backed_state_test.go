@@ -58,6 +58,12 @@ func TestPreparedValidationCandidateBuildsTheSuccessorOnTheProvenPredecessor(t *
 	if !prepared.verified.collated.full {
 		t.Fatal("fixture candidate does not carry full collated data")
 	}
+	if prepared.stateRoot != nil || prepared.candidate.State != nil {
+		t.Fatal("preparation applied the state update before config binding")
+	}
+	if err = prepared.bindConfig(t.Context(), req.Masterchain.Config); err != nil {
+		t.Fatalf("bind candidate config without a resident predecessor: %v", err)
+	}
 	if prepared.stateRoot.HashKeyAt(0) != candidate.State.HashKeyAt(0) {
 		t.Fatal("state restored from the proof differs from the collated one")
 	}
@@ -110,13 +116,17 @@ func TestPreparedValidationCandidateBuildsTheSuccessorOnTheProvenPredecessor(t *
 		BlockBOC:     plain.BlockBOC,
 		CollatedData: plain.CollatedData,
 	}
-	if _, err = prepareValidationCandidate(
+	controlPrepared, err := prepareValidationCandidate(
 		t.Context(),
 		controlArtifact,
 		plainReq.CreatedBy,
 		control.Session.Shard.IsMasterchain(),
 		control.Previous,
-	); err == nil {
+	)
+	if err != nil {
+		t.Fatalf("prepare narrowed control before config binding: %v", err)
+	}
+	if err = controlPrepared.bindConfig(t.Context(), plainReq.Masterchain.Config); err == nil {
 		t.Fatal("a narrowed predecessor restored a state without any proof to replace it")
 	}
 }
@@ -149,7 +159,7 @@ func TestCollatedProofAnswersImmediateMessageQueueLookups(t *testing.T) {
 		t.Fatal("fixture delivered no message immediately")
 	}
 
-	collated, err := verifyCollatedData(candidate, req.Header.GenUtime)
+	collated, err := verifyCollatedData(candidate, nil, req.Header.GenUtime)
 	if err != nil {
 		t.Fatalf("decode collated data: %v", err)
 	}

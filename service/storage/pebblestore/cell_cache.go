@@ -106,6 +106,10 @@ type decodedCellCacheEntry struct {
 	ref atomic.Bool
 }
 
+// decodedCellCacheKey is deliberately a plain comparable struct: it is both the
+// cache slot key and the in-flight load key, and keeping it comparable is what
+// lets decodedCellLoadGroup map on it directly instead of encoding it into a
+// string on every cold miss.
 type decodedCellCacheKey struct {
 	generation uint64
 	hash       [32]byte
@@ -242,9 +246,9 @@ func (c *decodedCellCache) getKey(key decodedCellCacheKey) (*cell.Cell, error) {
 	return nil, storage.ErrNotFound
 }
 
-func (c *decodedCellCache) set(generation uint64, hash []byte, loaded *cell.Cell) {
+func (c *decodedCellCache) set(generation uint64, hash []byte, loaded *cell.Cell) *cell.Cell {
 	if c == nil {
-		return
+		return loaded
 	}
 
 	key := newDecodedCellCacheKey(generation, hash)
@@ -257,8 +261,10 @@ func (c *decodedCellCache) set(generation uint64, hash []byte, loaded *cell.Cell
 	base := shard.bucketBase(key.hash)
 	bucket := base / shard.ways
 
-	// Same key already resident: replace in place. The new entry keeps the ref
-	// bit set — it was just written, which counts as use.
+	// Same key already resident: keep and return the canonical object. Replacing
+	// it would let two miss routes publish different *cell.Cell values for the
+	// same content hash, breaking the pointer identity the cache exists to
+	// provide to collation and validation.
 	freeWay := -1
 	for way := 0; way < shard.ways; way++ {
 		resident := shard.slots[base+way].Load()
@@ -269,14 +275,13 @@ func (c *decodedCellCache) set(generation uint64, hash []byte, loaded *cell.Cell
 			continue
 		}
 		if resident.key == key {
-			entry.ref.Store(true)
-			shard.slots[base+way].Store(entry)
-			return
+			resident.ref.Store(true)
+			return resident.cell
 		}
 	}
 	if freeWay >= 0 {
 		shard.slots[base+freeWay].Store(entry)
-		return
+		return loaded
 	}
 
 	// CLOCK victim scan over the full bucket: a set ref bit buys exactly one
@@ -293,12 +298,13 @@ func (c *decodedCellCache) set(generation uint64, hash []byte, loaded *cell.Cell
 		}
 		shard.slots[base+hand].Store(entry)
 		shard.hands[bucket] = uint8((hand + 1) % shard.ways)
-		return
+		return loaded
 	}
 	// Every ref bit was set twice over by concurrent readers while we scanned.
 	// Evict at the hand anyway: this is a cache, not a registry.
 	shard.slots[base+hand].Store(entry)
 	shard.hands[bucket] = uint8((hand + 1) % shard.ways)
+	return loaded
 }
 
 func (c *decodedCellCache) deleteGeneration(generation uint64) {

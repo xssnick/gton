@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -263,7 +262,7 @@ func assertTiedQueueShape(t *testing.T, req ShardRequest, candidate *Candidate, 
 
 	// The predecessor proof must actually prune part of the queue: a proof that
 	// carried the whole trie would verify no matter what the walk does.
-	data, err := verifyCollatedData(candidate, req.Header.GenUtime)
+	data, err := verifyCollatedData(candidate, nil, req.Header.GenUtime)
 	if err != nil {
 		t.Fatalf("decode collated data: %v", err)
 	}
@@ -670,48 +669,21 @@ func queuedPredecessorRequestWith(
 	return req
 }
 
-// TestProcessedQueueTraceSurvivesAnUnparseablePredecessorEntry pins the failure
-// mode nit (b) named: the replay applies a strict validator-side parse to data
-// we inherited rather than authored, and until this test it turned that into a
-// hard BuildShard failure — "produce a block others reject" became "produce
-// nothing", on every slot, forever, because the offending entry stays in the
-// queue precisely while we cannot build.
-//
-// The block must still be produced, and the reason must be recorded rather than
-// swallowed. The second half of the test is the justification: the validator
-// rejects this candidate for the SAME entry through the SAME parse, so failing
-// the collation never saved anyone from a bad block — it only cost the slot.
-func TestProcessedQueueTraceSurvivesAnUnparseablePredecessorEntry(t *testing.T) {
+// TestProcessedQueueTraceRefusesAnUnparseablePredecessorEntry pins acceptance
+// parity: the replay uses the same parse as validation, so a content verdict is
+// already proof that the candidate cannot be accepted. It must stop before the
+// remaining serialization/signing/publication work.
+func TestProcessedQueueTraceRefusesAnUnparseablePredecessorEntry(t *testing.T) {
 	req := unparseableEnvelopeRequest(t)
-	candidate, err := testBuilder().BuildShard(context.Background(), req)
-	if err != nil {
-		t.Fatalf("an unparseable predecessor queue entry killed the collation: %v", err)
+	_, err := testBuilder().BuildShard(context.Background(), req)
+	if err == nil {
+		t.Fatal("an unparseable predecessor queue entry shipped the block")
 	}
-	if candidate.Stats.ProcessedScanTraceError == "" {
-		t.Fatal("the replay stopped short without recording why")
+	if !errors.Is(err, ErrInvalidInput) ||
+		!strings.Contains(err.Error(), "v2 tag without emitted lt or metadata") {
+		t.Fatalf("build error = %v, want the validator-side content verdict", err)
 	}
-	if !strings.Contains(candidate.Stats.ProcessedScanTraceError, "v2 tag without emitted lt or metadata") {
-		t.Fatalf("recorded reason does not name the entry: %s", candidate.Stats.ProcessedScanTraceError)
-	}
-	t.Logf("block produced, trace stopped: %s", candidate.Stats.ProcessedScanTraceError)
-
-	// Verified against the RESIDENT predecessor, where nothing is pruned and a
-	// short proof cannot be the reason for anything.
-	resident := loadPreviousShardState(t, req)
-	verification := shardVerificationRequest(req, candidate)
-	verification.NeighborShardEndLT = req.NeighborShardEndLT
-	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-	verification.Neighbors = append([]Neighbor(nil), req.Neighbors...)
-	for i := range verification.Neighbors {
-		if verification.Neighbors[i].Block.Workchain != address.MasterchainID {
-			verification.Neighbors[i].OutMsgQueueInfo = resident.OutMsgQueueInfo
-		}
-	}
-	err = VerifyShardCandidate(context.Background(), verification)
-	if err == nil || !strings.Contains(err.Error(), "v2 tag without emitted lt or metadata") {
-		t.Fatalf("validator verdict = %v, want the same parse rejection the replay hit", err)
-	}
-	t.Logf("validator reaches the same entry through the same parse: %v", err)
+	t.Logf("collation stopped on the validator-side verdict: %v", err)
 }
 
 // TestProcessedQueueTraceHonoursCancellation covers the one bound this walk is
@@ -746,15 +718,8 @@ func TestProcessedQueueTraceHonoursCancellation(t *testing.T) {
 		t.Fatalf("cancelled walk returned %v, want context.Canceled", err)
 	}
 
-	// And the context is consulted BEFORE the failure is classified, which is
-	// the only thing standing between a cancellation and the swallow. The walk
-	// here fails with a verdict — the msg_envelope_v2 tag on a predecessor
-	// entry — while the context is already cancelled, so a classification that
-	// ran first would record it and return nil, shipping a block from a
-	// collation that was abandoned. The assertion is on identity rather than
-	// errors.Is: the cancellation must come back bare, not wrapped in the scan
-	// error, or it came from the walk's own per-entry check and this proves
-	// nothing about the classification.
+	// Cancellation is still returned bare even when the same walk would otherwise
+	// end in a semantic verdict.
 	verdictCtx, cancelVerdict := context.WithCancel(context.Background())
 	defer cancelVerdict()
 	verdictReq := unparseableEnvelopeRequest(t)
@@ -767,76 +732,16 @@ func TestProcessedQueueTraceHonoursCancellation(t *testing.T) {
 		lt:   requestStartLT(t, verdictReq),
 		hash: processedInfinityHash,
 	}
-	// The control: the same claim over the same queue with a live context is
-	// exactly the swallowed case, so the arm below differs by cancellation and
-	// by nothing else.
-	if err = verdict.traceProcessedQueueValidationClosure(); err != nil {
-		t.Fatalf("control replay over an unparseable entry: %v", err)
+	// Control: with a live context the malformed entry is the returned cause.
+	if err = verdict.traceProcessedQueueValidationClosure(); err == nil ||
+		!strings.Contains(err.Error(), "v2 tag without emitted lt or metadata") {
+		t.Fatalf("control replay error = %v, want the content verdict", err)
 	}
-	if verdict.stats.ProcessedScanTraceError == "" {
-		t.Fatal("the control did not reach the swallow; the fixture lost its verdict")
-	}
-	verdict.stats.ProcessedScanTraceError = ""
 
 	cancelVerdict()
 	err = verdict.traceProcessedQueueValidationClosure()
 	if err != context.Canceled { //nolint:errorlint // identity is the assertion
 		t.Fatalf("a cancelled walk that also met a verdict returned %v, want a bare context.Canceled", err)
-	}
-	if verdict.stats.ProcessedScanTraceError != "" {
-		t.Fatalf("a cancelled collation recorded a shipped short proof: %s",
-			verdict.stats.ProcessedScanTraceError)
-	}
-}
-
-// TestShippableQueueTraceFailureNeedsBothGuards pins the two conditions of the
-// swallow separately, which the end-to-end tests cannot: every failure the walk
-// actually raises about an entry carries both, so removing either guard leaves
-// them green.
-//
-// The rows are the four combinations. Two of them cannot arise from today's
-// walk and are the point: a verdict that does not carry ErrInvalidInput is this
-// node's own machinery failing while holding an entry, and a plain
-// ErrInvalidInput that is not a verdict is a structural complaint from
-// somewhere else on the path — neither is a rejection of predecessor DATA, and
-// the argument for shipping covers only that.
-func TestShippableQueueTraceFailureNeedsBothGuards(t *testing.T) {
-	entryRejection := fmt.Errorf("%w: decode outbound queue envelope ab: bad tag", ErrInvalidInput)
-
-	for _, tc := range []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{
-			name: "a verdict on predecessor data",
-			err:  semanticQueueEntryVerdict{err: entryRejection},
-			want: true,
-		},
-		{
-			name: "a verdict that is not about the input",
-			err:  semanticQueueEntryVerdict{err: errors.New("walk machinery failed while holding the entry")},
-		},
-		{
-			name: "an input rejection that is not a verdict",
-			err:  entryRejection,
-		},
-		{
-			name: "neither",
-			err:  errors.New("augmented dict has special cells in tree structure"),
-		},
-		{
-			name: "a verdict wrapped further up the chain still counts",
-			err: fmt.Errorf("trace predecessor inbound queue scan: %w",
-				semanticQueueEntryVerdict{err: entryRejection}),
-			want: true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := shippableQueueTraceFailure(tc.err); got != tc.want {
-				t.Fatalf("shippableQueueTraceFailure(%v) = %t, want %t", tc.err, got, tc.want)
-			}
-		})
 	}
 }
 
@@ -865,18 +770,9 @@ func prunedPredecessorQueue(t *testing.T, req ShardRequest) *tlb.OutMsgQueueAugD
 	return info.OutQueue
 }
 
-// TestProcessedQueueTraceRefusesToShipOnANonVerdictFailure is the other half of
-// TestProcessedQueueTraceSurvivesAnUnparseablePredecessorEntry, and the two
-// together are the whole rule.
-//
-// Continuing past a replay failure is justified by ONE argument and it covers
-// one class: the validator reaches the same entry through the same parse at the
-// same bound, so a verdict on a predecessor entry has already settled the
-// block's fate and failing here would only trade "produce a block others
-// reject" for "produce nothing". That argument says nothing about a walk that
-// could not open a node. There the collator has learned only that its own proof
-// is short — which is defect 1 exactly, manufactured on purpose instead of by
-// coincidence — so it must not ship.
+// TestProcessedQueueTraceRefusesToShipOnANonVerdictFailure covers the storage /
+// structural side of the same rule. It must preserve the original cause while
+// refusing to ship.
 //
 // The failure staged here is the incident's own error, raised by TraverseExtra
 // on a special cell it must parse to descend, and it is reached before any

@@ -727,7 +727,7 @@ func (e *sessionEndpoint) runConsensusPeerSender(
 ) {
 	defer e.sendWG.Done()
 
-	var lastWarning time.Time
+	var lastFailureLog time.Time
 	for {
 		var message []byte
 		select {
@@ -747,9 +747,13 @@ func (e *sessionEndpoint) runConsensusPeerSender(
 		if ctx.Err() != nil {
 			return
 		}
-		if err != nil && time.Since(lastWarning) >= time.Second {
-			e.warnPeer("send consensus message", peer, err)
-			lastWarning = time.Now()
+		if err != nil && time.Since(lastFailureLog) >= time.Second {
+			e.hub.manager.log.Debug().
+				Err(err).
+				Hex("session_id", e.hub.id[:]).
+				Hex("peer_id", peer[:]).
+				Msg("send consensus message")
+			lastFailureLog = time.Now()
 		}
 	}
 }

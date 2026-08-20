@@ -80,11 +80,14 @@ type collation struct {
 	outDescr            descriptorBatch
 
 	accounts *tlb.ShardAccountsAugDict
-	// pendingEstimate holds the account writes not yet applied to accounts;
-	// they are flushed together before each estimate read.
-	pendingEstimate []cell.AugmentedEntry
-	oldOutQueue     *tlb.OutMsgQueueAugDict
-	outQueue        *tlb.OutMsgQueueAugDict
+	// accountMutationDiff is the exact closure captured by the one final
+	// ShardAccounts bulk write. A destroyed account keeps this nil because its
+	// later individual delete cannot be composed with that receipt without
+	// retaining an intermediate Patricia shape; the post-state closure then uses
+	// the canonical full diff for that rare block.
+	accountMutationDiff *cell.AugmentedDictionaryDiff
+	oldOutQueue         *tlb.OutMsgQueueAugDict
+	outQueue            *tlb.OutMsgQueueAugDict
 	// queuePendingDelete holds out-queue removals not yet applied; they are
 	// flushed together before each root sample and at finish.
 	queuePendingDelete  []*cell.Cell
@@ -100,7 +103,14 @@ type collation struct {
 	dispatchChanged     map[[32]byte]struct{}
 
 	lanes map[[32]byte]*accountLane
-	new   newMessageHeap
+	// accountStorageProofs holds one traced storage-stat proof builder per
+	// initial dictionary hash, shared by every account that binds it. See
+	// sharedAccountStorageProof for why the sharing is what makes the emitted
+	// proof serve all of them.
+	accountStorageProofs map[cell.Hash]*accountStorageProof
+	accountPathRecorder  *accountPathRecorder
+	new                  newMessageHeap
+	prewarmedAccounts    map[prewarmAccountKey]struct{}
 
 	senderGenerated              map[[32]byte]uint32
 	lastDispatchEmitted          map[[32]byte]uint64
@@ -121,6 +131,7 @@ type collation struct {
 	// this pair, so the proof has to be widened to exactly this pair.
 	processedClaim   semanticMessageBound
 	processedClaimed bool
+	localCleanup     *localCleanupFrontier
 	// processedRecords caches the parsed parent ProcessedInfo entries; both
 	// constructors seed it from the parse they already do for processedMinMC.
 	// updateProcessedInfo hands the slice to InsertProcessedUpto and
@@ -184,9 +195,17 @@ func (b *Builder) BuildShard(ctx context.Context, req ShardRequest) (*Candidate,
 	if err := validateCollationRequest(&common); err != nil {
 		return nil, err
 	}
-	return retryUnderSizeLimit(func(narrowing sizeBudgetCap) (*Candidate, error) {
+	candidate, err := retryUnderSizeLimit(func(narrowing sizeBudgetCap) (*Candidate, error) {
 		return b.buildShardAttempt(ctx, req, narrowing)
 	})
+	if err != nil {
+		return candidate, err
+	}
+	if err = sealBuiltCandidate(candidate); err != nil {
+		return nil, err
+	}
+
+	return candidate, nil
 }
 
 func (b *Builder) buildShardAttempt(ctx context.Context, req ShardRequest, narrowing sizeBudgetCap) (*Candidate, error) {
@@ -204,12 +223,20 @@ func (b *Builder) buildShardAttemptPaced(
 		return nil, err
 	}
 	c.pace = pace
+	timer := c.req.assembly.start(CollationStageExecuteExternalMessages)
+	defer func() {
+		timer.stop()
+	}()
 	if err = c.processExternals(); err != nil {
 		return nil, err
 	}
+	timer.stop()
+
+	timer = c.req.assembly.start(CollationStageExecuteInternalMessages)
 	if err = c.processNewMessages(c.blockFull || c.haveUnprocessedDispatchQueue || req.internalsIncomplete()); err != nil {
 		return nil, err
 	}
+	timer.stop()
 
 	return c.finishShard()
 }
@@ -219,6 +246,10 @@ func (b *Builder) prepareShardPhases(
 	req ShardRequest,
 	narrowing sizeBudgetCap,
 ) (*collation, error) {
+	timer := req.assembly.start(CollationStagePrepareState)
+	defer func() {
+		timer.stop()
+	}()
 	c, err := b.prepare(ctx, req)
 	if err != nil {
 		return nil, err
@@ -233,30 +264,49 @@ func (b *Builder) prepareShardPhases(
 	if err = c.limits.addProof(c.dispatchQueue.RootCell()); err != nil {
 		return nil, fmt.Errorf("initial dispatch queue proof: %w", err)
 	}
+	timer.stop()
 
 	// The canonical phase order: cleanup of already-delivered own-queue
 	// entries, dispatch queue, inbound internal messages, then externals and
 	// newly-generated messages.
+	timer = c.req.assembly.start(CollationStageCleanupOutQueue)
 	if err = c.cleanupOutQueue(); err != nil {
 		return nil, err
 	}
+	timer.stop()
+
+	timer = c.req.assembly.start(CollationStageExecuteInternalMessages)
 	if err = c.processDispatchQueue(); err != nil {
 		return nil, err
 	}
 	if err = c.processInternals(); err != nil {
 		return nil, err
 	}
+	timer.stop()
 
 	return c, nil
 }
 
 func (c *collation) finishShard() (*Candidate, error) {
+	timer := c.req.assembly.start(CollationStageProcessedInfo)
+	defer func() {
+		timer.stop()
+	}()
 	if err := c.updateProcessedInfo(); err != nil {
 		return nil, err
 	}
+	timer.stop()
+	timer = c.req.assembly.start(CollationStageClaimedLocalCleanup)
+	if err := c.cleanupClaimedLocalDequeues(); err != nil {
+		return nil, err
+	}
+	timer.stop()
+
+	timer = c.req.assembly.start(CollationStageFinalizeAccounts)
 	if err := c.finishAccounts(); err != nil {
 		return nil, err
 	}
+	timer.stop()
 
 	return c.finish()
 }
@@ -465,6 +515,7 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 		fullCollated:          fullCollated,
 		collatedProofEstimate: collatedProofEstimate,
 	}
+	c.prepareAccountPathRecorder()
 	if fullCollated {
 		if err = c.prepareFullCollatedProofs(); err != nil {
 			return nil, err
@@ -735,6 +786,11 @@ func parseProofExact(dst any, root *cell.Cell) error {
 }
 
 func (c *collation) finish() (*Candidate, error) {
+	timer := c.req.assembly.start(CollationStageFlushBatches)
+	defer func() {
+		timer.stop()
+	}()
+
 	if err := c.ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -756,6 +812,8 @@ func (c *collation) finish() (*Candidate, error) {
 	if c.maxLT-c.header.StartLt > c.hardLTDelta {
 		return nil, fmt.Errorf("%w: block exceeds the logical time limit", ErrInvalidInput)
 	}
+	timer.stop()
+	timer = c.req.assembly.start(CollationStageBuildStateUpdate)
 
 	parts, err := c.buildStateAndBlockParts()
 	if err != nil {
@@ -776,6 +834,8 @@ func (c *collation) finish() (*Candidate, error) {
 	if err = c.limits.addProof(parts.state); err != nil {
 		return nil, fmt.Errorf("final state proof: %w", err)
 	}
+	timer.stop()
+	timer = c.req.assembly.start(CollationStageValidationClosure)
 	// The validation-closure shims run here, after the state update exists, and
 	// the position is the whole point. The update's source graph descends only
 	// through cells the read set recorded, so a read taken before this line ends
@@ -794,6 +854,8 @@ func (c *collation) finish() (*Candidate, error) {
 	if err = c.ctx.Err(); err != nil {
 		return nil, err
 	}
+	timer.stop()
+	timer = c.req.assembly.start(CollationStageSerializeBlock)
 	var blockRoot *cell.Cell
 	if parts.extraRoot == nil {
 		blockRoot, err = tlb.ToCell(&tlb.Block{
@@ -826,6 +888,9 @@ func (c *collation) finish() (*Candidate, error) {
 	if err = c.ctx.Err(); err != nil {
 		return nil, err
 	}
+
+	timer.stop()
+	timer = c.req.assembly.start(CollationStageSerializeCandidate)
 
 	// The two serialization tails are independent and both expensive, so they
 	// overlap. The collated branch only reads the read set, which stops
@@ -869,6 +934,9 @@ func (c *collation) finish() (*Candidate, error) {
 	if collatedErr != nil {
 		return nil, collatedErr
 	}
+	timer.stop()
+	timer = c.req.assembly.start(CollationStageFinalizeCandidate)
+
 	c.limits.collatedData = uint64(len(collatedData))
 	collatedFileHash := sha256.Sum256(collatedData)
 	rootHash := blockRoot.HashKey()
@@ -923,7 +991,7 @@ func (c *collation) finish() (*Candidate, error) {
 	c.stats.Transactions = uint32(c.limits.transactions)
 	c.stats.GasUsed = c.limits.gas
 	c.stats.Load = max(c.peakLoad, c.limits.classify())
-	return &Candidate{
+	candidate := &Candidate{
 		ID: ton.BlockIDExt{
 			Workchain: parts.header.Shard.WorkchainID,
 			Shard:     int64(parts.header.Shard.GetShardID()),
@@ -952,13 +1020,20 @@ func (c *collation) finish() (*Candidate, error) {
 		// predecessor, and a re-validation of a predecessor this very build read.
 		// The reference does strictly less at the same point — ChainState::apply
 		// deserializes lazily and applies, and checks nothing about the parent.
-		built: newBuiltCandidate(
-			blockRoot,
-			parts.header.StartLt,
-			parts.header.GenUtime,
-			c.builtPredecessors()...,
-		),
-	}, nil
+	}
+	// finish() creates the private derivation capsule, but the complete Builder
+	// entry point seals it only after wrappers have written their final Stats.
+	candidate.built = newBuiltCandidate(
+		candidate.ID,
+		blockRoot,
+		parts.state,
+		parts.stateUpdate,
+		parts.header.StartLt,
+		parts.header.GenUtime,
+		c.builtPredecessors()...,
+	)
+
+	return candidate, nil
 }
 
 // builtPredecessors names the predecessor states this collation's Merkle update
@@ -1116,6 +1191,7 @@ func (c *collation) buildCollatedRoots(consensusExtra, stateUpdate *cell.Cell) (
 	roots = append(roots, c.fullCollatedProofs...)
 
 	var storageProofs map[cell.Hash]*cell.Cell
+	var storageBuilders map[cell.Hash]*cell.MerkleProofBuilder
 	for _, lane := range c.lanes {
 		if lane.transactions == nil || lane.initialStorageStat == nil {
 			continue
@@ -1131,6 +1207,17 @@ func (c *collation) buildCollatedRoots(consensusExtra, stateUpdate *cell.Cell) (
 		// only reads its read set, so re-creating the proof here yields the
 		// union of every read the account made.
 		//
+		// It also has to cover every OTHER account bound to the same dictionary,
+		// for the same reason one step out: the collated data carries one proof
+		// per dictionary hash, not per account, and each of those accounts
+		// replays its own walk against it. That union is not assembled here —
+		// it is already true of the builder, because sharedAccountStorageProof
+		// hands every such account the same recorder. All this loop must do is
+		// emit each distinct builder once; keying the emitted map by dictionary
+		// hash while creating the proof per lane is exactly the defect this
+		// guards against, since the last lane's assignment would win and every
+		// other account's branches would reach the validator pruned.
+		//
 		// A missing builder is an internal invariant break, not a case to fall
 		// back on: a lane gets its storage stat and its builder in the same
 		// branch, and full collated data is exactly the mode that sets both. The
@@ -1141,15 +1228,40 @@ func (c *collation) buildCollatedRoots(consensusExtra, stateUpdate *cell.Cell) (
 		if lane.storageProof == nil {
 			return nil, fmt.Errorf("collated account storage proof: account %x has a storage stat without a proof builder", lane.key)
 		}
+		// An untouched builder produces an all-pruned proof. Shipping that proof
+		// is not merely useless: the validator binds it as the account storage
+		// dictionary and then cannot serve the first lookup. The reference omits
+		// the proof when the transaction made no storage-stat updates. Any real
+		// dictionary access starts at the root, so its presence in the read set is
+		// the equivalent signal here.
+		if !accountStorageProofUsed(lane.storageProof) {
+			continue
+		}
+		hash := lane.initialStorageStat.HashKey()
+		if shared, seen := storageBuilders[hash]; seen {
+			// Two lanes on one dictionary that do not share a recorder cannot be
+			// reconciled at this point — only one proof can be shipped for the
+			// hash — so this is raised rather than papered over.
+			if shared != lane.storageProof {
+				return nil, fmt.Errorf(
+					"collated account storage proof: account %x does not share the traced builder of storage dict %x",
+					lane.key,
+					hash,
+				)
+			}
+			continue
+		}
 		proof, err := lane.storageProof.CreateProof()
 		if err != nil {
-			return nil, fmt.Errorf("build account storage stat proof %x: %w", lane.initialStorageStat.HashKey(), err)
+			return nil, fmt.Errorf("build account storage stat proof %x: %w", hash, err)
 		}
 		proof = wrapAccountStorageProof(proof)
 		if storageProofs == nil {
 			storageProofs = make(map[cell.Hash]*cell.Cell)
+			storageBuilders = make(map[cell.Hash]*cell.MerkleProofBuilder)
 		}
-		storageProofs[lane.initialStorageStat.HashKey()] = proof
+		storageProofs[hash] = proof
+		storageBuilders[hash] = lane.storageProof
 	}
 	hashes := make([]cell.Hash, 0, len(storageProofs))
 	for hash := range storageProofs {
@@ -1231,7 +1343,7 @@ func (c *collation) fullCollatedQueueScan() *FullCollatedQueueScan {
 }
 
 // trackAccountStorageProof charges the account's storage-stat proof to the
-// collated size estimate, once, on the account's first transaction.
+// collated size estimate once its transactions first use the dictionary.
 //
 // The charged size is a FLOOR, not the final one: buildCollatedRoots emits the
 // proof re-created from the fully traced builder, which covers every dictionary
@@ -1249,27 +1361,56 @@ func (c *collation) fullCollatedQueueScan() *FullCollatedQueueScan {
 // own read set into the estimator would track the growth exactly, but it would
 // push an already conservative estimate further up and tighten admission for
 // every full-collated block, buying accuracy the hard check already provides.
+//
+// Accounts sharing an initial dictionary share the recorder and are emitted as
+// one proof, so what is charged is the growth this account's first transaction
+// added to that one proof, not a second copy of it. Charging each account the
+// whole proof would count bytes the block never carries — over-estimating, so
+// never unsafe, but the over-count is the whole proof per extra account and it
+// tightens admission against bytes that do not exist. The floor-versus-final
+// relationship above is unchanged by the sharing: what is charged is still the
+// proof as it stood at a first transaction (the last such account's), and what
+// is emitted is still the union at the end of collation.
 func (c *collation) trackAccountStorageProof(lane *accountLane) error {
 	if !c.fullCollated || lane.initialStorageStat == nil || lane.initialStorageProof != nil {
 		return nil
 	}
+	if !accountStorageProofUsed(lane.storageProof) {
+		return nil
+	}
+	hash := lane.initialStorageStat.HashKey()
 	proof, err := lane.storageProof.CreateProof()
 	if err != nil {
-		return fmt.Errorf("build account storage stat proof %x: %w", lane.initialStorageStat.HashKey(), err)
+		return fmt.Errorf("build account storage stat proof %x: %w", hash, err)
 	}
 	proof = wrapAccountStorageProof(proof)
 	boc, err := proof.ToBOCWithOptionsErr(cell.BOCSerializeOptions{WithCRC32C: true})
 	if err != nil {
 		return fmt.Errorf("estimate account storage stat proof: %w", err)
 	}
-	if math.MaxUint64-c.collatedFixedEstimate < uint64(len(boc)) {
+	lane.initialStorageProof = proof
+
+	charge := uint64(len(boc))
+	if shared := c.accountStorageProofs[hash]; shared != nil {
+		if charge <= shared.charged {
+			// This account read nothing the dictionary was not already charged
+			// for, so the emitted proof has not grown.
+			return nil
+		}
+		charge, shared.charged = charge-shared.charged, charge
+	}
+	if math.MaxUint64-c.collatedFixedEstimate < charge {
 		c.collatedFixedEstimate = math.MaxUint64
 	} else {
-		c.collatedFixedEstimate += uint64(len(boc))
+		c.collatedFixedEstimate += charge
 	}
-	lane.initialStorageProof = proof
 	c.updateCollatedEstimate()
 	return nil
+}
+
+func accountStorageProofUsed(builder *cell.MerkleProofBuilder) bool {
+	_, used := builder.ReadSet().Contains(builder.OriginalRoot().HashKey())
+	return used
 }
 
 func wrapAccountStorageProof(proof *cell.Cell) *cell.Cell {

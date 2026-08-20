@@ -291,6 +291,7 @@ func (j *journal) SaveCertificate(c *simplex.Certificate, done func(error)) {
 	key := voteKey(j.namespace, simplex.VoteRecordKey(hash))
 	value := simplex.EncodeCertificateRecord(c)
 	err := j.store.submitSession(j.namespace, writeRequest{
+		durability: restartRecoverable,
 		apply: func(batch *pebble.Batch) error {
 			summary, err := ensureSession(batch, j.session, j.namespace)
 			if err != nil {
@@ -340,6 +341,7 @@ func (j *journal) SaveFirstNonAnnouncedWindow(window uint32, done func(error)) {
 
 	value := simplex.EncodePoolStateRecord(window)
 	err := j.store.submitSession(j.namespace, writeRequest{
+		durability: restartRecoverable,
 		apply: func(batch *pebble.Batch) error {
 			summary, err := ensureSession(batch, j.session, j.namespace)
 			if err != nil {

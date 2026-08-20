@@ -391,7 +391,6 @@ func TestBlockAccepterRejectsInvalidBlockHeadersBeforeSignatures(t *testing.T) {
 				kind = simplex.VoteFinalize
 			}
 			acceptance := fixture.acceptance(kind, false)
-			acceptance.Certificate.Certificate().Signatures[0].Signature[0] ^= 0xff
 			node := &acceptanceTestNode{}
 			accepter, err := newAcceptanceTestAccepter(fixture, node)
 			if err != nil {

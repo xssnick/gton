@@ -906,7 +906,15 @@ func sendFastFECToPeer(
 		if err != nil {
 			return fmt.Errorf("build FEC part %d: %w", seqno, err)
 		}
-		if err = peer.SendCustomMessage(sendCtx, part.Full); err != nil {
+		if prepared, ok := peer.(overlay.PreparedBroadcastPeer); ok {
+			err = prepared.SendPreparedCustomMessage(sendCtx, part.FullWire)
+		} else {
+			// BroadcastPeer is a released extension point; production transports
+			// implement the prepared path, while external implementations retain
+			// source compatibility with the original interface.
+			err = peer.SendCustomMessage(sendCtx, part.Full)
+		}
+		if err != nil {
 			return fmt.Errorf("send FEC part %d to peer %x: %w", seqno, peer.ID(), err)
 		}
 	}

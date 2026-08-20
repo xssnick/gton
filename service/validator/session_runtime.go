@@ -3,6 +3,7 @@ package validator
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -93,8 +94,30 @@ type RuntimeOptions struct {
 	Tracer   simplex.Tracer
 	Observer ValidationObserver
 	Logger   *zerolog.Logger
+	// CaptureDir is the directory under the node data dir where a candidate this
+	// session refuses with a TVM/semantic replay error is dumped for offline
+	// replay. Empty disables capture, which is the case for every test runtime
+	// that does not set it.
+	CaptureDir string
 
 	observeConsensusProgress consensusProgressObserver
+}
+
+// newSessionFailedCandidateCapturer builds the refused-candidate capturer for a
+// session, stamped with its consensus identity. It returns nil when no capture
+// directory is configured, and every capture call is a no-op on a nil capturer.
+func newSessionFailedCandidateCapturer(config SessionConfig, options RuntimeOptions) *failedCandidateCapturer {
+	capturer := newFailedCandidateCapturer(options.CaptureDir, options.Observer, options.Logger)
+	if capturer == nil {
+		return nil
+	}
+	sessionID := hex.EncodeToString(config.SessionID[:])
+	var namespace string
+	if ns, err := config.StorageID.Namespace(); err == nil {
+		namespace = hex.EncodeToString(ns[:])
+	}
+
+	return capturer.withIdentity(sessionID, namespace)
 }
 
 type sessionRuntimePhase uint8
@@ -120,6 +143,7 @@ type sessionRuntime struct {
 	states     *stateResolver
 	engine     *simplex.Engine
 	runner     *simplex.Runner
+	capturer   *failedCandidateCapturer
 
 	lifecycleMu sync.Mutex
 	phase       sessionRuntimePhase
@@ -269,17 +293,18 @@ func prepareSessionRuntime(
 		return nil, err
 	}
 	resolver, err := newCandidateResolver(candidateResolverOptions{
-		Session:    config.StorageID,
-		SessionID:  config.SessionID,
-		Storage:    options.Storage,
-		Provider:   options.Network,
-		Codec:      codec,
-		Validators: validators,
-		PeerCount:  len(config.OverlayMembers),
-		Limits:     options.Limits,
-		Params:     params,
-		Stored:     stored,
-		Bootstrap:  bootstrap,
+		Session:            config.StorageID,
+		SessionID:          config.SessionID,
+		Storage:            options.Storage,
+		Provider:           options.Network,
+		Codec:              codec,
+		Validators:         validators,
+		PeerCount:          len(config.OverlayMembers),
+		ValidateCandidates: config.Identity.Validator != nil,
+		Limits:             options.Limits,
+		Params:             params,
+		Stored:             stored,
+		Bootstrap:          bootstrap,
 	})
 	if err != nil {
 		return nil, err
@@ -295,6 +320,7 @@ func prepareSessionRuntime(
 		metrics:                options.Observer,
 		log:                    options.Logger,
 		candidates:             resolver,
+		capturer:               newSessionFailedCandidateCapturer(config, options),
 		state:                  cloneSessionState(initial),
 		fatal:                  make(chan error, 1),
 		phase:                  sessionRuntimePrepared,
@@ -1088,6 +1114,13 @@ func (r *sessionRuntime) validateCandidateCore(
 		r.observeValidationStage(chain, ValidationStageWaitValidAfter, stageStarted)
 
 		return decisionDuration, err
+	}
+	// A semantic/TVM replay disagreement is dumped for offline replay before the
+	// error is classified below. This is the only place the candidate, its
+	// collated proofs and the resolved parent are all in hand; a not-ready or
+	// cancelled abstain is benign and is filtered out inside the capturer.
+	if r.capturer != nil && isCapturableValidationFailure(validateErr) {
+		r.capturer.capture(candidate, artifact, parent.State, chain, validateErr)
 	}
 	if errors.Is(validateErr, ErrCandidateRejected) {
 		r.reportSelfRejection(candidate, validateErr)

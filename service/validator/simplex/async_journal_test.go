@@ -125,10 +125,10 @@ func TestVoteSaveFailureFatalOnCompletion(t *testing.T) {
 	requireEqual(t, env.trans.countVotes(VoteNotarize), 0, "vote never sent")
 }
 
-// TestCertificateAppliedOnlyAfterDurable: a certificate is stored, gossiped
-// and announced downstream only after its record became durable; the saving
+// TestCertificateAppliedOnlyAfterPersistenceCallback: a certificate is stored,
+// gossiped and announced downstream only after its write callback; the saving
 // flag suppresses duplicates in flight.
-func TestCertificateAppliedOnlyAfterDurable(t *testing.T) {
+func TestCertificateAppliedOnlyAfterPersistenceCallback(t *testing.T) {
 	var dj *deferredJournal
 	env := newTestEnv(t, withLocal(1), func(env *testEnv, cfg *Config) {
 		dj = newDeferredJournal(env.journal, "cert")
@@ -141,17 +141,17 @@ func TestCertificateAppliedOnlyAfterDurable(t *testing.T) {
 	env.deliverVote(2, NotarizeVote(id))
 	env.deliverVote(3, NotarizeVote(id))
 
-	requireEqual(t, len(env.hooks.notarized), 0, "no notarization before durability")
-	requireEqual(t, len(env.trans.gossips), 0, "no gossip before durability")
-	requireEqual(t, env.eng.slots.at(0).notarCert == nil, true, "no stored cert before durability")
+	requireEqual(t, len(env.hooks.notarized), 0, "no notarization before callback")
+	requireEqual(t, len(env.trans.gossips), 0, "no gossip before callback")
+	requireEqual(t, env.eng.slots.at(0).notarCert == nil, true, "no stored cert before callback")
 
 	// A network copy of the same certificate is ignored while the save runs.
 	env.eng.HandleMessage(peer(2), 2, env.buildCert(NotarizeVote(id), 0, 2, 3).Serialize())
 	requireEqual(t, len(dj.pending), 1, "duplicate did not start a second save")
 
 	dj.releaseAt(t, 0)
-	requireEqual(t, len(env.hooks.notarized), 1, "notarization after durability")
-	requireEqual(t, len(env.trans.gossips), 1, "gossip after durability")
+	requireEqual(t, len(env.hooks.notarized), 1, "notarization after callback")
+	requireEqual(t, len(env.trans.gossips), 1, "gossip after callback")
 	env.requireNoFatal()
 }
 
@@ -188,10 +188,9 @@ func TestCertificateObsoletedByFinalizationInFlight(t *testing.T) {
 	env.requireNoFatal()
 }
 
-// TestWindowAnnouncesWaitForDurabilityAndStayOrdered: consensus windows are
-// announced only after their pool-state record is durable, and always in
-// window order even when journal completions invert.
-func TestWindowAnnouncesWaitForDurabilityAndStayOrdered(t *testing.T) {
+// TestWindowAnnouncesDoNotWaitForPoolState: consensus consumers start work in
+// window order while the restart cursor is still being written.
+func TestWindowAnnouncesDoNotWaitForPoolState(t *testing.T) {
 	var dj *deferredJournal
 	env := newTestEnv(t, withLocal(0), func(env *testEnv, cfg *Config) {
 		dj = newDeferredJournal(env.journal, "pool")
@@ -199,34 +198,51 @@ func TestWindowAnnouncesWaitForDurabilityAndStayOrdered(t *testing.T) {
 	})
 	env.start()
 
-	// Window 0 (ours) is pending on its record.
-	requireEqual(t, len(env.hooks.windows), 0, "no announce before durability")
-	requireEqual(t, env.eng.voter.alarmArmed, false, "no voter timers before announce")
+	// Window 0 (ours) is visible even though its completion is held back.
+	requireEqual(t, len(env.hooks.windows), 1, "window announced before storage callback")
+	requireEqual(t, env.eng.voter.alarmArmed, true, "voter timers start with announcement")
 
 	// Settle slots 0..3 with notarization certificates: window 1 queues too.
-	parent := Genesis()
 	for s := uint32(0); s < 4; s++ {
 		id := candID(s, byte(0x50+s))
-		_ = parent
 		env.eng.HandleMessage(peer(2), 2, env.buildCert(NotarizeVote(id), 0, 2, 3).Serialize())
-		parent = Parent(id)
 	}
 	requireEqual(t, len(dj.pending), 2, "two window records in flight")
-	requireEqual(t, len(env.hooks.windows), 0, "still nothing announced")
-
-	// Window 1's record completes first: order must hold, nothing fires.
-	dj.releaseAt(t, 1)
-	requireEqual(t, len(env.hooks.windows), 0, "younger window waits for the older")
-
-	// Window 0's record completes: both announce, in order.
-	dj.releaseAt(t, 0)
-	requireEqual(t, len(env.hooks.windows), 2, "durable windows announced")
+	requireEqual(t, len(env.hooks.windows), 2, "both windows announced")
 	requireEqual(t, env.hooks.windows[0].StartSlot, uint32(0), "window 0 first")
 	requireEqual(t, env.hooks.windows[0].LocalLeader, true, "window 0 is local")
 	requireEqual(t, env.hooks.windows[1].StartSlot, uint32(4), "window 1 second")
 	requireEqual(t, env.hooks.windows[1].LocalLeader, false, "window 1 is remote")
-	requireEqual(t, env.eng.voter.currentWindow, uint32(1), "window 1 observed after window 0")
+	requireEqual(t, env.eng.voter.currentWindow, uint32(1), "window 1 observed immediately")
+
+	// Inverted storage completions do not reorder or repeat already delivered
+	// events.
+	dj.releaseAt(t, 1)
+	requireEqual(t, len(env.hooks.windows), 2, "completion does not announce")
+	dj.releaseAt(t, 0)
+	requireEqual(t, len(env.hooks.windows), 2, "older completion does not announce")
 	env.requireNoFatal()
+}
+
+func TestWindowPoolStateFailureIsFatalAfterAnnouncement(t *testing.T) {
+	var dj *deferredJournal
+	env := newTestEnv(t, withLocal(0), func(env *testEnv, cfg *Config) {
+		dj = newDeferredJournal(env.journal, "pool")
+		cfg.Journal = dj
+	})
+	env.journal.OnBeforeWrite(func(kind string) error {
+		if kind == "pool" {
+			return errWriteInjected
+		}
+
+		return nil
+	})
+	env.start()
+
+	requireEqual(t, len(env.hooks.windows), 1, "window starts independently")
+	requireEqual(t, len(env.hooks.fatals), 0, "failure waits for callback")
+	dj.releaseAt(t, 0)
+	requireEqual(t, len(env.hooks.fatals), 1, "pool-state failure stops session")
 }
 
 // TestVotePayloadCache: the memoized dataToSign payload is always identical to

@@ -6,8 +6,6 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"math"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -21,68 +19,6 @@ import (
 	"github.com/xssnick/gton/service/validator/groups"
 	"github.com/xssnick/gton/service/validator/simplex"
 )
-
-const (
-	collatorCrashHelperEnv = "GTON_COLLATOR_STORE_CRASH_HELPER"
-	collatorCrashDirEnv    = "GTON_COLLATOR_STORE_CRASH_DIR"
-)
-
-func TestCollatorDurabilityWithoutClose(t *testing.T) {
-	if os.Getenv(collatorCrashHelperEnv) == "1" {
-		runCollatorCrashHelper(t, os.Getenv(collatorCrashDirEnv))
-		os.Exit(0)
-	}
-
-	dir := t.TempDir()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCollatorDurabilityWithoutClose$", "-test.count=1")
-	cmd.Env = append(os.Environ(), collatorCrashHelperEnv+"=1", collatorCrashDirEnv+"="+dir)
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() != nil {
-		t.Fatalf("collator crash helper timed out: %v", ctx.Err())
-	}
-	if err != nil {
-		t.Fatalf("collator crash helper: %v\n%s", err, output)
-	}
-
-	session := testCollatorSessionRecord(1)
-	candidate := testDelegatedCollatorCandidate(t, session, session.Update.CurrentWindowStart, session.Update.CurrentWindowStart, 1)
-	store := openTestStore(t, dir)
-	defer closeTestStore(t, store)
-
-	gotSession, err := store.Collator().Session(context.Background(), session.Session.ID)
-	if err != nil {
-		t.Fatalf("session after unclean exit: %v", err)
-	}
-	if !reflect.DeepEqual(gotSession, session) {
-		t.Fatalf("session after unclean exit = %#v, want %#v", gotSession, session)
-	}
-
-	gotCandidate, err := store.Collator().Candidate(context.Background(), candidate.WindowID, candidate.ID.Slot)
-	if err != nil {
-		t.Fatalf("candidate after unclean exit: %v", err)
-	}
-	if !reflect.DeepEqual(gotCandidate, candidate) {
-		t.Fatalf("candidate after unclean exit = %#v, want %#v", gotCandidate, candidate)
-	}
-}
-
-func runCollatorCrashHelper(t *testing.T, dir string) {
-	t.Helper()
-	if dir == "" {
-		t.Fatal("collator crash helper database directory is empty")
-	}
-
-	session := testCollatorSessionRecord(1)
-	candidate := testDelegatedCollatorCandidate(t, session, session.Update.CurrentWindowStart, session.Update.CurrentWindowStart, 1)
-	store := openTestStore(t, dir)
-	awaitTestSave(t, func(done func(error)) {
-		store.Collator().SaveSession(context.Background(), session, done)
-	})
-	awaitTestSave(t, func(done func(error)) { store.Collator().SaveCandidate(candidate, done) })
-	waitForNoOutstanding(t, store)
-}
 
 func TestCollatorStableViewsKeyspaceCodecsAndOwnership(t *testing.T) {
 	store := openTestStore(t, t.TempDir())

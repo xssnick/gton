@@ -2,6 +2,7 @@ package collator
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 	"time"
 
@@ -10,10 +11,13 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 
 	"github.com/xssnick/gton/service/validator/msgpool"
+	"github.com/xssnick/gton/service/validator/simplex"
 )
 
 func TestBuildShardWithReadyExternalsDrainsAlreadyAdmittedMessages(t *testing.T) {
 	req, pool, stream := readyExternalFixture(t, externalAcceptCode(t), 1)
+	var assembly candidateAssemblyDurations
+	req.assembly = &assembly
 	addReadyExternal(t, pool, readyExternalAddress(), 1)
 
 	candidate, _, err := testBuilder().buildShardWithReadyExternals(
@@ -34,6 +38,7 @@ func TestBuildShardWithReadyExternalsDrainsAlreadyAdmittedMessages(t *testing.T)
 	if candidate.Stats.ExternalStop != ExternalStopReadyDrained || candidate.Stats.ExternalWait != 0 {
 		t.Fatalf("unexpected ready stop: %+v", candidate.Stats)
 	}
+	requireCandidateAssemblyStages(t, &assembly)
 }
 
 func TestBuildShardWithReadyExternalsConsumesAdmissionsUntilSlotBoundary(t *testing.T) {
@@ -110,6 +115,8 @@ func TestBuildShardWithReadyExternalsSharesAttemptBudgetAcrossBatches(t *testing
 
 func TestBuildMasterWithReadyExternalsUsesOnlyStartSnapshot(t *testing.T) {
 	fixture := newMasterBuildFixture(t, false)
+	var assembly candidateAssemblyDurations
+	fixture.request.assembly = &assembly
 	pool := msgpool.New(msgpool.Config{})
 	t.Cleanup(pool.Close)
 	dst := address.NewAddress(0, 0xff, fixture.configAddress)
@@ -139,6 +146,112 @@ func TestBuildMasterWithReadyExternalsUsesOnlyStartSnapshot(t *testing.T) {
 	}
 	if candidate.Stats.ExternalStop != ExternalStopReadyDrained || candidate.Stats.ExternalWait != 0 {
 		t.Fatalf("masterchain followed later admissions: %+v", candidate.Stats)
+	}
+	requireCandidateAssemblyStages(t, &assembly)
+}
+
+func TestReadyExternalCandidateSignsAfterFinalStats(t *testing.T) {
+	runtime := newRuntimeFixture(t, 1, 1, nil, nil, nil)
+	defer runtime.close(t)
+	baseSession, _ := runtime.session(0x76, 1, 0, time.Now())
+
+	sign := func(t *testing.T, candidate *Candidate) {
+		t.Helper()
+		if candidate.Stats.ExternalBatches == 0 || candidate.Stats.ExternalStop == ExternalStopUnknown {
+			t.Fatalf("candidate was not decorated with final external stats: %+v", candidate.Stats)
+		}
+
+		session := baseSession
+		session.Shard.Workchain = candidate.ID.Workchain
+		session.Shard.Shard = candidate.ID.Shard
+		window := productionWindow{
+			ID:         WindowID{SessionID: session.ID, StartSlot: 0},
+			Leader:     0,
+			Authority:  CandidateAuthoritySelf,
+			SelfSigner: &runtimeCountingSigner{private: runtime.leaderPriv},
+		}
+		if _, err := runtime.service.signArtifact(
+			session,
+			window,
+			0,
+			simplex.Genesis(),
+			candidate,
+		); err != nil {
+			t.Fatalf("sign ready-external candidate with final stats: %v", err)
+		}
+
+		candidate.Stats.ExternalBatches++
+		if _, err := runtime.service.signArtifact(
+			session,
+			window,
+			0,
+			simplex.Genesis(),
+			candidate,
+		); !errors.Is(err, ErrCandidateConflict) {
+			t.Fatalf("candidate mutation error = %v, want %v", err, ErrCandidateConflict)
+		}
+	}
+
+	t.Run("shardchain", func(t *testing.T) {
+		req, pool, stream := readyExternalFixture(t, externalAcceptCode(t), 1)
+		req.CreatedBy = baseSession.Validators[0].PublicKey
+		addReadyExternal(t, pool, readyExternalAddress(), 1)
+
+		candidate, _, err := testBuilder().buildShardWithReadyExternals(
+			t.Context(),
+			req,
+			stream,
+			time.Time{},
+			time.Time{},
+			1,
+			time.Time{},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sign(t, candidate)
+	})
+
+	t.Run("masterchain", func(t *testing.T) {
+		fixture := newMasterBuildFixture(t, false)
+		fixture.request.CreatedBy = baseSession.Validators[0].PublicKey
+		pool := msgpool.New(msgpool.Config{})
+		t.Cleanup(pool.Close)
+		dst := address.NewAddress(0, 0xff, fixture.configAddress)
+		addReadyExternal(t, pool, dst, 1)
+		stream, err := pool.OpenExternalSnapshot(
+			msgpool.ShardIdent{Workchain: address.MasterchainID, Shard: msgpool.ShardAll},
+			1,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = stream.Close() })
+
+		candidate, _, err := testBuilder().buildMasterWithReadyExternals(
+			t.Context(),
+			fixture.request,
+			stream,
+			time.Time{},
+			1,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sign(t, candidate)
+	})
+}
+
+func requireCandidateAssemblyStages(t *testing.T, durations *candidateAssemblyDurations) {
+	t.Helper()
+
+	for _, stage := range candidateAssemblyStages {
+		if durations[stage] <= 0 {
+			t.Fatalf("candidate assembly stage %d was not measured", stage)
+		}
+	}
+	if durations[CollationStageWaitExternalMessages] != 0 {
+		t.Fatal("external wait leaked into candidate assembly durations")
 	}
 }
 

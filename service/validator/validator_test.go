@@ -42,6 +42,15 @@ type validatorTestCollator struct {
 	closeCalls int
 }
 
+type validatorTestMasterchainHead struct {
+	block ton.BlockIDExt
+	err   error
+}
+
+func (h *validatorTestMasterchainHead) SeenMasterchainBlock() (ton.BlockIDExt, error) {
+	return h.block, h.err
+}
+
 func (*validatorTestCollator) CollatorID() [32]byte { return [32]byte{1} }
 
 func (c *validatorTestCollator) Start(context.Context) error {
@@ -797,6 +806,46 @@ func TestServiceOwnsLocalCollatorLifecycle(t *testing.T) {
 	localCollator.mu.Unlock()
 	if !closed {
 		t.Fatal("validator close did not stop the local collator")
+	}
+	options.Runtime.Close()
+}
+
+func TestStartDefersRecoveredConsensusServicesDuringCatchup(t *testing.T) {
+	localCollator := &validatorTestCollator{}
+	options := validatorTestOptions(Options{
+		LocalCollator:   localCollator,
+		PrepareSession:  newSupervisorTestPreparer().prepare,
+		HeadSettleDelay: time.Hour,
+		StatsInterval:   -1,
+	})
+	node := validatorTestNodeWithGroups(t)
+	node.MasterchainHead = &validatorTestMasterchainHead{block: ton.BlockIDExt{SeqNo: 200}}
+	extension, err := New(options)(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := extension.(*Service)
+	if service.opts.ConsensusCatchupThreshold != 80*time.Second {
+		t.Fatalf("consensus catch-up threshold = %s, want 80s", service.opts.ConsensusCatchupThreshold)
+	}
+	if err = service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	localCollator.mu.Lock()
+	started := localCollator.started
+	localCollator.mu.Unlock()
+	if started || service.consensusStarted {
+		t.Fatal("recovered consensus services started from a stale startup snapshot")
+	}
+	if !service.consensusDeferred.Load() {
+		t.Fatal("stale startup snapshot did not enter consensus catch-up gate")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err = service.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
 	options.Runtime.Close()
 }
@@ -1629,7 +1678,7 @@ func TestConsensusAdmissionWaitsForCurrentSnapshotAndStaysLatched(t *testing.T) 
 	supervisor := newSessionSupervisor(zerolog.Nop(), nil, nil, nil)
 	service := &Service{
 		log:      zerolog.Nop(),
-		opts:     Options{FreshnessWindow: 5 * time.Minute},
+		opts:     Options{ConsensusCatchupThreshold: 80 * time.Second},
 		sessions: supervisor,
 	}
 
@@ -1660,6 +1709,95 @@ func TestConsensusAdmissionWaitsForCurrentSnapshotAndStaysLatched(t *testing.T) 
 	service.reconcileConsensus(staleAfterAdmission)
 	if supervisor.highestSeqno != 12 {
 		t.Fatalf("latched consensus did not accept newer snapshot: seqno=%d", supervisor.highestSeqno)
+	}
+}
+
+func TestConsensusAdmissionWaitsForSignedHeadAndStartsOnHaltedNetwork(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	head := &validatorTestMasterchainHead{block: ton.BlockIDExt{SeqNo: 20}}
+	localCollator := &validatorTestCollator{}
+	supervisor := newSessionSupervisor(zerolog.Nop(), nil, nil, nil)
+	defer supervisor.Close()
+	service := &Service{
+		log:             zerolog.Nop(),
+		opts:            Options{ConsensusCatchupThreshold: 80 * time.Second, HeadSettleDelay: time.Second},
+		sessions:        supervisor,
+		localCollator:   localCollator,
+		masterchainHead: head,
+		runCtx:          ctx,
+	}
+	stale := &groups.Snapshot{
+		MasterchainBlock: ton.BlockIDExt{SeqNo: 10},
+		GenUTime:         uint32(time.Now().Add(-time.Hour).Unix()),
+	}
+	if service.reconcileConsensus(stale) {
+		t.Fatal("stale snapshot was admitted immediately")
+	}
+	service.consensusMu.Lock()
+	service.consensusPending.at = time.Now().Add(-2 * service.opts.HeadSettleDelay)
+	service.consensusMu.Unlock()
+	if err := service.processSettledConsensus(); err != nil {
+		t.Fatal(err)
+	}
+	if service.consensusAdmitted.Load() || supervisor.hasSnapshot {
+		t.Fatal("local catch-up was admitted while a newer signed head was known")
+	}
+	localCollator.mu.Lock()
+	started := localCollator.started
+	localCollator.mu.Unlock()
+	if started {
+		t.Fatal("local collator started during catch-up")
+	}
+
+	// Once the local state reaches the newest signed head, its old generation
+	// time describes a halted network rather than local lag. The settled head
+	// must start production so validators can resume that network.
+	head.block.SeqNo = stale.MasterchainBlock.SeqNo
+	if err := service.processSettledConsensus(); err != nil {
+		t.Fatal(err)
+	}
+	supervisor.mu.Lock()
+	hasSnapshot := supervisor.hasSnapshot
+	supervisor.mu.Unlock()
+	if !service.consensusAdmitted.Load() || !hasSnapshot {
+		t.Fatal("halted network head did not admit consensus")
+	}
+	localCollator.mu.Lock()
+	started = localCollator.started
+	localCollator.mu.Unlock()
+	if !started {
+		t.Fatal("local collator did not start after halted-network admission")
+	}
+}
+
+func TestConsensusAdmissionCatchupStreamResetsSettlement(t *testing.T) {
+	supervisor := newSessionSupervisor(zerolog.Nop(), nil, nil, nil)
+	service := &Service{
+		log:      zerolog.Nop(),
+		opts:     Options{ConsensusCatchupThreshold: 80 * time.Second, HeadSettleDelay: time.Second},
+		sessions: supervisor,
+	}
+	first := &groups.Snapshot{
+		MasterchainBlock: ton.BlockIDExt{SeqNo: 10},
+		GenUTime:         uint32(time.Now().Add(-time.Hour).Unix()),
+	}
+	service.reconcileConsensus(first)
+	service.consensusMu.Lock()
+	service.consensusPending.at = time.Now().Add(-2 * service.opts.HeadSettleDelay)
+	service.consensusMu.Unlock()
+
+	second := &groups.Snapshot{
+		MasterchainBlock: ton.BlockIDExt{SeqNo: 11},
+		GenUTime:         first.GenUTime + 1,
+	}
+	service.reconcileConsensus(second)
+	if err := service.processSettledConsensus(); err != nil {
+		t.Fatal(err)
+	}
+	if service.consensusAdmitted.Load() || supervisor.hasSnapshot {
+		t.Fatal("superseding catch-up snapshot did not reset head settlement")
 	}
 }
 

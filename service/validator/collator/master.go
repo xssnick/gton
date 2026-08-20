@@ -65,9 +65,17 @@ func (b *Builder) BuildMaster(ctx context.Context, req MasterRequest) (*Candidat
 	if err := validateCollationRequest(&common); err != nil {
 		return nil, err
 	}
-	return retryUnderSizeLimit(func(narrowing sizeBudgetCap) (*Candidate, error) {
+	candidate, err := retryUnderSizeLimit(func(narrowing sizeBudgetCap) (*Candidate, error) {
 		return b.buildMasterAttempt(ctx, req, narrowing)
 	})
+	if err != nil {
+		return candidate, err
+	}
+	if err = sealBuiltCandidate(candidate); err != nil {
+		return nil, err
+	}
+
+	return candidate, nil
 }
 
 func (b *Builder) buildMasterAttempt(ctx context.Context, req MasterRequest, narrowing sizeBudgetCap) (*Candidate, error) {
@@ -75,9 +83,14 @@ func (b *Builder) buildMasterAttempt(ctx context.Context, req MasterRequest, nar
 	if err != nil {
 		return nil, err
 	}
+	timer := c.req.assembly.start(CollationStageExecuteExternalMessages)
+	defer func() {
+		timer.stop()
+	}()
 	if err = c.processExternals(); err != nil {
 		return nil, err
 	}
+	timer.stop()
 
 	return c.finishMaster(req)
 }
@@ -87,6 +100,10 @@ func (b *Builder) prepareMasterPhases(
 	req MasterRequest,
 	narrowing sizeBudgetCap,
 ) (*collation, error) {
+	timer := req.assembly.start(CollationStagePrepareState)
+	defer func() {
+		timer.stop()
+	}()
 	c, err := b.prepareMaster(ctx, req)
 	if err != nil {
 		return nil, err
@@ -98,13 +115,18 @@ func (b *Builder) prepareMasterPhases(
 	if err = c.limits.addProof(c.dispatchQueue.RootCell()); err != nil {
 		return nil, fmt.Errorf("initial dispatch queue proof: %w", err)
 	}
+	timer.stop()
 
 	// Dispatch processing is shared with shardchain; the tick/special/tock
 	// phases are masterchain-specific and are deliberately placed around
 	// ordinary inbound processing.
+	timer = c.req.assembly.start(CollationStageCleanupOutQueue)
 	if err = c.cleanupOutQueue(); err != nil {
 		return nil, err
 	}
+	timer.stop()
+
+	timer = c.req.assembly.start(CollationStageExecuteInternalMessages)
 	if err = c.processDispatchQueue(); err != nil {
 		return nil, err
 	}
@@ -117,11 +139,16 @@ func (b *Builder) prepareMasterPhases(
 	if err = c.processInternals(); err != nil {
 		return nil, err
 	}
+	timer.stop()
 
 	return c, nil
 }
 
 func (c *collation) finishMaster(req MasterRequest) (*Candidate, error) {
+	timer := c.req.assembly.start(CollationStageExecuteInternalMessages)
+	defer func() {
+		timer.stop()
+	}()
 	common := masterCollationRequest(req)
 	if err := c.processNewMessages(c.blockFull || c.haveUnprocessedDispatchQueue || common.internalsIncomplete()); err != nil {
 		return nil, err
@@ -132,15 +159,27 @@ func (c *collation) finishMaster(req MasterRequest) (*Candidate, error) {
 	if err := c.processNewMessages(true); err != nil {
 		return nil, err
 	}
+	timer.stop()
+
+	timer = c.req.assembly.start(CollationStageProcessedInfo)
 	if err := c.updateMasterPublicLibraries(); err != nil {
 		return nil, err
 	}
 	if err := c.updateProcessedInfo(); err != nil {
 		return nil, err
 	}
+	timer.stop()
+	timer = c.req.assembly.start(CollationStageClaimedLocalCleanup)
+	if err := c.cleanupClaimedLocalDequeues(); err != nil {
+		return nil, err
+	}
+	timer.stop()
+
+	timer = c.req.assembly.start(CollationStageFinalizeAccounts)
 	if err := c.finishAccounts(); err != nil {
 		return nil, err
 	}
+	timer.stop()
 
 	return c.finish()
 }
@@ -385,6 +424,7 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 		externals:           make([]msgpool.ExternalFeedback, 0, len(req.Externals)),
 		fullCollated:        req.Config.capabilities&capFullCollatedData != 0,
 	}
+	c.prepareAccountPathRecorder()
 	if err = c.prepareFullCollatedProofs(); err != nil {
 		return nil, err
 	}
@@ -672,22 +712,27 @@ func burnCurrency(config tlb.BurningConfig, value tlb.CurrencyCollection) (tlb.C
 // collation and the validation path. Rerouting it onto the in-state
 // configuration root would change the proof.
 func computeMinted(config tlb.BlockchainConfig, global tlb.CurrencyCollection) (tlb.CurrencyCollection, error) {
-	wanted, err := config.GetExtraCurrencyToMint()
+	param, err := config.GetParam(tlb.ConfigParamExtraCurrencyToMint)
 	if err != nil {
-		// Config::get_extra_currency_config treats an absent or wholly invalid
-		// parameter 7 as minting disabled. Once its outer collection decodes,
-		// malformed individual amounts remain fatal below.
+		// get_config_param(7) coming back null is minting disabled, not a fault
+		// (collator.cpp:2225-2227).
 		return tlb.CurrencyCollection{}, nil
 	}
-	if wanted.ToMint == nil || wanted.ToMint.GetKeySize() != 32 {
-		return tlb.CurrencyCollection{}, fmt.Errorf("%w: configured extra currency dictionary is malformed", ErrInvalidInput)
+	wanted, err := config.GetExtraCurrencyToMint()
+	if err != nil || wanted.ToMint == nil || wanted.ToMint.GetKeySize() != 32 {
+		return tlb.CurrencyCollection{}, nil
+	}
+	items, err := wanted.ToMint.LoadAll()
+	if err != nil {
+		// A structure LoadAll cannot read is one validate_ref would reject, and
+		// a rejected parameter disables the mint rather than failing the block.
+		return tlb.CurrencyCollection{}, nil
+	}
+	if !validExtraCurrencyToMintParam(param, items) {
+		return tlb.CurrencyCollection{}, nil
 	}
 
 	result := cell.NewDict(32)
-	items, err := wanted.ToMint.LoadAll()
-	if err != nil {
-		return tlb.CurrencyCollection{}, fmt.Errorf("%w: load configured extra currencies: %v", ErrInvalidInput, err)
-	}
 	for _, item := range items {
 		currencyID, loadErr := item.Key.LoadUInt(32)
 		if loadErr != nil || item.Key.BitsLeft() != 0 || currencyID == 0 {
@@ -716,6 +761,97 @@ func computeMinted(config tlb.BlockchainConfig, global tlb.CurrencyCollection) (
 		return tlb.CurrencyCollection{}, nil
 	}
 	return tlb.CurrencyCollection{ExtraCurrencies: result}, nil
+}
+
+// extraCurrencyMintValidateMaxCells is TLB::default_validate_max_cells
+// (crypto/tl/tlblib.hpp:35): the cell budget validate_ref spends before it gives
+// up and calls the parameter invalid. It is counted the way
+// TLB::validate_ref_internal counts — one per reference followed, repeats
+// included — because the collator installs no ValidateCache.
+const extraCurrencyMintValidateMaxCells = 1024
+
+// validExtraCurrencyToMintParam is block::tlb::t_ExtraCurrencyCollection
+// .validate_ref over configuration parameter 7, the gate compute_minted_amount
+// takes before it reads a single amount (collator.cpp:2228-2231).
+//
+// Failing it is NOT an error. The reference logs "configuration parameter #7
+// does not contain a valid ExtraCurrencyCollection, minting disabled" and
+// produces the block with to_mint zero, so a governance parameter that does not
+// typecheck costs us the mint and nothing else. Without this gate the three
+// shapes below each fork us from the reference on a masterchain block: we would
+// mint where it mints nothing, and on the trailing-data shape we would fail
+// collation outright where it ships a block.
+//
+// What it rejects that an ordinary VarUInteger decode accepts:
+//
+//   - an amount that is not VarUIntegerPos 32. Its length field must be in
+//     [1..31] and its first magnitude byte must be non-zero
+//     (VarUIntegerPos::validate_skip, block-parse.cpp); a zero-length amount
+//     typechecks as VarUInteger but not as VarUIntegerPos. One such entry
+//     disables the mint for the WHOLE parameter, not just for itself, which is
+//     why this runs as a pass over every entry before any of them is minted.
+//   - a cell that is not consumed exactly, bits and refs alike
+//     (TLB::validate_ref_internal's cs.empty_ext()).
+//   - a parameter whose cell walk does not fit the budget above.
+//
+// The walk stays on config.execution.Root(), the untraced epoch root, for the
+// same reason the entry scan below does: recording these cells would put them
+// in the block's read set, where the reference collator never puts them.
+func validExtraCurrencyToMintParam(param *cell.Cell, items []cell.DictKV) bool {
+	if !extraCurrencyMintParamFitsValidateBudget(param) {
+		return false
+	}
+	for _, item := range items {
+		if item.Key == nil || item.Key.Copy().BitsLeft() != 32 {
+			return false
+		}
+		if item.Value == nil || !validExtraCurrencyMintAmount(item.Value.Copy()) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// validExtraCurrencyMintAmount is VarUIntegerPos::validate_skip followed by the
+// exactness check its caller applies. It reads a copy, so the entry scan below
+// still sees an unconsumed value.
+func validExtraCurrencyMintAmount(value *cell.Slice) bool {
+	length, err := value.LoadUInt(5)
+	if err != nil || length == 0 || length >= 32 {
+		return false
+	}
+	head, err := value.LoadUInt(8)
+	if err != nil || head == 0 {
+		return false
+	}
+	if err = value.SkipBits(uint(length-1) * 8); err != nil {
+		return false
+	}
+
+	return value.BitsLeft() == 0 && value.RefsNum() == 0
+}
+
+func extraCurrencyMintParamFitsValidateBudget(param *cell.Cell) bool {
+	remaining := extraCurrencyMintValidateMaxCells
+	pending := []*cell.Cell{param}
+	for len(pending) > 0 {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if remaining == 0 {
+			return false
+		}
+		remaining--
+		for i := 0; i < int(current.RefsNum()); i++ {
+			ref, err := current.PeekRef(i)
+			if err != nil {
+				return false
+			}
+			pending = append(pending, ref)
+		}
+	}
+
+	return true
 }
 
 func extraCurrencyAmount(dict *cell.Dictionary, id uint32) (*big.Int, error) {

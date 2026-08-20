@@ -24,6 +24,7 @@ func TestCollationPhaseOrderMatchesBuildShard(t *testing.T) {
 		"processExternals",
 		"processNewMessages",
 		"updateProcessedInfo",
+		"cleanupClaimedLocalDequeues",
 		"finishAccounts",
 		"finish",
 	}

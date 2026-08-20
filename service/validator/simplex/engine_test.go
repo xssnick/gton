@@ -7,7 +7,7 @@ import (
 )
 
 // TestStartAnnouncesFirstWindow: on a fresh session the pool publishes window
-// 0 with a genesis base after its journal record is durable.
+// 0 with a genesis base while its restart cursor is persisted independently.
 func TestStartAnnouncesFirstWindow(t *testing.T) {
 	env := newTestEnv(t) // local 0 is the round-robin leader of window 0
 	env.start()
@@ -23,7 +23,8 @@ func TestStartAnnouncesFirstWindow(t *testing.T) {
 	requireEqual(t, w.Base.Exists, false, "window base is genesis")
 	env.requireNoFatal()
 
-	// The window announcement must already be durable.
+	// MemoryJournal completes inline, so the independent cursor write is visible
+	// too; asynchronous ordering is covered in async_journal_test.go.
 	bs, err := env.journal.Bootstrap()
 	if err != nil {
 		t.Fatal(err)

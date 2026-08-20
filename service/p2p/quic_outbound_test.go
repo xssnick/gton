@@ -918,6 +918,22 @@ func TestQUICOutboundOperationsReuseGatewayPathAndFrameOverlay(t *testing.T) {
 		t.Fatal("QUIC broadcast message was not received")
 	}
 
+	preparedPing, err := tl.Serialize(overlay.Ping{}, true)
+	if err != nil {
+		t.Fatalf("prepare QUIC broadcast message: %v", err)
+	}
+	if err = broadcastPeer.SendPreparedCustomMessage(ctx, preparedPing); err != nil {
+		t.Fatalf("send prepared QUIC broadcast message: %v", err)
+	}
+	select {
+	case messageErr := <-messages:
+		if messageErr != nil {
+			t.Fatalf("parse prepared QUIC broadcast message: %v", messageErr)
+		}
+	case <-ctx.Done():
+		t.Fatal("prepared QUIC broadcast message was not received")
+	}
+
 	if err = (quicRouteBroadcastPeer{
 		peer:     peer,
 		envelope: sub.quicEnvelope,

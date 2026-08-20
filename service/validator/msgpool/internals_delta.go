@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -417,6 +418,18 @@ func internalFromEnvelope(envCell *cell.Cell) (*InternalMessage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot load enveloped message destination: %w", err)
 	}
+	destinationWorkchain := dstAddr.Workchain()
+	var destinationAccount [32]byte
+	destinationPrewarmable := dstAddr.Type() == address.StdAddress
+	if destinationPrewarmable {
+		if dstAddr.BitsLen() != 256 || len(dstAddr.Data()) != len(destinationAccount) {
+			return nil, errors.New("envelope destination: malformed standard account address")
+		}
+		copy(destinationAccount[:], dstAddr.Data())
+		if err = RewriteAnycast(destinationAccount[:], dstAddr); err != nil {
+			return nil, fmt.Errorf("envelope destination: %w", err)
+		}
+	}
 	// value:CurrencyCollection — grams, then the extra-currency HashmapE,
 	// whose root is a reference and therefore costs a single bit here.
 	if err = skipGrams(msgLoader); err != nil {
@@ -462,13 +475,16 @@ func internalFromEnvelope(envCell *cell.Cell) (*InternalMessage, error) {
 	}
 
 	return &InternalMessage{
-		Key:          MakeQueueKey(hop, env.Msg.HashKey()),
-		EnqueuedLT:   enqueuedLT,
-		QueueLT:      createdLT,
-		EnvHash:      envCell.HashKey(),
-		Envelope:     env,
-		EnvelopeCell: envCell,
-		Root:         env.Msg,
+		Key:                    MakeQueueKey(hop, env.Msg.HashKey()),
+		EnqueuedLT:             enqueuedLT,
+		QueueLT:                createdLT,
+		EnvHash:                envCell.HashKey(),
+		Envelope:               env,
+		EnvelopeCell:           envCell,
+		Root:                   env.Msg,
+		DestinationWorkchain:   destinationWorkchain,
+		DestinationAccount:     destinationAccount,
+		DestinationPrewarmable: destinationPrewarmable,
 	}, nil
 }
 

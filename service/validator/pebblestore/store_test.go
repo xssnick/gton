@@ -318,9 +318,9 @@ func TestWriteBatchByteLimit(t *testing.T) {
 		// The durability partition: one batch commits with one WriteOptions, so a
 		// payload may not join a commitment batch however small it is, and coalescing
 		// within one class is untouched.
-		{name: "payload after commitment", nextClass: recoverablePayload},
-		{name: "commitment after payload", batchClass: recoverablePayload},
-		{name: "payload after payload", batchClass: recoverablePayload, nextClass: recoverablePayload, want: true},
+		{name: "payload after commitment", nextClass: restartRecoverable},
+		{name: "commitment after payload", batchClass: restartRecoverable},
+		{name: "payload after payload", batchClass: restartRecoverable, nextClass: restartRecoverable, want: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -630,11 +630,144 @@ func TestCandidateAtomicIdempotentConflictAndNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	contentHash := candidateContentHash(t, store, namespace, id)
-	if _, closer, err := store.db.Get(candidateContentKey(namespace, contentHash)); err != nil {
-		t.Fatalf("candidate content is not atomic with index: %v", err)
-	} else if err = closer.Close(); err != nil {
+	pointer := candidatePointer(t, store, namespace, id)
+	if pointer.hash != sha256.Sum256(want) {
+		t.Fatalf("candidate pointer hash = %x", pointer.hash)
+	}
+	if rows := countTestPrefixRows(t, store, candidateContentPrefix(namespace)); rows != 0 {
+		t.Fatalf("candidate payload kept %d Pebble rows, want 0", rows)
+	}
+	if _, err = os.Stat(store.Validator().candidatePacks.packPath(namespace, pointer.segment)); err != nil {
+		t.Fatalf("candidate pack: %v", err)
+	}
+}
+
+func TestCandidatePackRotatesAndStartsFreshAfterReopen(t *testing.T) {
+	dir := t.TempDir()
+	store := openTestStore(t, dir)
+	session := testSession(18)
+	firstID := testCandidateID(1, 1)
+	secondID := testCandidateID(2, 2)
+	thirdID := testCandidateID(3, 3)
+	firstWire := []byte("first")
+	secondWire := []byte("second")
+	thirdWire := []byte("third")
+	store.Validator().candidatePacks.maxSize = int64(len(candidatePackMagic) + candidatePackRecordHeader + len(firstWire))
+
+	awaitTestSave(t, func(done func(error)) {
+		store.Validator().SaveCandidate(session, validator.CandidateRecord{ID: firstID, Wire: firstWire}, done)
+	})
+	awaitTestSave(t, func(done func(error)) {
+		store.Validator().SaveCandidate(session, validator.CandidateRecord{ID: secondID, Wire: secondWire}, done)
+	})
+	namespace, err := namespaceForSession(session)
+	if err != nil {
 		t.Fatal(err)
+	}
+	firstPointer := candidatePointer(t, store, namespace, firstID)
+	secondPointer := candidatePointer(t, store, namespace, secondID)
+	if firstPointer.segment != 0 || secondPointer.segment != 1 {
+		t.Fatalf("candidate segments = %d/%d, want 0/1", firstPointer.segment, secondPointer.segment)
+	}
+	closeTestStore(t, store)
+
+	store = openTestStore(t, dir)
+	defer closeTestStore(t, store)
+	awaitTestSave(t, func(done func(error)) {
+		store.Validator().SaveCandidate(session, validator.CandidateRecord{ID: thirdID, Wire: thirdWire}, done)
+	})
+	thirdPointer := candidatePointer(t, store, namespace, thirdID)
+	if thirdPointer.segment != 2 {
+		t.Fatalf("candidate segment after reopen = %d, want 2", thirdPointer.segment)
+	}
+
+	for id, want := range map[simplex.CandidateID][]byte{
+		firstID: firstWire, secondID: secondWire, thirdID: thirdWire,
+	} {
+		got, loadErr := store.Validator().Candidate(context.Background(), session, id)
+		if loadErr != nil {
+			t.Fatalf("load candidate %v: %v", id, loadErr)
+		}
+		if !bytes.Equal(got.Wire, want) {
+			t.Fatalf("candidate %v = %q, want %q", id, got.Wire, want)
+		}
+	}
+}
+
+func TestCandidatePackCorruptionIsRecoverable(t *testing.T) {
+	store := openTestStore(t, t.TempDir())
+	defer closeTestStore(t, store)
+	session := testSession(19)
+	id := testCandidateID(4, 4)
+	wire := []byte("recoverable candidate")
+	record := validator.CandidateRecord{ID: id, Wire: wire}
+	awaitTestSave(t, func(done func(error)) {
+		store.Validator().SaveCandidate(session, record, done)
+	})
+
+	namespace, err := namespaceForSession(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pointer := candidatePointer(t, store, namespace, id)
+	path := store.Validator().candidatePacks.packPath(namespace, pointer.segment)
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.WriteAt([]byte{wire[0] ^ 0xff}, int64(pointer.offset)+candidatePackRecordHeader); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = store.Validator().Candidate(context.Background(), session, id); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("corrupt candidate error = %v, want ErrNotFound", err)
+	}
+	awaitTestSave(t, func(done func(error)) {
+		store.Validator().SaveCandidate(session, record, done)
+	})
+	repaired, err := store.Validator().Candidate(context.Background(), session, id)
+	if err != nil {
+		t.Fatalf("load repaired candidate: %v", err)
+	}
+	if !bytes.Equal(repaired.Wire, wire) {
+		t.Fatalf("repaired candidate = %q, want %q", repaired.Wire, wire)
+	}
+
+	status, err := store.Validator().Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Sessions) != 1 || status.Sessions[0].Candidates != 1 {
+		t.Fatalf("candidate count after repair = %+v, want 1", status.Sessions)
+	}
+}
+
+func TestDeleteSessionRemovesCandidatePacks(t *testing.T) {
+	store := openTestStore(t, t.TempDir())
+	defer closeTestStore(t, store)
+	session := testSession(20)
+	id := testCandidateID(5, 5)
+	awaitTestSave(t, func(done func(error)) {
+		store.Validator().SaveCandidate(session, validator.CandidateRecord{ID: id, Wire: []byte("candidate")}, done)
+	})
+
+	namespace, err := namespaceForSession(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := store.Validator().candidatePacks.sessionDir(namespace)
+	if _, err = os.Stat(dir); err != nil {
+		t.Fatalf("candidate pack dir before delete: %v", err)
+	}
+	if err = store.Validator().DeleteSession(context.Background(), session); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("candidate pack dir after delete: %v", err)
 	}
 }
 
@@ -965,8 +1098,9 @@ func TestLoadSessionEnumeratesCandidateMetadataOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	contentHash := candidateContentHash(t, store, namespace, id)
-	if err = store.db.Delete(candidateContentKey(namespace, contentHash), pebble.Sync); err != nil {
+	pointer := candidatePointer(t, store, namespace, id)
+	packPath := store.Validator().candidatePacks.packPath(namespace, pointer.segment)
+	if err = os.Truncate(packPath, int64(len(candidatePackMagic))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -977,8 +1111,8 @@ func TestLoadSessionEnumeratesCandidateMetadataOnly(t *testing.T) {
 	if !slices.Equal(state.CandidateIDs, []simplex.CandidateID{id}) {
 		t.Fatalf("candidate IDs = %#v", state.CandidateIDs)
 	}
-	if _, err = store.Validator().Candidate(context.Background(), session, id); err == nil {
-		t.Fatal("Candidate unexpectedly loaded missing payload")
+	if _, err = store.Validator().Candidate(context.Background(), session, id); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("Candidate missing payload error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -1566,30 +1700,27 @@ func receiveTestResult(t *testing.T, result <-chan error) error {
 	}
 }
 
-func candidateContentHash(
+func candidatePointer(
 	t *testing.T,
 	store *Store,
 	namespace storageNamespace,
 	id simplex.CandidateID,
-) [32]byte {
+) candidatePackPointer {
 	t.Helper()
 
 	value, closer, err := store.db.Get(candidateIndexKey(namespace, id))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(value) != 32 {
-		_ = closer.Close()
-		t.Fatalf("content hash length = %d", len(value))
-	}
-
-	var hash [32]byte
-	copy(hash[:], value)
+	pointer, decodeErr := decodeCandidatePackPointer(value)
 	if err = closer.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
 
-	return hash
+	return pointer
 }
 
 func waitForDeleting(t *testing.T, store *Store, namespace storageNamespace) {
@@ -1940,7 +2071,7 @@ func TestLeaderWindowsWriteNoPerWindowRows(t *testing.T) {
 
 // TestSaveCandidateBorrowsTheWireUntilItsCallback documents the contract change
 // that removed a full copy of every candidate payload from the store path. The
-// write goroutine reads Wire when it applies the batch, which is before done
+// write goroutine reads Wire when it appends the pack, which is before done
 // fires, so the buffer belongs to the caller again from that point on. The one
 // production caller satisfies this trivially: it hands over a wire it has
 // already published as immutable and shares with the request path.

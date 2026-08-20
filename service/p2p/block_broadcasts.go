@@ -87,12 +87,35 @@ type BlockCandidatePublication struct {
 	CertificateSigner overlay.BroadcastSigner
 }
 
-// TrustedBlockCandidate is canonical block data whose consensus-overlay source
-// and candidate signature have already been authenticated. The cache worker
-// still parses the block and verifies its root and file hashes before retention.
+// TrustedBlockCandidate is block data whose consensus-overlay source and
+// candidate signature have already been authenticated. A prepared instance
+// carries the decoder's immutable root/BOC/hash binding; a raw fallback keeps
+// compatibility with receiver implementations outside the built-in codec and
+// is fully parsed and verified by the cache worker.
 type TrustedBlockCandidate struct {
-	Block    ton.BlockIDExt
-	BlockBOC []byte
+	id       ton.BlockIDExt
+	root     *cell.Cell
+	blockBOC []byte
+}
+
+func NewTrustedBlockCandidate(prepared *storage.PreparedBlockCandidate) (TrustedBlockCandidate, error) {
+	if prepared == nil {
+		return TrustedBlockCandidate{}, errors.New("trusted block candidate is absent")
+	}
+
+	return TrustedBlockCandidate{
+		id:       prepared.ID(),
+		root:     prepared.Root(),
+		blockBOC: prepared.BlockBOC(),
+	}, nil
+}
+
+func NewTrustedRawBlockCandidate(id ton.BlockIDExt, blockBOC []byte) (TrustedBlockCandidate, error) {
+	if len(blockBOC) == 0 {
+		return TrustedBlockCandidate{}, errors.New("trusted raw block candidate is empty")
+	}
+
+	return TrustedBlockCandidate{id: *id.Copy(), blockBOC: bytes.Clone(blockBOC)}, nil
 }
 
 type blockPublicationKind uint8
@@ -226,6 +249,10 @@ func (b *BlockBroadcasts) TryRelayCandidate(publication BlockCandidatePublicatio
 // bounded cache worker without publishing it into any full-node overlay. It
 // returns false when the queue is full or closed.
 func (b *BlockBroadcasts) TryCacheCandidate(candidate TrustedBlockCandidate) bool {
+	if len(candidate.blockBOC) == 0 {
+		return false
+	}
+
 	return b.queue.Push(blockPublicationRequest{
 		kind:             blockCacheTrustedCandidate,
 		trustedCandidate: candidate,
@@ -246,7 +273,7 @@ func blockPublicationRequestBytes(request blockPublicationRequest) int64 {
 	case blockPublicationCandidate:
 		return overhead + int64(len(request.candidate.BlockBOC))
 	case blockCacheTrustedCandidate:
-		return overhead + int64(len(request.trustedCandidate.BlockBOC))
+		return overhead + int64(len(request.trustedCandidate.blockBOC))
 	default:
 		return overhead
 	}
@@ -516,15 +543,31 @@ func blockPublicationFanoutKey(class string, block ton.BlockIDExt) string {
 }
 
 func (b *BlockBroadcasts) cacheTrustedCandidate(candidate TrustedBlockCandidate) {
-	downloaded, err := decodeRawBlockCandidateBroadcast(
-		trustedConsensusCandidateKind,
-		candidate.Block,
-		candidate.BlockBOC,
-	)
+	if len(candidate.blockBOC) == 0 {
+		b.node.log.Warn().Msg("dropping absent trusted consensus candidate")
+		return
+	}
+	id := candidate.id
+	var downloaded *DownloadedBlock
+	var err error
+	if candidate.root != nil {
+		downloaded, err = newParsedBlockCandidateBroadcast(
+			trustedConsensusCandidateKind,
+			id,
+			candidate.blockBOC,
+			candidate.root,
+		)
+	} else {
+		downloaded, err = decodeRawBlockCandidateBroadcast(
+			trustedConsensusCandidateKind,
+			id,
+			candidate.blockBOC,
+		)
+	}
 	if err != nil {
 		b.node.log.Warn().
 			Err(err).
-			Str("block", storage.FormatBlockRef(candidate.Block)).
+			Str("block", storage.FormatBlockRef(id)).
 			Msg("dropping trusted consensus candidate")
 		return
 	}

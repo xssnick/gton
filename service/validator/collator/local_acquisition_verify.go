@@ -61,6 +61,14 @@ type ValidationRequest struct {
 	Candidate    simplex.Candidate
 	BlockBOC     []byte
 	CollatedData []byte
+	// BlockRoot and CollatedRoots are the network decoder's one-shot parsed
+	// payload. They are either both absent or both present, and are borrowed only
+	// for this validation. Digested must be true: it is the provenance that binds
+	// these cells to the two canonical byte buffers and their signed hashes. The
+	// byte path remains the required path for candidates restored without this
+	// in-process handoff.
+	BlockRoot     *cell.Cell
+	CollatedRoots []*cell.Cell
 	// Digested is the caller's assertion that Candidate.CollatedFileHash is
 	// already known to be the sha256 of CollatedData — not that it ought to be,
 	// but that the digest was taken of these bytes and compared, or that these
@@ -273,16 +281,18 @@ func (a *LocalAcquisition) ValidateCandidate(
 		return ValidationResult{}, fmt.Errorf("%w: candidate leader index is outside the roster", ErrInvalidInput)
 	}
 	artifact := CandidateArtifact{
-		SessionID:    request.Session.ID,
-		Candidate:    request.Candidate,
-		BlockBOC:     request.BlockBOC,
-		CollatedData: request.CollatedData,
-		digested:     request.Digested,
+		SessionID:     request.Session.ID,
+		Candidate:     request.Candidate,
+		BlockBOC:      request.BlockBOC,
+		CollatedData:  request.CollatedData,
+		digested:      request.Digested,
+		blockRoot:     request.BlockRoot,
+		collatedRoots: request.CollatedRoots,
 	}
 	started, waited := a.validationStageStarted(), inputWait.duration
-	// The capsule is this call's only parse of the candidate, and it dies with
-	// the call: it pins the block DAG, the successor state tree, both
-	// predecessor lists and the whole collated proof set.
+	// The capsule is this call's only decoded representation of the candidate,
+	// and it dies with the call: it pins the block DAG, the successor state tree,
+	// both predecessor lists and the whole collated proof set.
 	prepared, err := prepareValidationCandidate(
 		ctx,
 		artifact,

@@ -43,21 +43,11 @@ import (
 // this collator did not, on accounts d4331c4b…, d553394b…, d5cb623e…,
 // d67b6882…, d6acf203… and d887d0e2…, all at lt 76734071000003.
 //
-// WHAT IS CLOSED AND WHAT IS NOT. The reference's block was dumped and diffed
-// against ours by (account, lt): all 753 of its transactions are now produced
-// here, gas lands on its 557,695 exactly, and the per-site account-dictionary
-// proof charge is identical to the byte (46 calls, 2,404 cells, 256,450 bits,
-// 2,725 internal and 1,899 external refs on both sides). One residual is NOT
-// closed and is pinned below rather than hidden: at the message the reference
-// stops on, our estimate is 337 B BELOW its 1,048,713 — 0.03% of the budget —
-// so we admit one message more than it does (d9f83b85… at lt 76734071000003).
-// The residual is split between the out-queue root proof (-405 B) and the
-// per-transaction account proof (+29 B), and it is the irreducible part of a
-// hash-keyed predicate standing in for a per-object one: the reference can
-// serialize a body and charge a boundary for the same hash in one walk, because
-// two different cell objects carry it, and no hash-keyed set can reproduce that.
-// Closing it would mean replacing the update builder's hash-keyed pruning, which
-// the ReadSet design deliberately rejected.
+// The account-dictionary contribution no longer materializes those 46 sampled
+// roots. It charges the union of predecessor Patricia paths in the same
+// 16-transaction windows instead. On this byte-identical fixture that removes
+// the remaining one-message drift too: transactions, gas and stopping point all
+// match the reference while the real ShardAccounts root is built only once.
 //
 // So these numbers are pinned to catch movement, not to claim identity. If they
 // change, re-run the oracle before re-pinning them:
@@ -98,14 +88,12 @@ func TestMainnetHeavyStopsWhereTheReferenceStops(t *testing.T) {
 	if stats.GasUsed != referenceGas {
 		t.Fatalf("gas is %d, want the reference's %d", stats.GasUsed, referenceGas)
 	}
-	if stats.InternalsImported != referenceImported+1 {
-		t.Fatalf("imported %d internals, want %d — the reference imports %d and the "+
-			"known residual is exactly one message",
-			stats.InternalsImported, referenceImported+1, referenceImported)
+	if stats.InternalsImported != referenceImported {
+		t.Fatalf("imported %d internals, want the reference's %d",
+			stats.InternalsImported, referenceImported)
 	}
-	if stats.Transactions != referenceTransactions+1 {
-		t.Fatalf("produced %d transactions, want %d — the reference produces %d and the "+
-			"known residual is exactly one transaction",
-			stats.Transactions, referenceTransactions+1, referenceTransactions)
+	if stats.Transactions != referenceTransactions {
+		t.Fatalf("produced %d transactions, want the reference's %d",
+			stats.Transactions, referenceTransactions)
 	}
 }

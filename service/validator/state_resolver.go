@@ -64,12 +64,14 @@ type stateResolver struct {
 	mu sync.Mutex
 	// targetRate is the noncritical slot rate the wall-clock retention margins
 	// are converted against. It is read under mu because updateParams writes it.
-	targetRate time.Duration
-	genesis    *ChainState
-	startAt    *SessionStart
-	anchor     *resolvedAnchorState
-	states     map[simplex.ParentID]*stateFlight
-	finalized  map[simplex.CandidateID]*finalizedState
+	targetRate            time.Duration
+	resolveTimeoutCap     time.Duration
+	maxLeaderWindowDesync uint32
+	genesis               *ChainState
+	startAt               *SessionStart
+	anchor                *resolvedAnchorState
+	states                map[simplex.ParentID]*stateFlight
+	finalized             map[simplex.CandidateID]*finalizedState
 	// applied holds exactly the finalization markers still carrying a loaded
 	// state. finalized itself is never pruned — its markers are what keep an
 	// already-final block from being re-applied through a Merkle update — so the
@@ -88,10 +90,15 @@ type stateResolver struct {
 }
 
 type stateFlight struct {
-	done   chan struct{}
-	cancel context.CancelFunc
-	result ResolvedState
-	err    error
+	done      chan struct{}
+	cancel    context.CancelFunc
+	result    ResolvedState
+	err       error
+	waiters   int
+	finished  bool
+	cancelErr error
+	expires   time.Time
+	timer     *time.Timer
 }
 
 type finalizedState struct {
@@ -132,26 +139,28 @@ func newStateResolver(
 ) *stateResolver {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &stateResolver{
-		shard:                shard,
-		storageID:            storageID,
-		storage:              storage,
-		backend:              backend,
-		candidates:           candidates,
-		recovery:             recovery,
-		slotsPerLeaderWindow: slotsPerLeaderWindow,
-		targetRate:           params.TargetRate,
-		ctx:                  ctx,
-		cancel:               cancel,
-		states:               make(map[simplex.ParentID]*stateFlight),
-		finalized:            make(map[simplex.CandidateID]*finalizedState, len(stored.Finalized)),
-		applied:              make(map[simplex.CandidateID]*finalizedState),
-		persisted:            make(map[simplex.CandidateID]struct{}, len(stored.Finalized)),
+		shard:                 shard,
+		storageID:             storageID,
+		storage:               storage,
+		backend:               backend,
+		candidates:            candidates,
+		recovery:              recovery,
+		slotsPerLeaderWindow:  slotsPerLeaderWindow,
+		targetRate:            params.TargetRate,
+		resolveTimeoutCap:     params.CandidateResolveTimeoutCap,
+		maxLeaderWindowDesync: params.MaxLeaderWindowDesync,
+		ctx:                   ctx,
+		cancel:                cancel,
+		states:                make(map[simplex.ParentID]*stateFlight),
+		finalized:             make(map[simplex.CandidateID]*finalizedState, len(stored.Finalized)),
+		applied:               make(map[simplex.CandidateID]*finalizedState),
+		persisted:             make(map[simplex.CandidateID]struct{}, len(stored.Finalized)),
 	}
 	for _, id := range stored.Finalized {
 		r.finalized[id] = &finalizedState{isDone: true}
 		r.persisted[id] = struct{}{}
 	}
-	// A final certificate is itself durable consensus evidence. Include it in
+	// A final certificate is authenticated consensus evidence. Include it in
 	// the replay set even if the process crashed before MarkFinalized completed.
 	for _, certificate := range recovery {
 		id := certificate.Vote().ID
@@ -169,6 +178,8 @@ func newStateResolver(
 func (r *stateResolver) updateParams(params simplex.Params) {
 	r.mu.Lock()
 	r.targetRate = params.TargetRate
+	r.resolveTimeoutCap = params.CandidateResolveTimeoutCap
+	r.maxLeaderWindowDesync = params.MaxLeaderWindowDesync
 	r.mu.Unlock()
 }
 
@@ -267,7 +278,7 @@ func (r *stateResolver) reconcileAppliedRecovery(ctx context.Context) error {
 			continue
 		}
 
-		resolution, err := r.candidates.resolve(ctx, id)
+		resolution, err := r.candidates.resolveFinalization(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -337,27 +348,131 @@ func cloneSessionStart(start SessionStart) SessionStart {
 }
 
 func (r *stateResolver) resolve(ctx context.Context, id simplex.ParentID) (ResolvedState, error) {
-	r.mu.Lock()
-	if r.isClosed {
+	for {
+		r.mu.Lock()
+		if r.isClosed {
+			r.mu.Unlock()
+
+			return ResolvedState{}, ErrResolverClosed
+		}
+		flight := r.states[id]
+		if flight != nil {
+			select {
+			case <-flight.done:
+				result, err := flight.result, flight.err
+				flight.finished = true
+				if flight.timer != nil {
+					flight.timer.Stop()
+					flight.timer = nil
+				}
+				r.mu.Unlock()
+
+				return result, err
+			default:
+			}
+			if flight.cancelErr != nil {
+				done := flight.done
+				r.mu.Unlock()
+				select {
+				case <-ctx.Done():
+					return ResolvedState{}, ctx.Err()
+				case <-done:
+					continue
+				}
+			}
+		}
+		if flight == nil {
+			flightCtx, cancel := context.WithCancel(r.ctx)
+			flight = &stateFlight{done: make(chan struct{}), cancel: cancel}
+			r.states[id] = flight
+			r.armStateExpiryLocked(id, flight)
+			r.wg.Add(1)
+			go r.resolveLoop(flightCtx, id, flight)
+		}
+		flight.waiters++
 		r.mu.Unlock()
 
-		return ResolvedState{}, ErrResolverClosed
-	}
-	flight := r.states[id]
-	if flight == nil {
-		flightCtx, cancel := context.WithCancel(r.ctx)
-		flight = &stateFlight{done: make(chan struct{}), cancel: cancel}
-		r.states[id] = flight
-		r.wg.Add(1)
-		go r.resolveLoop(flightCtx, id, flight)
-	}
-	r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			r.releaseStateWaiter(id, flight)
 
-	select {
-	case <-ctx.Done():
-		return ResolvedState{}, ctx.Err()
-	case <-flight.done:
-		return flight.result, flight.err
+			return ResolvedState{}, ctx.Err()
+		case <-flight.done:
+			r.releaseStateWaiter(id, flight)
+
+			return flight.result, flight.err
+		}
+	}
+}
+
+func (r *stateResolver) armStateExpiryLocked(id simplex.ParentID, flight *stateFlight) {
+	if flight.expires.IsZero() {
+		params := simplex.Params{
+			TargetRate:                 r.targetRate,
+			CandidateResolveTimeoutCap: r.resolveTimeoutCap,
+			MaxLeaderWindowDesync:      r.maxLeaderWindowDesync,
+		}
+		flight.expires = time.Now().Add(resolverFlightTTL(params, r.slotsPerLeaderWindow))
+	}
+	delay := time.Until(flight.expires)
+	if delay <= 0 {
+		delay = time.Nanosecond
+	}
+	flight.timer = time.AfterFunc(delay, func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		flight.timer = nil
+		if r.states[id] != flight || flight.finished {
+			return
+		}
+		flight.cancelErr = context.DeadlineExceeded
+		flight.cancel()
+	})
+}
+
+func (r *stateResolver) releaseStateWaiter(id simplex.ParentID, flight *stateFlight) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if flight.waiters > 0 {
+		flight.waiters--
+	}
+	if flight.waiters != 0 || r.states[id] != flight || flight.finished {
+		return
+	}
+	if flight.timer != nil {
+		flight.timer.Stop()
+		flight.timer = nil
+	}
+	flight.cancelErr = context.Canceled
+	flight.cancel()
+}
+
+func (r *stateResolver) finishStateFlightLocked(
+	id simplex.ParentID,
+	flight *stateFlight,
+	result ResolvedState,
+	err error,
+	cache bool,
+) {
+	if flight.finished {
+		return
+	}
+
+	flight.finished = true
+	flight.result = result
+	flight.err = err
+	if flight.timer != nil {
+		flight.timer.Stop()
+		flight.timer = nil
+	}
+	if !cache && r.states[id] == flight {
+		delete(r.states, id)
+	}
+	close(flight.done)
+	if flight.cancel != nil {
+		flight.cancel()
 	}
 }
 
@@ -379,7 +494,7 @@ func (r *stateResolver) rememberValidatedState(id simplex.CandidateID, resolved 
 	if flight == nil {
 		done := make(chan struct{})
 		close(done)
-		r.states[parent] = &stateFlight{done: done, result: resolved}
+		r.states[parent] = &stateFlight{done: done, result: resolved, finished: true}
 		r.mu.Unlock()
 
 		return
@@ -391,15 +506,8 @@ func (r *stateResolver) rememberValidatedState(id simplex.CandidateID, resolved 
 		return
 	default:
 	}
-	flight.result = resolved
-	flight.err = nil
-	close(flight.done)
-	cancel := flight.cancel
+	r.finishStateFlightLocked(parent, flight, resolved, nil, true)
 	r.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
 }
 
 // stateRetainedSlots is the margin of already-finalized parents kept resolved.
@@ -458,10 +566,10 @@ type retentionFloor struct {
 // its block BOC; a finalized parent pins a whole separately loaded state tree,
 // which is where the bulk of the bytes are.
 //
-// A flight that is still resolving is never removed. resolveLoop reconciles
-// r.states[id] against its own flight only on the error path, so dropping an
-// in-flight entry would let the next resolve start a second, concurrent
-// ApplyMerkleUpdate over a full state.
+// A flight with an active waiter is never removed by this sweep. The last
+// waiter cancels its flight; the loop removes it only after the current
+// ApplyMerkleUpdate returns, and a later caller waits for that cleanup before
+// restarting. That keeps the non-context-aware cell apply single-flight.
 //
 // It returns the floor both sweeps ran under, because the candidate payloads
 // have the same consumer and must be released against the same bound.
@@ -855,23 +963,18 @@ func (r *stateResolver) resolveLoop(
 	flight *stateFlight,
 ) {
 	defer r.wg.Done()
-	defer flight.cancel()
 
 	result, err := r.resolveInner(ctx, id)
 	r.mu.Lock()
-	select {
-	case <-flight.done:
+	if flight.finished {
 		r.mu.Unlock()
 
 		return
-	default:
 	}
-	flight.result = result
-	flight.err = err
-	if err != nil && r.states[id] == flight {
-		delete(r.states, id)
+	if flight.cancelErr != nil {
+		err = flight.cancelErr
 	}
-	close(flight.done)
+	r.finishStateFlightLocked(id, flight, result, err, err == nil)
 	r.mu.Unlock()
 }
 
@@ -1031,11 +1134,10 @@ func (r *stateResolver) rememberAppliedStateLocked(
 // reached at most once per backstop, so the 1 Hz that used to be the whole
 // mechanism is now the fallback of a fallback.
 //
-// Two callers, two very different bounds, and both are deliberate: resolveInner
-// runs under the resolve flight (session lifetime, with the caller's own
-// validation deadline observed by resolve() itself), and waitReplayApplied runs
-// under r.ctx during crash replay, which is exact parity with the reference's
-// masterchain finalize ordering.
+// Two callers, two different bounds, and both are deliberate: resolveInner
+// runs under the shared resolve flight, bounded by its waiters and the session
+// horizon TTL, while waitReplayApplied runs under r.ctx during crash replay,
+// which is exact parity with the reference's masterchain finalize ordering.
 func (r *stateResolver) loadFinalizedChainState(
 	ctx context.Context,
 	request ChainStateRequest,
@@ -1178,7 +1280,7 @@ func (r *stateResolver) finalizeInner(
 		return nil
 	}
 
-	resolution, err := r.candidates.resolve(r.ctx, id)
+	resolution, err := r.candidates.resolveFinalization(r.ctx, id)
 	if err != nil {
 		return err
 	}

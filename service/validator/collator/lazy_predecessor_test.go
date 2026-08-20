@@ -57,7 +57,7 @@ func TestVerifyPredecessorStateDecodesAProvenStateAsProof(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collate mainnet candidate: %v", err)
 	}
-	collated, err := verifyCollatedData(candidate, req.Header.GenUtime)
+	collated, err := verifyCollatedData(candidate, nil, req.Header.GenUtime)
 	if err != nil {
 		t.Fatal(err)
 	}

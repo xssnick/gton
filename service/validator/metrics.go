@@ -158,6 +158,19 @@ type ValidationObserver interface {
 	// this node and it is otherwise invisible: the candidate simply never gets
 	// our vote, and every rejection log that names it belongs to a peer.
 	AddSelfRejectedCandidate(collator.MetricChain)
+	// AddCapturedFailedCandidate counts one candidate refused with a TVM/semantic
+	// replay error whose block, collated proofs and context were dumped to disk
+	// for offline replay. It is the on-node signal that a diagnosable
+	// producer/validator disagreement was recorded — pair it with an operator
+	// pulling the newest dump directory.
+	AddCapturedFailedCandidate(collator.MetricChain)
+	// AddStorageStatRecompute counts one replayed transaction whose bound
+	// account storage-stat proof was pruned short of this validator's own
+	// update walk, so the stat was recomputed from the account state instead.
+	// The candidate still validates — this is the signal that the producer's
+	// proof shape (its update order) and our replay disagreed and the fallback
+	// carried the block.
+	AddStorageStatRecompute(collator.MetricChain)
 	// AddChainTipWaitBackstop counts one predecessor read that waited past the
 	// backstop without the block becoming readable. It is an alarm, not a rate:
 	// every block this session finalizes is published into the live view at
@@ -270,6 +283,18 @@ func (o *blockStatsValidationObserver) AddSelfRejectedCandidate(chain collator.M
 	}
 }
 
+func (o *blockStatsValidationObserver) AddCapturedFailedCandidate(chain collator.MetricChain) {
+	if o.observer != nil {
+		o.observer.AddCapturedFailedCandidate(chain)
+	}
+}
+
+func (o *blockStatsValidationObserver) AddStorageStatRecompute(chain collator.MetricChain) {
+	if o.observer != nil {
+		o.observer.AddStorageStatRecompute(chain)
+	}
+}
+
 func (o *blockStatsValidationObserver) AddChainTipWaitBackstop(chain collator.MetricChain) {
 	if o.observer != nil {
 		o.observer.AddChainTipWaitBackstop(chain)
@@ -329,6 +354,8 @@ type PrometheusValidationMetrics struct {
 	retentionCapped       *prometheus.CounterVec
 	persistFailures       *prometheus.CounterVec
 	selfRejections        *prometheus.CounterVec
+	capturedFailures      *prometheus.CounterVec
+	storageStatRecomputes *prometheus.CounterVec
 	chainTipWaitBackstops *prometheus.CounterVec
 	sessionRejections     *prometheus.CounterVec
 	lineageWalkCandidates *prometheus.HistogramVec
@@ -403,6 +430,17 @@ func NewPrometheusValidationMetrics(registry MetricsRegistry) (*PrometheusValida
 			Namespace: namespace, Subsystem: "validator", Name: "self_rejected_candidates_total",
 			Help: "Candidates produced by this node and then rejected by its own validation. Always a defect in this node.",
 		}, []string{"chain"}),
+		capturedFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: "validator", Name: "captured_failed_candidates_total",
+			Help: "Candidates refused with a TVM/semantic replay error whose block, collated proofs and " +
+				"context were dumped to disk for offline replay.",
+		}, []string{"chain"}),
+		storageStatRecomputes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: "validator", Name: "storage_stat_recomputes_total",
+			Help: "Replayed transactions whose bound account storage-stat proof was pruned short of this " +
+				"validator's update walk, making the executor recompute the stat from state. The candidate " +
+				"still validates; a steady rate names a producer whose proof shape disagrees with our replay.",
+		}, []string{"chain"}),
 		chainTipWaitBackstops: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Subsystem: "validator", Name: "chain_tip_wait_backstops_total",
 			Help: "Predecessor reads that waited past the backstop for a block to become readable. " +
@@ -438,7 +476,9 @@ func NewPrometheusValidationMetrics(registry MetricsRegistry) (*PrometheusValida
 		metrics.stageDuration, metrics.semanticStageDuration, metrics.taskDuration,
 		metrics.candidateSize,
 		metrics.candidateCacheEntries, metrics.candidateCacheBytes, metrics.retentionCapped,
-		metrics.persistFailures, metrics.selfRejections, metrics.chainTipWaitBackstops,
+		metrics.persistFailures, metrics.selfRejections, metrics.capturedFailures,
+		metrics.storageStatRecomputes,
+		metrics.chainTipWaitBackstops,
 		metrics.sessionRejections,
 		metrics.lineageWalkCandidates, metrics.lineageWalkDuration, metrics.lineageWalkSteps,
 		metrics.consensus,
@@ -477,6 +517,8 @@ type prometheusValidationObserver struct {
 	retentionCapped       [2]prometheus.Counter
 	persistFailures       [2]prometheus.Counter
 	selfRejections        [2]prometheus.Counter
+	capturedFailures      [2]prometheus.Counter
+	storageStatRecomputes [2]prometheus.Counter
 	chainTipWaitBackstops [2]prometheus.Counter
 	sessionRejections     [2][sessionSpecRoleCount][sessionSpecRejectionReasonCount]prometheus.Counter
 	lineageWalkCandidates [2]prometheus.Observer
@@ -550,6 +592,8 @@ func (m *PrometheusValidationMetrics) Observer() ValidationObserver {
 		o.retentionCapped[chain] = m.retentionCapped.WithLabelValues(chainLabel)
 		o.persistFailures[chain] = m.persistFailures.WithLabelValues(chainLabel)
 		o.selfRejections[chain] = m.selfRejections.WithLabelValues(chainLabel)
+		o.capturedFailures[chain] = m.capturedFailures.WithLabelValues(chainLabel)
+		o.storageStatRecomputes[chain] = m.storageStatRecomputes.WithLabelValues(chainLabel)
 		o.chainTipWaitBackstops[chain] = m.chainTipWaitBackstops.WithLabelValues(chainLabel)
 		for role := SessionSpecRole(0); role < sessionSpecRoleCount; role++ {
 			for reason := SessionSpecRejectionReason(0); reason < sessionSpecRejectionReasonCount; reason++ {
@@ -680,6 +724,14 @@ func (o *prometheusValidationObserver) AddCandidatePersistFailure(chain collator
 
 func (o *prometheusValidationObserver) AddSelfRejectedCandidate(chain collator.MetricChain) {
 	o.selfRejections[boundedValidationChain(chain)].Inc()
+}
+
+func (o *prometheusValidationObserver) AddCapturedFailedCandidate(chain collator.MetricChain) {
+	o.capturedFailures[boundedValidationChain(chain)].Inc()
+}
+
+func (o *prometheusValidationObserver) AddStorageStatRecompute(chain collator.MetricChain) {
+	o.storageStatRecomputes[boundedValidationChain(chain)].Inc()
 }
 
 func (o *prometheusValidationObserver) AddChainTipWaitBackstop(chain collator.MetricChain) {

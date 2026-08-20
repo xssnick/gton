@@ -21,8 +21,8 @@ const (
 // THE PROPERTY the relaxed class rests on beyond the quorum argument: an unsynced
 // write lands in the SAME write-ahead log as the commitments around it, so the next
 // SYNCED commit flushes that log past it and makes it durable for free. If it did
-// not hold, the risk would have to be described differently — an unsynced candidate
-// would stay at risk until pebble happened to rotate the log.
+// not hold, the risk would have to be described differently — an unsynced
+// recoverable Pebble record would stay at risk until Pebble rotated the log.
 //
 // It is verified from two directions, because neither alone is enough:
 //

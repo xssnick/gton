@@ -184,7 +184,7 @@ func executionReadShardAccount(t *testing.T, addr *address.Address, code, data *
 func executionReadProvenAccountData(t *testing.T, req ShardRequest, candidate *Candidate, addr *address.Address) *cell.Cell {
 	t.Helper()
 
-	verified, err := verifyCollatedData(candidate, req.Header.GenUtime)
+	verified, err := verifyCollatedData(candidate, nil, req.Header.GenUtime)
 	if err != nil {
 		t.Fatalf("decode collated data: %v", err)
 	}

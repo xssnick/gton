@@ -160,6 +160,7 @@ func TestCommitBuiltAndReplayedDerivationsAgree(t *testing.T) {
 			fast, bound := fixture.built.built.bind(
 				fixture.built.ID,
 				fixture.built.State,
+				fixture.built.StateUpdate,
 				[]PreviousBlock{shardReq.Previous},
 			)
 			if !bound {
@@ -181,6 +182,20 @@ func TestCommitBuiltAndReplayedDerivationsAgree(t *testing.T) {
 			}
 			if fast.genUTime != replayed.genUTime {
 				t.Fatalf("generation time %d != %d", fast.genUTime, replayed.genUTime)
+			}
+			if fast.outQueueSize != replayed.outQueueSize || fast.outQueueSize != fixture.built.Stats.OutQueueSize {
+				t.Fatalf(
+					"queue sizes built=%d fast=%d replayed=%d",
+					fixture.built.Stats.OutQueueSize,
+					fast.outQueueSize,
+					replayed.outQueueSize,
+				)
+			}
+			if !equalCandidateStorageStats(fast.storageStats, replayed.storageStats) {
+				t.Fatal("storage statistics differ")
+			}
+			if !equalCandidateExternals(fast.externals, replayed.externals) {
+				t.Fatal("external feedback differs")
 			}
 
 			// The out-message walk is the one consumer that reads deep into the
@@ -256,7 +271,7 @@ func TestNextBlockCollatedDataIdenticalOverBuiltPredecessor(t *testing.T) {
 	if first.built == nil {
 		t.Fatal("the canonical build path produced no derivation capsule")
 	}
-	fastDerivation, bound := first.built.bind(first.ID, first.State, []PreviousBlock{base.Previous})
+	fastDerivation, bound := first.built.bind(first.ID, first.State, first.StateUpdate, []PreviousBlock{base.Previous})
 	if !bound {
 		t.Fatal("the capsule did not bind the chain it was built over")
 	}
@@ -333,6 +348,7 @@ func TestBuiltCapsuleDoesNotBindForeignChain(t *testing.T) {
 	if _, bound := fixture.built.built.bind(
 		fixture.built.ID,
 		fixture.built.State,
+		fixture.built.StateUpdate,
 		[]PreviousBlock{foreign},
 	); bound {
 		t.Fatal("the capsule bound a chain it was not built over")
@@ -340,6 +356,7 @@ func TestBuiltCapsuleDoesNotBindForeignChain(t *testing.T) {
 	if _, bound := fixture.built.built.bind(
 		fixture.built.ID,
 		fixture.built.State,
+		fixture.built.StateUpdate,
 		[]PreviousBlock{shardReq.Previous, shardReq.Previous},
 	); bound {
 		t.Fatal("the capsule bound a merge chain although it was built over one predecessor")
@@ -349,9 +366,38 @@ func TestBuiltCapsuleDoesNotBindForeignChain(t *testing.T) {
 	if _, bound := fixture.built.built.bind(
 		other,
 		fixture.built.State,
+		fixture.built.StateUpdate,
 		[]PreviousBlock{shardReq.Previous},
 	); bound {
 		t.Fatal("the capsule bound a different block id")
+	}
+	other = fixture.built.ID
+	other.SeqNo++
+	if _, bound := fixture.built.built.bind(
+		other,
+		fixture.built.State,
+		fixture.built.StateUpdate,
+		[]PreviousBlock{shardReq.Previous},
+	); bound {
+		t.Fatal("the capsule bound a different block sequence number")
+	}
+	foreignState := cell.BeginCell().MustStoreUInt(0x57a7e, 32).EndCell()
+	if _, bound := fixture.built.built.bind(
+		fixture.built.ID,
+		foreignState,
+		fixture.built.StateUpdate,
+		[]PreviousBlock{shardReq.Previous},
+	); bound {
+		t.Fatal("the capsule bound a successor state it did not build")
+	}
+	foreignUpdate := cell.BeginCell().MustStoreUInt(0xadd, 32).EndCell()
+	if _, bound := fixture.built.built.bind(
+		fixture.built.ID,
+		fixture.built.State,
+		foreignUpdate,
+		[]PreviousBlock{shardReq.Previous},
+	); bound {
+		t.Fatal("the capsule bound a state update it did not build")
 	}
 
 	// A capsule that does not bind falls back to the replay and records the miss.
@@ -397,6 +443,45 @@ func TestRestoreCandidateNeverTakesBuiltPath(t *testing.T) {
 	}
 	if state.block.State.HashKeyAt(0) != fixture.built.State.HashKeyAt(0) {
 		t.Fatal("the restored state differs from the built one")
+	}
+}
+
+func TestRestoreCandidatePreservesOutQueueSizeForNextBuild(t *testing.T) {
+	shardReq := emptyCandidateRequest(t)
+	shardReq.Previous.State = previousStateWithDenseOutQueue(t, shardReq.Previous.State, 1)
+	queueSize := uint64(1)
+	shardReq.Previous.OutQueueSize = &queueSize
+	shardReq.Internals = &msgpool.Cut{More: true}
+
+	fixture := newBuiltCommitFixture(t, shardReq)
+	if fixture.built.Stats.OutQueueSize != queueSize {
+		t.Fatalf("built queue size = %d, want %d", fixture.built.Stats.OutQueueSize, queueSize)
+	}
+	if err := fixture.acquisition.RestoreCandidate(
+		context.Background(),
+		fixture.request,
+		fixture.artifact,
+	); err != nil {
+		t.Fatalf("restore candidate: %v", err)
+	}
+
+	state, exists := fixture.managed.candidates[fixture.artifact.Candidate.ID]
+	if !exists {
+		t.Fatal("restore recorded no candidate state")
+	}
+	if state.block.OutQueueSize == nil {
+		t.Fatal("restored queue size is absent")
+	}
+	if got := *state.block.OutQueueSize; got != queueSize {
+		t.Fatalf("restored queue size = %d, want %d", got, queueSize)
+	}
+
+	next := shardReq
+	next.Previous = state.block
+	next.Header.GenUtime++
+	next.Header.GenUtimeMS = uint64(next.Header.GenUtime) * 1_000
+	if _, err := testBuilder().BuildShard(context.Background(), next); err != nil {
+		t.Fatalf("build over restored candidate: %v", err)
 	}
 }
 

@@ -20,6 +20,29 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
+func preparedTrustedCandidate(t *testing.T, block DownloadedBlock) TrustedBlockCandidate {
+	t.Helper()
+
+	prepared, err := tnstore.PrepareBlockCandidate(
+		block.ID.Workchain,
+		block.ID.Shard,
+		block.ID.SeqNo,
+		block.Block,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preparedID := prepared.ID(); !preparedID.Equals(&block.ID) {
+		t.Fatalf("prepared block id = %s, want %s", tnstore.FormatBlockRef(preparedID), tnstore.FormatBlockRef(block.ID))
+	}
+	trusted, err := NewTrustedBlockCandidate(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return trusted
+}
+
 func TestBlockBroadcastsQueueIsBoundedAndTransfersOwnership(t *testing.T) {
 	node := newTestNode(t)
 	broadcasts := node.BlockBroadcasts()
@@ -62,11 +85,13 @@ func TestBlockBroadcastsTrustedCandidateQueueIsBoundedAndTransfersOwnership(t *t
 	broadcasts := node.BlockBroadcasts()
 	broadcasts.queue = newBoundedQueue(1, 1<<20, blockPublicationRequestBytes)
 
-	owned := []byte{1, 2, 3, 4}
-	if !broadcasts.TryCacheCandidate(TrustedBlockCandidate{BlockBOC: owned}) {
+	firstCandidate := testBlockFinalityCandidate(t, 408)
+	first := preparedTrustedCandidate(t, firstCandidate)
+	owned := first.blockBOC
+	if !broadcasts.TryCacheCandidate(first) {
 		t.Fatal("trusted candidate was not queued")
 	}
-	if broadcasts.TryCacheCandidate(TrustedBlockCandidate{BlockBOC: []byte{5}}) {
+	if broadcasts.TryCacheCandidate(preparedTrustedCandidate(t, testBlockFinalityCandidate(t, 409))) {
 		t.Fatal("trusted candidate was queued above the item bound")
 	}
 
@@ -74,21 +99,19 @@ func TestBlockBroadcastsTrustedCandidateQueueIsBoundedAndTransfersOwnership(t *t
 	if !ok || request.kind != blockCacheTrustedCandidate {
 		t.Fatalf("trusted candidate request = %+v, ok=%v", request, ok)
 	}
-	if len(request.trustedCandidate.BlockBOC) == 0 ||
-		&request.trustedCandidate.BlockBOC[0] != &owned[0] {
+	queued := request.trustedCandidate.blockBOC
+	if len(queued) == 0 || &queued[0] != &owned[0] {
 		t.Fatal("successful enqueue copied instead of taking ownership of the trusted candidate BOC")
 	}
 }
 
-func TestBlockBroadcastsCachesTrustedCandidateWithoutPublishing(t *testing.T) {
+func TestBlockBroadcastsCachesTrustedCandidateAsColdPayloadWithoutPublishing(t *testing.T) {
 	node := newPrivateOverlayTestNode(t)
 	_, peer := blockPublicationTestCustomOverlay(t, node, "trusted-candidate")
 	candidate := testBlockFinalityCandidate(t, 410)
+	trusted := preparedTrustedCandidate(t, candidate)
 
-	node.BlockBroadcasts().cacheTrustedCandidate(TrustedBlockCandidate{
-		Block:    candidate.ID,
-		BlockBOC: candidate.BlockBOC,
-	})
+	node.BlockBroadcasts().cacheTrustedCandidate(trusted)
 
 	key := tnstore.BlockKey(candidate.ID)
 	node.blockFinalityCache.mu.Lock()
@@ -97,12 +120,18 @@ func TestBlockBroadcastsCachesTrustedCandidateWithoutPublishing(t *testing.T) {
 	if finalityCandidate == nil {
 		t.Fatal("trusted candidate is missing from the finality cache")
 	}
+	if !bytes.Equal(finalityCandidate.block.blockBOC, trusted.blockBOC) {
+		t.Fatal("finality cache changed the trusted candidate BOC")
+	}
 
 	node.shardCandidateCache.mu.Lock()
-	_, shardCandidateFound := node.shardCandidateCache.candidates[key]
+	shardCandidate, shardCandidateFound := node.shardCandidateCache.candidates[key]
 	node.shardCandidateCache.mu.Unlock()
 	if !shardCandidateFound {
 		t.Fatal("trusted candidate is missing from the shard candidate cache")
+	}
+	if !bytes.Equal(shardCandidate.block.blockBOC, trusted.blockBOC) {
+		t.Fatal("shard cache changed the trusted candidate BOC")
 	}
 	if _, ok := node.eventQueue.TryPop(); ok {
 		t.Fatal("candidate without finality produced a signed block event")
@@ -112,16 +141,14 @@ func TestBlockBroadcastsCachesTrustedCandidateWithoutPublishing(t *testing.T) {
 	}
 }
 
-func TestBlockBroadcastsRejectsInvalidTrustedCandidate(t *testing.T) {
+func TestBlockBroadcastsRejectsAbsentTrustedCandidate(t *testing.T) {
 	node := newTestNode(t)
 	candidate := testBlockFinalityCandidate(t, 411)
-	corruptBOC := bytes.Clone(candidate.BlockBOC)
-	corruptBOC[len(corruptBOC)-1] ^= 0xff
 
-	node.BlockBroadcasts().cacheTrustedCandidate(TrustedBlockCandidate{
-		Block:    candidate.ID,
-		BlockBOC: corruptBOC,
-	})
+	if node.BlockBroadcasts().TryCacheCandidate(TrustedBlockCandidate{}) {
+		t.Fatal("absent trusted candidate entered the queue")
+	}
+	node.BlockBroadcasts().cacheTrustedCandidate(TrustedBlockCandidate{})
 
 	key := tnstore.BlockKey(candidate.ID)
 	node.blockFinalityCache.mu.Lock()
@@ -139,6 +166,27 @@ func TestBlockBroadcastsRejectsInvalidTrustedCandidate(t *testing.T) {
 	}
 }
 
+func TestBlockBroadcastsRejectsInvalidRawTrustedCandidate(t *testing.T) {
+	node := newTestNode(t)
+	candidate := testBlockFinalityCandidate(t, 411)
+	corruptBOC := bytes.Clone(candidate.BlockBOC)
+	corruptBOC[len(corruptBOC)-1] ^= 0xff
+	trusted, err := NewTrustedRawBlockCandidate(candidate.ID, corruptBOC)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	node.BlockBroadcasts().cacheTrustedCandidate(trusted)
+
+	key := tnstore.BlockKey(candidate.ID)
+	node.blockFinalityCache.mu.Lock()
+	_, found := node.blockFinalityCache.candidates[key]
+	node.blockFinalityCache.mu.Unlock()
+	if found {
+		t.Fatal("invalid raw trusted candidate entered the finality cache")
+	}
+}
+
 func TestBlockBroadcastsTrustedCandidateDeliversAssembledFinality(t *testing.T) {
 	node := newPrivateOverlayTestNode(t)
 	_, peer := blockPublicationTestCustomOverlay(t, node, "trusted-finality")
@@ -148,10 +196,7 @@ func TestBlockBroadcastsTrustedCandidateDeliversAssembledFinality(t *testing.T) 
 		t.Fatalf("prime finality cache: blocks=%d err=%v", len(blocks), err)
 	}
 
-	node.BlockBroadcasts().cacheTrustedCandidate(TrustedBlockCandidate{
-		Block:    candidate.ID,
-		BlockBOC: candidate.BlockBOC,
-	})
+	node.BlockBroadcasts().cacheTrustedCandidate(preparedTrustedCandidate(t, candidate))
 
 	event, ok := node.eventQueue.TryPop()
 	if !ok {

@@ -1,8 +1,11 @@
 package collator
 
 import (
+	"bytes"
+	"fmt"
 	"sync/atomic"
 
+	"github.com/xssnick/gton/service/validator/msgpool"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -45,6 +48,137 @@ type builtCandidate struct {
 	// bind refuses a chain that is not those parents, so the reused successor
 	// can never belong to a different predecessor than the one being committed.
 	parents []cell.Hash
+	// state and stateUpdate bind the successor handed to CommitCandidate to the
+	// transition finish() actually built. Both are cached level-0 hashes, so the
+	// check is O(1) and does not retain another tree.
+	state       cell.Hash
+	stateUpdate cell.Hash
+	workchain   int32
+	shard       int64
+	seqno       uint32
+	fileHash    [32]byte
+	// metadata is installed only when the complete Builder entry point seals
+	// the candidate. finish() deliberately leaves the capsule provisional so
+	// ready-external wrappers can finish the candidate statistics first.
+	metadata *candidateProvenance
+}
+
+// candidateProvenance is an immutable seal over the exported Candidate fields
+// whose ownership crosses the public Pipeline boundary. It is deliberately
+// separate from builtCandidate: a build whose predecessor shape cannot use the
+// commit fast path may still reuse its prepared broadcast payload safely.
+type candidateProvenance struct {
+	workchain        int32
+	shard            int64
+	seqno            uint32
+	rootHash         cell.Hash
+	fileHash         [32]byte
+	collatedFileHash [32]byte
+	stateHash        cell.Hash
+	stateUpdateHash  cell.Hash
+	stats            Stats
+	storageStats     AccountStorageStats
+	externals        []msgpool.ExternalFeedback
+}
+
+// sealBuiltCandidate closes the canonical Builder ownership boundary after
+// every wrapper has finished decorating the candidate. It is deliberately
+// one-shot: resealing after the Candidate crossed that boundary would bless a
+// mutation the provenance exists to reject.
+func sealBuiltCandidate(candidate *Candidate) error {
+	if candidate == nil || candidate.built == nil || candidate.built.root == nil {
+		return fmt.Errorf("%w: candidate derivation is absent at seal", ErrInvalidInput)
+	}
+	if candidate.provenance != nil || candidate.built.metadata != nil {
+		return fmt.Errorf("%w: candidate is already sealed", ErrInvalidInput)
+	}
+
+	provenance := newCandidateProvenance(candidate, candidate.built.root)
+	if provenance == nil {
+		return fmt.Errorf("%w: candidate is incomplete at seal", ErrInvalidInput)
+	}
+	candidate.provenance = provenance
+	candidate.built.metadata = provenance
+
+	return nil
+}
+
+func newCandidateProvenance(
+	candidate *Candidate,
+	root *cell.Cell,
+) *candidateProvenance {
+	if candidate == nil || root == nil || candidate.State == nil || candidate.StateUpdate == nil ||
+		len(candidate.ID.RootHash) != 32 || len(candidate.ID.FileHash) != 32 {
+		return nil
+	}
+	storageStats := make(AccountStorageStats, len(candidate.StorageStats))
+	for hash, stat := range candidate.StorageStats {
+		storageStats[hash] = stat
+	}
+
+	p := &candidateProvenance{
+		workchain:        candidate.ID.Workchain,
+		shard:            candidate.ID.Shard,
+		seqno:            candidate.ID.SeqNo,
+		rootHash:         root.HashKeyAt(0),
+		collatedFileHash: candidate.CollatedFileHash,
+		stateHash:        candidate.State.HashKeyAt(0),
+		stateUpdateHash:  candidate.StateUpdate.HashKeyAt(0),
+		stats:            candidate.Stats,
+		storageStats:     storageStats,
+		externals:        append([]msgpool.ExternalFeedback(nil), candidate.Externals...),
+	}
+	copy(p.fileHash[:], candidate.ID.FileHash)
+
+	return p
+}
+
+func (p *candidateProvenance) binds(candidate *Candidate, fileHash, collatedFileHash [32]byte) bool {
+	if p == nil || candidate == nil || candidate.State == nil || candidate.StateUpdate == nil ||
+		len(candidate.ID.RootHash) != len(p.rootHash) || len(candidate.ID.FileHash) != len(p.fileHash) {
+		return false
+	}
+
+	return candidate.ID.Workchain == p.workchain &&
+		candidate.ID.Shard == p.shard &&
+		candidate.ID.SeqNo == p.seqno &&
+		bytes.Equal(candidate.ID.RootHash, p.rootHash[:]) &&
+		bytes.Equal(candidate.ID.FileHash, p.fileHash[:]) &&
+		fileHash == p.fileHash &&
+		collatedFileHash == p.collatedFileHash &&
+		candidate.CollatedFileHash == p.collatedFileHash &&
+		candidate.State.HashKeyAt(0) == p.stateHash &&
+		candidate.StateUpdate.HashKeyAt(0) == p.stateUpdateHash &&
+		candidate.Stats == p.stats &&
+		equalCandidateStorageStats(candidate.StorageStats, p.storageStats) &&
+		equalCandidateExternals(candidate.Externals, p.externals)
+}
+
+func equalCandidateStorageStats(left, right AccountStorageStats) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for hash, stat := range left {
+		other, exists := right[hash]
+		if !exists || other != stat {
+			return false
+		}
+	}
+
+	return true
+}
+
+func equalCandidateExternals(left, right []msgpool.ExternalFeedback) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+
+	return true
 }
 
 // commitDerivation is what committing a candidate needs to know about the block
@@ -61,14 +195,27 @@ type commitDerivation struct {
 	startLT uint64
 	// genUTime is the successor state's GenUTime.
 	genUTime uint32
+	// The remaining values are local commit metadata. Builder-owned derivations
+	// carry the sealed snapshots rather than rereading the mutable public
+	// Candidate after it crossed the Pipeline boundary.
+	outQueueSize uint64
+	storageStats AccountStorageStats
+	externals    []msgpool.ExternalFeedback
 }
 
 func newBuiltCandidate(
+	id ton.BlockIDExt,
 	root *cell.Cell,
+	state *cell.Cell,
+	stateUpdate *cell.Cell,
 	startLT uint64,
 	genUTime uint32,
 	previous ...*PreviousBlock,
 ) *builtCandidate {
+	if root == nil || state == nil || stateUpdate == nil || len(id.FileHash) != 32 {
+		return nil
+	}
+
 	parents := make([]cell.Hash, 0, len(previous))
 	for _, parent := range previous {
 		if parent == nil || parent.State == nil {
@@ -77,7 +224,20 @@ func newBuiltCandidate(
 		parents = append(parents, parent.State.HashKeyAt(0))
 	}
 
-	return &builtCandidate{root: root, startLT: startLT, genUTime: genUTime, parents: parents}
+	built := &builtCandidate{
+		root:        root,
+		startLT:     startLT,
+		genUTime:    genUTime,
+		parents:     parents,
+		state:       state.HashKeyAt(0),
+		stateUpdate: stateUpdate.HashKeyAt(0),
+		workchain:   id.Workchain,
+		shard:       id.Shard,
+		seqno:       id.SeqNo,
+	}
+	copy(built.fileHash[:], id.FileHash)
+
+	return built
 }
 
 // bind hands over the builder's derivation for one specific commit, or reports
@@ -91,15 +251,24 @@ func newBuiltCandidate(
 func (b *builtCandidate) bind(
 	id ton.BlockIDExt,
 	state *cell.Cell,
+	stateUpdate *cell.Cell,
 	previous []PreviousBlock,
 ) (commitDerivation, bool) {
-	if b == nil || b.root == nil || state == nil || len(previous) != len(b.parents) {
+	if b == nil || b.root == nil || b.metadata == nil || state == nil || stateUpdate == nil ||
+		len(previous) != len(b.parents) {
 		return commitDerivation{}, false
 	}
 	if len(id.RootHash) != 32 {
 		return commitDerivation{}, false
 	}
+	if id.Workchain != b.workchain || id.Shard != b.shard || id.SeqNo != b.seqno ||
+		len(id.FileHash) != len(b.fileHash) || !bytes.Equal(id.FileHash, b.fileHash[:]) {
+		return commitDerivation{}, false
+	}
 	if b.root.HashKeyAt(0) != cell.Hash(id.RootHash) {
+		return commitDerivation{}, false
+	}
+	if state.HashKeyAt(0) != b.state || stateUpdate.HashKeyAt(0) != b.stateUpdate {
 		return commitDerivation{}, false
 	}
 	for i := range previous {
@@ -109,9 +278,12 @@ func (b *builtCandidate) bind(
 	}
 
 	return commitDerivation{
-		root:     b.root,
-		state:    state,
-		startLT:  b.startLT,
-		genUTime: b.genUTime,
+		root:         b.root,
+		state:        state,
+		startLT:      b.startLT,
+		genUTime:     b.genUTime,
+		outQueueSize: b.metadata.stats.OutQueueSize,
+		storageStats: b.metadata.storageStats,
+		externals:    b.metadata.externals,
 	}, true
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 
+	tnstore "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/gton/service/validator/groups"
 	"github.com/xssnick/gton/service/validator/simplex"
 )
@@ -67,15 +68,40 @@ type CandidateArtifact struct {
 	// package from anywhere but those two producers cannot claim it, and the
 	// validator it is handed to then re-derives the digest itself.
 	digested bool
+
+	// preparedBlock is present only for Protocol-1 received candidates. The
+	// decoder already held the parsed root and serialized the canonical block;
+	// carrying that immutable result lets the asynchronous node cache build
+	// metadata without parsing and hashing BlockBOC again.
+	preparedBlock *tnstore.PreparedBlockCandidate
+
+	// validationRoots is the parsed payload the network codec already verified
+	// while decoding this candidate. A voting resolver moves it out of the
+	// retained artifact and hands it to at most one validation; observers and
+	// long-lived candidate storage keep only the canonical bytes.
+	validationRoots *candidateValidationRoots
+}
+
+type candidateValidationRoots struct {
+	block    *cell.Cell
+	collated []*cell.Cell
+}
+
+// PreparedBlockCandidate is the storage-ready Protocol-1 block artifact, or nil
+// for candidate protocols that do not use the legacy cache route. The returned
+// value and its BOC are immutable and may be retained by the publication queue.
+func (a CandidateArtifact) PreparedBlockCandidate() *tnstore.PreparedBlockCandidate {
+	return a.preparedBlock
 }
 
 type candidateCodec struct {
-	sessionID      [32]byte
-	shard          groups.ShardID
-	validators     []simplex.Validator
-	schedule       simplex.LeaderSchedule
-	slotsPerWindow uint32
-	limits         CandidateLimits
+	sessionID       [32]byte
+	shard           groups.ShardID
+	validators      []simplex.Validator
+	schedule        simplex.LeaderSchedule
+	slotsPerWindow  uint32
+	limits          CandidateLimits
+	protocolVersion uint8
 }
 
 func newCandidateCodec(config SessionConfig, limits CandidateLimits) (*candidateCodec, error) {
@@ -100,7 +126,7 @@ func newCandidateCodec(config SessionConfig, limits CandidateLimits) (*candidate
 	for i := range config.Validators {
 		validator := &config.Validators[i]
 		validators[i] = simplex.Validator{
-			PublicKey: ed25519.PublicKey(validator.PublicKey[:]),
+			PublicKey: append(ed25519.PublicKey(nil), validator.PublicKey[:]...),
 			Weight:    validator.Weight,
 		}
 	}
@@ -113,8 +139,9 @@ func newCandidateCodec(config SessionConfig, limits CandidateLimits) (*candidate
 			SlotsPerLeaderWindow: config.Protocol.SlotsPerLeaderWindow,
 			Validators:           uint32(len(validators)),
 		},
-		slotsPerWindow: config.Protocol.SlotsPerLeaderWindow,
-		limits:         limits,
+		slotsPerWindow:  config.Protocol.SlotsPerLeaderWindow,
+		limits:          limits,
+		protocolVersion: config.Protocol.ProtocolVersion,
 	}, nil
 }
 
@@ -279,7 +306,12 @@ func (c *candidateCodec) decodeBlock(
 		// is computed from them here, so the digests are not merely consistent
 		// with the payload — they are the only thing that made this candidate
 		// identifiable at all.
-		digested: true,
+		digested:      true,
+		preparedBlock: payload.preparedBlock,
+		validationRoots: &candidateValidationRoots{
+			block:    payload.blockRoot,
+			collated: payload.collatedRoots,
+		},
 	}, nil
 }
 
@@ -308,6 +340,9 @@ type decodedCandidatePayload struct {
 	fileHash         [32]byte
 	collatedFileHash [32]byte
 	prepared         *simplex.PreparedCandidate
+	preparedBlock    *tnstore.PreparedBlockCandidate
+	blockRoot        *cell.Cell
+	collatedRoots    []*cell.Cell
 }
 
 func (c *candidateCodec) decodePayload(data []byte, prepare bool) (decodedCandidatePayload, error) {
@@ -390,16 +425,37 @@ func (c *candidateCodec) finishPayload(
 		return decodedCandidatePayload{}, errors.New("validator runtime: candidate root hash mismatch")
 	}
 
-	// This is the byte form emitted by reference std_boc_serialize(root, 31):
-	// its root marker is not set, so WithTopHash must remain disabled.
-	blockBOC, err := roots[0].ToBOCWithOptionsErr(cell.BOCSerializeOptions{
-		WithCRC32C:    true,
-		WithIndex:     true,
-		WithCacheBits: true,
-		WithIntHashes: true,
-	})
-	if err != nil {
-		return decodedCandidatePayload{}, fmt.Errorf("validator runtime: serialize candidate block boc: %w", err)
+	// Protocol 1 hands the block to the node cache immediately after consensus
+	// decode. Build a sealed root+BOC artifact here, while the parsed graph is in
+	// hand, so that worker does not deserialize and hash the same block again.
+	// Later protocols do not use that cache route and keep the allocation-free
+	// direct serialization.
+	var err error
+	var preparedBlock *tnstore.PreparedBlockCandidate
+	var blockBOC []byte
+	if c.protocolVersion == 1 {
+		preparedBlock, err = tnstore.PrepareBlockCandidate(
+			c.shard.Workchain,
+			c.shard.Shard,
+			uint32(round),
+			roots[0],
+		)
+		if err != nil {
+			return decodedCandidatePayload{}, fmt.Errorf("validator runtime: prepare candidate block: %w", err)
+		}
+		blockBOC = preparedBlock.BlockBOC()
+	} else {
+		// This is the byte form emitted by reference std_boc_serialize(root, 31):
+		// its root marker is not set, so WithTopHash must remain disabled.
+		blockBOC, err = roots[0].ToBOCWithOptionsErr(cell.BOCSerializeOptions{
+			WithCRC32C:    true,
+			WithIndex:     true,
+			WithCacheBits: true,
+			WithIntHashes: true,
+		})
+		if err != nil {
+			return decodedCandidatePayload{}, fmt.Errorf("validator runtime: serialize candidate block boc: %w", err)
+		}
 	}
 	collatedData, err := cell.ToBOCWithOptionsErr(
 		roots[1:],
@@ -415,12 +471,22 @@ func (c *candidateCodec) finishPayload(
 		return decodedCandidatePayload{}, errors.New("validator runtime: candidate collated data is too large")
 	}
 
+	var fileHash [32]byte
+	if preparedBlock != nil {
+		preparedID := preparedBlock.ID()
+		copy(fileHash[:], preparedID.FileHash)
+	} else {
+		fileHash = sha256.Sum256(blockBOC)
+	}
 	result := decodedCandidatePayload{
 		round:            uint32(round),
 		blockBOC:         blockBOC,
 		collatedData:     collatedData,
-		fileHash:         sha256.Sum256(blockBOC),
+		fileHash:         fileHash,
 		collatedFileHash: sha256.Sum256(collatedData),
+		preparedBlock:    preparedBlock,
+		blockRoot:        roots[0],
+		collatedRoots:    roots[1:],
 	}
 	copy(result.rootHash[:], rootHash)
 	if prepare {

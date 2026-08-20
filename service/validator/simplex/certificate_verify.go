@@ -1,6 +1,7 @@
 package simplex
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
@@ -104,15 +105,14 @@ func (b CertificateBinding) Check(c VerifiedCertificate) error {
 //
 // Both fields are unexported and the type has no populated literal form outside
 // this package: every value in existence came out of sealCertificate, which has
-// exactly four callers, each of which has just verified or attested the quorum:
+// exactly three callers, each of which has just verified or attested the quorum:
 //
 //  1. CertificateVerifier.Verify (and the free VerifyCertificate) — ran
-//     verifyCertificatePayload over the certificate;
-//  2. ValidateBootstrap — ran verifyCertificatePayload over every journaled
-//     certificate;
-//  3. Engine.verifyCertificate — ran verifyCertificatePayload with the memoized
+//     verifyCertificatePayload over the certificate; ValidateBootstrap uses
+//     the same verifier for every journaled certificate;
+//  2. Engine.verifyCertificate — ran verifyCertificatePayload with the memoized
 //     payload and the precomputed threshold;
-//  4. Engine.seal — caller attestation for a certificate the engine assembled
+//  3. Engine.seal — caller attestation for a certificate the engine assembled
 //     itself out of votes it had already verified one by one; see the comment
 //     there.
 //
@@ -121,8 +121,9 @@ func (b CertificateBinding) Check(c VerifiedCertificate) error {
 // accepter call blockproof.CheckPreparedSignatureWeight instead of
 // blockproof.CheckPreparedSignatures.
 //
-// The referenced Certificate must be treated as immutable: the seal proves a
-// statement about the signature slice as it was at verification time.
+// The certificate is copied into the seal before the proof is exposed. Public
+// accessors return another copy, so neither the verification input nor a
+// consumer can mutate the statement the seal proves.
 type VerifiedCertificate struct {
 	cert    *Certificate
 	binding CertificateBinding
@@ -130,13 +131,21 @@ type VerifiedCertificate struct {
 
 // sealCertificate is the single funnel every VerifiedCertificate comes out of.
 // It is unexported and takes no error path on purpose: its callers are the
-// verification sites, and the type is meaningless without one of them.
+// verification sites, and the type is meaningless without one of them. The
+// deep copy is the ownership boundary: callers may keep and reuse cert after
+// this function returns without changing the sealed proof.
 func sealCertificate(cert *Certificate, binding CertificateBinding) VerifiedCertificate {
-	return VerifiedCertificate{cert: cert, binding: binding}
+	return VerifiedCertificate{cert: cloneCertificate(cert), binding: binding}
 }
 
-// Certificate is the verified certificate, or nil for the zero value.
-func (c VerifiedCertificate) Certificate() *Certificate { return c.cert }
+// Certificate returns a copy of the verified certificate, or nil for the zero
+// value. Mutating the result cannot change this proof.
+func (c VerifiedCertificate) Certificate() *Certificate { return cloneCertificate(c.cert) }
+
+// certificate returns the package-owned immutable certificate. It is for
+// simplex internals only; a pointer crossing an injected interface or package
+// boundary must go through Certificate instead.
+func (c VerifiedCertificate) certificate() *Certificate { return c.cert }
 
 // Vote is the certified vote, or the zero Vote (Kind 0, which no VoteKind
 // constant uses) for the zero value.
@@ -154,6 +163,42 @@ func (c VerifiedCertificate) Binding() CertificateBinding { return c.binding }
 // IsZero reports the never-verified zero value.
 func (c VerifiedCertificate) IsZero() bool { return c.cert == nil }
 
+func cloneCertificate(cert *Certificate) *Certificate {
+	if cert == nil {
+		return nil
+	}
+
+	cloned := &Certificate{Vote: cert.Vote}
+	if cert.Signatures != nil {
+		cloned.Signatures = make([]VoteSignature, len(cert.Signatures))
+	}
+	for i := range cert.Signatures {
+		cloned.Signatures[i] = VoteSignature{
+			ValidatorIndex: cert.Signatures[i].ValidatorIndex,
+			Signature:      bytes.Clone(cert.Signatures[i].Signature),
+		}
+	}
+
+	return cloned
+}
+
+func certificatesEqual(left, right *Certificate) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if left.Vote != right.Vote || len(left.Signatures) != len(right.Signatures) {
+		return false
+	}
+	for i := range left.Signatures {
+		if left.Signatures[i].ValidatorIndex != right.Signatures[i].ValidatorIndex ||
+			!bytes.Equal(left.Signatures[i].Signature, right.Signatures[i].Signature) {
+			return false
+		}
+	}
+
+	return true
+}
+
 // CertificateVerifier verifies certificates of one session without an Engine.
 // It exists so that the roster digest and the quorum threshold are derived once
 // per session rather than once per certificate; the candidate resolver holds
@@ -166,23 +211,36 @@ type CertificateVerifier struct {
 
 // NewCertificateVerifier prepares the per-session verification state.
 func NewCertificateVerifier(sessionID [32]byte, validators []Validator) (*CertificateVerifier, error) {
-	if len(validators) == 0 {
+	ownedValidators := cloneValidators(validators)
+	if len(ownedValidators) == 0 {
 		return nil, fmt.Errorf("simplex: empty validator set")
 	}
-	totalWeight, err := totalValidatorWeight(validators)
+	totalWeight, err := totalValidatorWeight(ownedValidators)
 	if err != nil {
 		return nil, err
 	}
-	binding, err := NewCertificateBinding(sessionID, validators)
+	binding, err := NewCertificateBinding(sessionID, ownedValidators)
 	if err != nil {
 		return nil, err
 	}
 
 	return &CertificateVerifier{
 		binding:    binding,
-		validators: validators,
+		validators: ownedValidators,
 		threshold:  totalWeight*2/3 + 1,
 	}, nil
+}
+
+func cloneValidators(validators []Validator) []Validator {
+	cloned := make([]Validator, len(validators))
+	for i := range validators {
+		cloned[i] = Validator{
+			PublicKey: bytes.Clone(validators[i].PublicKey),
+			Weight:    validators[i].Weight,
+		}
+	}
+
+	return cloned
 }
 
 // Binding is the binding every certificate this verifier seals carries.
@@ -194,16 +252,29 @@ func (v *CertificateVerifier) Verify(cert *Certificate) (VerifiedCertificate, er
 	if cert == nil {
 		return VerifiedCertificate{}, fmt.Errorf("simplex: nil certificate")
 	}
+	// Reject shapes that cannot possibly verify before copying their payload.
+	// The same checks run on the owned snapshot below; this preflight only keeps
+	// an oversized in-process input from turning a cheap rejection into a large
+	// allocation.
 	if err := validateCertificateVote(cert.Vote); err != nil {
 		return VerifiedCertificate{}, err
 	}
+	if len(cert.Signatures) > len(v.validators) {
+		return VerifiedCertificate{}, fmt.Errorf("too many signatures in certificate")
+	}
 
-	payload := DataToSign(v.binding.sessionID, VoteBytes(cert.Vote))
-	if err := verifyCertificatePayload(v.validators, v.threshold, payload, cert); err != nil {
+	sealed := sealCertificate(cert, v.binding)
+	owned := sealed.certificate()
+	if err := validateCertificateVote(owned.Vote); err != nil {
 		return VerifiedCertificate{}, err
 	}
 
-	return sealCertificate(cert, v.binding), nil
+	payload := DataToSign(v.binding.sessionID, VoteBytes(owned.Vote))
+	if err := verifyCertificatePayload(v.validators, v.threshold, payload, owned); err != nil {
+		return VerifiedCertificate{}, err
+	}
+
+	return sealed, nil
 }
 
 // VerifyCertificate checks a certificate without requiring an Engine. It is

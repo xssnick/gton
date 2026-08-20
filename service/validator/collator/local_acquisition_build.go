@@ -69,6 +69,7 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 	if err != nil {
 		return ShardRequest{}, err
 	}
+	a.prewarmCurrentInternals(messages.cut)
 
 	result := ShardRequest{
 		Shard:               request.Session.Shard,
@@ -84,6 +85,7 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 		Internals:           messages.cut,
 		Neighbors:           messages.neighbors,
 		NeighborShardEndLT:  messages.shardEndLT,
+		accountPrewarmer:    a.accountPrewarmer,
 	}
 	if len(chain.previous) == 2 {
 		second := chain.previous[1]
@@ -208,6 +210,7 @@ func (a *LocalAcquisition) AcquireMaster(ctx context.Context, request BuildReque
 	if err != nil {
 		return MasterRequest{}, err
 	}
+	a.prewarmCurrentInternals(messages.cut)
 	result := MasterRequest{
 		Previous:            chain.previous[0],
 		Config:              master.context.Config,
@@ -222,6 +225,7 @@ func (a *LocalAcquisition) AcquireMaster(ctx context.Context, request BuildReque
 		Neighbors:           messages.neighbors,
 		NeighborShardEndLT:  messages.shardEndLT,
 		ShardTops:           tops,
+		accountPrewarmer:    a.accountPrewarmer,
 	}
 	if master.context.Config.capabilities&capFullCollatedData != 0 {
 		result.FullCollatedProofs = messages.proofs
@@ -510,10 +514,11 @@ func (a *LocalAcquisition) RestoreCandidate(
 	ready := &readyCommit{
 		chain: chain,
 		derivation: commitDerivation{
-			root:     blockRoot,
-			state:    stateRoot,
-			startLT:  block.BlockInfo.StartLt,
-			genUTime: state.GenUTime,
+			root:         blockRoot,
+			state:        stateRoot,
+			startLT:      block.BlockInfo.StartLt,
+			genUTime:     state.GenUTime,
+			outQueueSize: queueSize,
 		},
 	}
 
@@ -708,7 +713,7 @@ func (a *LocalAcquisition) deriveCommitLocked(
 	built *Candidate,
 	previous []PreviousBlock,
 ) (commitDerivation, error) {
-	if derivation, bound := built.built.bind(built.ID, built.State, previous); bound {
+	if derivation, bound := built.built.bind(built.ID, built.State, built.StateUpdate, previous); bound {
 		return derivation, nil
 	}
 	if built.built != nil {
@@ -756,10 +761,13 @@ func deriveCommitByReplay(built *Candidate, previous []PreviousBlock) (commitDer
 	}
 
 	return commitDerivation{
-		root:     root,
-		state:    stateRoot,
-		startLT:  block.BlockInfo.StartLt,
-		genUTime: candidateState.GenUTime,
+		root:         root,
+		state:        stateRoot,
+		startLT:      block.BlockInfo.StartLt,
+		genUTime:     candidateState.GenUTime,
+		outQueueSize: built.Stats.OutQueueSize,
+		storageStats: built.StorageStats,
+		externals:    built.Externals,
 	}, nil
 }
 
@@ -780,11 +788,11 @@ func (a *LocalAcquisition) recordCandidateLocked(
 		ID:           cloneBlockID(built.ID),
 		Block:        derivation.root,
 		State:        derivation.state,
-		OutQueueSize: uint64Pointer(built.Stats.OutQueueSize),
+		OutQueueSize: uint64Pointer(derivation.outQueueSize),
 	}
 	state := localCandidateState{
 		block:        previous,
-		storageStats: built.StorageStats,
+		storageStats: derivation.storageStats,
 	}
 	var err error
 	if request.Session.Shard.IsMasterchain() {
@@ -844,7 +852,7 @@ func (a *LocalAcquisition) recordCandidateLocked(
 	if err = managed.branch.AddCandidate(queueRequest); err != nil {
 		return fmt.Errorf("commit candidate message delta: %w", err)
 	}
-	if err = a.messages.Complete(built.Externals); err != nil {
+	if err = a.messages.Complete(derivation.externals); err != nil {
 		managed.branch.DropCandidate(queueID)
 
 		return fmt.Errorf("complete candidate external messages: %w", err)
@@ -937,17 +945,9 @@ func applyCandidateStateUpdate(
 	update *cell.Cell,
 ) (*cell.Cell, tlb.ShardStateUnsplit, cell.Hash, error) {
 	var none cell.Hash
-	var oldRoot *cell.Cell
-	var err error
-	switch len(previous) {
-	case 1:
-		oldRoot = previous[0].State
-	case 2:
-		if oldRoot, err = mechanicalSplitState(previous[0].State, previous[1].State); err != nil {
-			return nil, tlb.ShardStateUnsplit{}, none, fmt.Errorf("%w: combine predecessor states: %v", ErrInvalidInput, err)
-		}
-	default:
-		return nil, tlb.ShardStateUnsplit{}, none, fmt.Errorf("%w: invalid predecessor count", ErrInvalidInput)
+	oldRoot, err := candidateStateUpdateSource(previous)
+	if err != nil {
+		return nil, tlb.ShardStateUnsplit{}, none, err
 	}
 	stateRoot, err := cell.ApplyMerkleUpdate(oldRoot.WithoutTrace(), update)
 	if err != nil {
@@ -959,6 +959,45 @@ func applyCandidateStateUpdate(
 	}
 
 	return stateRoot, state, oldRoot.HashKeyAt(0), nil
+}
+
+func applyPreparedCandidateStateUpdate(
+	previous []PreviousBlock,
+	update *cell.PreparedMerkleUpdate,
+) (*cell.Cell, tlb.ShardStateUnsplit, cell.Hash, error) {
+	var none cell.Hash
+	if update == nil {
+		return nil, tlb.ShardStateUnsplit{}, none, fmt.Errorf("%w: prepared state update is absent", ErrInvalidInput)
+	}
+	oldRoot, err := candidateStateUpdateSource(previous)
+	if err != nil {
+		return nil, tlb.ShardStateUnsplit{}, none, err
+	}
+	stateRoot, err := update.ApplyTo(oldRoot.WithoutTrace())
+	if err != nil {
+		return nil, tlb.ShardStateUnsplit{}, none, fmt.Errorf("%w: apply state update: %v", ErrInvalidInput, err)
+	}
+	var state tlb.ShardStateUnsplit
+	if err = parseExact(&state, stateRoot); err != nil {
+		return nil, tlb.ShardStateUnsplit{}, none, fmt.Errorf("%w: decode updated state: %v", ErrInvalidInput, err)
+	}
+
+	return stateRoot, state, oldRoot.HashKeyAt(0), nil
+}
+
+func candidateStateUpdateSource(previous []PreviousBlock) (*cell.Cell, error) {
+	switch len(previous) {
+	case 1:
+		return previous[0].State, nil
+	case 2:
+		oldRoot, err := mechanicalSplitState(previous[0].State, previous[1].State)
+		if err != nil {
+			return nil, fmt.Errorf("%w: combine predecessor states: %v", ErrInvalidInput, err)
+		}
+		return oldRoot, nil
+	default:
+		return nil, fmt.Errorf("%w: invalid predecessor count", ErrInvalidInput)
+	}
 }
 
 func parseCandidateBlock(id ton.BlockIDExt, boc []byte) (*cell.Cell, tlb.Block, error) {
@@ -1122,6 +1161,10 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 			request.BuildSoftDeadline,
 			request.ExternalWaitUntil,
 		)
+		var assemblyDurations candidateAssemblyDurations
+		if a.collationObserver != nil {
+			input.assembly = &assemblyDurations
+		}
 
 		started := time.Now()
 		candidate, external, buildErr := a.builder.buildMasterWithReadyExternals(
@@ -1132,7 +1175,7 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 			a.externalLimit,
 		)
 		elapsed := time.Since(started)
-		a.observeCandidateAssembly(chain, elapsed, external.wait)
+		a.observeCandidateAssembly(chain, &assemblyDurations, external.wait)
 		a.logCandidateAssembly(request, elapsed, external, candidate, buildErr)
 		a.reportCollationAlarms(chain, request, candidate, buildErr)
 		return candidate, buildErr
@@ -1168,6 +1211,10 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 		request.BuildSoftDeadline,
 		request.ExternalWaitUntil,
 	)
+	var assemblyDurations candidateAssemblyDurations
+	if a.collationObserver != nil {
+		input.assembly = &assemblyDurations
+	}
 
 	started := time.Now()
 	candidate, external, buildErr := a.builder.buildShardWithReadyExternals(
@@ -1180,7 +1227,7 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 		assembly,
 	)
 	elapsed := time.Since(started)
-	a.observeCandidateAssembly(chain, elapsed, external.wait)
+	a.observeCandidateAssembly(chain, &assemblyDurations, external.wait)
 	a.logCandidateAssembly(request, elapsed, external, candidate, buildErr)
 	a.reportCollationAlarms(chain, request, candidate, buildErr)
 	return candidate, buildErr
@@ -1204,10 +1251,12 @@ func (a *LocalAcquisition) observeCollationStage(
 
 func (a *LocalAcquisition) observeCandidateAssembly(
 	chain MetricChain,
-	duration time.Duration,
+	durations *candidateAssemblyDurations,
 	externalWait time.Duration,
 ) {
-	a.observeCollationStage(chain, CollationStageAssembleCandidate, duration-externalWait)
+	for _, stage := range candidateAssemblyStages {
+		a.observeCollationStage(chain, stage, durations[stage])
+	}
 	a.observeCollationStage(chain, CollationStageWaitExternalMessages, externalWait)
 }
 

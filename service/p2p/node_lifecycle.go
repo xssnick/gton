@@ -164,7 +164,7 @@ func (n *Node) start(ctx context.Context) (bool, error) {
 		n.blockBroadcasts.run(runCtx)
 	})
 	n.runAsync(func() {
-		n.runShardBroadcastCacheJanitor(runCtx)
+		n.runBroadcastBlockCacheJanitor(runCtx)
 	})
 	n.runAsync(func() {
 		n.runSubscriptionLifecycleLoop(runCtx)

@@ -31,6 +31,21 @@ var ErrSemanticExecution = errors.New("collator: semantic execution failed")
 // account lanes concurrently at the call-site level.
 type SemanticVerifier struct {
 	machine *tvm.TVM
+	// onStorageStatRecompute observes every replayed transaction whose bound
+	// account storage-stat proof fell short of this replay's own update walk,
+	// making the executor recompute the stat from state (see
+	// tvm.TransactionExecutionResult.StorageStatRecomputed). The candidate
+	// still validates; the observation is the only signal that a producer's
+	// proof shape and our walk disagreed. Replay lanes run concurrently, so
+	// the callback must be safe to call from multiple goroutines.
+	onStorageStatRecompute func(MetricChain, [32]byte)
+}
+
+// SetStorageStatRecomputeObserver installs the storage-stat recompute
+// observer; see the field for the contract. Set once, before the verifier
+// starts serving.
+func (v *SemanticVerifier) SetStorageStatRecomputeObserver(fn func(MetricChain, [32]byte)) {
+	v.onStorageStatRecompute = fn
 }
 
 // NewSemanticVerifier constructs the production candidate transition
@@ -60,13 +75,11 @@ func (v *SemanticVerifier) VerifyCandidateTransition(ctx context.Context, transi
 	// writes nothing the queue preparation reads, so the two run together and
 	// the cheaper of them stops costing wall time.
 	//
-	// It joins before verifyAccounts rather than before the accept, and both
-	// reasons are load-bearing. The replay lanes read the predecessor accounts
-	// this pass decoded, and GOMAXPROCS goroutines must not race its map. And a
-	// candidate that is structurally invalid and also trips the local emulator
-	// has to keep being rejected with the precheck's ErrInvalidInput: letting
-	// verifyAccounts answer first would turn a rejection into ErrSemanticExecution,
-	// which is documented above as "retry", not "invalid".
+	// It joins before verifyAccounts because a candidate that is structurally
+	// invalid and also trips the local emulator has to keep being rejected with
+	// the precheck's ErrInvalidInput. Letting verifyAccounts answer first would
+	// turn a rejection into ErrSemanticExecution, which is documented above as
+	// "retry", not "invalid".
 	var (
 		precheckErr error
 		precheck    sync.WaitGroup
@@ -121,13 +134,6 @@ type semanticReplay struct {
 	// from GOMAXPROCS goroutines at once. Nothing in this replay writes it.
 	accountBlockIndex *accountBlockIndex
 
-	// precheckedAccounts holds the predecessor ShardAccounts precheckAccountUpdates
-	// already decoded out of the structural diff, so the replay does not descend
-	// the shard's whole account trie a second time for the same key. It is built
-	// once, before the lanes start, and never written afterwards: the lanes read
-	// it from GOMAXPROCS goroutines.
-	precheckedAccounts map[[32]byte]semanticCachedAccount
-
 	// shape accumulates what the candidate contains, from the walks this replay
 	// already makes. It is handed to the candidate once, after the replay has
 	// accepted the block, so a rejected candidate reports nothing.
@@ -153,16 +159,6 @@ type semanticReplay struct {
 	specialGasUsed  uint64
 	normalGasLimit  uint64
 	specialGasLimit uint64
-}
-
-// semanticCachedAccount is one predecessor ShardAccount as the account precheck
-// decoded it. exists is carried explicitly because the placeholder
-// semanticDiffAccount builds for an absent leaf is value-identical to a real
-// empty account, and replayAccount consumes the difference when it checks for a
-// predecessor transaction at or after block start.
-type semanticCachedAccount struct {
-	account *tlb.ShardAccount
-	exists  bool
 }
 
 type semanticAccountResult struct {
@@ -295,8 +291,7 @@ func (r *semanticReplay) loadMasterSpecialTransactions() error {
 // statistics and block info of a masterchain candidate. The structural verifier
 // decodes both before it hands the transition over, and re-deriving the info
 // means opening the creator statistics tail again — so its values are reused
-// when present, exactly as precheckedAccount reuses the account updates that
-// pass already walked.
+// when present.
 //
 // They stay separate because their consumers are: the execution context needs
 // both, while the public library check needs only the statistics and must keep
@@ -421,7 +416,6 @@ func (r *semanticReplay) precheckAccountUpdates() error {
 		return fmt.Errorf("%w: shard account dictionary is absent", ErrInvalidInput)
 	}
 
-	r.precheckedAccounts = make(map[[32]byte]semanticCachedAccount)
 	err := oldAccounts.ScanDiff(newAccounts.AugmentedDictionary, true, func(
 		keyCell *cell.Cell,
 		oldValueExtra, newValueExtra *cell.Slice,
@@ -465,11 +459,6 @@ func (r *semanticReplay) precheckAccountUpdates() error {
 		if err != nil {
 			return fmt.Errorf("%w: decode predecessor ShardAccount %x: %v", ErrInvalidInput, key, err)
 		}
-		// The replay needs exactly this value for exactly this key. Handing it
-		// over is what keeps the account trie from being descended twice per
-		// touched account; a nil oldValueExtra is a leaf the candidate creates,
-		// which semanticLoadAccount would report as absent.
-		r.precheckedAccounts[key] = semanticCachedAccount{account: oldAccount, exists: oldValueExtra != nil}
 		newAccount, err := semanticDiffAccount(newValueExtra)
 		if err != nil {
 			return fmt.Errorf("%w: decode candidate ShardAccount %x: %v", ErrInvalidInput, key, err)
@@ -633,7 +622,7 @@ func (r *semanticReplay) decodeAccountLanes() ([]semanticAccountLane, error) {
 // strictly larger index than the first failure, which the sequential replay
 // would not have reached either.
 func (r *semanticReplay) replayAccountLanes(lanes []semanticAccountLane) {
-	workers := min(8, runtime.GOMAXPROCS(0), len(lanes))
+	workers := min(collationParallelism, runtime.GOMAXPROCS(0), len(lanes))
 	if workers < 2 {
 		for i := range lanes {
 			if lanes[i].err != nil {
@@ -736,7 +725,7 @@ func (r *semanticReplay) mergeAccountLanes(lanes []semanticAccountLane) error {
 
 	// One descent for the whole replay: the accounts are already in ascending
 	// key order, and the resulting dictionary is the one repeated writes build.
-	if err := r.replayedAccounts.SetMany(replayed); err != nil {
+	if err := r.replayedAccounts.SetMany(replayed, collationParallelism); err != nil {
 		return fmt.Errorf("%w: apply replayed accounts: %v", ErrInvalidInput, err)
 	}
 	return nil
@@ -780,17 +769,14 @@ func (r *semanticReplay) replayAccount(lane *semanticAccountLane) error {
 		return fmt.Errorf("%w: account block %x is outside the candidate shard", ErrInvalidInput, key)
 	}
 
-	// The account precheck decoded this same predecessor leaf out of the
-	// structural diff. The fallback is not an optimization guard: an account
-	// whose leaf is unchanged is not in the diff at all, verifyMasterTickTock
-	// loads keys outside it, and the lane tests drive the replay without ever
-	// running the precheck.
-	original, originallyExists, ok := r.precheckedAccount(key)
-	if !ok {
-		var err error
-		if original, originallyExists, err = semanticLoadAccount(r.previous.Accounts.ShardAccounts, key); err != nil {
-			return err
-		}
+	// The structural diff above authenticates the predecessor leaf but is not
+	// an execution view. Load the account from the predecessor dictionary just
+	// before replay, matching ValidateQuery::CheckAccountTxs::unpack_account in
+	// the reference validator. In particular, this avoids handing TVM a
+	// traced/virtualized value borrowed from the diff walk over a lazy state.
+	original, originallyExists, err := semanticLoadAccount(r.previous.Accounts.ShardAccounts, key)
+	if err != nil {
+		return err
 	}
 	addr := address.NewAddress(0, byte(r.candidate.block.BlockInfo.Shard.WorkchainID), key[:])
 	current, err := tvm.PrepareAccount(original, addr)
@@ -883,13 +869,27 @@ func (r *semanticReplay) replayAccount(lane *semanticAccountLane) error {
 		if replayErr != nil {
 			return fmt.Errorf("replay transaction %x:%d: %w", key, lt, replayErr)
 		}
+		if result.StorageStatRecomputed && r.verifier.onStorageStatRecompute != nil {
+			chain := MetricChainShardchain
+			if !header.NotMaster {
+				chain = MetricChainMasterchain
+			}
+			r.verifier.onStorageStatRecompute(chain, key)
+		}
 		transactionResult.afterActive = result.NextAccount.State().Status == tlb.AccountStatusActive
 		if result.TransactionCell.HashKey() != root.HashKey() {
+			missingLibrary := "none"
+			if result.MissingLibrary != nil {
+				missingLibrary = fmt.Sprintf("%x", *result.MissingLibrary)
+			}
 			return fmt.Errorf(
-				"%w: transaction %x:%d hash differs from deterministic replay",
+				"%w: transaction %x:%d hash differs from deterministic replay: missing_library=%s, expected %s, got %s",
 				ErrInvalidInput,
 				key,
 				lt,
+				missingLibrary,
+				semanticTransactionFingerprint(root),
+				semanticTransactionFingerprint(result.TransactionCell),
 			)
 		}
 		if result.StartLT != transaction.LT || result.EndLT != transaction.LT+1+uint64(transaction.OutMsgCount) {
@@ -1047,15 +1047,6 @@ func semanticGasLimitOverridden(workchain int32, account [32]byte, version, now 
 	return false
 }
 
-// precheckedAccount returns the predecessor ShardAccount the account precheck
-// decoded for key, if it decoded one. The map is nil whenever the precheck has
-// not run.
-func (r *semanticReplay) precheckedAccount(key [32]byte) (*tlb.ShardAccount, bool, bool) {
-	cached, ok := r.precheckedAccounts[key]
-
-	return cached.account, cached.exists, ok
-}
-
 func semanticLoadAccount(
 	accounts *tlb.ShardAccountsAugDict,
 	key [32]byte,
@@ -1158,6 +1149,15 @@ func (r *semanticReplay) replayTransaction(
 		return nil, nil, fmt.Errorf("%w: TVM returned an incomplete transaction result", ErrInvalidInput)
 	}
 	return result, inboundMessage, nil
+}
+
+func semanticTransactionFingerprint(root *cell.Cell) string {
+	refs := make([]cell.Hash, root.RefsNum())
+	for i := range refs {
+		refs[i] = root.MustRefHashAt(i)
+	}
+
+	return fmt.Sprintf("hash=%x bits=%s refs=%x", root.Hash(), root.DumpBits(), refs)
 }
 
 func classifySemanticExecutionError(err error) error {

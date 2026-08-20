@@ -88,100 +88,35 @@ func (c *collation) neighborQueueStream(shard msgpool.ShardIdent) (*cell.AugMinI
 // partition — costs O(Q log Q) before the first dequeue and, under
 // capFullCollatedData, drags the whole queue trie into the shipped proof.
 //
-// Three bounds end the FOREIGN part of the loop, in the C++ order
+// Three bounds end the loop, for every part, in the C++ order
 // (collator.cpp:2616-2624): the block-limit gate, the wall-clock budget, then
 // cancellation. Stopping there early is legal — the neighbour keeps its own
 // entry until a later block of ours dequeues it, and nothing validates the
 // completeness of that half.
 //
-// The predecessor's own half is NOT discretionary and is drained first, outside
-// both early stops. An entry whose next hop is our own shard and which the
-// predecessor's own frontier already covers has been processed by this shard,
-// so every validator demands a dequeue descriptor for it in this block:
-// verifyProcessedLocalDequeue (semantic_verify_processed.go:189) and, verbatim,
-// ValidateQuery::check_neighbor_outbound_message — "if this message comes from
-// our own outbound queue, we must have dequeued it ... but there is no
-// ext_message_deq OutMsg record for this message in this block"
-// (validate-query.cpp:5283-5289). That set is fixed by the predecessor state
-// and does not shrink when we import less, so it cannot be deferred to a later
-// block the way a neighbour's half can.
+// The predecessor's own part is subject to the same three stops. This is both
+// the reference order (the local predecessor is one of C++ queue_parts) and the
+// validator's actual rule: an unchanged ProcessedInfo makes check_in_queue /
+// verifyProcessedInfo return before inspecting any source queue. Consequently
+// an idle block may leave an old, already-covered local entry queued.
 //
-// C++ does budget this half — its queue_parts are built from neighbors_, which
-// includes our own shard — and so did we until the shape below. It is an
-// upstream defect rather than a rule: it makes the collator emit blocks its own
-// ValidateQuery rejects. cleanupMergedOutQueue already refuses a budget for the
-// same reason, in the same words.
+// If this block later advances ProcessedInfo, the rule becomes narrower and
+// stronger: validators inspect exactly the claimed (lt, hash) prefix and demand
+// dequeue descriptors for old-covered local entries inside that prefix. The
+// claim does not exist yet during this phase, so cleanupClaimedLocalDequeues
+// closes precisely that prefix after updateProcessedInfo. It does not turn the
+// whole local frontier into mandatory work.
 //
-// Draining it is bounded by the stale own-shard population, which ordinary
-// traffic keeps at zero: importInternal dequeues an offered own entry in the
-// same block through msg_export_deq_imm. The two demands on that drain — it
-// cannot be truncated, and it cannot inflate the block past its limits —
-// genuinely collide once that population is large enough, and neither side can
-// give way: a truncated drain ships a block every validator rejects, and a
-// completed one that crosses the hard limits ships a block that violates them.
-// So the collation FAILS there, loudly, and loses the slot; see
-// cleanupMandatoryDrain for what the operator sees and why losing a slot is the
-// only correct outcome.
-//
-// One residual is PRE-EXISTING and at C++ parity, and is documented rather than
-// changed. It is NOT the one an earlier revision of this comment described:
-// that revision claimed the stream is ordered by enqueued_lt while coverage is
-// decided on the created/emitted lt, and the first half of that is false, so
-// the residual as stated there does not exist.
-//
-// The OutMsgQueue augmentation is the EMITTED lt. block.tlb:243 declares the
-// queue as (HashmapAugE 352 EnqueuedMsg uint64) and Aug_OutMsgQueue::eval_leaf
-// fetches the envelope REFERENCE and evaluates MsgEnvelope::get_emitted_lt over
-// it (block-parse.cpp:2142-2147) — msg_envelope_v2's explicit emitted_lt when
-// present, otherwise the enclosed message's created_lt
-// (block-parse.cpp:953-973). EnqueuedMsg's inline enqueued_lt contributes
-// nothing to it. tonutils computes the identical leaf (tlb/block_augs.go,
-// AugOutMsgQueue.LeafExtra) and parseQueueEntry derives descr.LT by the same
-// rule, exactly as EnqueuedMsgDescr::unpack sets lt_ from get_emitted_lt and
-// enqueued_lt_ from the inline field (block.cpp:628-652). So a part's rank and
-// the quantity coverage is decided on are the same number, and the stream's
-// tie-break — the 256-bit message hash, the key past its first 96 bits — is the
-// tie-break already_processed applies (block.cpp:551), which is also the pair
-// OutputQueueMerger::MsgKeyValue::operator< orders by
-// (output-queue-merger.cpp:30-33). On the same-shard branch (block.cpp:554-559)
-// coverage is therefore downward-closed in precisely the order the stream
-// emits, and dropping the part at its first uncovered entry leaves nothing
-// covered behind it.
-//
-// What does remain open is the branch AFTER that one, plus the per-record shard
-// restrictions around it. Both need a ProcessedInfo carrying records for shards
-// NARROWER than the one we now are, which is a post-merge collection and only
-// from the block after the merged one — the merged block itself takes
-// cleanupMergedOutQueue, which is exhaustive:
-//
-//   - a message the record's shard did not generate is covered by
-//     enqueued_lt < the source shard's registered end lt (block.cpp:560-562),
-//     a different quantity from the rank, so an entry the frontier covers can
-//     sit behind one it does not;
-//   - and coverage is per record, each applying only to entries whose next hop
-//     and current position both lie under its own shard prefix (block.cpp:548
-//     and :554), so a collection holding records for two sibling halves does
-//     not cover a prefix of the rank order even on the same-shard branch.
-//
-// Either leaves the shape defect 2 is about, from a second cause, and the fix
-// below does not close it.
-//
-// Changing it would mean scanning the own prefix to exhaustion instead of
-// stopping at the first uncovered entry, and two things break. Blocks stop
-// matching the reference collator's for the same input — C++ leaves the scan at
-// that same first entry and pops the part there: the undelivered branch is
-// collator.cpp:2662-2666, it falls out of the per-part loop at :2667, and the
-// part is dropped by the swap and pop_back at :2669-2670. So we would dequeue
-// entries it leaves queued and every differential golden fixture would move — and the stop
-// is the only thing that keeps the drain proportional to what was delivered
-// rather than to the whole prefix, against a queue capped at maxOutMsgQueueSize
-// = 2^48-1 at roughly 2.0-2.4us an entry.
+// The reference-budget pass keeps C++'s per-part stop at the first uncovered
+// entry. The post-claim pass is intentionally different: it walks exactly the
+// validator's claimed prefix, which is the only safe way to cover non-prefix
+// ProcessedInfo shapes inherited after topology changes.
 func (c *collation) cleanupOutQueue() error {
-	// An empty registered set used to return here, before anything ran. That
-	// skipped the mandatory drain along with the discretionary half and produced
-	// exactly the block defect 2 is about, because the predecessor is a neighbour
-	// of itself: normalizeTrivialNeighbors contributes it whether or not the
-	// masterchain registered anyone, so an empty set still has own-shard work.
+	// An empty registered set used to return here, before anything ran. The
+	// predecessor is a neighbour of itself: normalizeTrivialNeighbors contributes
+	// it whether or not the masterchain registered anyone, so an empty set still
+	// has ordinary budgeted own-shard cleanup work and may later have an exact
+	// claimed-prefix obligation.
 	//
 	// After a MERGE it is different, and the return stays for that one case. The
 	// merged predecessor's identity is assembled out of the registered child
@@ -201,6 +136,16 @@ func (c *collation) cleanupOutQueue() error {
 	if err != nil {
 		return err
 	}
+	for i := range neighbors {
+		if neighbors[i].Shard != c.shard {
+			continue
+		}
+		c.localCleanup = &localCleanupFrontier{
+			endLT:     neighbors[i].EndLT,
+			processed: append([]tlb.ProcessedUptoRecord(nil), neighbors[i].Processed...),
+		}
+		break
+	}
 	if c.topology.kind == topologyAfterMerge {
 		return c.cleanupMergedOutQueue(neighbors)
 	}
@@ -211,29 +156,17 @@ func (c *collation) cleanupOutQueue() error {
 	// same aliasing C++ relies on when it hands OutputQueueMerger
 	// out_msg_queue_->get_root_cell() and then mutates out_msg_queue_ under it.
 	parts := make([]cleanupPart, 0, len(neighbors))
-	var local *cleanupPart
 	for i := range neighbors {
 		stream, streamErr := c.neighborQueueStream(neighbors[i].Shard)
 		if streamErr != nil {
 			return fmt.Errorf("%w: open outbound queue stream for neighbor %d: %v",
 				ErrInvalidInput, i, streamErr)
 		}
-		// normalizeTrivialNeighbors withholds every registered neighbor that
-		// intersects us and puts the predecessor in its place, so exactly one
-		// effective entry carries our own shard.
-		if neighbors[i].Shard == c.shard {
-			local = &cleanupPart{neighbor: neighbors[i], stream: stream}
-			continue
-		}
 		parts = append(parts, cleanupPart{neighbor: neighbors[i], stream: stream})
 	}
 
-	// Phase one: the mandatory half, to exhaustion.
-	if err = c.cleanupMandatoryDrain(local); err != nil {
-		return err
-	}
-
-	// Phase two: the discretionary half, round-robin under the C++ bounds.
+	// Every part, including the local predecessor, participates in the same
+	// round-robin under the C++ bounds.
 	stop := CleanupStopExhausted
 	for i := 0; len(parts) > 0; {
 		if c.blockFull {
@@ -270,76 +203,112 @@ func (c *collation) cleanupOutQueue() error {
 	return c.limits.addProof(c.outQueue.RootCell())
 }
 
-// cleanupMandatoryDrain empties the predecessor's own frontier. It takes none
-// of the three discretionary bounds: not the block-limit gate, not the
-// wall-clock budget, not a count. An entry it would have to leave behind is one
-// this shard has already processed, so every validator demands a dequeue
-// descriptor for it in THIS block, and a block missing one is rejected on a
-// resident state with no proofs involved at all.
-//
-// Cancellation still ends it, because a cancelled collation produces no block.
-//
-// What cannot be answered by draining harder is a drain that does not fit. The
-// dequeue descriptors are block content: each one adds bytes, and under
-// capFullCollatedData the queue paths they open add collated bytes, so a large
-// enough stale population walks the block up to and past its hard limits. Both
-// demands are absolute and they contradict each other, so one of them has to
-// become a failure, and the choice is not close:
-//
-//   - Truncate the drain, ship the block. Every peer rejects it for a message
-//     that remains in the local predecessor queue without a dequeue descriptor
-//     (validate-query.cpp:5283-5289). The slot is lost anyway, and the shard
-//     tries again next slot from the same predecessor with the same population
-//     — plus whatever the failed slot added.
-//   - Complete the drain, ship the block over its limits. Nothing downstream
-//     accepts a block past ParamLimits hard, so the slot is lost anyway, and
-//     this time after paying for the whole drain.
-//   - Fail the collation. The slot is lost, nothing invalid reaches the wire,
-//     and the reason is on the operator's screen instead of being inferred from
-//     other nodes' rejection logs.
-//
-// So it fails, and it says why. The error names the shard, how many entries the
-// drain had already taken, which limit axis went over and by how much. It is
-// NOT a sizeLimitError: retryUnderSizeLimit answers those by narrowing the byte
-// budget, which here only makes the same mandatory work overflow sooner, so a
-// retry would burn two more attempts to reach the identical verdict.
-//
-// What the operator sees: a build failure carrying ErrMandatoryDequeueOverflow,
-// an Error-level "collation lost the slot" line from the producer
-// (reportCollationAlarms), and gton_collator_alarms_total{alarm=
-// "mandatory_dequeue_overflow"} moving on :8085. It means this shard's
-// predecessor carries more already-processed own-shard queue entries than one
-// block can dequeue, which ordinary traffic cannot produce — importInternal
-// dequeues an offered own entry in the same block — so it points at a preceding
-// run of blocks that stopped their own drain early, at a restored or imported
-// predecessor, or at block limits configured below what the shard's own queue
-// needs. The shard cannot produce a block until the population fits, and it
-// will report this every slot until it does.
-func (c *collation) cleanupMandatoryDrain(local *cleanupPart) error {
-	if local == nil {
+type localCleanupFrontier struct {
+	endLT     uint64
+	processed []tlb.ProcessedUptoRecord
+}
+
+// cleanupClaimedLocalDequeues closes the only local work that is mandatory for
+// validity: old-covered entries inside the ProcessedInfo prefix this block has
+// actually claimed. Cleanup runs before imports and cannot know that prefix;
+// this pass runs immediately after updateProcessedInfo.
+func (c *collation) cleanupClaimedLocalDequeues() error {
+	if !c.processedClaimed || c.localCleanup == nil || c.topology.kind == topologyAfterMerge {
 		return nil
 	}
+
 	drained := uint32(0)
-	for {
-		if err := c.ctx.Err(); err != nil {
-			return err
+	dequeue := func(entry semanticQueueEntry) error {
+		key := msgpool.MakeQueueKey(entry.envelope.next, entry.envelope.message.HashKey())
+		keyCell := cell.BeginCell().MustStoreSlice(key[:], 352).EndCell()
+		value, err := c.outQueue.LoadValue(keyCell)
+		if isMissingKey(err) {
+			// An old-covered entry cannot be removed by importInternal: that
+			// path returns at its processed check before dequeueOwn. Therefore
+			// absence here means the reference-budget cleanup already removed
+			// this exact key and emitted its descriptor.
+			return nil
 		}
-		more, err := c.cleanupQueuePartStep(local, "predecessor")
+		if err != nil {
+			return fmt.Errorf("load claimed local queue entry %x: %w", key, err)
+		}
+		current, err := parseQueueEntry(value, key)
 		if err != nil {
 			return err
 		}
-		if !more {
-			return nil
+		if current.envelope.HashKey() != entry.enqueued.Msg.HashKey() {
+			return fmt.Errorf("%w: claimed local queue entry %x changed envelope", ErrInvalidInput, key)
 		}
+		if err = c.dequeueDelivered(current, c.localCleanup.endLT); err != nil {
+			return err
+		}
+		c.stats.QueueCleaned++
 		drained++
 		if what, value, limit, over := c.limits.hardOverflow(); over {
 			return fmt.Errorf(
-				"%w: shard %d:%016x dequeued %d already-processed own-shard entries and %s reached %d "+
-					"against a hard limit of %d; the drain is mandatory for validity and cannot be "+
-					"truncated, so this block cannot be produced",
+				"%w: shard %d:%016x dequeued %d already-processed entries inside the claimed prefix and "+
+					"%s reached %d against a hard limit of %d; the claimed prefix cannot be truncated",
 				ErrMandatoryDequeueOverflow, c.shard.Workchain, c.shard.Shard, drained, what, value, limit)
 		}
+
+		return nil
 	}
+
+	// The scan below is DISCOVERY, and its reads must not be recorded. This pass
+	// runs before create_shard_state generates the Merkle update, and the update
+	// descends only through cells the read set holds, so a read taken here lands
+	// in the update's OLD side — cells the reference collator never puts there.
+	// It is the same rule finish() states at the traceValidationClosure call
+	// site, and the cost is not theoretical: on the mainnet fixture this walk
+	// dequeues nothing and still added 697 block bytes, and 9175 on the
+	// three-times-traffic arm, because what it retains scales with the own-shard
+	// queue prefix rather than with the work it finds.
+	//
+	// Nothing is lost by ignoring them. traceProcessedQueueValidationClosure
+	// (proof_closure.go) replays walkSemanticQueuePrefix over this identical
+	// region — same queue, same target shard, same claimed bound — after the
+	// update exists, which is where these cells belong: in the collated proof
+	// and nowhere else.
+	//
+	// Recording is switched back on around the dequeue itself. An entry this
+	// block actually removes is block content, and its cells have to reach both
+	// the update and the proof; the traced c.outQueue lookup inside dequeue is
+	// what puts them there.
+	c.usage.IgnoreReads(true)
+	defer c.usage.IgnoreReads(false)
+
+	err := walkSemanticQueuePrefix(c.oldOutQueue, c.shard, c.processedClaim, func(entry semanticQueueEntry) error {
+		if err := c.ctx.Err(); err != nil {
+			return err
+		}
+		if !c.shard.ContainsPrefix(entry.envelope.current) {
+			return nil
+		}
+		processed, err := c.shardEndLT.alreadyProcessed(
+			c.localCleanup.processed,
+			c.shard.Workchain,
+			c.shard.Shard,
+			&entry.descr,
+		)
+		if err != nil {
+			return fmt.Errorf("%w: check predecessor processed info: %v", ErrInvalidInput, err)
+		}
+		if !processed {
+			return nil
+		}
+
+		c.usage.IgnoreReads(false)
+		err = dequeue(entry)
+		c.usage.IgnoreReads(true)
+
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("close claimed local queue prefix to (%d,%x): %w",
+			c.processedClaim.lt, c.processedClaim.hash, err)
+	}
+
+	return nil
 }
 
 // cleanupQueuePartStep advances one stream by a single entry and dequeues it if
@@ -347,8 +316,8 @@ func (c *collation) cleanupMandatoryDrain(local *cleanupPart) error {
 // stream that ran out or reached its first undelivered entry is finished, and
 // C++ pops exactly those two cases off queue_parts.
 //
-// The label only names the part in errors; it is the neighbor index for the
-// discretionary parts and a word for the predecessor, which has no index.
+// The label only names the part in errors; it is the current neighbor index in
+// the round-robin set.
 func (c *collation) cleanupQueuePartStep(part *cleanupPart, label string) (bool, error) {
 	if !part.stream.Next() {
 		if err := part.stream.Err(); err != nil {

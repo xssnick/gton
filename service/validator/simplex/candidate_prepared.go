@@ -42,6 +42,7 @@ type PreparedCandidate struct {
 	rootHash         [32]byte
 	fileHash         [32]byte
 	collatedFileHash [32]byte
+	seqNo            uint32
 }
 
 // PrepareCandidate builds the payload on the calling goroutine. cellsHint is
@@ -99,6 +100,7 @@ func newPreparedCandidate(
 		ready:            make(chan struct{}),
 		fileHash:         fileHash,
 		collatedFileHash: collatedFileHash,
+		seqNo:            seqNo,
 	}
 	if blockRoot == nil {
 		prepared.err = errors.New("simplex: prepared candidate has no block root")
@@ -138,6 +140,9 @@ func (p *PreparedCandidate) payloadFor(candidate Candidate) ([]byte, error) {
 func (p *PreparedCandidate) bind(candidate Candidate) error {
 	if candidate.Empty {
 		return fmt.Errorf("%w: empty candidate carries a payload", ErrPreparedCandidateMismatch)
+	}
+	if candidate.Block.SeqNo != p.seqNo {
+		return fmt.Errorf("%w: block sequence number", ErrPreparedCandidateMismatch)
 	}
 	if !bytes.Equal(candidate.Block.RootHash, p.rootHash[:]) {
 		return fmt.Errorf("%w: block root hash", ErrPreparedCandidateMismatch)

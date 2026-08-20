@@ -30,6 +30,10 @@ var (
 	ErrMandatoryDequeueOverflow = errors.New("collator: mandatory own-shard dequeue exceeds the block limits")
 )
 
+// collationParallelism is the total worker budget for independent Patricia and
+// Merkle-proof branches. Small operations remain sequential inside tonutils.
+const collationParallelism = 16
+
 type PreviousBlock struct {
 	ID ton.BlockIDExt
 	// Block is required for a non-zerostate predecessor when
@@ -250,6 +254,9 @@ type ShardRequest struct {
 	// disables the budget under the same convention QueueCleanupUntil uses.
 	// Derive it with internalMsgUntil.
 	InternalMsgUntil time.Time
+
+	accountPrewarmer AccountPrewarmer
+	assembly         *candidateAssemblyDurations
 }
 
 // MasterRequest contains the previous masterchain state and the deterministic
@@ -286,6 +293,9 @@ type MasterRequest struct {
 	InternalMsgUntil time.Time
 
 	ShardTops []ShardTop
+
+	accountPrewarmer AccountPrewarmer
+	assembly         *candidateAssemblyDurations
 }
 
 // CandidateTransitionVerifier closes the semantic validation boundary that
@@ -433,6 +443,8 @@ type collationRequest struct {
 	// generated-message phases in wall-clock time. Zero leaves the budget
 	// inert; see internalMsgUntil for the derivation.
 	internalMsgUntil time.Time
+	accountPrewarmer AccountPrewarmer
+	assembly         *candidateAssemblyDurations
 }
 
 func shardCollationRequest(req ShardRequest) collationRequest {
@@ -452,6 +464,8 @@ func shardCollationRequest(req ShardRequest) collationRequest {
 		fullCollatedProofs:  req.FullCollatedProofs,
 		queueCleanupUntil:   req.QueueCleanupUntil,
 		internalMsgUntil:    req.InternalMsgUntil,
+		accountPrewarmer:    req.accountPrewarmer,
+		assembly:            req.assembly,
 	}
 }
 
@@ -471,6 +485,8 @@ func masterCollationRequest(req MasterRequest) collationRequest {
 		fullCollatedProofs:  req.FullCollatedProofs,
 		queueCleanupUntil:   req.QueueCleanupUntil,
 		internalMsgUntil:    req.InternalMsgUntil,
+		accountPrewarmer:    req.accountPrewarmer,
+		assembly:            req.assembly,
 	}
 }
 
@@ -663,6 +679,14 @@ type Candidate struct {
 	// canonical build path; a Pipeline that returns a Candidate of its own
 	// leaves it nil and its candidate is serialized from the BOCs as before.
 	prepared *simplex.PreparedCandidate
+
+	// provenance binds every mutable field an optimization capsule depends on
+	// to the exact values the complete Builder entry point produced. A Pipeline
+	// may decorate the canonical builder and return the same Candidate pointer,
+	// so an unexported flag alone is not provenance: the exported fields can
+	// have changed while the flag survives. Service checks this seal at the
+	// public Pipeline boundary before retaining prepared or built.
+	provenance *candidateProvenance
 
 	// built is the derivation finish() already performed for this block: its
 	// parsed root, the header's start logical time, the successor state's

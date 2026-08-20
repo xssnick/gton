@@ -46,6 +46,8 @@ func TestCandidateCodecRoundTripValidatorAndDelegatedSupportedProtocols(t *testi
 				t.Fatal(err)
 			}
 			assertCandidateArtifactEqual(t, decoded, ordinary)
+			assertDecodedValidationRoots(t, decoded)
+			assertPreparedBlockRoute(t, protocolVersion, decoded)
 			if decoded.Candidate.Delegation != nil {
 				t.Fatal("validator candidate gained delegation")
 			}
@@ -98,6 +100,8 @@ func TestCandidateCodecRoundTripValidatorAndDelegatedSupportedProtocols(t *testi
 				t.Fatal(err)
 			}
 			assertCandidateArtifactEqual(t, decoded, &delegated)
+			assertDecodedValidationRoots(t, decoded)
+			assertPreparedBlockRoute(t, protocolVersion, decoded)
 			if decoded.Candidate.Delegation == nil ||
 				!bytes.Equal(decoded.Candidate.Delegation.CollatorKey, collatorPublic) ||
 				!bytes.Equal(decoded.Candidate.Delegation.Signature, delegated.Candidate.Delegation.Signature) {
@@ -125,6 +129,41 @@ func TestCandidateCodecRoundTripValidatorAndDelegatedSupportedProtocols(t *testi
 				t.Fatal("prepared payload survived encodeForBroadcast")
 			}
 		})
+	}
+}
+
+func assertDecodedValidationRoots(t *testing.T, artifact *CandidateArtifact) {
+	t.Helper()
+
+	if artifact.validationRoots == nil || artifact.validationRoots.block == nil {
+		t.Fatal("decoded candidate carries no validation roots")
+	}
+	if !bytes.Equal(artifact.validationRoots.block.Hash(), artifact.Candidate.Block.RootHash) {
+		t.Fatal("decoded validation block root differs from the candidate")
+	}
+	if len(artifact.validationRoots.collated) == 0 {
+		t.Fatal("decoded candidate carries no collated roots")
+	}
+}
+
+func assertPreparedBlockRoute(t *testing.T, protocolVersion uint8, artifact *CandidateArtifact) {
+	t.Helper()
+
+	prepared := artifact.PreparedBlockCandidate()
+	if protocolVersion != 1 {
+		if prepared != nil {
+			t.Fatalf("protocol %d retained a legacy cache artifact", protocolVersion)
+		}
+		return
+	}
+	if prepared == nil {
+		t.Fatal("protocol 1 candidate has no prepared cache artifact")
+	}
+	if id := prepared.ID(); !sameBlockID(id, artifact.Candidate.Block) {
+		t.Fatalf("prepared block id differs from candidate: got %+v want %+v", id, artifact.Candidate.Block)
+	}
+	if !bytes.Equal(prepared.BlockBOC(), artifact.BlockBOC) {
+		t.Fatal("prepared block BOC differs from candidate artifact")
 	}
 }
 

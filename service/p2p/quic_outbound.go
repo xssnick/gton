@@ -49,6 +49,8 @@ type quicRouteBroadcastPeer struct {
 
 var _ overlay.BroadcastPeer = quicBroadcastSource{}
 var _ overlay.BroadcastPeer = quicRouteBroadcastPeer{}
+var _ overlay.PreparedBroadcastPeer = quicBroadcastSource{}
+var _ overlay.PreparedBroadcastPeer = quicRouteBroadcastPeer{}
 
 func (p quicBroadcastSource) ID() []byte {
 	return p.id[:]
@@ -58,6 +60,10 @@ func (quicBroadcastSource) SendCustomMessage(
 	context.Context,
 	tl.Serializable,
 ) error {
+	return nil
+}
+
+func (quicBroadcastSource) SendPreparedCustomMessage(context.Context, []byte) error {
 	return nil
 }
 
@@ -104,6 +110,20 @@ func (p quicRouteBroadcastPeer) SendCustomMessage(ctx context.Context, req tl.Se
 	}
 	if err = peer.SendOutboundMessage(ctx, payload); err != nil {
 		return fmt.Errorf("send quic overlay message: %w", err)
+	}
+	return nil
+}
+
+func (p quicRouteBroadcastPeer) SendPreparedCustomMessage(ctx context.Context, body []byte) error {
+	node := p.peer.node
+	peer, err := node.quicGateway.OutboundPeerDefaultID(p.peer.id[:])
+	if err != nil {
+		p.peer.requestBackgroundQUICDial()
+		return errQUICPeerOffline
+	}
+	prefix := p.envelope.state.Load().messagePrefix
+	if err = peer.SendOutboundMessageParts(ctx, prefix, body); err != nil {
+		return fmt.Errorf("send prepared quic overlay message: %w", err)
 	}
 	return nil
 }

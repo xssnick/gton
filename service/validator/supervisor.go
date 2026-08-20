@@ -416,6 +416,7 @@ func (s *sessionSupervisor) run(ctx context.Context) {
 	reaper := newSessionReaper(s.storage, &s.log)
 	var prepareWG sync.WaitGroup
 	defer func() {
+		reaper.close()
 		s.mu.Lock()
 		s.isClosed = true
 		s.mu.Unlock()
@@ -1062,11 +1063,11 @@ func (s *sessionSupervisor) reconcileDesired(
 		// one risks the outcome this whole subsystem exists to prevent. Defer
 		// the pass instead; the namespaces it would have freed are bounded and
 		// wait for the next one.
-		reaper.fail(now, err, "key live validator namespaces")
+		reaper.scheduleFailure(ctx, now, err, "key live validator namespaces")
 
 		return
 	}
-	reaper.reap(ctx, desired, claimed, now)
+	reaper.schedule(ctx, desired, claimed, now)
 }
 
 // claimedNamespaces is every durable namespace a live actor still owns, keyed

@@ -65,10 +65,9 @@ func TestFullCollatedMainnetCandidateVerifies(t *testing.T) {
 
 // assertMainnetStorageStatWorkload fails unless the candidate really contains
 // the shape the bug needed: an account that carries a storage-stat dictionary
-// and runs more than one transaction in the block. It also counts the storage
-// proofs the collated data carries, because an account proof that stopped being
-// emitted would make the replay compute the dictionary itself and pass — a green
-// test over an untested path.
+// and runs more than one transaction in the block. It also requires both used
+// and unused storage-stat dictionaries: used ones exercise proof-backed replay,
+// while unused ones must be omitted instead of becoming all-pruned proofs.
 func assertMainnetStorageStatWorkload(tb testing.TB, req ShardRequest, candidate *Candidate) {
 	tb.Helper()
 
@@ -136,9 +135,9 @@ func assertMainnetStorageStatWorkload(tb testing.TB, req ShardRequest, candidate
 			proofs++
 		}
 	}
-	if proofs != withStorageStat {
-		tb.Fatalf("collated data carries %d account storage proofs, want one per storage-stat account (%d)",
-			proofs, withStorageStat)
+	if proofs == 0 || proofs >= withStorageStat {
+		tb.Fatalf("collated data carries %d account storage proofs for %d storage-stat accounts, "+
+			"want both proof-backed and omitted dictionaries", proofs, withStorageStat)
 	}
 	tb.Logf("mainnet collated workload: %d accounts with a storage stat, %d of them transact more than once, "+
 		"%d storage proofs in %d collated bytes",

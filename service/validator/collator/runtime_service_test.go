@@ -564,6 +564,36 @@ type runtimeFixture struct {
 	sourceADNL [32]byte
 }
 
+type runtimeScheduleObserver struct {
+	mu     sync.Mutex
+	events map[ScheduleEvent]int
+}
+
+func (o *runtimeScheduleObserver) ObserveScheduleLateness(_ MetricChain, event ScheduleEvent, _ time.Duration) {
+	o.mu.Lock()
+	o.events[event]++
+	o.mu.Unlock()
+}
+
+func (o *runtimeScheduleObserver) count(event ScheduleEvent) int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return o.events[event]
+}
+
+func (*runtimeScheduleObserver) AddCollationBuildInflight(MetricChain, int)                {}
+func (*runtimeScheduleObserver) ObserveCollationBuild(CollationBuildObservation)           {}
+func (*runtimeScheduleObserver) ObserveCollationStage(CollationStageObservation)           {}
+func (*runtimeScheduleObserver) ObserveCollationCandidate(CandidateObservation)            {}
+func (*runtimeScheduleObserver) ObserveCandidateProduction(CandidateProductionObservation) {}
+func (*runtimeScheduleObserver) ObserveCollationDeadline(MetricChain, CollationDeadline, DeadlineAction) {
+}
+func (*runtimeScheduleObserver) ObserveCollationRetry(MetricChain, ProductionRetryReason) {}
+func (*runtimeScheduleObserver) ObserveCollationAlarm(MetricChain, CollationAlarm)        {}
+func (*runtimeScheduleObserver) AddCollationWindowInflight(MetricChain, int)              {}
+func (*runtimeScheduleObserver) ObserveCollationWindow(WindowObservation)                 {}
+
 func newRuntimeFixture(
 	t *testing.T,
 	_ int,
@@ -742,6 +772,54 @@ func TestRuntimeBackendReportsCollatorID(t *testing.T) {
 	var backend Collator = fixture.service
 	if got := backend.CollatorID(); got != fixture.keys.id {
 		t.Fatalf("collator id = %x, want %x", got, fixture.keys.id)
+	}
+}
+
+func TestRuntimeBuildStartLatenessExcludesFirstShardWindowSlot(t *testing.T) {
+	emitted := make(chan CandidateArtifact, 2)
+	releaseFirst := make(chan struct{})
+	fixture := newRuntimeSelfFixture(
+		t,
+		nil,
+		nil,
+		nil,
+		func(_ context.Context, artifact CandidateArtifact) error {
+			emitted <- artifact
+			if artifact.Candidate.ID.Slot == 0 {
+				<-releaseFirst
+			}
+
+			return nil
+		},
+	)
+	defer fixture.close(t)
+
+	observer := &runtimeScheduleObserver{events: make(map[ScheduleEvent]int)}
+	fixture.service.opts.Observer = observer
+	session, update := fixture.session(91, 2, 0, time.Now().Add(-time.Second))
+	fixture.prepare(t, session, update)
+	if err := fixture.service.ActivateSelfWindow(
+		context.Background(),
+		fixture.selfRequest(session, 0, time.Now().Add(5*time.Second)),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	first := runtimeAwaitArtifact(t, emitted)
+	if got := observer.count(ScheduleEventBuildStart); got != 0 {
+		close(releaseFirst)
+		t.Fatalf("first-slot build-start observations = %d, want 0", got)
+	}
+	close(releaseFirst)
+	second := runtimeAwaitArtifact(t, emitted)
+	if first.Candidate.ID.Slot != 0 || second.Candidate.ID.Slot != 1 {
+		t.Fatalf("emitted slots = %d, %d, want 0, 1", first.Candidate.ID.Slot, second.Candidate.ID.Slot)
+	}
+	if got := observer.count(ScheduleEventBuildStart); got != 1 {
+		t.Fatalf("continuation build-start observations = %d, want 1", got)
+	}
+	if got := observer.count(ScheduleEventBroadcast); got != 2 {
+		t.Fatalf("broadcast observations = %d, want 2", got)
 	}
 }
 
@@ -1069,7 +1147,7 @@ func TestRuntimeRestartDoesNotRebuildSelfCandidateMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	if marker.Authority != CandidateAuthoritySelf {
-		t.Fatalf("durable marker authority = %d, want self", marker.Authority)
+		t.Fatalf("persisted marker authority = %d, want self", marker.Authority)
 	}
 	first.close(t)
 
@@ -2438,7 +2516,7 @@ func TestRuntimeStartsEveryActiveWindowAndCloseCancels(t *testing.T) {
 	}
 }
 
-// A durable candidate marker outlives the process that signed it, but the
+// A persisted candidate marker may outlive the process that signed it, but the
 // payload behind it does not. The successor must neither re-emit (it has no
 // bytes) nor rebuild (collation is not byte-reproducible, so a rebuilt
 // candidate would be a second signature on a slot already broadcast). It ends

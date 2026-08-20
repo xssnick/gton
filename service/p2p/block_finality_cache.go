@@ -49,10 +49,7 @@ type blockFinalityCandidateEntry struct {
 
 type blockFinalityCandidate struct {
 	id                    ton.BlockIDExt
-	blockRoot             *cell.Cell
 	blockBOC              []byte
-	meta                  *tnstore.BlockMeta
-	stateUpdate           *cell.Cell
 	sourcePeerID          PeerID
 	signaturesVerifiedKey []byte
 }
@@ -232,7 +229,11 @@ func assembleBlockFinality(candidate *blockFinalityCandidateEntry, finality *blo
 		return nil, fmt.Errorf("block finality candidate %s finality belongs to %s", tnstore.FormatBlockRef(candidate.block.id), tnstore.FormatBlockRef(finality.block))
 	}
 
-	proofRoot, err := blockproof.BroadcastProofRoot(candidate.block.id, candidate.block.blockRoot)
+	downloaded, err := candidate.block.downloaded()
+	if err != nil {
+		return nil, err
+	}
+	proofRoot, err := blockproof.BroadcastProofRoot(candidate.block.id, downloaded.Block)
 	if err != nil {
 		return nil, err
 	}
@@ -249,8 +250,20 @@ func assembleBlockFinality(candidate *blockFinalityCandidateEntry, finality *blo
 		return nil, err
 	}
 
-	block := candidate.block.downloaded(proof, proofBOC, isLink, finality)
-	return []DownloadedBlock{block}, nil
+	downloaded.Kind = blockFinalityBroadcastKind
+	downloaded.Proof = proof
+	downloaded.ProofBOC = proofBOC
+	downloaded.SourcePeerID = finality.sourcePeerID
+	if downloaded.SourcePeerID.IsZero() {
+		downloaded.SourcePeerID = candidate.block.sourcePeerID
+	}
+	downloaded.IsLink = isLink
+	downloaded.SignaturesVerifiedKey = append([]byte(nil), finality.signaturesVerifiedKey...)
+	if len(downloaded.SignaturesVerifiedKey) == 0 {
+		downloaded.SignaturesVerifiedKey = append([]byte(nil), candidate.block.signaturesVerifiedKey...)
+	}
+
+	return []DownloadedBlock{*downloaded}, nil
 }
 
 func (c *blockFinalityCache) pruneExpiredLocked(now time.Time) {
@@ -309,40 +322,23 @@ func (e *blockFinalityAssembledEntry) blockFinalityCacheExpiresAt() time.Time {
 func blockFinalityCandidateFrom(downloaded DownloadedBlock) blockFinalityCandidate {
 	return blockFinalityCandidate{
 		id:                    cloneBlockID(downloaded.ID),
-		blockRoot:             downloaded.Block,
 		blockBOC:              downloaded.BlockBOC,
-		meta:                  downloaded.Meta.Clone(),
-		stateUpdate:           downloaded.StateUpdate,
 		sourcePeerID:          downloaded.SourcePeerID,
 		signaturesVerifiedKey: append([]byte(nil), downloaded.SignaturesVerifiedKey...),
 	}
 }
 
-func (c blockFinalityCandidate) downloaded(proof *cell.Cell, proofBOC []byte, isLink bool, finality *blockFinalityEntry) DownloadedBlock {
-	signaturesVerifiedKey := finality.signaturesVerifiedKey
-	if len(signaturesVerifiedKey) == 0 {
-		signaturesVerifiedKey = c.signaturesVerifiedKey
+func (c blockFinalityCandidate) downloaded() (*DownloadedBlock, error) {
+	downloaded, err := decodeRawBlockCandidateBroadcast(
+		trustedConsensusCandidateKind,
+		c.id,
+		c.blockBOC,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("decode cached block finality candidate %s: %w", tnstore.FormatBlockRef(c.id), err)
 	}
 
-	sourcePeerID := finality.sourcePeerID
-	if sourcePeerID.IsZero() {
-		sourcePeerID = c.sourcePeerID
-	}
-
-	return DownloadedBlock{
-		ID:                    cloneBlockID(c.id),
-		Kind:                  blockFinalityBroadcastKind,
-		Block:                 c.blockRoot,
-		Proof:                 proof,
-		BlockBOC:              c.blockBOC,
-		ProofBOC:              proofBOC,
-		Meta:                  c.meta.Clone(),
-		StateUpdate:           c.stateUpdate,
-		SourcePeerID:          sourcePeerID,
-		IsLink:                isLink,
-		VerifiedRootHash:      true,
-		SignaturesVerifiedKey: append([]byte(nil), signaturesVerifiedKey...),
-	}
+	return downloaded, nil
 }
 
 func blockFinalityCandidateBytes(downloaded DownloadedBlock) int64 {

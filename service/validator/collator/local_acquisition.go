@@ -36,36 +36,48 @@ type LocalShardTopSource interface {
 	Select(context.Context, ShardTopSelection) ([]ShardTop, error)
 }
 
+// AccountPrewarmer accepts best-effort account-state cache hints. EnqueueAccount
+// must not wait for I/O; candidate acquisition and collation do not depend on
+// warming for correctness.
+type AccountPrewarmer interface {
+	EnqueueAccount(workchain int32, account [32]byte) bool
+	PrewarmAccountNow(workchain int32, account [32]byte) bool
+}
+
 type LocalAcquisitionOptions struct {
-	Builder             *Builder
-	Logger              zerolog.Logger
-	CollationObserver   CollationObserver
-	ValidationObserver  ValidationCoreObserver
-	Store               LocalStateStore
-	Groups              LocalGroupSource
-	Messages            LocalMessageSource
-	ShardTops           LocalShardTopSource
-	Semantics           CandidateTransitionVerifier
-	Random              io.Reader
-	ExternalLimit       int
-	MaxExternalAttempts int
-	Dispatch            *DispatchPolicy
+	Builder                *Builder
+	Logger                 zerolog.Logger
+	CollationObserver      CollationObserver
+	ValidationObserver     ValidationCoreObserver
+	Store                  LocalStateStore
+	Groups                 LocalGroupSource
+	Messages               LocalMessageSource
+	ShardTops              LocalShardTopSource
+	Semantics              CandidateTransitionVerifier
+	AccountPrewarmer       AccountPrewarmer
+	AccountPrewarmCapacity int
+	Random                 io.Reader
+	ExternalLimit          int
+	MaxExternalAttempts    int
+	Dispatch               *DispatchPolicy
 }
 
 // LocalAcquisition materializes exact Builder requests from the node's local
 // authenticated state. Independent sessions do not share a build lock.
 type LocalAcquisition struct {
-	builder            *Builder
-	log                zerolog.Logger
-	collationObserver  CollationObserver
-	validationObserver ValidationCoreObserver
-	store              LocalStateStore
-	groups             LocalGroupSource
-	messages           LocalMessageSource
-	shardTops          LocalShardTopSource
-	semantics          CandidateTransitionVerifier
-	random             io.Reader
-	randomMu           sync.Mutex
+	builder                *Builder
+	log                    zerolog.Logger
+	collationObserver      CollationObserver
+	validationObserver     ValidationCoreObserver
+	store                  LocalStateStore
+	groups                 LocalGroupSource
+	messages               LocalMessageSource
+	shardTops              LocalShardTopSource
+	semantics              CandidateTransitionVerifier
+	accountPrewarmer       AccountPrewarmer
+	accountPrewarmCapacity int
+	random                 io.Reader
+	randomMu               sync.Mutex
 
 	externalLimit       int
 	maxExternalAttempts int
@@ -163,6 +175,9 @@ func NewLocalAcquisition(options LocalAcquisitionOptions) (*LocalAcquisition, er
 	if options.ExternalLimit < 0 || options.MaxExternalAttempts < 0 {
 		return nil, errors.New("collator: local acquisition limits must not be negative")
 	}
+	if options.AccountPrewarmer != nil && options.AccountPrewarmCapacity <= 0 {
+		return nil, errors.New("collator: account prewarm capacity must be positive")
+	}
 	if options.ExternalLimit == 0 {
 		options.ExternalLimit = defaultLocalExternalLimit
 	}
@@ -178,22 +193,24 @@ func NewLocalAcquisition(options LocalAcquisitionOptions) (*LocalAcquisition, er
 	}
 
 	return &LocalAcquisition{
-		builder:             options.Builder,
-		log:                 options.Logger,
-		collationObserver:   options.CollationObserver,
-		validationObserver:  options.ValidationObserver,
-		store:               options.Store,
-		groups:              options.Groups,
-		messages:            options.Messages,
-		shardTops:           options.ShardTops,
-		semantics:           options.Semantics,
-		random:              options.Random,
-		externalLimit:       options.ExternalLimit,
-		maxExternalAttempts: options.MaxExternalAttempts,
-		dispatch:            dispatch,
-		configs:             localConfigCache{log: options.Logger, entries: make(map[cell.Hash]localPreparedConfig)},
-		blocks:              localBlockCache{entries: make(map[[32]byte]*localBlockSource)},
-		sessions:            make(map[[32]byte]*localAcquisitionSession),
+		builder:                options.Builder,
+		log:                    options.Logger,
+		collationObserver:      options.CollationObserver,
+		validationObserver:     options.ValidationObserver,
+		store:                  options.Store,
+		groups:                 options.Groups,
+		messages:               options.Messages,
+		shardTops:              options.ShardTops,
+		semantics:              options.Semantics,
+		accountPrewarmer:       options.AccountPrewarmer,
+		accountPrewarmCapacity: options.AccountPrewarmCapacity,
+		random:                 options.Random,
+		externalLimit:          options.ExternalLimit,
+		maxExternalAttempts:    options.MaxExternalAttempts,
+		dispatch:               dispatch,
+		configs:                localConfigCache{log: options.Logger, entries: make(map[cell.Hash]localPreparedConfig)},
+		blocks:                 localBlockCache{entries: make(map[[32]byte]*localBlockSource)},
+		sessions:               make(map[[32]byte]*localAcquisitionSession),
 	}, nil
 }
 

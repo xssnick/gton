@@ -23,17 +23,16 @@
 //     for both), the finalize rule, slot timeouts with adaptive first-block
 //     timeout, startup skip votes for the last announced leader window.
 //
-//   - Journal — durable intent log. The engine enforces the
-//     critical order for every own vote:
+//   - Journal — consensus persistence log. The engine enforces the critical
+//     order for every own vote:
 //
 //     decision -> durable journal write -> sign -> apply to pool -> send
 //
-//     Writes are asynchronous: the engine keeps
-//     serving inputs while a record persists (an fsync never stalls the
-//     loop), and the dependent continuation — sign+apply+send for votes,
-//     application and gossip for certificates, the leader-window
-//     announcement — runs only from the completion. A journal failure is
-//     fatal for the session (fail-closed).
+//     Writes are asynchronous: the engine keeps serving inputs while a record
+//     persists (an fsync never stalls the loop). Votes resume sign+apply+send
+//     from the completion; certificates resume application and gossip. Window
+//     consumers run immediately while their restart cursor is stored in
+//     parallel. A journal failure is fatal for the session (fail-closed).
 //
 // Recovery: Engine.Start replays the journal — certificates first (without
 // re-gossip), then own votes in seqno order (re-signed, not re-broadcast,
@@ -393,10 +392,10 @@ type CandidateRejection interface {
 // validator must be able to serve every candidate it votes to notarize.
 //
 // HandleWindow and the outcome methods run on the engine goroutine and must
-// not block. Every validator and observer receives HandleWindow after the
-// corresponding pool-state journal record is durable. Notarized and finalized
-// events are re-emitted during journal replay, so implementations must be
-// idempotent. Candidate methods are not called for observer engines.
+// not block. Every validator and observer receives HandleWindow as soon as the
+// pool enters it; the restart cursor is persisted independently. Notarized and
+// finalized events are re-emitted during journal replay, so implementations
+// must be idempotent. Candidate methods are not called for observer engines.
 type Hooks interface {
 	ValidateCandidate(c *Candidate, done func(error))
 	StoreCandidate(c *Candidate, done func(error))

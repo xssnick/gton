@@ -1274,7 +1274,11 @@ func equalCell(left, right *cell.Cell) bool {
 	return left.HashKeyAt(0) == right.HashKeyAt(0)
 }
 
-func verifyCollatedData(candidate *Candidate, genUtime uint32) (verifiedCollatedData, error) {
+func verifyCollatedData(
+	candidate *Candidate,
+	roots []*cell.Cell,
+	genUtime uint32,
+) (verifiedCollatedData, error) {
 	// Skipped only for a candidate whose CollatedFileHash is where these bytes'
 	// digest came from, or was compared against it a moment ago: a wire-decoded
 	// candidate, whose codec derived the hash from the payload and folded it
@@ -1288,9 +1292,12 @@ func verifyCollatedData(candidate *Candidate, genUtime uint32) (verifiedCollated
 			return verifiedCollatedData{}, fmt.Errorf("%w: candidate collated data file hash mismatch", ErrInvalidInput)
 		}
 	}
-	roots, err := cell.FromBOCMultiRoot(candidate.CollatedData)
-	if err != nil {
-		return verifiedCollatedData{}, fmt.Errorf("%w: decode candidate collated data: %v", ErrInvalidInput, err)
+	if roots == nil {
+		var err error
+		roots, err = cell.FromBOCMultiRoot(candidate.CollatedData)
+		if err != nil {
+			return verifiedCollatedData{}, fmt.Errorf("%w: decode candidate collated data: %v", ErrInvalidInput, err)
+		}
 	}
 	if len(roots) == 0 {
 		return verifiedCollatedData{}, fmt.Errorf("%w: candidate collated data has no roots", ErrInvalidInput)

@@ -401,7 +401,7 @@ func TestBuildCollatedRootsIncludesOnlyUsedStorageStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	used := storageStatTestDict(t)
-	unused := cell.BeginCell().MustStoreUInt(0xcc, 8).EndCell()
+	unused := storageStatTestDict(t)
 	usedProof := cell.NewMerkleProofBuilder(used)
 	if _, err := usedProof.Root().AsDict(256).LoadValueByBytesKey(storageStatTestKeys[0][:]); err != nil {
 		t.Fatal(err)
@@ -419,9 +419,13 @@ func TestBuildCollatedRootsIncludesOnlyUsedStorageStats(t *testing.T) {
 				storageProof:       usedProof,
 				transactions:       new(tlb.AccountTransactionsAugDict),
 			},
-			// A lane that never committed a transaction contributes no proof, so
-			// it needs no builder either.
-			{2}: {initialStorageStat: unused},
+			// A committed transaction that never reads its storage-stat dictionary
+			// must not contribute an all-pruned proof.
+			{2}: {
+				initialStorageStat: unused,
+				storageProof:       cell.NewMerkleProofBuilder(unused),
+				transactions:       new(tlb.AccountTransactionsAugDict),
+			},
 		},
 		fullCollated:          true,
 		collatedProofEstimate: estimator,
@@ -661,7 +665,7 @@ func TestPreviousStateProofCoversTransactionDispatchLookup(t *testing.T) {
 			transactionAccount: {transactions: new(tlb.AccountTransactionsAugDict)},
 		},
 	}
-	if err := c.traceDispatchValidationClosure(); err != nil {
+	if err := c.traceDispatchQueueValidationClosure(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -745,6 +749,25 @@ func TestTrackAccountStorageProofUsesDictionaryReads(t *testing.T) {
 	}
 	if _, err = proven.AsDict(256).LoadValueByBytesKey(keys[3][:]); err == nil {
 		t.Fatal("unread account storage branch was included in usage proof")
+	}
+}
+
+func TestTrackAccountStorageProofSkipsUntouchedDictionary(t *testing.T) {
+	root := storageStatTestDict(t)
+	lane := &accountLane{
+		initialStorageStat: root,
+		storageProof:       cell.NewMerkleProofBuilder(root),
+	}
+	c := &collation{fullCollated: true, collatedProofEstimate: newProofSizeEstimator(0)}
+
+	if err := c.trackAccountStorageProof(lane); err != nil {
+		t.Fatal(err)
+	}
+	if lane.initialStorageProof != nil {
+		t.Fatal("untouched storage dictionary produced a proof")
+	}
+	if c.collatedFixedEstimate != 0 {
+		t.Fatalf("untouched storage dictionary charged %d collated bytes", c.collatedFixedEstimate)
 	}
 }
 

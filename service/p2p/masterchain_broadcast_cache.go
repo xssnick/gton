@@ -48,15 +48,12 @@ func (c *masterchainNextBroadcastCache) storeAt(downloaded DownloadedBlock, now 
 		key:          key,
 		block:        cloneBlockID(downloaded.ID),
 		kind:         downloaded.Kind,
-		blockRoot:    downloaded.Block,
-		proofRoot:    downloaded.Proof,
-		stateUpdate:  downloaded.StateUpdate,
 		blockBOC:     downloaded.BlockBOC,
 		proofBOC:     downloaded.ProofBOC,
 		isLink:       downloaded.IsLink,
-		meta:         downloaded.Meta.Clone(),
 		sourcePeerID: downloaded.SourcePeerID,
 		bytes:        size,
+		hot:          downloadedHotCacheEntry(downloaded),
 
 		signaturesVerifiedKey: append([]byte(nil), downloaded.SignaturesVerifiedKey...),
 	}
@@ -73,7 +70,7 @@ func (c *masterchainNextBroadcastCache) BlockAfter(prev ton.BlockIDExt) (*Downlo
 }
 
 func masterchainNextBroadcastBlockCacheSize(blockBOC []byte, proofBOC []byte) int64 {
-	return int64(len(blockBOC)*2 + len(proofBOC)*2 + masterchainNextBroadcastCacheOverhead)
+	return int64(len(blockBOC) + len(proofBOC) + masterchainNextBroadcastCacheOverhead)
 }
 
 func (n *Node) rememberMasterchainNextBroadcastBlock(downloaded *DownloadedBlock) bool {

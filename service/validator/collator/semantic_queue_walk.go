@@ -100,24 +100,23 @@ type semanticQueueLeafCells struct {
 // entry is parsed, and exists so that a storage fault and a verdict on the
 // entry's content cannot arrive as the same error.
 //
-// They used to be indistinguishable, and the difference decides whether a block
-// ships. traceProcessedQueueValidationClosure may continue past a verdict on a
-// predecessor entry — the validator reaches the same bytes through the same
-// parse — but must not continue past a failure to READ one, because that is a
-// proof this node knows to be short. Until this split, a lazy load raised
-// strictly below the leaf surfaced from inside the parse: tonutils lazy loaders
-// return the storage error unchanged and there is no I/O sentinel to test for,
-// so a transient disk error was classified as a parse verdict and shipped.
+// They used to be indistinguishable. Both now stop collation, but preserving the
+// distinction keeps the returned cause actionable: a content verdict identifies
+// a candidate every validator would reject, while a load failure identifies the
+// local storage/read path that prevented proof closure. Until this split, a lazy
+// load raised strictly below the leaf surfaced from inside the parse because
+// tonutils lazy loaders return the storage error unchanged and there is no I/O
+// sentinel to inspect afterwards.
 //
 // The split is by CALL, not by error inspection. Cell.Prewarm does one thing —
 // resolve a lazy reference — and every error it can return comes from the
 // loader or from validating what the loader returned
 // (ErrLazyLoaderNotSet, ErrLazyRefNotFound, ErrLazyRefMismatch, or the store's
-// own error). Those are returned bare, and the walk's caller therefore cannot
-// swallow them. Taking the reference itself is a separate step on cells already
-// in hand: a leaf value with no reference, or an envelope with none, is a
-// malformed entry that the validator's own parse rejects in the same place, so
-// those are marked as verdicts here exactly as the parse would have marked them.
+// own error). Those are returned bare. Taking the reference itself is a separate
+// step on cells already in hand: a leaf value with no reference, or an envelope
+// with none, is malformed content that the validator's own parse rejects in the
+// same place, so those are marked as verdicts here exactly as the parse would
+// have marked them.
 //
 // It adds no I/O. Prewarm performs the load the parse would have performed on
 // first touch, the loaded cells are then handed to the parse, and a
@@ -163,16 +162,11 @@ func materialiseSemanticQueueLeaf(value *cell.Slice) (semanticQueueLeafCells, er
 // message reference — which the parse itself would have rejected in the same
 // place had it got that far.
 //
-// It exists so that the collator's proof-closure replay can tell those two
-// apart. That replay may continue after a verdict on a PREDECESSOR entry —
-// the validator meets the same bytes through the same parse at the same bound,
-// so the block's fate is already sealed and failing collation only converts
-// "produce a block others reject" into "produce nothing" (see
-// traceProcessedQueueValidationClosure). It may not continue after anything
-// else: a traversal that could not open a node, a lazy load that failed below
-// the leaf, a structural complaint from this file's own callback, or a failure
-// below the walk says nothing about what the validator will find, and shipping
-// past one ships a proof this node knows to be short.
+// It exists so callers and diagnostics can tell content from traversal/storage
+// failures without parsing error text. Proof closure returns either class as an
+// error: a verdict means the candidate's acceptance result is already known to
+// be rejection, while any other failure means this node could not complete the
+// validator's read set.
 //
 // Deliberately transparent. Error() is the wrapped message verbatim and
 // Unwrap exposes the cause, so every existing errors.Is/As test and every

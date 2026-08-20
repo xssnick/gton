@@ -1,8 +1,10 @@
 package pebblestore
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"testing"
 	"time"
@@ -34,60 +36,72 @@ func TestMeasureDurabilitySplit(t *testing.T) {
 	}
 
 	const rounds = 40
+	type candidateStore func(
+		index int,
+		wire []byte,
+		hash [sha256.Size]byte,
+		db *pebble.DB,
+		packs *candidatePackStore,
+	) error
 	for _, arm := range []struct {
 		name  string
-		class durabilityClass
+		store candidateStore
 	}{
-		{name: "before: candidate fsynced, then vote fsynced", class: durableCommitment},
-		{name: "after:  candidate unsynced, then vote fsynced", class: recoverablePayload},
+		{
+			name: "before: candidate in synced Pebble, then vote synced",
+			store: func(index int, wire []byte, _ [sha256.Size]byte, db *pebble.DB, _ *candidatePackStore) error {
+				return db.Set([]byte(fmt.Sprintf("wire-%04d", index)), wire, pebble.Sync)
+			},
+		},
+		{
+			name: "after:  candidate in pack + pointer NoSync, then vote synced",
+			store: func(index int, wire []byte, hash [sha256.Size]byte, db *pebble.DB, packs *candidatePackStore) error {
+				pointer, err := packs.append(storageNamespace{}, wire, hash)
+				if err != nil {
+					return err
+				}
+
+				return db.Set(
+					[]byte(fmt.Sprintf("pointer-%04d", index)),
+					encodeCandidatePackPointer(pointer),
+					pebble.NoSync,
+				)
+			},
+		},
 	} {
 		counting := &syncCountingFS{FS: vfs.Default}
-		db, err := pebble.Open(t.TempDir(), &pebble.Options{FS: counting})
+		dir := filepath.Join(t.TempDir(), "validator")
+		db, err := pebble.Open(dir, &pebble.Options{FS: counting})
 		if err != nil {
 			t.Fatal(err)
 		}
-		store := &Store{db: db, queue: make(chan writeRequest, 8), writerDone: make(chan struct{})}
-		go store.runWriter()
+		packs := newCandidatePackStore(dir)
 
 		var payload, commitment, total []time.Duration
 		wire := make([]byte, measureWireBytes)
+		hash := sha256.Sum256(wire)
 		for i := 0; i < rounds; i++ {
-			payloadDone := make(chan time.Duration, 1)
-			commitmentDone := make(chan time.Duration, 1)
-
 			slotStart := time.Now()
-			if err = store.submit(writeRequest{
-				durability: arm.class,
-				sizeHint:   len(wire),
-				apply: func(batch *pebble.Batch) error {
-					return batch.Set([]byte(fmt.Sprintf("wire-%04d", i)), wire, nil)
-				},
-				done: func(error) { payloadDone <- time.Since(slotStart) },
-			}); err != nil {
+			if err = arm.store(i, wire, hash, db, packs); err != nil {
 				t.Fatal(err)
 			}
-			payloadLatency := <-payloadDone
+			payloadLatency := time.Since(slotStart)
 
 			// Only now, exactly as maybeVoteNotar -> castVote does.
 			voteStart := time.Now()
-			if err = store.submit(writeRequest{
-				apply: func(batch *pebble.Batch) error {
-					return batch.Set([]byte(fmt.Sprintf("vote-%04d", i)), []byte{1}, nil)
-				},
-				done: func(error) { commitmentDone <- time.Since(voteStart) },
-			}); err != nil {
+			if err = db.Set([]byte(fmt.Sprintf("vote-%04d", i)), []byte{1}, pebble.Sync); err != nil {
 				t.Fatal(err)
 			}
-			commitmentLatency := <-commitmentDone
+			commitmentLatency := time.Since(voteStart)
 
 			payload = append(payload, payloadLatency)
 			commitment = append(commitment, commitmentLatency)
 			total = append(total, time.Since(slotStart))
 		}
-		close(store.queue)
-		<-store.writerDone
-		store.callbackWG.Wait()
 		syncs := counting.syncs.Load()
+		if err = packs.close(); err != nil {
+			t.Fatal(err)
+		}
 		if err = db.Close(); err != nil {
 			t.Fatal(err)
 		}

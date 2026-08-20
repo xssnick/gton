@@ -89,6 +89,191 @@ func TestStateResolverAcceptanceRetryCancels(t *testing.T) {
 	}
 }
 
+func TestStateResolverDropsFlightAfterLastWaiterCancels(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	provider := &retryCandidateProvider{
+		called:   make(chan struct{}, 1),
+		finished: make(chan struct{}, 1),
+	}
+	params := simplex.DefaultParams()
+	params.CandidateResolveTimeout = time.Minute
+	params.CandidateResolveTimeoutCap = time.Minute
+	candidates := newResolverForTest(storage, provider, 2, params)
+	defer candidates.close()
+
+	config, _ := runtimeTestConfig(0x90, &runtimeTestJournal{})
+	resolver := newStateResolver(
+		config.Shard,
+		config.StorageID,
+		storage,
+		newRuntimeTestBackend(),
+		candidates,
+		StoredSessionState{},
+		nil,
+		params,
+		config.Protocol.SlotsPerLeaderWindow,
+	)
+	defer resolver.close()
+	if err := resolver.start(context.Background(), runtimeTestStart()); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := simplex.Parent(simplex.CandidateID{Slot: 31, Hash: [32]byte{0x31}})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := resolver.resolve(ctx, parent)
+		result <- err
+	}()
+	select {
+	case <-provider.called:
+	case <-time.After(time.Second):
+		t.Fatal("state flight did not enter candidate resolution")
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("state resolve error = %v, want context cancellation", err)
+	}
+	select {
+	case <-provider.finished:
+	case <-time.After(time.Second):
+		t.Fatal("candidate request outlived the last state waiter")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		resolver.mu.Lock()
+		flight := resolver.states[parent]
+		resolver.mu.Unlock()
+		if flight == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cancelled state flight remains cached: %p", flight)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestStateResolverFinalizationCandidateEpochExpires(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	provider := &retryCandidateProvider{
+		called:   make(chan struct{}, 1),
+		finished: make(chan struct{}, 1),
+	}
+	params := simplex.DefaultParams()
+	params.TargetRate = time.Millisecond
+	params.MaxLeaderWindowDesync = 1
+	params.CandidateResolveTimeout = time.Second
+	params.CandidateResolveTimeoutCap = 30 * time.Millisecond
+	candidates := newResolverForTest(storage, provider, 2, params)
+	defer candidates.close()
+
+	config, _ := runtimeTestConfig(0x8f, &runtimeTestJournal{})
+	resolver := newStateResolver(
+		config.Shard,
+		config.StorageID,
+		storage,
+		newRuntimeTestBackend(),
+		candidates,
+		StoredSessionState{},
+		nil,
+		params,
+		config.Protocol.SlotsPerLeaderWindow,
+	)
+	defer resolver.close()
+	if err := resolver.start(context.Background(), runtimeTestStart()); err != nil {
+		t.Fatal(err)
+	}
+
+	id := simplex.CandidateID{Slot: 41, Hash: [32]byte{0x41}}
+	err := resolver.finalize(context.Background(), id, simplex.VerifiedCertificate{})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("finalization candidate epoch error = %v, want context deadline", err)
+	}
+	select {
+	case <-provider.finished:
+	case <-time.After(time.Second):
+		t.Fatal("expired finalization left its candidate request running")
+	}
+	waitForCandidateResolveFlight(t, candidates, id, nil)
+
+	resolver.mu.Lock()
+	marker := resolver.finalized[id]
+	resolver.mu.Unlock()
+	if marker != nil {
+		t.Fatalf("failed finalization retained marker %+v", marker)
+	}
+}
+
+func TestStateResolverWaitsForCancelledFlightCleanupBeforeRestart(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	params := simplex.DefaultParams()
+	candidates := newResolverForTest(
+		storage,
+		&retryCandidateProvider{called: make(chan struct{}, 1)},
+		1,
+		params,
+	)
+	defer candidates.close()
+
+	config, _ := runtimeTestConfig(0x91, &runtimeTestJournal{})
+	resolver := newStateResolver(
+		config.Shard,
+		config.StorageID,
+		storage,
+		newRuntimeTestBackend(),
+		candidates,
+		StoredSessionState{},
+		nil,
+		params,
+		config.Protocol.SlotsPerLeaderWindow,
+	)
+	defer resolver.close()
+	if err := resolver.start(context.Background(), runtimeTestStart()); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := simplex.Genesis()
+	old := &stateFlight{
+		done:      make(chan struct{}),
+		cancel:    func() {},
+		cancelErr: context.Canceled,
+	}
+	resolver.mu.Lock()
+	resolver.states[parent] = old
+	resolver.mu.Unlock()
+
+	result := make(chan error, 1)
+	go func() {
+		resolved, err := resolver.resolve(context.Background(), parent)
+		if err == nil && resolved.State == nil {
+			err = errors.New("restarted genesis resolve returned no state")
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("new caller joined the cancelled flight: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	resolver.mu.Lock()
+	delete(resolver.states, parent)
+	old.finished = true
+	old.err = context.Canceled
+	close(old.done)
+	resolver.mu.Unlock()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("resolve after cancelled-flight cleanup: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("caller did not restart after cancelled-flight cleanup")
+	}
+}
+
 func TestStateResolverReplaysPersistedFinalizationOnce(t *testing.T) {
 	storage := newRuntimeTestStorage()
 	config, privateKey := runtimeTestConfig(0x92, &runtimeTestJournal{})

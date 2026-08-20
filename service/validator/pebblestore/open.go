@@ -24,15 +24,15 @@ var (
 	ErrUnsupportedSchema = errors.New("validator pebblestore: unsupported schema version")
 )
 
-// Options configures the validator database rooted directly at Dir.
+// Options configures the validator store rooted directly at Dir.
 type Options struct {
 	Dir       string
 	CacheSize int64
 	QueueSize int
 }
 
-// Open opens one WAL-backed Pebble database and starts its bounded durable
-// writer.
+// Open opens the WAL-backed metadata database, candidate packs and their
+// bounded writer.
 func Open(opts Options) (*Store, error) {
 	if opts.Dir == "" {
 		return nil, errors.New("validator pebblestore: dir is empty")
@@ -81,10 +81,11 @@ func Open(opts Options) (*Store, error) {
 		closeDone:  make(chan struct{}),
 	}
 	store.validator = &ValidatorStore{
-		store:    store,
-		deleting: make(map[storageNamespace]struct{}),
-		deleted:  make(map[storageNamespace]struct{}),
-		journals: make(map[storageNamespace]*journal),
+		store:          store,
+		candidatePacks: newCandidatePackStore(opts.Dir),
+		deleting:       make(map[storageNamespace]struct{}),
+		deleted:        make(map[storageNamespace]struct{}),
+		journals:       make(map[storageNamespace]*journal),
 	}
 	store.collator = &CollatorStore{
 		store:    store,

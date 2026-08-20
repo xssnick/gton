@@ -125,7 +125,7 @@ func TestFullCollatedShardVerificationRejectsNarrowedPredecessorProof(t *testing
 func collatedNeighborQueues(tb testing.TB, req ShardRequest, candidate *Candidate) []Neighbor {
 	tb.Helper()
 
-	data, err := verifyCollatedData(candidate, req.Header.GenUtime)
+	data, err := verifyCollatedData(candidate, nil, req.Header.GenUtime)
 	if err != nil {
 		tb.Fatalf("decode candidate collated data: %v", err)
 	}

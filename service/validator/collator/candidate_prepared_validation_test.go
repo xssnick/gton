@@ -79,11 +79,8 @@ func TestPreparedValidationCandidateIsTheOnlyParse(t *testing.T) {
 	if prepared.candidate.StateUpdate != prepared.verified.block.StateUpdate {
 		t.Fatal("the candidate carries a state update from another parse")
 	}
-	if prepared.candidate.State != prepared.stateRoot {
-		t.Fatal("the candidate carries a state root from another apply")
-	}
-	if prepared.stateRoot.HashKeyAt(0) != candidate.State.HashKeyAt(0) {
-		t.Fatal("the successor state differs from the collated one")
+	if prepared.candidate.State != nil || prepared.stateRoot != nil {
+		t.Fatal("preparation applied the state update before the config-bound stage")
 	}
 	if len(prepared.resident) != 1 || prepared.resident[0].State != req.Previous.State {
 		t.Fatal("the capsule lost the resident predecessor list")
@@ -93,6 +90,12 @@ func TestPreparedValidationCandidateIsTheOnlyParse(t *testing.T) {
 	// every view the structural pass reads is filled in place.
 	if err = prepared.bindConfig(t.Context(), req.Masterchain.Config); err != nil {
 		t.Fatalf("bind candidate to config: %v", err)
+	}
+	if prepared.candidate.State != prepared.stateRoot {
+		t.Fatal("the candidate carries a state root from another apply")
+	}
+	if prepared.stateRoot.HashKeyAt(0) != candidate.State.HashKeyAt(0) {
+		t.Fatal("the successor state differs from the collated one")
 	}
 	if prepared.verified.state.OutMsgQueueInfo == nil || prepared.verified.queue.OutQueue == nil ||
 		prepared.verified.inMessages == nil || prepared.verified.outMessages == nil ||
@@ -104,6 +107,111 @@ func TestPreparedValidationCandidateIsTheOnlyParse(t *testing.T) {
 	}
 	if err = verifyPreparedShardCandidate(t.Context(), shardVerificationRequest(req, prepared.candidate), &prepared.verified); err != nil {
 		t.Fatalf("verify the candidate the capsule prepared: %v", err)
+	}
+}
+
+func TestPreparedValidationCandidateUsesBorrowedNetworkRoots(t *testing.T) {
+	req := emptyCandidateRequest(t)
+	req.Internals = &msgpool.Cut{}
+	candidate, err := testBuilder().BuildShard(t.Context(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	artifact := candidateValidationArtifact(candidate)
+	artifact.digested = true
+	artifact.blockRoot, err = cell.FromBOC(candidate.BlockBOC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact.collatedRoots, err = cell.FromBOCMultiRoot(candidate.CollatedData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := prepareValidationCandidate(
+		t.Context(),
+		artifact,
+		req.CreatedBy,
+		false,
+		[]PreviousBlock{req.Previous},
+	)
+	if err != nil {
+		t.Fatalf("prepare candidate from borrowed roots: %v", err)
+	}
+	if prepared.root != artifact.blockRoot {
+		t.Fatal("validation decoded another block root")
+	}
+	if len(prepared.verified.collated.roots) != len(artifact.collatedRoots) {
+		t.Fatal("validation changed the collated root set")
+	}
+	for i := range artifact.collatedRoots {
+		if prepared.verified.collated.roots[i] != artifact.collatedRoots[i] {
+			t.Fatalf("validation decoded collated root %d again", i)
+		}
+	}
+
+	incomplete := artifact
+	incomplete.collatedRoots = nil
+	if _, err = prepareValidationCandidate(
+		t.Context(), incomplete, req.CreatedBy, false, []PreviousBlock{req.Previous},
+	); !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), "parsed candidate payload is incomplete") {
+		t.Fatalf("incomplete parsed payload error = %v", err)
+	}
+
+	unbound := artifact
+	unbound.digested = false
+	if _, err = prepareValidationCandidate(
+		t.Context(), unbound, req.CreatedBy, false, []PreviousBlock{req.Previous},
+	); !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), "no digest provenance") {
+		t.Fatalf("unbound parsed payload error = %v", err)
+	}
+
+	wrong := artifact
+	wrong.blockRoot = cell.BeginCell().MustStoreUInt(1, 1).EndCell()
+	if _, err = prepareValidationCandidate(
+		t.Context(), wrong, req.CreatedBy, false, []PreviousBlock{req.Previous},
+	); !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), "root hash mismatch") {
+		t.Fatalf("foreign parsed block error = %v", err)
+	}
+}
+
+func BenchmarkPrepareValidationCandidatePayload(b *testing.B) {
+	req := benchMainnetCollatedRequest(b, 1)
+	candidate, err := testBuilder().BuildShard(b.Context(), req)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	decoded := candidateValidationArtifact(candidate)
+	decoded.digested = true
+	prepared := decoded
+	prepared.blockRoot, err = cell.FromBOC(candidate.BlockBOC)
+	if err != nil {
+		b.Fatal(err)
+	}
+	prepared.collatedRoots, err = cell.FromBOCMultiRoot(candidate.CollatedData)
+	if err != nil {
+		b.Fatal(err)
+	}
+	previous := []PreviousBlock{req.Previous}
+
+	for _, benchmark := range []struct {
+		name     string
+		artifact CandidateArtifact
+	}{
+		{name: "decode_boc", artifact: decoded},
+		{name: "borrowed_roots", artifact: prepared},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, prepareErr := prepareValidationCandidate(
+					b.Context(), benchmark.artifact, req.CreatedBy, false, previous,
+				); prepareErr != nil {
+					b.Fatal(prepareErr)
+				}
+			}
+		})
 	}
 }
 
@@ -627,6 +735,9 @@ func TestValidatedSuccessorLeavesVerificationOnTheProofBackedRoot(t *testing.T) 
 	if prepared.previous[0].State == narrowed.State {
 		t.Fatal("the successor was built on the resident tree after all")
 	}
+	if prepared.stateRoot != nil || prepared.candidate.State != nil {
+		t.Fatal("preparation applied the state update before the config and size limits were known")
+	}
 
 	// The successor really is a proof: applying the same update to the full
 	// resident state gives an equal hash and a materialized tree, which is the
@@ -634,6 +745,9 @@ func TestValidatedSuccessorLeavesVerificationOnTheProofBackedRoot(t *testing.T) 
 	resident, err := cell.ApplyMerkleUpdate(req.Previous.State, prepared.verified.block.StateUpdate)
 	if err != nil {
 		t.Fatalf("apply the same transition to the resident predecessor: %v", err)
+	}
+	if err = prepared.bindConfig(t.Context(), req.Masterchain.Config); err != nil {
+		t.Fatalf("bind the candidate to its config: %v", err)
 	}
 	if resident.HashKeyAt(0) != prepared.stateRoot.HashKeyAt(0) {
 		t.Fatal("the two successors differ by hash, so cell identity below proves nothing")
@@ -645,20 +759,14 @@ func TestValidatedSuccessorLeavesVerificationOnTheProofBackedRoot(t *testing.T) 
 		t.Fatal("the resident successor is pruned too, so the previous assertion is not evidence")
 	}
 
-	// Every structural view is a parse of that exact root, before and after the
-	// config is bound.
+	// Every structural view is a parse of that exact root after the config is
+	// bound and the deferred update is applied.
 	queueInfo, err := prepared.stateRoot.PeekRef(0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if prepared.verified.state.OutMsgQueueInfo != queueInfo {
 		t.Fatal("the parsed state does not come from the proof-backed successor")
-	}
-	if err = prepared.bindConfig(t.Context(), req.Masterchain.Config); err != nil {
-		t.Fatalf("bind the candidate to its config: %v", err)
-	}
-	if prepared.verified.state.OutMsgQueueInfo != queueInfo {
-		t.Fatal("binding the config replaced the state the verifier reads")
 	}
 	if prepared.candidate.State != prepared.stateRoot {
 		t.Fatal("the verified candidate carries another state root")

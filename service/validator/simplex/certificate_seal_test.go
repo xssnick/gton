@@ -27,10 +27,8 @@ var (
 		"CertificateVerifier.Verify",
 		"Engine.seal",
 		"Engine.verifyCertificate",
-		"ValidateBootstrap",
 	}
 	engineSealCallers = []string{
-		"Engine.Start",
 		"Engine.onVoteApplied",
 	}
 )

@@ -60,6 +60,8 @@ labels. When metrics are disabled, the new stage clocks are skipped entirely.
 | `gton_validator_candidate_retention_capped_total` | counter | `chain` | Finalizations whose candidate retention pruned past the lineage the local producer still needs. |
 | `gton_validator_candidate_persist_failures_total` | counter | `chain` | Failed durable writes of a candidate produced by this node. |
 | `gton_validator_self_rejected_candidates_total` | counter | `chain` | Candidates this node produced and then rejected in its own validation. Always a defect on this node. |
+| `gton_validator_captured_failed_candidates_total` | counter | `chain` | Candidates refused with a TVM/semantic replay error whose block, collated proofs and context were dumped to disk for offline replay. |
+| `gton_validator_storage_stat_recomputes_total` | counter | `chain` | Replayed transactions whose bound account storage-stat proof was pruned short of this validator's update walk, so the stat was recomputed from state. The candidate still validates; a steady rate names a producer whose proof shape (update order) disagrees with our replay. |
 | `gton_validator_chain_tip_wait_backstops_total` | counter | `chain` | Predecessor reads that waited past the backstop for a block to become readable. |
 | `gton_validator_session_spec_rejections_total` | counter | `chain`, `role`, `reason` | Transitions of a local validator or observer session specification into rejection. |
 | `gton_validator_consensus_slot` | gauge | `chain` | Present consensus slot of the newest live session on this chain. |
@@ -220,6 +222,22 @@ observer session has no voting identity at all, so a remote candidate cannot
 raise it. A delegated window does count: the block was produced by a collator
 this node authorized and published under its leadership.
 
+`captured_failed_candidates_total` counts refused candidates — from any leader,
+not only this node's — whose semantic replay failed with a TVM/semantic error
+(for example `TVM execution failed`) and were dumped to disk for offline replay.
+Each increment is one directory written under `<data-dir>/validator/failed-candidates`
+(or `<data-dir>/collator/failed-candidates` for a standalone collator) holding
+the candidate block wire, its collated data, and a `meta.json` naming the
+session, slot, leader, the candidate and predecessor block ids, the min
+masterchain id and the full error string. Dumps are bounded: at most eight are
+kept (the oldest is evicted) and at most eight are written per rolling hour, so a
+persistently disagreeing lane records evidence without filling the disk. A
+not-ready or cancelled abstain never increments it. The predecessor and
+masterchain-view STATE cells and the neighbour out-message queues are not copied
+into the dump; the block ids in `meta.json` let an operator reconstruct them from
+a node holding the same chain. Any nonzero rate is an incident to investigate
+from the newest dump, and the accompanying Error line carries the dump path.
+
 Useful examples:
 
 ```promql
@@ -233,6 +251,7 @@ sum(gton_validator_candidate_cache_bytes) by (chain)
 sum(rate(gton_validator_candidate_retention_capped_total[5m])) by (chain)
 sum(rate(gton_validator_candidate_persist_failures_total[5m])) by (chain)
 sum(rate(gton_validator_self_rejected_candidates_total[5m])) by (chain)
+sum(rate(gton_validator_captured_failed_candidates_total[5m])) by (chain)
 sum(rate(gton_validator_chain_tip_wait_backstops_total[5m])) by (chain)
 time() - max(gton_validator_consensus_last_finalization_timestamp_seconds) by (chain)
 sum(rate(gton_validator_consensus_certificates_total[5m])) by (chain, kind)
@@ -283,8 +302,10 @@ collation-only, because they measure work only a producer performs.
 | `gton_collator_candidate_production_duration_seconds` | histogram | `mode`, `chain`, `kind`, `result` | Candidate production through persistence, state commit, schedule wait, and emission; recovered candidates are a separate kind. |
 | `gton_collator_candidate_size_bytes` | histogram | `mode`, `chain`, `origin`, `part` | Block and collated-data sizes. `origin="collation"` is a block this node built; `origin="validation"` is one it accepted from another validator. |
 | `gton_collator_candidate_transactions` | histogram | `mode`, `chain`, `origin` | Transactions in a non-empty candidate, by `origin`. |
+| `gton_collator_candidate_latest_transactions` | gauge | `mode`, `chain` | Exact transaction count in the latest candidate produced by this process. An empty candidate resets it to zero. |
 | `gton_collator_candidate_gas_used` | histogram | `mode`, `chain` | Gas used by a produced block. Collation only: gas is a producer's own metering and is not recoverable from a block. |
 | `gton_collator_candidate_messages` | histogram | `mode`, `chain`, `origin`, `kind` | External and imported internal messages in a candidate, by `origin`. |
+| `gton_collator_candidate_latest_messages` | gauge | `mode`, `chain`, `kind` | Exact external or imported-internal message count in the latest candidate produced by this process. An empty candidate resets both kinds to zero. |
 | `gton_collator_candidate_out_queue_messages` | histogram | `mode`, `chain` | Resulting outbound queue size. |
 | `gton_collator_candidate_queue_cleaned_messages` | histogram | `mode`, `chain` | Outbound queue entries removed by the cleanup phase. |
 | `gton_collator_queue_cleanup_stop_total` | counter | `mode`, `chain`, `reason` | Why the NEIGHBOUR half of out-queue cleanup stopped: `exhausted`, `block_full` or `budget`. A rising `budget` share means the wall-clock cleanup budget is binding. It says nothing about the predecessor's own half, which is drained to exhaustion under every reason — leaving one of our own processed entries queued produces a block every validator rejects. When that drain cannot fit the block limits the collation fails instead of truncating, and that is reported by `gton_collator_alarms_total{alarm="mandatory_dequeue_overflow"}`, not here. |
@@ -295,7 +316,7 @@ collation-only, because they measure work only a producer performs.
 | `gton_collator_deadline_events_total` | counter | `mode`, `chain`, `deadline`, `action` | Soft/hard producer deadline decisions. |
 | `gton_collator_retries_total` | counter | `mode`, `chain`, `reason` | Retried producer windows. |
 | `gton_collator_alarms_total` | counter | `mode`, `chain`, `alarm` | Producer faults that need an operator, not a trend line: `short_collated_proof` and `mandatory_dequeue_overflow`. Any nonzero rate is a defect on this node. |
-| `gton_collator_schedule_lateness_seconds` | histogram | `mode`, `chain`, `event` | Positive lateness at build-start or broadcast slot boundaries. |
+| `gton_collator_schedule_lateness_seconds` | histogram | `mode`, `chain`, `event` | Positive lateness at build-start or broadcast slot boundaries. The first shardchain slot of a window is excluded from `build_start` because its early schedule is established only after resolving the window base; masterchain starts and `broadcast` still include every slot. |
 | `gton_collator_windows_inflight` | gauge | `mode`, `chain` | Producer windows currently running. |
 | `gton_collator_windows_total` | counter | `mode`, `chain`, `result` | Finished producer windows. |
 | `gton_collator_window_duration_seconds` | histogram | `mode`, `chain`, `result` | Whole producer-window duration, including retries. |
@@ -313,10 +334,23 @@ Common values:
 - candidate `kind`: `block`, `empty`, `recovered`.
 - `alarm`: `short_collated_proof`, `mandatory_dequeue_overflow`.
 - `stage`, in the order a produced candidate passes through them:
-  `acquire_inputs`, `assemble_candidate`, `wait_external_messages`,
+  `acquire_inputs`, then the candidate-assembly breakdown `prepare_state`,
+  `cleanup_out_queue`, `execute_internal_messages`,
+  `execute_external_messages`, `processed_info`, `claimed_local_cleanup`,
+  `finalize_accounts`, `flush_batches`, `build_state_update`,
+  `validation_closure`, `serialize_block`,
+  `serialize_candidate`, `finalize_candidate`, with
+  `wait_external_messages` kept separate, followed by
   `resolve_candidate_state`, `restore_candidate`, `sign_candidate`,
-  `commit_candidate_state`, `wait_broadcast_slot`, `persist_candidate`,
+  `commit_candidate_state`, `wait_broadcast_slot`, `persist_candidate`, and
   `deliver_candidate`.
+  Assembly stages are exclusive wall time and accumulate across serialized-size
+  retries. Internal and external execution can alternate around external waits;
+  their samples therefore name work classes rather than one contiguous interval.
+  `serialize_candidate` counts the wall time of the parallel block-BOC and
+  collated-proof branches once, not the sum of their CPU times. The enclosing
+  total remains `gton_collator_build_duration_seconds`; the removed
+  `assemble_candidate` aggregate is no longer exported.
   `persist_candidate` is not the candidate marker's whole synced commit. The
   producer submits that write before `commit_candidate_state` and only waits for
   it here, at the last instant where the marker still has to be durable before
@@ -400,7 +434,7 @@ Useful examples:
 ```promql
 histogram_quantile(0.95, sum(rate(gton_collator_build_duration_seconds_bucket{mode="validator",result="success"}[5m])) by (le, chain))
 histogram_quantile(0.95, sum(rate(gton_collator_stage_duration_seconds_bucket{mode="standalone"}[5m])) by (le, chain, stage))
-sum by (stage) (rate(gton_collator_stage_duration_seconds_sum{stage=~"acquire_inputs|assemble_candidate|wait_external_messages"}[5m]))
+sum by (stage) (rate(gton_collator_stage_duration_seconds_sum{stage=~"acquire_inputs|prepare_state|cleanup_out_queue|execute_internal_messages|execute_external_messages|finalize_accounts|build_state_update|serialize_candidate|finalize_candidate|wait_external_messages"}[5m]))
   / scalar(sum(rate(gton_collator_build_duration_seconds_count[5m])))
 histogram_quantile(0.95, sum(rate(gton_collator_schedule_lateness_seconds_bucket[5m])) by (le, mode, chain, event))
 sum(rate(gton_collator_deadline_events_total[5m])) by (mode, chain, deadline, action)

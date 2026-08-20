@@ -12,6 +12,15 @@ import (
 
 const estimatedPrunedBranchBytes = uint64(41)
 
+// A new key can replace the terminal old node with a fork and add two leaves.
+// Charging three maximum-sized cells bounds that local Patricia rewrite without
+// constructing it. Existing keys use their exact predecessor path instead.
+const estimatedAccountInsertPathBytes = uint64(3 * (12 + 1023/8 + 3))
+
+const (
+	estimatedAccountDeletePathBytes = uint64(12 + 1023/8 + 3)
+)
+
 // proofSizeEstimator reproduces the canonical admission estimate:
 // loaded cells replace their pruned boundary and unseen children contribute a
 // fixed-size pruned branch. It is fed by the read set's record callback.
@@ -208,8 +217,13 @@ func (s *proofSeenHashSet) observe(hash cell.Hash, loaded bool) (bool, bool) {
 }
 
 func (s proofSeenHashSet) loaded(hash cell.Hash) bool {
+	_, loaded := s.status(hash)
+	return loaded
+}
+
+func (s proofSeenHashSet) status(hash cell.Hash) (bool, bool) {
 	if len(s.slots) == 0 {
-		return false
+		return false, false
 	}
 	fingerprint := proofCellFingerprint(hash)
 	mask := len(s.slots) - 1
@@ -217,14 +231,14 @@ func (s proofSeenHashSet) loaded(hash cell.Hash) bool {
 	for range s.slots {
 		slot := s.slots[pos]
 		if slot == 0 {
-			return false
+			return false, false
 		}
 		if uint32(slot>>32) == fingerprint && s.hashAt((uint32(slot)>>1)-1) == hash {
-			return slot&1 != 0
+			return true, slot&1 != 0
 		}
 		pos = (pos + 1) & mask
 	}
-	return false
+	return false, false
 }
 
 // merkleUpdateSourceShape returns the non-leaf source cells whose structure
@@ -493,10 +507,12 @@ func (s *blockLimitStatus) narrowBytes(ceiling sizeBudgetCap) {
 }
 
 type blockLimitStatus struct {
-	limits  blockLimits
-	startLT uint64
-	usage   *cell.ReadSet
-	storage *cell.CellStorageStat
+	limits           blockLimits
+	startLT          uint64
+	usage            *cell.ReadSet
+	storage          *cell.CellStorageStat
+	accountPaths     accountPathSizeEstimator
+	accountPathBytes uint64
 
 	transactions      uint64
 	extraOutMsgs      uint64
@@ -542,7 +558,8 @@ func newBlockLimitStatus(
 func (s *blockLimitStatus) estimatedBytes() uint64 {
 	stat := s.storage.TotalStat()
 	return uint64(2000) + stat.Bits/8 + stat.Cells*12 + stat.InternalRefs*3 +
-		stat.ExternalRefs*40 + s.transactions*200 + s.extraOutMsgs*300 + s.publicLibraryDiff*700
+		stat.ExternalRefs*40 + s.accountPathBytes + s.transactions*200 +
+		s.extraOutMsgs*300 + s.publicLibraryDiff*700
 }
 
 // rebuildEstimate is the estimate a size-limit rebuild must do its arithmetic
@@ -557,6 +574,93 @@ func (s *blockLimitStatus) rebuildEstimate() uint64 {
 
 func (s *blockLimitStatus) addProof(root *cell.Cell) error {
 	return s.storage.AddProof(root, s.usage)
+}
+
+// accountPathSizeEstimator counts the union of predecessor ShardAccounts paths
+// with the same weights estimatedBytes applies to a real proof walk. A child is
+// initially a 40-byte external boundary; if another changed account descends
+// into it, the boundary is replaced by that child's loaded-cell cost.
+type accountPathSizeEstimator struct {
+	seen  proofSeenHashSet
+	bytes uint64
+}
+
+func (e *accountPathSizeEstimator) addLoadedCell(loaded *cell.Cell) {
+	hash := loaded.HashKey()
+	seen, wasLoaded := e.seen.observe(hash, true)
+	if seen && wasLoaded {
+		return
+	}
+	if seen {
+		e.bytes -= 40
+	}
+
+	// One full-cell edge belongs to every loaded cell: the root edge for the
+	// first one, and the parent edge for descendants.
+	e.bytes += 12 + uint64(loaded.BitsSize())/8 + 3
+	for i := 0; i < int(loaded.RefsNum()); i++ {
+		ref := loaded.MustRefHashAt(i)
+		seen, wasLoaded = e.seen.observe(ref, false)
+		switch {
+		case !seen:
+			e.bytes += 40
+		case wasLoaded:
+			// A new edge to content already reached by another path.
+			e.bytes += 3
+		default:
+			// A repeated external edge is serialized again. Patricia paths do
+			// not normally share it, but counting it keeps the estimate safe
+			// for content-addressed augmentation references.
+			e.bytes += 40
+		}
+	}
+}
+
+func (e *accountPathSizeEstimator) satisfyReference(hash cell.Hash) {
+	seen, loaded := e.seen.status(hash)
+	if !seen || loaded {
+		return
+	}
+	e.seen.observe(hash, true)
+	e.bytes -= 40
+}
+
+func (e *accountPathSizeEstimator) reset() {
+	clear(e.seen.slots)
+	e.seen.count = 0
+	if len(e.seen.hashes) > 0 {
+		e.seen.hashes[0] = e.seen.hashes[0][:0]
+		e.seen.hashes = e.seen.hashes[:1]
+	}
+	e.bytes = 0
+}
+
+func (s *blockLimitStatus) addAccountPath(
+	path []*cell.Cell,
+	existed bool,
+	deleted bool,
+	oldAccount *cell.Cell,
+) {
+	for _, loaded := range path {
+		s.accountPaths.addLoadedCell(loaded)
+	}
+	if existed {
+		// The old leaf points at the old Account. A changed leaf points at the
+		// new Account, whose full tree addTransaction already charged.
+		s.accountPaths.satisfyReference(oldAccount.HashKey())
+		if deleted {
+			// Removing a compressed Patricia tail can re-encode its surviving
+			// sibling. One maximum-sized cell bounds that local rewrite.
+			s.accountPaths.bytes += estimatedAccountDeletePathBytes
+		}
+		return
+	}
+	s.accountPaths.bytes += estimatedAccountInsertPathBytes
+}
+
+func (s *blockLimitStatus) commitAccountPaths() {
+	s.accountPathBytes += s.accountPaths.bytes
+	s.accountPaths.reset()
 }
 
 func (s *blockLimitStatus) addTransaction(account, transaction *cell.Cell, endLT uint64, gas uint64) error {
@@ -587,9 +691,9 @@ func (s *blockLimitStatus) classify() LoadClass {
 // threshold, with the two numbers an operator needs and a flag for "none of
 // them is". It is not the admission gate — fits() answers that, and answers it
 // against the class a phase is allowed to reach — but the diagnosis for the one
-// caller that has no admission decision to make: cleanupMandatoryDrain, which
-// must dequeue what it dequeues and can only report that the result does not
-// fit.
+// caller that has no admission decision to make:
+// cleanupClaimedLocalDequeues, which must close the prefix the block already
+// claimed and can only report that the result does not fit.
 //
 // All four axes are checked even though a dequeue can only move two of them.
 // The drain does not own the block: it runs after the predecessor queue and

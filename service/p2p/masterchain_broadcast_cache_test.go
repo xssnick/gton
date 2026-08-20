@@ -1,14 +1,15 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/xssnick/gton/service/storage"
 
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -206,30 +207,61 @@ func TestWatchMasterchainNextBroadcastBlockFiresOnStore(t *testing.T) {
 func testMasterchainBroadcastDownloadedBlock(t *testing.T, prev ton.BlockIDExt, seqno uint32, payload uint64) DownloadedBlock {
 	t.Helper()
 
-	root := cell.BeginCell().MustStoreUInt(payload, 16).EndCell()
-	blockBOC := root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
+	stateRoot := cell.BeginCell().MustStoreUInt(payload, 64).EndCell()
+	var header tlb.BlockHeader
+	header.Version = 1
+	header.Shard = tlb.ShardIdent{
+		PrefixBits:  0,
+		WorkchainID: -1,
+		ShardPrefix: uint64(1) << 63,
+	}
+	header.SeqNo = seqno
+	header.StartLt = 1
+	header.EndLt = 100
+	header.GenUtime = 1000
+	header.MinRefMcSeqno = prev.SeqNo
+	header.PrevKeyBlockSeqno = prev.SeqNo
+	header.KeyBlock = true
+	header.PrevRef = tlb.BlkPrevInfo{Prev1: tlb.ExtBlkRef{
+		EndLt:    1,
+		SeqNo:    prev.SeqNo,
+		RootHash: bytes.Clone(prev.RootHash),
+		FileHash: bytes.Clone(prev.FileHash),
+	}}
+	root, err := tlb.ToCell(&tlb.Block{
+		GlobalID:    -239,
+		BlockInfo:   header,
+		ValueFlow:   cell.BeginCell().EndCell(),
+		StateUpdate: testPeerMerkleUpdateCell(t, cell.BeginCell().EndCell(), stateRoot),
+		Extra: &tlb.BlockExtra{
+			InMsgDesc:          cell.BeginCell().EndCell(),
+			OutMsgDesc:         cell.BeginCell().EndCell(),
+			ShardAccountBlocks: cell.BeginCell().EndCell(),
+			RandSeed:           bytes.Repeat([]byte{0x01}, 32),
+			CreatedBy:          bytes.Repeat([]byte{0x02}, 32),
+		},
+	})
+	if err != nil {
+		t.Fatalf("build masterchain block root: %v", err)
+	}
+	blockBOC := serializeCompressedBlockRoot(root)
 	rootHash := root.HashKey()
-	fileHash := sha256.Sum256(blockBOC)
 
 	block := testBlockID(-1, topShard, seqno)
-	block.RootHash = append([]byte(nil), rootHash[:]...)
-	block.FileHash = append([]byte(nil), fileHash[:]...)
+	block.RootHash = bytes.Clone(rootHash[:])
+	block.FileHash = hashSimpleBroadcastPayload(blockBOC)
 
-	proof := testBlockProofCell(t, block, nil)
-	proofBOC := proof.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
-	return DownloadedBlock{
-		ID:       block,
-		Kind:     "tonNode.blockBroadcast",
-		Block:    root,
-		Proof:    proof,
-		BlockBOC: blockBOC,
-		ProofBOC: proofBOC,
-		Meta: &storage.BlockMeta{
-			ID:       block,
-			PrevRefs: []ton.BlockIDExt{prev},
-		},
-		StateUpdate:      cell.BeginCell().EndCell(),
-		IsLink:           true,
-		VerifiedRootHash: true,
+	proofBOC := testPeerBlockProofEnvelopeBOC(t, block, root, testPeerBlockProofSignatures())
+	downloaded, err := decodeRawDownloadedBlock(
+		"tonNode.blockBroadcast",
+		block,
+		proofBOC,
+		blockBOC,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("build verified masterchain broadcast: %v", err)
 	}
+
+	return *downloaded
 }

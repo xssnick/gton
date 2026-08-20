@@ -2,6 +2,7 @@ package collator
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -13,7 +14,7 @@ import (
 // The state update is built from the read set's source graph, and that graph
 // descends only through cells the read set recorded. A closure read taken
 // before the update therefore lands in the update's old side. Measured on the
-// heavy mainnet fixture, moving these three calls after buildStateAndBlockParts
+// heavy mainnet fixture, moving these closure reads after buildStateAndBlockParts
 // took the block from 678703 to 669409 bytes with the collated data unchanged
 // at 421534 — the same proof, 9 KB less block.
 //
@@ -43,7 +44,7 @@ func TestValidationClosureRunsAfterTheStateUpdate(t *testing.T) {
 	}
 }
 
-// The three parts are one unit, and each one exists because a specific
+// The five parts are one unit, and each one exists because a specific
 // validator read has no counterpart in collation. Losing one is silent until a
 // validator running on proofs meets a pruned branch, so the composition is
 // pinned here rather than left to the call site.
@@ -57,5 +58,10 @@ func TestValidationClosureReplaysEveryPart(t *testing.T) {
 	}
 	if got := methodCallOrder(t, "proof_closure.go", "traceValidationClosure", "c"); !slices.Equal(got, want) {
 		t.Fatalf("traceValidationClosure replays %v, want %v", got, want)
+	}
+	for _, call := range methodCallOrder(t, "execute.go", "finishAccounts", "c") {
+		if strings.HasPrefix(call, "trace") {
+			t.Fatalf("finishAccounts calls %s before the state update", call)
+		}
 	}
 }

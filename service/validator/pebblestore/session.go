@@ -19,34 +19,19 @@ type pebbleReader interface {
 	NewIter(options *pebble.IterOptions) (*pebble.Iterator, error)
 }
 
-// SaveCandidate stores candidate content and its ID index atomically.
+// SaveCandidate appends candidate content to a session pack and stores its
+// compact ID index in Pebble.
 //
 // Wire is borrowed, not copied: the write goroutine reads it when it applies
-// the batch, so it must stay unmodified until done fires, and is free
-// afterwards. It used to be cloned here on entry, which meant a full extra copy
-// of a multi-megabyte payload for every candidate produced or received — to
-// guard a window no caller uses, since the resolver hands over a wire it has
-// already published as immutable, and pebble copies the value into the batch
-// itself.
+// the request, so it must stay unmodified until done fires and is free
+// afterwards. The resolver already publishes this wire as immutable.
 //
-// THIS IS THE ONE RECOVERABLE PAYLOAD in the store, and the only write that does
-// not wait for an fsync. The obligation the durable write exists for is real —
-// simplex/voter.go gates the notarize vote on slot.stored because a validator must
-// be able to serve every candidate it votes to notarize (simplex/types.go:392) — but
-// it is satisfied REDUNDANTLY: the candidate is broadcast before it is stored, and
-// notarization requires 2/3 of weight to have voted, which requires those 2/3 to
-// have stored it. So a notarized candidate is held by at least 2/3 of the network,
-// and a candidate only we hold cannot be notarized. Losing this write to a crash
-// costs a re-fetch, never a conflicting record.
-//
-// What it buys: the fsync in front of the vote. Measured on the field box, on the
-// filesystem the store lives on, with a 760 KB payload matching a real candidate
-// wire — write only 0.669 ms median, write plus fsync 19.35 ms median and up to
-// ~60 ms in the tail, against a 200 ms slot. One candidate per slot per node means
-// there is nothing to coalesce that fsync with.
-//
-// The write is still ordered through the same FIFO, its failure is still fatal, and
-// its callback still gates the vote. Only the wait for the disk is gone.
+// Both the pack append and the Pebble pointer are intentionally unsynced. A
+// crash may leave an orphan pack tail or a pointer to a lost tail; Candidate
+// verifies the record hash and reports the latter as not found, so the resolver
+// fetches it again. The callback still gates the vote after both writes have
+// reached the operating system, without putting the multi-megabyte payload in
+// Pebble's WAL or waiting for an fsync.
 func (s *ValidatorStore) SaveCandidate(
 	session validator.SessionStorageID,
 	candidate validator.CandidateRecord,
@@ -72,8 +57,8 @@ func (s *ValidatorStore) SaveCandidate(
 	}
 
 	s.submitSessionAsync(namespace, writeRequest{
-		sizeHint:   len(wire),
-		durability: recoverablePayload,
+		sizeHint:   candidatePackPointerSize,
+		durability: restartRecoverable,
 		apply: func(batch *pebble.Batch) error {
 			summary, err := ensureSession(batch, session, namespace)
 			if err != nil {
@@ -85,33 +70,38 @@ func (s *ValidatorStore) SaveCandidate(
 			// them means nothing beyond ensureSession's idempotent namespace
 			// bootstrap has been written into the shared batch.
 			indexKey := candidateIndexKey(namespace, candidate.ID)
-			storedHash, err := getBatchCopy(batch, indexKey)
+			storedValue, err := getBatchCopy(batch, indexKey)
+			isNew := errors.Is(err, pebble.ErrNotFound)
 			if err == nil {
-				if len(storedHash) != len(wireHash) {
-					return rejectRequest(fmt.Errorf(
-						"validator pebblestore: candidate index hash length %d",
-						len(storedHash),
-					))
+				pointer, decodeErr := decodeCandidatePackPointer(storedValue)
+				if decodeErr != nil {
+					return rejectRequest(decodeErr)
 				}
-				if !bytes.Equal(storedHash, wireHash[:]) {
+				if pointer.hash != wireHash {
 					return rejectRequest(validator.ErrCandidateConflict)
 				}
-
-				// The index hash equals this request's, so the stored content is
-				// this wire. Reading it back to compare would be a full copy of
-				// the payload to rule out a sha256 collision.
-				return nil
+				if _, readErr := s.candidatePacks.read(namespace, pointer); readErr == nil {
+					return nil
+				} else if !errors.Is(readErr, storage.ErrNotFound) {
+					return readErr
+				}
+				// The pointer itself committed atomically, but its unsynced pack
+				// tail may have been lost in a machine crash. Appending the wire
+				// again and replacing that pointer is the recovery path.
 			}
-			if !errors.Is(err, pebble.ErrNotFound) {
+			if err != nil && !isNew {
 				return fmt.Errorf("validator pebblestore: read candidate index: %w", err)
 			}
 
-			if err = batch.Set(candidateContentKey(namespace, wireHash), wire, nil); err != nil {
-				return fmt.Errorf("validator pebblestore: save candidate content: %w", err)
+			pointer, err := s.candidatePacks.append(namespace, wire, wireHash)
+			if err != nil {
+				return err
 			}
-
-			if err = batch.Set(indexKey, wireHash[:], nil); err != nil {
+			if err = batch.Set(indexKey, encodeCandidatePackPointer(pointer), nil); err != nil {
 				return fmt.Errorf("validator pebblestore: save candidate index: %w", err)
+			}
+			if !isNew {
+				return nil
 			}
 			if err = incrementSummaryCount("candidate", &summary.candidates); err != nil {
 				return err
@@ -144,35 +134,31 @@ func (s *ValidatorStore) Candidate(
 		return validator.CandidateRecord{}, err
 	}
 
-	hash, err := readerGetCopy(ctx, snapshot, candidateIndexKey(namespace, id))
+	value, err := readerGetCopy(ctx, snapshot, candidateIndexKey(namespace, id))
 	if errors.Is(err, pebble.ErrNotFound) {
 		return validator.CandidateRecord{}, storage.ErrNotFound
 	}
 	if err != nil {
 		return validator.CandidateRecord{}, fmt.Errorf("validator pebblestore: read candidate index: %w", err)
 	}
-	if len(hash) != sha256.Size {
-		return validator.CandidateRecord{}, fmt.Errorf("validator pebblestore: candidate index hash length %d", len(hash))
+	pointer, err := decodeCandidatePackPointer(value)
+	if err != nil {
+		return validator.CandidateRecord{}, err
+	}
+	wire, err := s.candidatePacks.read(namespace, pointer)
+	if err != nil {
+		return validator.CandidateRecord{}, err
+	}
+	if err = ctx.Err(); err != nil {
+		return validator.CandidateRecord{}, err
 	}
 
-	var contentHash [32]byte
-	copy(contentHash[:], hash)
-	wire, err := readerGetCopy(ctx, snapshot, candidateContentKey(namespace, contentHash))
-	if errors.Is(err, pebble.ErrNotFound) {
-		return validator.CandidateRecord{}, errors.New("validator pebblestore: candidate index points to missing content")
-	}
-	if err != nil {
-		return validator.CandidateRecord{}, fmt.Errorf("validator pebblestore: read candidate content: %w", err)
-	}
-	// The wire is returned unhashed: this store wrote it, pebble verifies its own
-	// block checksums on read, and both consumers authenticate it downstream —
-	// a loaded candidate is decoded through the codec's signature and identity
-	// checks, and one served to a peer is verified by that peer. Re-deriving the
-	// key from a multi-megabyte payload on every read buys none of that.
-	return validator.CandidateRecord{ID: id, Wire: wire, ContentHash: contentHash}, nil
+	return validator.CandidateRecord{ID: id, Wire: wire, ContentHash: pointer.hash}, nil
 }
 
-// MarkFinalized durably records one candidate finality marker.
+// MarkFinalized records one candidate finality marker. The authenticated final
+// certificate is the authority and can be re-fetched; this derived replay index
+// is restart-recoverable.
 func (s *ValidatorStore) MarkFinalized(
 	session validator.SessionStorageID,
 	id simplex.CandidateID,
@@ -186,6 +172,7 @@ func (s *ValidatorStore) MarkFinalized(
 	}
 
 	s.submitSessionAsync(namespace, writeRequest{
+		durability: restartRecoverable,
 		apply: func(batch *pebble.Batch) error {
 			summary, err := ensureSession(batch, session, namespace)
 			if err != nil {
@@ -246,6 +233,7 @@ func (s *ValidatorStore) RecordLeaderWindow(
 	}
 
 	s.submitSessionAsync(namespace, writeRequest{
+		durability: restartRecoverable,
 		apply: func(batch *pebble.Batch) error {
 			summary, err := ensureSession(batch, session, namespace)
 			if err != nil {
@@ -499,6 +487,9 @@ func (s *ValidatorStore) DeleteSession(ctx context.Context, session validator.Se
 		if err = batch.Delete(sessionKey(namespace), nil); err != nil {
 			return fmt.Errorf("validator pebblestore: delete session descriptor: %w", err)
 		}
+		if err = s.candidatePacks.delete(namespace); err != nil {
+			return err
+		}
 
 		return nil
 	})
@@ -588,8 +579,8 @@ func loadCandidateIDs(
 		if decodeErr != nil {
 			return decodeErr
 		}
-		if len(value) != sha256.Size {
-			return fmt.Errorf("validator pebblestore: candidate index hash length %d", len(value))
+		if _, decodeErr = decodeCandidatePackPointer(value); decodeErr != nil {
+			return decodeErr
 		}
 		state.CandidateIDs = append(state.CandidateIDs, id)
 

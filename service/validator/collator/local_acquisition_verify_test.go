@@ -220,7 +220,7 @@ func TestFullCollatedProofsSkipPredecessorNeighbors(t *testing.T) {
 		neighbors = append(neighbors, localNeighbor(view, source))
 	}
 
-	provider := &localFullProofProvider{views: views}
+	provider := &localFullProofProvider{proofViews: views}
 	proofs, err := provider.BuildFullCollatedProofs(context.Background(), FullCollatedProofRequest{
 		Previous:  first,
 		Previous2: &second,

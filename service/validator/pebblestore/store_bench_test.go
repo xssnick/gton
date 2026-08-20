@@ -2,16 +2,14 @@ package pebblestore
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"testing"
 
-	"github.com/cockroachdb/pebble/v2"
+	"github.com/xssnick/gton/service/validator"
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
-// benchLargeWriteBytes approximates one collated candidate value. SaveCandidate
-// appends the block BOC and the collated data verbatim into a single batch.Set,
-// so a raw write of the same size is a faithful stand-in for the queue and
-// fsync behavior under study here.
+// benchLargeWriteBytes approximates one candidate wire.
 const benchLargeWriteBytes = 4 << 20
 
 // BenchmarkJournalVoteWrite measures one durable consensus vote on an idle
@@ -34,83 +32,62 @@ func BenchmarkJournalVoteWrite(b *testing.B) {
 	}
 }
 
-// BenchmarkJournalVoteWriteBehindLargeWrite measures the same vote while a
-// multi-megabyte write is already in the queue, which is what a validator with
-// a local collator does on every leader slot: both workloads share one queue,
-// one writer goroutine and one synced batch. The reported latency is the vote's
-// only; the large write is submitted asynchronously and drained afterwards.
-//
-// The comparison against BenchmarkJournalVoteWrite is not purely head-of-line
-// cost: the queue is also a group-commit mechanism, so the vote can ride the
-// large write's single fsync instead of paying its own.
-func BenchmarkJournalVoteWriteBehindLargeWrite(b *testing.B) {
+// BenchmarkJournalVoteWriteAfterCandidatePack measures the serial store-then-vote
+// path used by notarization. The candidate payload is an unsynced pack append;
+// only its compact pointer enters Pebble before the durable vote.
+func BenchmarkJournalVoteWriteAfterCandidatePack(b *testing.B) {
 	store := openBenchStore(b)
 	defer closeBenchStore(b, store)
 
-	j := store.Validator().Journal(testSession(3), 8)
+	session := testSession(3)
+	j := store.Validator().Journal(session, 8)
 	payload := bytes.Repeat([]byte{0x31}, benchLargeWriteBytes)
+	payloadHash := sha256.Sum256(payload)
 	result := make(chan error, 1)
-	large := make(chan error, 1)
 	slot := uint32(0)
 
 	b.ReportAllocs()
 	for b.Loop() {
 		slot++
-		key := binaryBenchKey(slot)
-		if err := store.submit(writeRequest{
-			sizeHint: len(payload),
-			apply: func(batch *pebble.Batch) error {
-				return batch.Set(key, payload, nil)
-			},
-			done: func(err error) { large <- err },
-		}); err != nil {
+		store.Validator().SaveCandidate(session, validator.CandidateRecord{
+			ID:          simplex.CandidateID{Slot: slot},
+			Wire:        payload,
+			ContentHash: payloadHash,
+		}, func(err error) { result <- err })
+		if err := <-result; err != nil {
 			b.Fatal(err)
 		}
 		j.SaveOurVote(simplex.SkipVote(slot), func(err error) { result <- err })
 		if err := <-result; err != nil {
 			b.Fatal(err)
 		}
-		b.StopTimer()
-		if err := <-large; err != nil {
-			b.Fatal(err)
-		}
-		b.StartTimer()
 	}
 }
 
-// BenchmarkLargeWrite is the cost of the large write on its own, for scale.
-func BenchmarkLargeWrite(b *testing.B) {
+// BenchmarkCandidatePackWrite is the candidate store half on its own.
+func BenchmarkCandidatePackWrite(b *testing.B) {
 	store := openBenchStore(b)
 	defer closeBenchStore(b, store)
 
+	session := testSession(4)
 	payload := bytes.Repeat([]byte{0x31}, benchLargeWriteBytes)
-	large := make(chan error, 1)
-	index := uint32(0)
+	payloadHash := sha256.Sum256(payload)
+	result := make(chan error, 1)
+	slot := uint32(0)
 
 	b.ReportAllocs()
 	b.SetBytes(int64(len(payload)))
 	for b.Loop() {
-		index++
-		key := binaryBenchKey(index)
-		if err := store.submit(writeRequest{
-			sizeHint: len(payload),
-			apply: func(batch *pebble.Batch) error {
-				return batch.Set(key, payload, nil)
-			},
-			done: func(err error) { large <- err },
-		}); err != nil {
-			b.Fatal(err)
-		}
-		if err := <-large; err != nil {
+		slot++
+		store.Validator().SaveCandidate(session, validator.CandidateRecord{
+			ID:          simplex.CandidateID{Slot: slot},
+			Wire:        payload,
+			ContentHash: payloadHash,
+		}, func(err error) { result <- err })
+		if err := <-result; err != nil {
 			b.Fatal(err)
 		}
 	}
-}
-
-// binaryBenchKey addresses a scratch keyspace that no production key kind uses,
-// so benchmark payloads never collide with real records.
-func binaryBenchKey(index uint32) []byte {
-	return append([]byte{0xfe}, byte(index), byte(index>>8), byte(index>>16), byte(index>>24))
 }
 
 func openBenchStore(b *testing.B) *Store {

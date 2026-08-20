@@ -352,11 +352,40 @@ func TestComputeMintedDisabledWhenParameterAbsent(t *testing.T) {
 // Collapsing "present but malformed inner amount" into "disabled" is the
 // opposite protocol bug: we would mint nothing where the reference throws,
 // produce a block C++ rejects, and accept such a block as a validator.
-func TestComputeMintedRejectsMalformedEntry(t *testing.T) {
+// TestComputeMintedMintsAWellFormedParameter is the positive control the two
+// disabled cases below are read against: without it, a gate that rejected
+// everything would pass them both.
+func TestComputeMintedMintsAWellFormedParameter(t *testing.T) {
 	toMint := cell.NewDict(32)
+	mintConfigEntry(t, toMint, 7, big.NewInt(1_000_000))
+	root := mintConfigRoot(t, toMint)
+	epochConfigOf(t, root)
+
+	minted, err := computeMinted(tlb.BlockchainConfig{Root: root}, tlb.CurrencyCollection{})
+	if err != nil {
+		t.Fatalf("well-formed parameter 7: %v", err)
+	}
+	if currencyZero(minted) {
+		t.Fatal("well-formed parameter 7 minted nothing")
+	}
+}
+
+// TestComputeMintedDisablesOnMalformedEntry pins the reference outcome for an
+// entry that is not an amount at all: t_ExtraCurrencyCollection.validate_ref
+// fails, compute_minted_amount logs "minting disabled" and returns to_mint zero,
+// and the block is still produced (collator.cpp:2228-2231).
+//
+// The valid entry beside it is the point. Rejection is not per entry: one bad
+// leaf disables the mint for the WHOLE parameter, so a per-entry skip would
+// mint 1,000,000 of currency 7 where the reference mints nothing and hand a
+// masterchain block no C++ validator agrees with. Failing collation instead
+// would be its own divergence — the reference ships a block here.
+func TestComputeMintedDisablesOnMalformedEntry(t *testing.T) {
+	toMint := cell.NewDict(32)
+	mintConfigEntry(t, toMint, 7, big.NewInt(1_000_000))
 	// A value that is not a var-uint amount: the outer collection decodes, the
 	// entry does not.
-	if err := toMint.SetIntKey(big.NewInt(7), cell.BeginCell().MustStoreUInt(0xff, 8).EndCell()); err != nil {
+	if err := toMint.SetIntKey(big.NewInt(9), cell.BeginCell().MustStoreUInt(0xff, 8).EndCell()); err != nil {
 		t.Fatal(err)
 	}
 	root := mintConfigRoot(t, toMint)
@@ -365,9 +394,75 @@ func TestComputeMintedRejectsMalformedEntry(t *testing.T) {
 	// what keeps a shard-only path from dying on it.
 	epochConfigOf(t, root)
 
-	_, err := computeMinted(tlb.BlockchainConfig{Root: root}, tlb.CurrencyCollection{})
-	if !errors.Is(err, ErrInvalidInput) {
+	minted, err := computeMinted(tlb.BlockchainConfig{Root: root}, tlb.CurrencyCollection{})
+	if err != nil {
 		t.Fatalf("malformed extra currency amount error = %v", err)
+	}
+	if !currencyZero(minted) {
+		t.Fatalf("malformed entry still minted %+v", minted)
+	}
+}
+
+// TestComputeMintedDisablesOnZeroLengthAmount is the shape an ordinary
+// VarUInteger decode accepts and the reference does not. The leaf below carries
+// a five-bit length of zero: VarUInteger::validate_skip allows len == 0,
+// VarUIntegerPos::validate_skip requires len > 0, and parameter 7 is declared
+// over VarUIntegerPos 32 (block-parse.h ExtraCurrencyCollection). Decoding it
+// as an amount yields a harmless 0 whose delta is skipped, which is exactly why
+// this needs the type gate rather than the entry scan to catch it: the other
+// entry would otherwise mint.
+func TestComputeMintedDisablesOnZeroLengthAmount(t *testing.T) {
+	toMint := cell.NewDict(32)
+	mintConfigEntry(t, toMint, 7, big.NewInt(1_000_000))
+	if err := toMint.SetIntKey(big.NewInt(9), cell.BeginCell().MustStoreUInt(0, 5).EndCell()); err != nil {
+		t.Fatal(err)
+	}
+	root := mintConfigRoot(t, toMint)
+	epochConfigOf(t, root)
+
+	minted, err := computeMinted(tlb.BlockchainConfig{Root: root}, tlb.CurrencyCollection{})
+	if err != nil {
+		t.Fatalf("zero-length extra currency amount error = %v", err)
+	}
+	if !currencyZero(minted) {
+		t.Fatalf("zero-length amount still minted %+v", minted)
+	}
+}
+
+// TestComputeMintedDisablesOnTrailingLeafData covers the third shape, and it is
+// the one that used to cost a slot rather than a mint: a leaf with data past the
+// amount made the entry scan return ErrInvalidInput and abort the collation,
+// where the reference merely disables minting and ships the block.
+func TestComputeMintedDisablesOnTrailingLeafData(t *testing.T) {
+	toMint := cell.NewDict(32)
+	amount := cell.BeginCell()
+	if err := amount.StoreBigVarUInt(big.NewInt(1_000_000), 32); err != nil {
+		t.Fatal(err)
+	}
+	if err := toMint.SetIntKey(big.NewInt(7), amount.MustStoreUInt(1, 1).EndCell()); err != nil {
+		t.Fatal(err)
+	}
+	root := mintConfigRoot(t, toMint)
+	epochConfigOf(t, root)
+
+	minted, err := computeMinted(tlb.BlockchainConfig{Root: root}, tlb.CurrencyCollection{})
+	if err != nil {
+		t.Fatalf("trailing leaf data error = %v", err)
+	}
+	if !currencyZero(minted) {
+		t.Fatalf("trailing leaf data still minted %+v", minted)
+	}
+}
+
+func mintConfigEntry(t *testing.T, toMint *cell.Dictionary, currency int64, amount *big.Int) {
+	t.Helper()
+
+	value := cell.BeginCell()
+	if err := value.StoreBigVarUInt(amount, 32); err != nil {
+		t.Fatal(err)
+	}
+	if err := toMint.SetIntKey(big.NewInt(currency), value.EndCell()); err != nil {
+		t.Fatal(err)
 	}
 }
 

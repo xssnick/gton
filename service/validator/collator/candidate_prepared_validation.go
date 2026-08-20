@@ -11,11 +11,12 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-// preparedValidationCandidate is the one and only parse of one candidate inside
-// one validation call. Everything downstream — the master view selection, the
-// structural pass, the semantic replay — reads the block, the successor state
-// and the collated proof set from here instead of decoding the same bytes
-// again.
+// preparedValidationCandidate is the one decoded representation of one
+// candidate inside one validation call. A network candidate borrows the roots
+// its codec already parsed; every other path parses its BOCs here exactly once.
+// Everything downstream — the master view selection, the structural pass, the
+// semantic replay — reads the block, the successor state and the collated proof
+// set from here.
 //
 // It is deliberately not a cache and must never be stored: it transitively pins
 // the block DAG, the successor state tree, both predecessor trees (the resident
@@ -36,10 +37,11 @@ type preparedValidationCandidate struct {
 	// caller on the exported one. State and StateUpdate are filled by stage 2.
 	candidate *Candidate
 	// root is the decoded block, hash-checked against candidate.ID.RootHash and
-	// untraced (cell.FromBOC produces no trace listener).
+	// untraced. It either came directly from the network BOC decoder or from the
+	// byte path below; neither producer attaches a trace listener.
 	root *cell.Cell
 
-	// ---- stage 2: the successor state ----
+	// ---- stage 2: predecessor selection (still no update walk) ----
 
 	// resident is exactly the predecessor list the caller handed in. It is
 	// never overwritten: after a proof substitution it is the only remaining
@@ -56,13 +58,14 @@ type preparedValidationCandidate struct {
 	// stored rather than re-derived from a pointer comparison at the point of
 	// use.
 	substituted bool
-	// stateRoot is the successor state the update produced on top of previous.
+	// stateRoot is filled by bindConfig after the authenticated config and byte
+	// limits are known. It is the successor the update produced on previous.
 	stateRoot *cell.Cell
 	// sourceRoot is the level-0 hash of the single root the update was applied
 	// to: previous[0].State, or the merged root over two predecessors.
 	sourceRoot cell.Hash
 
-	// ---- stage 3: everything that needs the masterchain config ----
+	// ---- stage 3: config-bound update verdict/apply and structural views ----
 
 	verified verifiedCandidate
 	// stateParsed records that verified.state is already the parse of
@@ -73,9 +76,11 @@ type preparedValidationCandidate struct {
 	stateParsed bool
 }
 
-// prepareValidationCandidate performs stages 1 and 2 for a consensus candidate:
-// it decodes the candidate once and decides which tree its successor state is
-// built on.
+// prepareValidationCandidate performs the input-only stages for a consensus
+// candidate: it binds the codec's decoded roots or decodes the bytes once, then
+// decides which predecessor tree its successor will be built on. It deliberately
+// does not walk or apply the state update; the master view and candidate size
+// limits are still unknown.
 //
 // With full collated data a shard candidate is self-contained, so the
 // predecessors are re-pointed at the states it proves and the resident ones are
@@ -99,17 +104,23 @@ func prepareValidationCandidate(
 	previous []PreviousBlock,
 ) (*preparedValidationCandidate, error) {
 	p := &preparedValidationCandidate{resident: previous, previous: previous}
-	if err := p.decodeBlock(ctx, &Candidate{
+	if (artifact.blockRoot == nil) != (artifact.collatedRoots == nil) {
+		return nil, fmt.Errorf("%w: parsed candidate payload is incomplete", ErrInvalidInput)
+	}
+	if artifact.blockRoot != nil && !artifact.digested {
+		return nil, fmt.Errorf("%w: parsed candidate payload has no digest provenance", ErrInvalidInput)
+	}
+	if err := p.prepareBlock(ctx, &Candidate{
 		ID:               cloneBlockID(artifact.Candidate.Block),
 		CreatedBy:        createdBy,
 		BlockBOC:         artifact.BlockBOC,
 		CollatedData:     artifact.CollatedData,
 		CollatedFileHash: artifact.Candidate.CollatedFileHash,
 		digested:         artifact.digested,
-	}); err != nil {
+	}, artifact.blockRoot); err != nil {
 		return nil, err
 	}
-	if err := p.verifyCollated(); err != nil {
+	if err := p.verifyCollated(artifact.collatedRoots); err != nil {
 		return nil, err
 	}
 	if p.verified.collated.full && !isMasterchain {
@@ -121,34 +132,9 @@ func prepareValidationCandidate(
 		p.substituted = true
 	}
 
-	// The plain apply, and deliberately not one driven by a decided update. The
-	// update's verdict is what bindConfig decides, and bindConfig is past the
-	// masterchain view. A node that is behind suspends this same prepared capsule
-	// there, so the walk must not run before the dependency arrives; an oversized
-	// candidate must also reach the size limits before paying it. The verdict is
-	// a pure function of the update cell and cannot change with anything this
-	// stage learns, so nothing is lost by deciding it later.
-	stateRoot, state, sourceRoot, err := applyCandidateStateUpdate(p.previous, p.verified.block.StateUpdate)
-	if err != nil {
-		return nil, err
-	}
-	// Cheap enough to keep here rather than folding into the state-header check
-	// of stage 3: a candidate that does not even produce its own state is
-	// rejected before the master view is resolved, so a node that is behind
-	// still votes it down instead of abstaining.
-	id := &p.candidate.ID
-	if state.Seqno != id.SeqNo || state.ShardIdent.WorkchainID != id.Workchain ||
-		int64(state.ShardIdent.GetShardID()) != id.Shard {
-		return nil, fmt.Errorf("%w: recovered state differs from candidate ID", ErrInvalidInput)
-	}
-	p.stateRoot = stateRoot
-	p.sourceRoot = sourceRoot
-	p.verified.state = state
-	p.stateParsed = true
-	p.candidate.State = stateRoot
 	p.candidate.StateUpdate = p.verified.block.StateUpdate
-	if p.candidate.State == nil || p.candidate.StateUpdate == nil {
-		return nil, fmt.Errorf("%w: candidate state or state update is absent", ErrInvalidInput)
+	if p.candidate.StateUpdate == nil {
+		return nil, fmt.Errorf("%w: candidate state update is absent", ErrInvalidInput)
 	}
 
 	return p, nil
@@ -210,7 +196,7 @@ func prepareVerificationCandidate(
 	}
 
 	p := &preparedValidationCandidate{}
-	if err := p.decodeBlock(ctx, candidate); err != nil {
+	if err := p.prepareBlock(ctx, candidate, nil); err != nil {
 		return nil, err
 	}
 	// This caller names the creator itself instead of deriving it from a roster
@@ -219,7 +205,7 @@ func prepareVerificationCandidate(
 		return nil, err
 	}
 	p.stateRoot = candidate.State
-	if err := p.verifyCollated(); err != nil {
+	if err := p.verifyCollated(nil); err != nil {
 		return nil, err
 	}
 	if err := p.bindConfig(ctx, config); err != nil {
@@ -229,12 +215,16 @@ func prepareVerificationCandidate(
 	return p, nil
 }
 
-// decodeBlock is stage 1: everything that is a pure function of the candidate
-// bytes and its consensus-fixed ID. None of it can change with local readiness
-// — nothing here reads a view this node might be behind on — which is why it
-// runs before the master view is resolved on the session path. The creator
-// check is the one that does not qualify; see verifyCreator.
-func (p *preparedValidationCandidate) decodeBlock(ctx context.Context, candidate *Candidate) error {
+// prepareBlock is stage 1: everything that is a pure function of the candidate
+// bytes, its decoded root and its consensus-fixed ID. None of it can change
+// with local readiness — nothing here reads a view this node might be behind on
+// — which is why it runs before the master view is resolved on the session
+// path. The creator check is the one that does not qualify; see verifyCreator.
+func (p *preparedValidationCandidate) prepareBlock(
+	ctx context.Context,
+	candidate *Candidate,
+	root *cell.Cell,
+) error {
 	if candidate == nil {
 		return fmt.Errorf("%w: candidate is absent", ErrInvalidInput)
 	}
@@ -249,11 +239,14 @@ func (p *preparedValidationCandidate) decodeBlock(ctx context.Context, candidate
 	if !bytes.Equal(candidate.ID.FileHash, fileHash[:]) {
 		return fmt.Errorf("%w: candidate block file hash mismatch", ErrInvalidInput)
 	}
-	root, err := cell.FromBOC(candidate.BlockBOC)
-	if err != nil {
-		return fmt.Errorf("%w: decode candidate block boc: %v", ErrInvalidInput, err)
+	if root == nil {
+		var err error
+		root, err = cell.FromBOC(candidate.BlockBOC)
+		if err != nil {
+			return fmt.Errorf("%w: decode candidate block boc: %v", ErrInvalidInput, err)
+		}
 	}
-	if err = ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if !bytes.Equal(candidate.ID.RootHash, root.Hash()) {
@@ -261,17 +254,17 @@ func (p *preparedValidationCandidate) decodeBlock(ctx context.Context, candidate
 	}
 
 	block := &p.verified.block
-	if err = parseExact(block, root); err != nil {
+	if err := parseExact(block, root); err != nil {
 		return fmt.Errorf("%w: decode candidate block: %v", ErrInvalidInput, err)
 	}
 	// The reflection parse above is the lax one. This replaces its header and
 	// extra with an exact re-parse of the same cells, so everything downstream
 	// — including the GenUtime that selects the masterchain view — reads the
 	// canonical header rather than whatever the lax decoder accepted.
-	if err = verifyExactBlockParts(root, block); err != nil {
+	if err := verifyExactBlockParts(root, block); err != nil {
 		return err
 	}
-	if err = verifyHeaderAndID(&block.BlockInfo, candidate); err != nil {
+	if err := verifyHeaderAndID(&block.BlockInfo, candidate); err != nil {
 		return err
 	}
 	if block.Extra == nil {
@@ -318,11 +311,12 @@ func (p *preparedValidationCandidate) verifyCreator() error {
 	return nil
 }
 
-// verifyCollated decodes the collated data against the exact header's GenUtime.
-// One capsule owns both, so collated data belonging to another block is not
-// representable here and needs no separate check.
-func (p *preparedValidationCandidate) verifyCollated() error {
-	collated, err := verifyCollatedData(p.candidate, p.verified.block.BlockInfo.GenUtime)
+// verifyCollated verifies the decoded collated roots against the exact header's
+// GenUtime. The byte path decodes them here first. One capsule owns both, so
+// collated data belonging to another block is not representable here and needs
+// no separate check.
+func (p *preparedValidationCandidate) verifyCollated(roots []*cell.Cell) error {
+	collated, err := verifyCollatedData(p.candidate, roots, p.verified.block.BlockInfo.GenUtime)
 	if err != nil {
 		return err
 	}
@@ -413,6 +407,29 @@ func (p *preparedValidationCandidate) bindConfig(ctx context.Context, config *Co
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// Only now — after the authenticated master view selected this config and
+	// after its cheap byte limits — apply the already-decided update. This reuses
+	// the update-side verdict/plan instead of paying a classic Apply walk before
+	// PrepareMerkleUpdate and then walking the update again here.
+	if p.stateRoot == nil {
+		stateRoot, state, sourceRoot, applyErr := applyPreparedCandidateStateUpdate(
+			p.previous,
+			p.verified.stateUpdate,
+		)
+		if applyErr != nil {
+			return applyErr
+		}
+		id := &candidate.ID
+		if state.Seqno != id.SeqNo || state.ShardIdent.WorkchainID != id.Workchain ||
+			int64(state.ShardIdent.GetShardID()) != id.Shard {
+			return fmt.Errorf("%w: recovered state differs from candidate ID", ErrInvalidInput)
+		}
+		p.stateRoot = stateRoot
+		p.sourceRoot = sourceRoot
+		p.verified.state = state
+		p.stateParsed = true
+		candidate.State = stateRoot
 	}
 	newStateProof, err := block.StateUpdate.PeekRef(1)
 	if err != nil {

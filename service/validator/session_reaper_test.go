@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +13,86 @@ import (
 	"github.com/xssnick/gton/service/validator/groups"
 	"github.com/xssnick/gton/service/validator/simplex"
 )
+
+// reap runs at most one namespace pass synchronously. It is the tests' entry
+// point onto reapHighest, which is the whole pass body and the same code
+// production runs; what production does NOT do is call this, because the
+// supervisor hands the reaper a snapshot with schedule() and an owned worker
+// runs the pass off the actor. Keeping the wrapper here rather than in
+// session_reaper.go is what makes that split visible: a synchronous pass has no
+// production caller, and TestSessionReaperWorker* below cover the dispatch that
+// does.
+//
+// desired supplies the supersede proof; claimed is every namespace a live actor
+// still owns, which is never deleted even when a newer generation exists,
+// because a session that has not finished closing is still writing.
+//
+// claimed is keyed by the namespace, not by the descriptor: liveness has to be
+// proven on the same identity the rows are addressed by, or a namespace whose
+// stored descriptor differs from the desired one in a field no derivation reads
+// looks unclaimed and its live vote journal is deleted.
+func (r *sessionReaper) reap(
+	ctx context.Context,
+	desired map[sessionActorID]desiredSession,
+	claimed map[sessionNamespaceKey]struct{},
+	now time.Time,
+) {
+	if r == nil || r.storage == nil || ctx.Err() != nil {
+		return
+	}
+
+	r.reapHighest(ctx, highestDesiredSeqnos(desired), claimed, now)
+}
+
+type permanentReaperTestError struct {
+	error
+}
+
+func (permanentReaperTestError) PermanentSessionDelete() bool {
+	return true
+}
+
+type gatedReaperStorage struct {
+	*validatorTestStorage
+
+	once     sync.Once
+	mu       sync.Mutex
+	calls    int
+	started  chan struct{}
+	release  chan struct{}
+	finished chan struct{}
+}
+
+func (s *gatedReaperStorage) DeleteSession(ctx context.Context, id SessionStorageID) error {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+
+	blocked := false
+	s.once.Do(func() {
+		blocked = true
+		close(s.started)
+	})
+	if blocked {
+		if s.finished != nil {
+			defer close(s.finished)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.release:
+		}
+	}
+
+	return s.validatorTestStorage.DeleteSession(ctx, id)
+}
+
+func (s *gatedReaperStorage) deleteCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.calls
+}
 
 func reaperTestNamespace(session byte, shard groups.ShardID, identity [32]byte, seqno uint32) SessionStorageID {
 	return SessionStorageID{
@@ -60,6 +141,248 @@ func newReaperTest(t *testing.T) (*sessionReaper, *validatorTestStorage) {
 	log := zerolog.Nop()
 
 	return newSessionReaper(storage, &log), storage
+}
+
+func TestSessionReaperScheduleDoesNotBlockSupervisor(t *testing.T) {
+	shard := supervisorTestShard()
+	identity := supervisorTestID(0x31)
+	desired := reaperTestNamespace(0x32, shard, identity, 2)
+	stale := reaperTestNamespace(0x33, shard, identity, 1)
+	base := newValidatorTestStorage()
+	base.setNamespaces(stale)
+	storage := &gatedReaperStorage{
+		validatorTestStorage: base,
+		started:              make(chan struct{}),
+		release:              make(chan struct{}),
+	}
+	log := zerolog.Nop()
+	reaper := newSessionReaper(storage, &log)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	desiredSet := reaperTestDesired(desired)
+	claims := reaperTestClaims(t, desired)
+
+	returned := make(chan struct{})
+	go func() {
+		reaper.schedule(ctx, desiredSet, claims, time.Now())
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(100 * time.Millisecond):
+		close(storage.release)
+		reaper.close()
+		t.Fatal("reaper schedule blocked on storage")
+	}
+	select {
+	case <-storage.started:
+	case <-time.After(time.Second):
+		close(storage.release)
+		reaper.close()
+		t.Fatal("reaper worker did not start deletion")
+	}
+
+	close(storage.release)
+	deadline := time.Now().Add(time.Second)
+	for len(base.deletedNamespaces()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	reaper.close()
+	if deleted := base.deletedNamespaces(); len(deleted) != 1 || deleted[0] != stale {
+		t.Fatalf("asynchronous deleted namespaces = %+v, want stale namespace", deleted)
+	}
+}
+
+func TestSessionReaperCloseCancelsWorker(t *testing.T) {
+	shard := supervisorTestShard()
+	identity := supervisorTestID(0x38)
+	desired := reaperTestNamespace(0x39, shard, identity, 2)
+	stale := reaperTestNamespace(0x3a, shard, identity, 1)
+	base := newValidatorTestStorage()
+	base.setNamespaces(stale)
+	storage := &gatedReaperStorage{
+		validatorTestStorage: base,
+		started:              make(chan struct{}),
+		release:              make(chan struct{}),
+	}
+	log := zerolog.Nop()
+	reaper := newSessionReaper(storage, &log)
+	reaper.schedule(
+		context.Background(),
+		reaperTestDesired(desired),
+		reaperTestClaims(t, desired),
+		time.Now(),
+	)
+	select {
+	case <-storage.started:
+	case <-time.After(time.Second):
+		close(storage.release)
+		reaper.close()
+		t.Fatal("reaper worker did not enter the cancellable delete")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		reaper.close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		close(storage.release)
+		t.Fatal("reaper close did not cancel and join its worker")
+	}
+	if len(reaper.deleteFailures) != 0 || len(reaper.abandoned) != 0 {
+		t.Fatalf("shutdown cancellation created failures=%v abandoned=%v", reaper.deleteFailures, reaper.abandoned)
+	}
+}
+
+func TestSessionReaperFailureBarrierCancelsActivePass(t *testing.T) {
+	shard := supervisorTestShard()
+	identity := supervisorTestID(0x3b)
+	desired := reaperTestNamespace(0x3c, shard, identity, 2)
+	stale := reaperTestNamespace(0x3d, shard, identity, 1)
+	base := newValidatorTestStorage()
+	base.setNamespaces(stale)
+	storage := &gatedReaperStorage{
+		validatorTestStorage: base,
+		started:              make(chan struct{}),
+		release:              make(chan struct{}),
+		finished:             make(chan struct{}),
+	}
+	log := zerolog.Nop()
+	reaper := newSessionReaper(storage, &log)
+	reaper.schedule(
+		context.Background(),
+		reaperTestDesired(desired),
+		reaperTestClaims(t, desired),
+		time.Now(),
+	)
+	select {
+	case <-storage.started:
+	case <-time.After(time.Second):
+		close(storage.release)
+		reaper.close()
+		t.Fatal("reaper worker did not enter deletion")
+	}
+
+	reaper.scheduleFailure(
+		context.Background(),
+		time.Now(),
+		errors.New("live namespace cannot be keyed"),
+		"key live validator namespaces",
+	)
+	select {
+	case <-storage.finished:
+	case <-time.After(time.Second):
+		close(storage.release)
+		reaper.close()
+		t.Fatal("unsafe claim did not cancel the in-flight reap pass")
+	}
+	reaper.close()
+	if deleted := base.deletedNamespaces(); len(deleted) != 0 {
+		t.Fatalf("failure barrier let an in-flight pass delete %+v", deleted)
+	}
+	if len(reaper.deleteFailures) != 0 || len(reaper.abandoned) != 0 {
+		t.Fatalf("barrier cancellation created failures=%v abandoned=%v", reaper.deleteFailures, reaper.abandoned)
+	}
+}
+
+// TestSessionReaperPublishKeepsOnlyTheNewestSnapshot pins the one dispatch
+// invariant the pass tests cannot see. schedule() is called on every supervisor
+// reconciliation, which is far more often than a pass takes, so several
+// snapshots routinely queue behind one running pass. Only the newest may
+// survive: an older snapshot's claimed set is missing every namespace claimed
+// since it was taken, so running one would delete storage a live session is
+// still writing to — the exact failure the claimed set exists to prevent.
+//
+// The worker is deliberately not started here. Coalescing happens entirely in
+// publish, under workerMu, and asserting on r.pending states the contract
+// without racing a pass for the observation.
+func TestSessionReaperPublishKeepsOnlyTheNewestSnapshot(t *testing.T) {
+	shard := supervisorTestShard()
+	identity := supervisorTestID(0x41)
+	live := reaperTestNamespace(0x42, shard, identity, 4)
+	reaper, _ := newReaperTest(t)
+
+	oldest := time.Now()
+	for i, claimed := range []map[sessionNamespaceKey]struct{}{
+		nil,
+		nil,
+		reaperTestClaims(t, live),
+	} {
+		reaper.publish(sessionReapRequest{
+			highest: highestDesiredSeqnos(reaperTestDesired(live)),
+			claimed: claimed,
+			now:     oldest.Add(time.Duration(i) * time.Second),
+		}, false)
+	}
+
+	pending := reaper.pending
+	if pending == nil {
+		t.Fatal("publish dropped every snapshot")
+	}
+	if !pending.now.Equal(oldest.Add(2 * time.Second)) {
+		t.Fatalf("pending snapshot is %v, want the newest at %v", pending.now, oldest.Add(2*time.Second))
+	}
+	if len(pending.claimed) != 1 {
+		t.Fatalf("pending snapshot carries %d claims, want the newest snapshot's 1", len(pending.claimed))
+	}
+	if pending.barrier != reaper.passBarrier {
+		t.Fatalf("ordinary publish moved the barrier to %d against %d", pending.barrier, reaper.passBarrier)
+	}
+
+	// A failure publish is the one that must supersede a running pass, so it
+	// raises the barrier and leaves the snapshot behind it stale by construction.
+	before := reaper.passBarrier
+	reaper.publish(sessionReapRequest{now: oldest, err: errors.New("boom"), what: "test"}, true)
+	if reaper.passBarrier != before+1 {
+		t.Fatalf("failure publish moved the barrier to %d, want %d", reaper.passBarrier, before+1)
+	}
+	if reaper.pending == nil || reaper.pending.err == nil {
+		t.Fatal("failure publish did not replace the pending snapshot")
+	}
+	if pending.barrier == reaper.passBarrier {
+		t.Fatal("the superseded snapshot still matches the current barrier")
+	}
+}
+
+func TestSessionReaperDeadlineDoesNotPoisonTailNamespaces(t *testing.T) {
+	shard := supervisorTestShard()
+	identity := supervisorTestID(0x34)
+	desired := reaperTestNamespace(0x35, shard, identity, 3)
+	first := reaperTestNamespace(0x36, shard, identity, 1)
+	tail := reaperTestNamespace(0x37, shard, identity, 2)
+	base := newValidatorTestStorage()
+	base.setNamespaces(first, tail)
+	storage := &gatedReaperStorage{
+		validatorTestStorage: base,
+		started:              make(chan struct{}),
+		release:              make(chan struct{}),
+	}
+	log := zerolog.Nop()
+	reaper := newSessionReaper(storage, &log)
+	now := time.Now()
+	passCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	reaper.reap(passCtx, reaperTestDesired(desired), reaperTestClaims(t, desired), now)
+
+	if calls := storage.deleteCalls(); calls != 1 {
+		t.Fatalf("delete calls after deadline = %d, want only the blocked head", calls)
+	}
+	if len(reaper.deleteFailures) != 0 || len(reaper.abandoned) != 0 {
+		t.Fatalf("deadline created failures=%v abandoned=%v", reaper.deleteFailures, reaper.abandoned)
+	}
+
+	reaper.reap(
+		context.Background(),
+		reaperTestDesired(desired),
+		reaperTestClaims(t, desired),
+		now.Add(2*sessionReapRetryDelay),
+	)
+	if deleted := base.deletedNamespaces(); len(deleted) != 2 {
+		t.Fatalf("retry deleted = %+v, want both healthy namespaces", deleted)
+	}
 }
 
 // TestReaperDeletesSupersededValidatorNamespaces is the regression test for the
@@ -252,6 +575,17 @@ func TestReaperRetriesAfterAFailedPass(t *testing.T) {
 	reaper.reap(context.Background(), reaperTestDesired(desired), claimed, now.Add(time.Second))
 	if storage.scanCount() != 1 {
 		t.Fatalf("retried within the backoff: scans = %d", storage.scanCount())
+	}
+
+	// Untyped storage failures remain retryable even after more passes than the
+	// poison-record budget. Only a storage-classified permanent error may enter
+	// deleteFailures or abandoned.
+	for attempt := 0; attempt < sessionReapMaxDeleteAttempts; attempt++ {
+		now = now.Add(2 * sessionReapRetryDelay)
+		reaper.reap(context.Background(), reaperTestDesired(desired), claimed, now)
+	}
+	if len(reaper.deleteFailures) != 0 || len(reaper.abandoned) != 0 {
+		t.Fatalf("transient failure created failures=%v abandoned=%v", reaper.deleteFailures, reaper.abandoned)
 	}
 
 	storage.deleteErr = nil
@@ -463,7 +797,9 @@ func TestReaperReapsPastAnUndeletableNamespace(t *testing.T) {
 	// Enumeration order puts the poison first, which is the only order in which
 	// the old shape could be observed at all.
 	storage.setNamespaces(poison, reapable, otherLineage)
-	storage.failDelete(poison, errors.New("validator pebblestore: session summary is missing"))
+	storage.failDelete(poison, permanentReaperTestError{
+		error: errors.New("validator pebblestore: session summary is missing"),
+	})
 
 	reaper.reap(
 		context.Background(),
@@ -494,7 +830,9 @@ func TestReaperAbandonsAPermanentlyUndeletableNamespace(t *testing.T) {
 
 	reaper, storage := newReaperTest(t)
 	storage.setNamespaces(poison)
-	storage.failDelete(poison, errors.New("validator pebblestore: session summary is missing"))
+	storage.failDelete(poison, permanentReaperTestError{
+		error: errors.New("validator pebblestore: session summary is missing"),
+	})
 
 	now := time.Now()
 	claims := reaperTestClaims(t, desired)

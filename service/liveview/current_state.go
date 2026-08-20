@@ -9,6 +9,7 @@ import (
 	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func (s *Store) loadInitialStoredCurrentState(ctx context.Context) {
@@ -197,6 +198,35 @@ func (s *Store) CurrentAccountBlocks(_ context.Context, workchain int32, account
 	blocks, err := currentAccountBlocksFromState(s.current, workchain, account)
 	s.mu.RUnlock()
 	return blocks, err
+}
+
+// AccountRoot returns the account state root from an already-built current live
+// shard view. A cold view reports ErrNotFound instead of starting detached state
+// I/O: this method serves best-effort background warming and must remain
+// cancellable during node shutdown. The returned root is content-addressed and
+// remains valid if the live view advances while the warm is in flight.
+func (s *Store) AccountRoot(ctx context.Context, workchain int32, account [32]byte) (cell.Hash, error) {
+	blocks, err := s.CurrentAccountBlocks(ctx, workchain, account[:])
+	if err != nil {
+		return cell.Hash{}, err
+	}
+
+	view, err := s.cachedBlockFragments(blocks.Account)
+	if err != nil {
+		return cell.Hash{}, err
+	}
+	if err = ctx.Err(); err != nil {
+		return cell.Hash{}, err
+	}
+	root, err := view.AccountCell(account[:])
+	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
+		return cell.Hash{}, storage.ErrNotFound
+	}
+	if err != nil {
+		return cell.Hash{}, err
+	}
+
+	return root.HashKey(), nil
 }
 
 func (s *Store) CurrentMasterchainInfo(ctx context.Context) (ton.BlockIDExt, []byte, uint32, error) {

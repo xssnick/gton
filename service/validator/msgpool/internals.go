@@ -60,6 +60,14 @@ type InternalMessage struct {
 	EnvelopeCell *cell.Cell
 	Root         *cell.Cell
 
+	// DestinationWorkchain and DestinationAccount identify the canonical
+	// destination account, including its anycast rewrite. Variable-length
+	// addresses remain routable but are not eligible for 256-bit account
+	// prewarming, as indicated by DestinationPrewarmable.
+	DestinationWorkchain   int32
+	DestinationAccount     [32]byte
+	DestinationPrewarmable bool
+
 	// Source identifies the queue the message comes from; SourceSeqno the
 	// source block that enqueued it. Seeded entries carry the seed block
 	// seqno as a floor.

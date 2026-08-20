@@ -53,6 +53,10 @@ type Store struct {
 	// Capacity is bounded in ENTRIES because each entry is live Go objects that
 	// every GC mark scans; see decodedCellCacheConfig.
 	decodedCells *decodedCellCache
+	// decodedCellLoads collapses a cold miss for one (generation, hash) into one
+	// record/Pebble read and one decode. It is separate from decodedCells so the
+	// lock-free resident hit path remains unchanged.
+	decodedCellLoads decodedCellLoadGroup
 	// recordCache is the encoded cell RECORD tier under decodedCells: raw
 	// celldb record bytes, pre-decode, keyed by hash alone (content-addressed,
 	// so it needs no generation namespace and survives generation swaps). Its

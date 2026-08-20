@@ -82,10 +82,6 @@ func candidateContentPrefix(namespace storageNamespace) []byte {
 	return namespacedPrefix(keyCandidateContent, namespace)
 }
 
-func candidateContentKey(namespace storageNamespace, hash [32]byte) []byte {
-	return append(candidateContentPrefix(namespace), hash[:]...)
-}
-
 func finalizedPrefix(namespace storageNamespace) []byte {
 	return namespacedPrefix(keyFinalized, namespace)
 }

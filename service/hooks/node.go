@@ -21,14 +21,33 @@ import (
 // Node exposes the node capabilities available to a statically linked
 // extension.
 type Node struct {
-	Network         Network
-	PrivateOverlays *p2p.PrivateOverlayRegistry
-	BlockBroadcasts *p2p.BlockBroadcasts
-	Store           Store
-	TVM             *tvm.TVM
-	Logger          zerolog.Logger
-	Metrics         any
-	Commands        *console.Registry
+	Network                Network
+	MasterchainHead        MasterchainHead
+	PrivateOverlays        *p2p.PrivateOverlayRegistry
+	BlockBroadcasts        *p2p.BlockBroadcasts
+	Store                  Store
+	AccountPrewarmer       AccountPrewarmer
+	AccountPrewarmCapacity int
+	TVM                    *tvm.TVM
+	Logger                 zerolog.Logger
+	Metrics                any
+	Commands               *console.Registry
+}
+
+// MasterchainHead exposes the newest masterchain block whose consensus
+// signatures were verified by the node. An extension may use it to distinguish
+// local catch-up from a network whose actual head is old.
+type MasterchainHead interface {
+	SeenMasterchainBlock() (ton.BlockIDExt, error)
+}
+
+// AccountPrewarmer schedules raw cell-record warming for account state trees.
+// Implementations are non-blocking: a saturated bounded queue may discard a
+// hint because warming never participates in block correctness.
+type AccountPrewarmer interface {
+	EnqueueRoot(cell.Hash) bool
+	EnqueueAccount(workchain int32, account [32]byte) bool
+	PrewarmAccountNow(workchain int32, account [32]byte) bool
 }
 
 // Network exposes node traffic operations without exposing the full p2p node.

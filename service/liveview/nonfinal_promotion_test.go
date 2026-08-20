@@ -2,6 +2,8 @@ package liveview
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/xssnick/gton/service/storage"
@@ -9,6 +11,41 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+func TestNonfinalCandidateRootLivesUntilCurrentStateCoversBlock(t *testing.T) {
+	live, _ := acceptedStateStore(t, Options{
+		MasterBlockCache: 4,
+		ShardBlockCache:  64,
+		NonFinalEnabled:  true,
+		NonFinalCache:    64,
+	})
+	fixture := newAcceptedBlockFixture(t, acceptedStateAppliedSeqno+1, 0xa1)
+	previous := testLiveBlockID(0, acceptedStateShardID(), acceptedStateAppliedSeqno, 0x60)
+	artifacts := fixture.ingestArtifacts(t, appliedShardTopState(0x60), previous)
+
+	if err := live.PublishNonfinalBlockArtifacts(artifacts, storage.LiveBlockNonfinalCandidate); err != nil {
+		t.Fatalf("publish non-final candidate: %v", err)
+	}
+	root, err := live.BlockRoot(context.Background(), fixture.block)
+	if err != nil {
+		t.Fatalf("read candidate block root: %v", err)
+	}
+	if root != fixture.root {
+		t.Fatal("live view did not retain the decoded candidate root")
+	}
+
+	advanceAppliedShardTop(t, live, fixture.block.SeqNo, 901, 0xa2)
+
+	live.mu.RLock()
+	retained := live.blocks[storage.BlockKey(fixture.block)]
+	live.mu.RUnlock()
+	if retained != nil {
+		t.Fatal("candidate root remained live after current state covered its slot")
+	}
+	if _, err = live.BlockRoot(context.Background(), fixture.block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("released candidate root error = %v, want ErrNotFound", err)
+	}
+}
 
 func BenchmarkPromoteNonfinalWaitingBlockedCandidate(b *testing.B) {
 	live, _ := testNonfinalBlockedCandidate(b, 5)

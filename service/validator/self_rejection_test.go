@@ -36,6 +36,8 @@ func (o *selfRejectionObserver) ObserveValidationCandidateSize(collator.MetricCh
 func (o *selfRejectionObserver) AddCandidateCache(collator.MetricChain, CandidateCacheDelta) {}
 func (o *selfRejectionObserver) AddCandidateRetentionCapped(collator.MetricChain)            {}
 func (o *selfRejectionObserver) AddCandidatePersistFailure(collator.MetricChain)             {}
+func (o *selfRejectionObserver) AddCapturedFailedCandidate(collator.MetricChain)             {}
+func (o *selfRejectionObserver) AddStorageStatRecompute(collator.MetricChain)                {}
 func (o *selfRejectionObserver) AddChainTipWaitBackstop(collator.MetricChain)                {}
 func (o *selfRejectionObserver) ObserveSessionSpecRejection(SessionSpecRejectionObservation) {}
 func (o *selfRejectionObserver) ObserveValidationCoreStage(collator.ValidationCoreStageObservation) {

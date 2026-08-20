@@ -44,6 +44,8 @@ func TestPrometheusValidationObserverExportsRuntimeAndSemanticMetrics(t *testing
 	observer.AddCandidateRetentionCapped(collator.MetricChainMasterchain)
 	observer.AddCandidatePersistFailure(collator.MetricChainMasterchain)
 	observer.AddSelfRejectedCandidate(collator.MetricChainMasterchain)
+	observer.AddCapturedFailedCandidate(collator.MetricChainShardchain)
+	observer.AddStorageStatRecompute(collator.MetricChainShardchain)
 	observer.ObserveValidationCandidateSize(collator.MetricChainMasterchain, 1024, 256)
 	observer.ObserveSessionSpecRejection(SessionSpecRejectionObservation{
 		Chain: collator.MetricChainMasterchain, Role: SessionSpecRoleValidator,
@@ -84,6 +86,8 @@ func TestPrometheusValidationObserverExportsRuntimeAndSemanticMetrics(t *testing
 		"gton_validator_candidate_retention_capped_total",
 		"gton_validator_candidate_persist_failures_total",
 		"gton_validator_self_rejected_candidates_total",
+		"gton_validator_captured_failed_candidates_total",
+		"gton_validator_storage_stat_recomputes_total",
 		"gton_validator_session_spec_rejections_total",
 	} {
 		if byName[name] == nil {

@@ -188,7 +188,11 @@ func (c *collation) buildMasterStateAndBlockParts() (blockParts, error) {
 	}
 	// One pass produces both the update and the shared, trace-free state; see
 	// buildShardStateAndBlockParts for why the published root comes from here.
-	stateUpdate, stateRoot, memoCells, err := c.usage.CreateMerkleUpdateAppliedSized(stateRoot, c.builder.updateMemoHint())
+	stateUpdate, stateRoot, memoCells, err := c.usage.CreateMerkleUpdateAppliedSized(
+		stateRoot,
+		c.builder.updateMemoHint(),
+		collationParallelism,
+	)
 	if err != nil {
 		return blockParts{}, fmt.Errorf("create masterchain state update: %w", err)
 	}

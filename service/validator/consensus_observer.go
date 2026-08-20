@@ -48,6 +48,10 @@ type ConsensusObserverOptions struct {
 	Logger    zerolog.Logger
 
 	CloseTimeout time.Duration
+	// CaptureDir is the directory under the node data dir where a candidate this
+	// observer's session refuses with a TVM/semantic replay error is dumped for
+	// offline replay. Empty disables capture.
+	CaptureDir string
 }
 
 type consensusObserverState uint8
@@ -86,6 +90,7 @@ type ConsensusObserver struct {
 	tracer       simplex.Tracer
 	log          zerolog.Logger
 	closeTimeout time.Duration
+	captureDir   string
 	localADNLID  [32]byte
 
 	mu           sync.RWMutex
@@ -168,6 +173,7 @@ func NewConsensusObserver(options ConsensusObserverOptions) (*ConsensusObserver,
 		tracer:       options.Tracer,
 		log:          options.Logger,
 		closeTimeout: options.CloseTimeout,
+		captureDir:   options.CaptureDir,
 		localADNLID:  localADNLID,
 		sessions:     make(map[[32]byte]*observerSession),
 	}, nil
@@ -948,12 +954,13 @@ func (o *ConsensusObserver) prepareRuntime(
 		return nil, fmt.Errorf("validator consensus observer: prepare local backend: %w", err)
 	}
 	runtime, err := prepareSessionRuntime(ctx, config, session.state, RuntimeOptions{
-		Storage: o.storage,
-		Network: session.network,
-		Backend: backend,
-		Limits:  session.limits,
-		Tracer:  o.tracer,
-		Logger:  &o.log,
+		Storage:    o.storage,
+		Network:    session.network,
+		Backend:    backend,
+		Limits:     session.limits,
+		Tracer:     o.tracer,
+		Logger:     &o.log,
+		CaptureDir: o.captureDir,
 		observeConsensusProgress: func(ctx context.Context, progress sessionConsensusProgress) error {
 			return o.handleProgress(ctx, session, progress)
 		},

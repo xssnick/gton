@@ -33,7 +33,7 @@ func (c *collation) flushQueueDeletes() error {
 	if len(c.queuePendingDelete) == 0 {
 		return nil
 	}
-	if err := c.outQueue.DeleteMany(c.queuePendingDelete); err != nil {
+	if err := c.outQueue.DeleteMany(c.queuePendingDelete, collationParallelism); err != nil {
 		return fmt.Errorf("%w: outbound queue deletes did not apply: %v", ErrInvalidInput, err)
 	}
 	c.queuePendingDelete = c.queuePendingDelete[:0]

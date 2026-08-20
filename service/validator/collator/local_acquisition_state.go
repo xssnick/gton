@@ -463,6 +463,19 @@ func (c *localConfigCache) prepare(root *cell.Cell) (localPreparedConfig, error)
 	if exists {
 		return prepared, nil
 	}
+	if root.IsVirtualized() {
+		parsed, err := parseMasterConfigEpoch(root)
+		if err != nil {
+			return localPreparedConfig{}, err
+		}
+
+		// A collated masterchain proof carries only the configuration paths the
+		// candidate touched. Its root hash authenticates those paths, but the
+		// physical tree is not an epoch-wide execution context: a later contract
+		// may request another CONFIGPARAM and hit a pruned boundary. Keep it local
+		// to this validation; only a resident configuration may populate the cache.
+		return localPreparedConfig{execution: parsed.execution, config: parsed.config, groups: parsed.groups}, nil
+	}
 
 	// The capture runs here, before the entry is published, so no other goroutine
 	// can observe a Config whose footprint is still being filled in. It is also

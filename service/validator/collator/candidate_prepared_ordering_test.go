@@ -59,6 +59,9 @@ func TestValidationDefersTheUpdateWalkPastTheMasterView(t *testing.T) {
 	if prepared.verified.stateUpdate != nil {
 		t.Fatal("the task walked the candidate state update before acquiring its master view")
 	}
+	if prepared.stateRoot != nil || prepared.candidate.State != nil {
+		t.Fatal("the task applied the candidate state update before acquiring its master view")
+	}
 
 	// The size limits reject before the walk, on the very stage that owns both.
 	oversized := *req.Masterchain.Config
@@ -68,6 +71,9 @@ func TestValidationDefersTheUpdateWalkPastTheMasterView(t *testing.T) {
 	}
 	if prepared.verified.stateUpdate != nil {
 		t.Fatal("an oversized candidate paid the update walk before it was refused for its size")
+	}
+	if prepared.stateRoot != nil || prepared.candidate.State != nil {
+		t.Fatal("an oversized candidate applied its state update before it was refused for its size")
 	}
 
 	// And once the config accepts the candidate, the walk runs exactly once.

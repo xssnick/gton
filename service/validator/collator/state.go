@@ -95,7 +95,11 @@ func (c *collation) buildStateAndBlockParts() (blockParts, error) {
 	// walk actually filled, and what this one fills is carried back for the next.
 	// The read set is the wrong ruler for it: it is three times this size and
 	// moves for different reasons.
-	stateUpdate, stateRoot, memoCells, err := c.usage.CreateMerkleUpdateAppliedSized(stateRoot, c.builder.updateMemoHint())
+	stateUpdate, stateRoot, memoCells, err := c.usage.CreateMerkleUpdateAppliedSized(
+		stateRoot,
+		c.builder.updateMemoHint(),
+		collationParallelism,
+	)
 	if err != nil {
 		return blockParts{}, fmt.Errorf("create shard state update: %w", err)
 	}

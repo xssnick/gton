@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
 
+	"github.com/xssnick/gton/service/validator/msgpool"
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
@@ -163,7 +164,7 @@ type managedCollatorSession struct {
 	// emitted keeps the artifacts this process signed for the window it is
 	// currently producing, so a retried production re-emits the same bytes
 	// instead of collating a second candidate for a slot it already broadcast.
-	// The durable record is only the signature marker, so this memory is the
+	// The persisted record is only the signature marker, so this memory is the
 	// entire difference between resuming a window and ending it. One window is
 	// held at a time: remembering a slot of a new window drops the previous one.
 	emittedMu     sync.Mutex
@@ -304,8 +305,8 @@ func candidateCollatedBytes(candidate *Candidate) int {
 var errHardBuildDeadline = errors.New("collator runtime: hard build deadline exceeded")
 
 // errWindowNotResumable ends a window whose already signed slot cannot be
-// re-emitted, because the artifact behind its durable marker did not survive
-// into this process. Retrying cannot help: the marker is durable and the
+// re-emitted, because the artifact behind its persisted marker did not survive
+// into this process. Retrying cannot help: the marker exists but the
 // payload is not coming back, so this error is deliberately terminal.
 var errWindowNotResumable = errors.New("collator runtime: signed window cannot be resumed")
 
@@ -1587,7 +1588,7 @@ func (s *Service) Probe(ctx context.Context, preparation WindowPreparation) erro
 
 // CommitDelegation accepts one final leader authorization in receiver memory
 // and starts current-window production. Candidate markers, not delegations,
-// are the durable anti-equivocation boundary.
+// are the persisted anti-equivocation boundary.
 func (s *Service) CommitDelegation(ctx context.Context, request WindowRequest) error {
 	if s.opts.ProductionMode != ProductionModeDelegated {
 		return ErrUnsupported
@@ -1662,7 +1663,7 @@ func (s *Service) CommitDelegation(ctx context.Context, request WindowRequest) e
 }
 
 // ActivateSelfWindow opens one local-validator production window in memory.
-// Its durable authority is the session/progress WAL plus each candidate's
+// Its persisted authority is the session/progress WAL plus each candidate's
 // anti-equivocation marker; there is deliberately no delegation fsync at
 // activation. A late WAL completion cannot start work after Deadline.
 func (s *Service) ActivateSelfWindow(ctx context.Context, request SelfWindowRequest) error {
@@ -2676,7 +2677,13 @@ func (s *Service) runProduction(job *productionJob) error {
 			if err = waitUntil(job.ctx, buildStartTime(record, slot)); err != nil {
 				return err
 			}
-			if s.opts.Observer != nil {
+			// The first shard slot cannot be scheduled one target rate before a
+			// window whose start time is only established after resolving its base.
+			// C++ starts it immediately too. Counting that inherent deficit makes
+			// build_start p95 converge on TargetRate instead of showing carry-over
+			// from the preceding slot, which is the actionable lateness here.
+			if s.opts.Observer != nil &&
+				(record.Session.Shard.IsMasterchain() || slot != job.window.ID.StartSlot) {
 				s.opts.Observer.ObserveScheduleLateness(
 					chain,
 					ScheduleEventBuildStart,
@@ -2800,8 +2807,12 @@ func (s *Service) runProduction(job *productionJob) error {
 			}
 			return fmt.Errorf("collator runtime: build slot %d: %w", slot, result.err)
 		}
+		// Pipeline is public and may retain the pointer it returns. Take ownership
+		// before signing so later extension-side mutation cannot change the bytes
+		// being persisted or the metadata consumed by CommitCandidate.
+		built := clonePipelineCandidate(result.candidate)
 		stageStarted := s.metricStageStarted()
-		artifact, err := s.signArtifact(record.Session, job.window, slot, parent, result.candidate)
+		artifact, err := s.signArtifact(record.Session, job.window, slot, parent, built)
 		s.observeMetricStage(chain, CollationStageSignCandidate, stageStarted)
 		if err != nil {
 			s.observeCandidateProduction(chain, CandidateKindBlock, finishedFuture.started, err)
@@ -2811,9 +2822,9 @@ func (s *Service) runProduction(job *productionJob) error {
 		s.logCollatedCandidate(
 			request,
 			&artifact.Candidate,
-			len(result.candidate.BlockBOC),
-			len(result.candidate.CollatedData),
-			&result.candidate.Stats,
+			len(built.BlockBOC),
+			len(built.CollatedData),
+			&built.Stats,
 			result.elapsed,
 		)
 		if err = s.persistAndEmit(job.ctx, managed, record, artifact, &CandidateCommit{
@@ -2821,7 +2832,7 @@ func (s *Service) runProduction(job *productionJob) error {
 			// extends the same block, but the signed candidate belongs to the
 			// current slot and parent.
 			Request:  request,
-			Built:    result.candidate,
+			Built:    built,
 			Artifact: artifact,
 		}, finishedFuture.started, CandidateKindBlock); err != nil {
 			return err
@@ -3009,23 +3020,13 @@ func (s *Service) persistAndEmit(
 	}
 
 	candidateRecord := recordFromArtifact(artifact)
-	// Remember before the marker is durable, never after. A marker that lands
+	// Remember before the marker lands, never after. A marker that lands
 	// while its payload was never remembered is unresumable, and the write is
 	// abandonable, so its outcome can be unknown to this goroutine.
 	managed.rememberEmitted(artifact.WindowID, artifact)
-	// Submitted here, awaited below. The marker's whole cost is one synced
-	// commit — measured at 4.88 ms per candidate against 4.87 ms for a bare
-	// synced Pebble commit on the same device, so the encoding, the window scan
-	// and the signature checks together are under 1% of it — and waiting for it
-	// here served nothing: what the marker has to be earlier than is the
-	// broadcast, not the state commit that follows building the block. The
-	// reference does not wait for its equivalent at all; the collator producer
-	// detaches its store (simplex/collator-producer.cpp:81) and consensus.cpp
-	// starts one at :228 and collects it at :252, after the parent wait, the
-	// state resolve, the block interval and a whole validation.
-	//
-	// The property is unchanged, and it is the one that matters: no candidate is
-	// emitted for a slot whose marker is not durable.
+	// Submit now and overlap the WAL write with the candidate-state commit and
+	// the scheduled broadcast wait. The callback means Pebble accepted the
+	// marker into its WAL; NoSync deliberately does not promise stable media.
 	markerWrite := startStorageWrite(func(done func(error)) {
 		s.opts.Storage.SaveCandidate(candidateRecord, done)
 	})
@@ -3046,11 +3047,7 @@ func (s *Service) persistAndEmit(
 		return err
 	}
 	s.observeMetricStage(chain, CollationStageWaitBroadcastSlot, stageStarted)
-	// The marker's commit has to have landed before this candidate reaches
-	// anyone, and this is the last instant where that is still true. The stage
-	// keeps its name and now reports what the producer actually spends on the
-	// marker rather than the whole synced commit: everything above overlapped
-	// it, so on a healthy device this is the residue.
+	// Report only the residue after the work above overlapped the WAL commit.
 	stageStarted = s.metricStageStarted()
 	if err := markerWrite.wait(ctx); err != nil {
 		s.observeMetricStage(chain, CollationStagePersistCandidate, stageStarted)
@@ -3137,23 +3134,30 @@ func (s *Service) signArtifact(
 	if len(built.ID.RootHash) != sha256.Size || len(built.ID.FileHash) != sha256.Size {
 		return CandidateArtifact{}, fmt.Errorf("%w: candidate block hashes have invalid length", ErrCandidateConflict)
 	}
-	// Only for a candidate whose digests this process did not compute. Our own
-	// builder returns ID.FileHash and CollatedFileHash as the sha256 it took of
-	// these exact buffers inside finish(), so the two hashes below would be a
-	// megabyte of sha256 spent comparing a value with itself — the reference
-	// producer takes the collator's hashes as given and re-derives neither
-	// (window-producer.cpp:99-131). A Pipeline supplied from outside this
-	// package is a different matter: there the hashes are a claim, and a claim
-	// that is wrong is a signature over an ID no other validator can reproduce,
-	// which burns the whole leader window.
-	if !built.digested {
-		fileHash := sha256.Sum256(built.BlockBOC)
-		if !bytes.Equal(fileHash[:], built.ID.FileHash) {
-			return CandidateArtifact{}, fmt.Errorf("%w: candidate file hash does not match block BOC", ErrCandidateConflict)
-		}
-		if sha256.Sum256(built.CollatedData) != built.CollatedFileHash {
-			return CandidateArtifact{}, fmt.Errorf("%w: collated file hash does not match collated data", ErrCandidateConflict)
-		}
+	// Pipeline is a public ownership boundary. A decorator can call the
+	// canonical builder, mutate the exported Candidate fields, and return the
+	// same pointer with every unexported optimization capsule still attached.
+	// Re-derive both digests here before signing; an unexported boolean cannot
+	// prove that mutable bytes still match it.
+	fileHash := sha256.Sum256(built.BlockBOC)
+	if !bytes.Equal(fileHash[:], built.ID.FileHash) {
+		return CandidateArtifact{}, fmt.Errorf("%w: candidate file hash does not match block BOC", ErrCandidateConflict)
+	}
+	collatedFileHash := sha256.Sum256(built.CollatedData)
+	if collatedFileHash != built.CollatedFileHash {
+		return CandidateArtifact{}, fmt.Errorf("%w: collated file hash does not match collated data", ErrCandidateConflict)
+	}
+
+	// A foreign Pipeline has no private provenance and therefore takes the
+	// generic serialization/commit path. A canonical candidate that still has
+	// provenance but no longer binds it was mutated after Builder returned;
+	// rejecting here avoids signing a valid block together with poisoned local
+	// queue/storage/feedback metadata.
+	if built.provenance == nil {
+		built.prepared = nil
+		built.built = nil
+	} else if !built.provenance.binds(built, fileHash, collatedFileHash) {
+		return CandidateArtifact{}, fmt.Errorf("%w: canonical candidate changed after build", ErrCandidateConflict)
 	}
 
 	candidate := simplex.Candidate{
@@ -3184,6 +3188,28 @@ func (s *Service) signArtifact(
 		// again.
 		digested: true,
 	}, nil
+}
+
+// clonePipelineCandidate takes ownership of the mutable fields returned by a
+// public Pipeline. Cell trees are immutable and stay shared; byte slices, block
+// ID hashes, maps and feedback slices can be changed by the producer and must
+// not alias the candidate persisted and committed by Service.
+func clonePipelineCandidate(source *Candidate) *Candidate {
+	if source == nil {
+		return nil
+	}
+
+	owned := *source
+	owned.ID = cloneBlockID(source.ID)
+	owned.BlockBOC = bytes.Clone(source.BlockBOC)
+	owned.CollatedData = bytes.Clone(source.CollatedData)
+	owned.StorageStats = make(AccountStorageStats, len(source.StorageStats))
+	for hash, stat := range source.StorageStats {
+		owned.StorageStats[hash] = stat
+	}
+	owned.Externals = append([]msgpool.ExternalFeedback(nil), source.Externals...)
+
+	return &owned
 }
 
 func (s *Service) signEmptyArtifact(
@@ -3218,7 +3244,7 @@ func (s *Service) signEmptyArtifact(
 	return CandidateArtifact{SessionID: session.ID, WindowID: window.ID, Candidate: candidate}, nil
 }
 
-// artifactFromRecord rebinds a durable signature marker to the artifact this
+// artifactFromRecord rebinds a persisted signature marker to the artifact this
 // process still holds for that slot. The marker alone cannot produce an
 // artifact — it carries no payload — so a producer that no longer remembers the
 // slot it signed reports errWindowNotResumable and ends the window rather than
@@ -3320,7 +3346,7 @@ func (s *Service) artifactFromRecord(
 		prepared:     remembered.prepared,
 		// Established by the two hash checks above, which had to run here: they
 		// bind the payload this process still holds in memory to the digests the
-		// durable marker recorded for the candidate this window already signed.
+		// persisted marker recorded for the candidate this window already signed.
 		// An empty candidate takes neither of them and carries no payload to
 		// have digested.
 		digested: !candidate.Empty,
@@ -3359,7 +3385,7 @@ func awaitSessionWrite(ctx context.Context, submit func(func(error))) error {
 	}
 }
 
-// awaitStorageWrite submits one durable write and waits for its callback until
+// awaitStorageWrite submits one storage write and waits for its callback until
 // ctx is done. The submission runs on its own goroutine on purpose: the shared
 // store enqueues under a global lock behind a bounded queue, so a saturated
 // writer blocks the submitting goroutine before any callback exists at all.
@@ -3371,8 +3397,9 @@ func awaitSessionWrite(ctx context.Context, submit func(func(error))) error {
 // duplicate idempotently and rejects a conflicting one, so an abandoned wait
 // leaves an unknown outcome: retry the whole step, never assume either result.
 // In particular an abandoned candidate write must not be treated as persisted.
-// Persist-before-emit is what stops a restarted producer from signing a second
-// candidate for a slot it already broadcast.
+// Persist-before-emit normally stops a restarted producer from signing a second
+// candidate for a slot it already broadcast. NoSync stores explicitly accept
+// losing the latest WAL tail on an abrupt machine failure.
 //
 // Ordering across two writes from one caller survives, because a completed wait
 // means the callback has already fired. Only an abandoned wait can leave a
@@ -3382,12 +3409,10 @@ func awaitStorageWrite(ctx context.Context, submit func(func(error))) error {
 	return startStorageWrite(submit).wait(ctx)
 }
 
-// storageWriteFlight is one submitted durable write whose outcome has not been
+// storageWriteFlight is one submitted write whose outcome has not been
 // collected yet. It exists so a caller can put the write in the store's queue
 // at the point in its sequence where it belongs and collect the result at the
-// point where the write actually has to have landed — which for the candidate
-// marker is immediately before the candidate is emitted, not before the state
-// commit that follows building it.
+// point where the write actually has to have landed.
 type storageWriteFlight struct {
 	result chan error
 }

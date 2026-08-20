@@ -115,7 +115,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "description": "p95 non-overlapping stages. Compare core with acquire_inputs, persist, commit, wait, and emit.",
+      "description": "p95 non-overlapping stages. Candidate assembly is split into state preparation, queue cleanup, internal/external execution, account finalization, state-update construction, serialization, and final bookkeeping; external-message waiting remains separate.",
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
       "gridPos": { "h": 20, "w": 16, "x": 0, "y": 13 },
       "id": 8,
@@ -128,7 +128,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "description": "Positive lateness relative to build-start and candidate-broadcast slot boundaries.",
+      "description": "Positive schedule lateness. Shardchain build_start excludes the first slot of each window and shows only carry-over between sequential candidates; masterchain build_start and broadcast include every slot.",
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "spanNulls": true }, "unit": "s" }, "overrides": [] },
       "gridPos": { "h": 20, "w": 8, "x": 16, "y": 13 },
       "id": 9,

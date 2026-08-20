@@ -111,6 +111,10 @@ func (b *Builder) buildShardWithReadyExternals(
 	startedAt time.Time,
 ) (*Candidate, readyExternalStats, error) {
 	var live readyExternalStats
+	timer := req.assembly.start(CollationStagePrepareState)
+	defer func() {
+		timer.stop()
+	}()
 	if batchLimit <= 0 {
 		return nil, live, fmt.Errorf("%w: ready external batch limit must be positive", ErrInvalidInput)
 	}
@@ -121,6 +125,7 @@ func (b *Builder) buildShardWithReadyExternals(
 	if err := validateCollationRequest(&common); err != nil {
 		return nil, live, err
 	}
+	timer.stop()
 
 	transcript := make([]ExternalInput, 0, len(req.Externals))
 	attempt := 0
@@ -171,6 +176,9 @@ func (b *Builder) buildShardWithReadyExternals(
 		candidate.Stats.ExternalBatches = live.batches
 		candidate.Stats.ExternalStop = live.stop
 	}
+	if err == nil {
+		err = sealBuiltCandidate(candidate)
+	}
 
 	return candidate, live, err
 }
@@ -212,9 +220,17 @@ func (b *Builder) buildShardReadyAttempt(
 		live.observe(c, len(req.Externals))
 	}()
 
+	// The batch timers below are stopped by hand, unlike the phase timers in
+	// build.go and master.go, and that is not an oversight to tidy up. They are
+	// declared inside loop bodies, where a deferred stop would not run at the
+	// end of the iteration that started it: every iteration's timer would pile
+	// up and close together when the whole collation returned, charging the
+	// external stage once per batch for the entire remaining build.
 	if len(req.Externals) > 0 {
 		live.batches++
+		timer := c.req.assembly.start(CollationStageExecuteExternalMessages)
 		result, processErr := c.processExternalBatch(req.Externals, processUntil)
+		timer.stop()
 		*transcript = append(*transcript, req.Externals[:result.consumed]...)
 		stop, err = result.stop, processErr
 		if err != nil {
@@ -224,17 +240,21 @@ func (b *Builder) buildShardReadyAttempt(
 	}
 	for {
 		for stop == ExternalStopUnknown {
+			timer := c.req.assembly.start(CollationStageExecuteExternalMessages)
 			snapshots := stream.TakeReady(batchLimit)
 			if len(snapshots) == 0 {
+				timer.stop()
 				break
 			}
 			inputs, prepareErr := prepareExternalSnapshots(snapshots)
 			if prepareErr != nil {
+				timer.stop()
 				live.failedAt = externalPhaseTakeReadyBatch
 				return nil, prepareErr
 			}
 			live.batches++
 			result, processErr := c.processExternalBatch(inputs, processUntil)
+			timer.stop()
 			*transcript = append(*transcript, inputs[:result.consumed]...)
 			stop, err = result.stop, processErr
 			if err != nil {
@@ -243,7 +263,9 @@ func (b *Builder) buildShardReadyAttempt(
 			}
 		}
 
+		timer := c.req.assembly.start(CollationStageExecuteInternalMessages)
 		if err = c.processNewMessages(c.blockFull || c.haveUnprocessedDispatchQueue || req.internalsIncomplete()); err != nil {
+			timer.stop()
 			// The phase every one of the field's seven external_batches==1 events
 			// died in, and the only one that can raise the order violation:
 			// advanceProcessedBound's "generated" caller is deliverImmediate, which
@@ -252,13 +274,16 @@ func (b *Builder) buildShardReadyAttempt(
 			return nil, err
 		}
 		if stop != ExternalStopUnknown {
+			timer.stop()
 			break
 		}
 		c.updateCollatedEstimate()
 		if !c.limits.fits(LoadSoft) {
+			timer.stop()
 			stop = ExternalStopSoftLimit
 			break
 		}
+		timer.stop()
 		if waitUntil.IsZero() {
 			stop = ExternalStopReadyDrained
 			break
@@ -275,13 +300,16 @@ func (b *Builder) buildShardReadyAttempt(
 			live.failedAt = externalPhaseWait
 			return nil, nextErr
 		}
+		timer = c.req.assembly.start(CollationStageExecuteExternalMessages)
 		inputs, prepareErr := prepareExternalSnapshots(snapshots)
 		if prepareErr != nil {
+			timer.stop()
 			live.failedAt = externalPhaseWaitedBatch
 			return nil, prepareErr
 		}
 		live.batches++
 		result, processErr := c.processExternalBatch(inputs, processUntil)
+		timer.stop()
 		*transcript = append(*transcript, inputs[:result.consumed]...)
 		stop, err = result.stop, processErr
 		if err != nil {
@@ -322,6 +350,10 @@ func (b *Builder) buildMasterWithReadyExternals(
 	batchLimit int,
 ) (*Candidate, readyExternalStats, error) {
 	var live readyExternalStats
+	timer := req.assembly.start(CollationStagePrepareState)
+	defer func() {
+		timer.stop()
+	}()
 	if batchLimit <= 0 {
 		return nil, live, fmt.Errorf("%w: ready external batch limit must be positive", ErrInvalidInput)
 	}
@@ -332,6 +364,7 @@ func (b *Builder) buildMasterWithReadyExternals(
 	if err := validateCollationRequest(&common); err != nil {
 		return nil, live, err
 	}
+	timer.stop()
 
 	transcript := make([]ExternalInput, 0, len(req.Externals))
 	attempt := 0
@@ -364,6 +397,9 @@ func (b *Builder) buildMasterWithReadyExternals(
 		candidate.Stats.ExternalBatches = live.batches
 		candidate.Stats.ExternalStop = live.stop
 	}
+	if err == nil {
+		err = sealBuiltCandidate(candidate)
+	}
 
 	return candidate, live, err
 }
@@ -392,7 +428,9 @@ func (b *Builder) buildMasterReadyAttempt(
 
 	if len(req.Externals) > 0 {
 		live.batches++
+		timer := c.req.assembly.start(CollationStageExecuteExternalMessages)
 		result, processErr := c.processExternalBatch(req.Externals, processUntil)
+		timer.stop()
 		*transcript = append(*transcript, req.Externals[:result.consumed]...)
 		stop, err = result.stop, processErr
 		if err != nil {
@@ -401,18 +439,22 @@ func (b *Builder) buildMasterReadyAttempt(
 		}
 	}
 	for stop == ExternalStopUnknown {
+		timer := c.req.assembly.start(CollationStageExecuteExternalMessages)
 		snapshots := stream.TakeReady(batchLimit)
 		if len(snapshots) == 0 {
+			timer.stop()
 			stop = ExternalStopReadyDrained
 			break
 		}
 		inputs, prepareErr := prepareExternalSnapshots(snapshots)
 		if prepareErr != nil {
+			timer.stop()
 			live.failedAt = externalPhaseTakeReadyBatch
 			return nil, prepareErr
 		}
 		live.batches++
 		result, processErr := c.processExternalBatch(inputs, processUntil)
+		timer.stop()
 		*transcript = append(*transcript, inputs[:result.consumed]...)
 		stop, err = result.stop, processErr
 		if err != nil {

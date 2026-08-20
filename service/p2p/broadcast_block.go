@@ -211,6 +211,15 @@ func newVerifiedBlockCandidateBroadcast(kind string, id ton.BlockIDExt, data []b
 		return nil, fmt.Errorf("%s %w for %s", kind, errBlockFileHashMismatch, tnstore.FormatBlockRef(id))
 	}
 
+	return newParsedBlockCandidateBroadcast(kind, id, data, effectiveRoot)
+}
+
+// newParsedBlockCandidateBroadcast consumes a root/BOC/hash binding already
+// established by storage.PreparedBlockCandidate. Keeping this separate from
+// the wire decoder is the Protocol-1 fast path: metadata is still parsed and
+// validated exactly once, but the canonical BOC is not deserialized and hashed
+// a second time in the asynchronous cache worker.
+func newParsedBlockCandidateBroadcast(kind string, id ton.BlockIDExt, data []byte, effectiveRoot *cell.Cell) (*DownloadedBlock, error) {
 	parsed, err := tnstore.ParseVerifiedBlockCell(id, effectiveRoot)
 	if err != nil {
 		return nil, fmt.Errorf("%s parse verified block %s: %w", kind, tnstore.FormatBlockRef(id), err)

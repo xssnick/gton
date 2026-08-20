@@ -1,9 +1,10 @@
 package collator
 
 import (
-	"errors"
 	"fmt"
+	"sync"
 
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -21,20 +22,32 @@ func (c *collation) traceValidationClosure() error {
 	if !c.fullCollated || c.master != nil {
 		return nil
 	}
-	if err := c.traceAccountValidationClosure(); err != nil {
-		return err
-	}
-	if err := c.traceOutQueueValidationClosure(); err != nil {
-		return err
-	}
-	if err := c.traceImmediateQueueValidationClosure(); err != nil {
-		return err
-	}
-	if err := c.traceProcessedQueueValidationClosure(); err != nil {
-		return err
-	}
 
-	return c.traceDispatchQueueValidationClosure()
+	tasks := [...]func() error{
+		func() error { return c.traceAccountValidationClosure() },
+		func() error { return c.traceOutQueueValidationClosure() },
+		func() error { return c.traceImmediateQueueValidationClosure() },
+		func() error { return c.traceProcessedQueueValidationClosure() },
+		func() error { return c.traceDispatchQueueValidationClosure() },
+	}
+	var errs [len(tasks)]error
+	var wait sync.WaitGroup
+	for i, task := range tasks {
+		wait.Go(func() {
+			errs[i] = task()
+		})
+	}
+	wait.Wait()
+
+	// Keep the old deterministic error priority even though the work is now
+	// concurrent. A later failure must not hide the account or queue error the
+	// sequential implementation returned first.
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // traceProcessedQueueValidationClosure retains the predecessor outbound-queue
@@ -86,62 +99,16 @@ func (c *collation) traceValidationClosure() error {
 // cleanupMergedOutQueue an exhaustive queueCandidates scan — so every cell this
 // walk can reach is already recorded and the read set drops the repeat.
 //
-// Two things this pass must NOT do, both learned the hard way.
+// This pass must not take a truncating budget. Its extent is not an input: the
+// bound is the one the block claims and the validator opens exactly that
+// region. Cancellation is safe because a cancelled collation ships nothing.
 //
-// It must not take a truncating budget. Its extent is not an input: the bound
-// is the one the block claims and the validator opens exactly that region, so a
-// walk that stopped early ships a proof with a pruned branch inside the region
-// the validator descends — the incident this shim exists to prevent, produced
-// on a schedule instead of by coincidence. The only legal way to shorten it is
-// to claim less, which is a decision for import, not for here. It is linear in
-// the predecessor's own-prefix queue at roughly four cell loads per entry, with
-// no cap anywhere (maxOutMsgQueueSize is 2^48-1), so the cost is real; what it
-// gets instead of a budget is the per-entry cancellation check every sibling
-// pass already has (cleanupOutQueue, cleanupMergedOutQueue,
-// verifyMergedQueueCleanup). Cancellation truncates nothing that could ever
-// ship — a cancelled collation produces no block — while today an abandoned
-// slot keeps burning loads and allocation that the next slot needs.
-//
-// And it must not veto the block FOR ONE CLASS OF FAILURE, which is narrower
-// than "any failure". The walk exists to record cells; its parse results are
-// discarded. A semantic rejection of a PREDECESSOR entry — data we inherited,
-// possibly from a persistent state or an archive import, and never validated
-// ourselves — is a verdict on the predecessor, not on this candidate, and it
-// reaches the validator through the very same parseSemanticNeighborQueueEntry
-// on the very same dictionary at the very same bound. So the block's fate is
-// already settled by that entry whatever we do here, and failing the collation
-// only converts "produce a block others reject" into "produce nothing", which
-// on a mixed network stalls every Go node every slot while the reference nodes
-// keep collating. For that class the walk stops widening, records that it did,
-// and the block goes out.
-//
-// Every OTHER failure must stop the block, because that reasoning does not
-// reach it. A node whose storage could not open a queue node, whose child
-// context was cancelled, or whose walk met a structural inconsistency of its
-// own making has learned nothing about what the validator will find — it has
-// only learned that its proof is short. Shipping there is defect 1 recreated
-// on purpose: a candidate with a knowingly incomplete collated proof, rejected
-// by every proof-backed peer for "augmented dict has special cells in tree
-// structure", with no record of why.
-//
-// So the swallow is keyed on semanticQueueEntryVerdict, which
-// walkSemanticQueuePrefix raises only about cells it already holds, and on
-// ErrInvalidInput. Cancellation is read from the context rather than from the
-// error chain, because a cancelled lazy load surfaces as whatever the storage
-// returned and the entry parse re-wraps it with %v: the chain is not a reliable
-// witness there while the context always is, and a cancelled collation ships
-// nothing anyway.
-//
-// The storage fault raised strictly BELOW the leaf — inside the envelope
-// reference the entry parse follows — used to be the one case this could not
-// tell from a malformed entry, because tonutils lazy loaders return the
-// underlying error unchanged and there is no I/O sentinel to test for. It is
-// closed by separating the load from the parse rather than by inspecting
-// errors: materialiseSemanticQueueLeaf resolves the envelope and the message
-// through Cell.Prewarm, whose every error comes from the loader, and the parse
-// then runs on those cells, so what it can still raise is a statement about
-// content. See materialiseSemanticQueueLeaf for why the two structural checks
-// it makes on the way are verdicts, and for why it costs no extra loads.
+// Every replay failure is fatal, including a semantic verdict on inherited
+// content. The same verdict would make every validator reject this candidate;
+// continuing would only spend serialization, signing, storage and broadcast on
+// a block whose acceptance result is already known. Loading remains separated
+// from parsing in walkSemanticQueuePrefix so the returned error still tells an
+// operator whether storage or content stopped the closure.
 func (c *collation) traceProcessedQueueValidationClosure() error {
 	// The validator's own gate: verifyProcessedInfo returns before the source
 	// loop unless the candidate moved ProcessedInfo, so an unchanged dictionary
@@ -159,31 +126,7 @@ func (c *collation) traceProcessedQueueValidationClosure() error {
 	}
 	scanErr := fmt.Errorf("trace predecessor inbound queue scan to (%d,%x): %w",
 		c.processedClaim.lt, c.processedClaim.hash, err)
-	if !shippableQueueTraceFailure(err) {
-		return scanErr
-	}
-	c.stats.ProcessedScanTraceError = scanErr.Error()
-
-	return nil
-}
-
-// shippableQueueTraceFailure reports whether a replay failure is one the block
-// may ship past. Both conditions are load-bearing and neither implies the
-// other:
-//
-//   - the failure must be a semanticQueueEntryVerdict, which the walk raises
-//     only about a leaf's content, never about reaching one;
-//   - and it must carry ErrInvalidInput, which is what the entry parse marks a
-//     rejection of predecessor DATA with. A verdict that does not is not a
-//     rejection of the entry — it is this node's own machinery failing while
-//     holding the entry, and the argument for shipping (the validator meets the
-//     same bytes through the same parse) says nothing about that.
-//
-// It is a function rather than two lines at the call site so each condition can
-// be pinned on its own; see TestShippableQueueTraceFailureNeedsBothGuards.
-func shippableQueueTraceFailure(err error) bool {
-	var verdict semanticQueueEntryVerdict
-	return errors.As(err, &verdict) && errors.Is(err, ErrInvalidInput)
+	return scanErr
 }
 
 // traceImmediateQueueValidationClosure retains the outbound-queue paths of
@@ -222,11 +165,17 @@ func (c *collation) traceImmediateQueueValidationClosure() error {
 }
 
 // traceAccountValidationClosure retains the structural predecessor reads made
-// by the reference collator's ShardAccounts scan_diff(..., mode=2). Direct
-// account lookups are not sufficient: Patricia labels may change around a
-// modified range, and validating new fork augmentations reads sibling roots at
-// every changed structural boundary.
+// by the reference collator's ShardAccounts scan_diff(..., mode=2). The normal
+// bulk mutation captures its exact net structural closure and this late replay
+// checks every changed candidate node through its final Patricia path. A block
+// that destroys an account uses the canonical scan below because its later
+// individual delete cannot be composed with the earlier receipt without
+// retaining an intermediate trie.
 func (c *collation) traceAccountValidationClosure() error {
+	if c.accountMutationDiff != nil {
+		return c.accountMutationDiff.Replay()
+	}
+
 	return c.oldState.Accounts.ShardAccounts.ScanDiff(
 		c.accounts.AugmentedDictionary,
 		true,
@@ -254,25 +203,49 @@ func (c *collation) traceAccountValidationClosure() error {
 // ordinary account that merely happens to sit next to a deferring one.
 func (c *collation) traceDispatchQueueValidationClosure() error {
 	err := c.oldDispatchQueue.ScanDiff(c.dispatchQueue.AugmentedDictionary, true, func(
-		_ *cell.Cell,
+		keyCell *cell.Cell,
 		oldValueExtra, newValueExtra *cell.Slice,
 	) error {
+		keyLoader, err := keyCell.BeginParse()
+		if err != nil {
+			return fmt.Errorf("%w: load dispatch diff key: %v", ErrInvalidInput, err)
+		}
+		var accountID [32]byte
+		if err = keyLoader.LoadSliceInto(accountID[:], 256); err != nil {
+			return fmt.Errorf("%w: decode dispatch diff key: %v", ErrInvalidInput, err)
+		}
+
+		var oldAccount *tlb.AccountDispatchQueue
 		if oldValueExtra != nil {
-			account, parseErr := dispatchDiffAccount(oldValueExtra)
-			if parseErr != nil {
-				return fmt.Errorf("%w: decode predecessor dispatch account: %v", ErrInvalidInput, parseErr)
+			var traced bool
+			oldAccount, traced = c.oldDispatchAccounts[accountID]
+			if !traced {
+				oldAccount, err = c.loadPredecessorDispatchAccount(accountID)
+				if err != nil {
+					return fmt.Errorf("%w: decode predecessor dispatch account: %v", ErrInvalidInput, err)
+				}
 			}
-			if _, _, parseErr = account.Messages.LoadMax(); parseErr != nil {
-				return fmt.Errorf("%w: load predecessor dispatch account maximum: %v", ErrInvalidInput, parseErr)
+			if _, _, err = oldAccount.Messages.LoadMax(); err != nil {
+				return fmt.Errorf("%w: load predecessor dispatch account maximum: %v", ErrInvalidInput, err)
 			}
 		}
 		if newValueExtra != nil {
-			account, parseErr := dispatchDiffAccount(newValueExtra)
-			if parseErr != nil {
-				return fmt.Errorf("%w: decode candidate dispatch account: %v", ErrInvalidInput, parseErr)
+			newAccount, err := dispatchDiffAccount(newValueExtra)
+			if err != nil {
+				return fmt.Errorf("%w: decode candidate dispatch account: %v", ErrInvalidInput, err)
 			}
-			if _, _, parseErr = account.Messages.LoadMin(); parseErr != nil {
-				return fmt.Errorf("%w: load candidate dispatch account minimum: %v", ErrInvalidInput, parseErr)
+			minimum, _, err := newAccount.Messages.LoadMin()
+			if err != nil {
+				return fmt.Errorf("%w: load candidate dispatch account minimum: %v", ErrInvalidInput, err)
+			}
+			// Mutating the nested dictionary rebuilds its Patricia path. Trace the
+			// same minimum through the immutable predecessor source so a reused leaf
+			// is retained in the previous-state proof.
+			if oldAccount != nil {
+				_, oldErr := oldAccount.Messages.LoadValue(minimum)
+				if oldErr != nil && !isMissingKey(oldErr) {
+					return fmt.Errorf("%w: load candidate dispatch account minimum from predecessor: %v", ErrInvalidInput, oldErr)
+				}
 			}
 		}
 
@@ -282,12 +255,12 @@ func (c *collation) traceDispatchQueueValidationClosure() error {
 		return fmt.Errorf("trace dispatch queue difference: %w", err)
 	}
 
-	for _, key := range sortedAccountKeys(c.lanes) {
-		if c.lanes[key].transactions == nil {
+	for _, accountID := range sortedAccountKeys(c.lanes) {
+		if c.lanes[accountID].transactions == nil {
 			continue
 		}
-		if _, err = loadAccountDispatchQueue(c.oldDispatchQueue, key); err != nil && !isMissingKey(err) {
-			return fmt.Errorf("trace predecessor dispatch account %x: %w", key, err)
+		if _, err = c.loadPredecessorDispatchValue(accountID); err != nil && !isMissingKey(err) {
+			return fmt.Errorf("trace predecessor dispatch account %x: %w", accountID, err)
 		}
 	}
 

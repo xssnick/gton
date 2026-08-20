@@ -359,7 +359,7 @@ func (e *Engine) buildCertificate(slot *poolSlot, v Vote) *Certificate {
 // saving flag makes the persist single-flight per (slot, kind) while the engine
 // keeps serving other inputs.
 func (e *Engine) handleCertificate(vc VerifiedCertificate) {
-	cert := vc.Certificate()
+	cert := vc.certificate()
 	slot := e.slots.at(cert.Vote.Slot())
 	if slot == nil || !slot.needs(cert.Vote) {
 		return
@@ -367,17 +367,20 @@ func (e *Engine) handleCertificate(vc VerifiedCertificate) {
 	_, saving := slot.certByKind(cert.Vote.Kind)
 	*saving = true
 
-	e.journal.SaveCertificate(cert, e.journalDone(func(err error) {
+	// Journal is injected code and may retain its argument. Hand it a copy so
+	// it cannot mutate the certificate carried by vc after this callback seals
+	// the persistence transition.
+	e.journal.SaveCertificate(vc.Certificate(), e.journalDone(func(err error) {
 		e.finishCertificateSave(vc, err)
 	}))
 }
 
-// finishCertificateSave resumes certificate application once the record is
-// durable. The pool may have moved on while the write was in flight: a
-// finalization can prune the slot, in which case the certificate is obsolete
+// finishCertificateSave resumes certificate application once the persistence
+// callback succeeds. The pool may have moved on while the write was in flight:
+// a finalization can prune the slot, in which case the certificate is obsolete
 // and dropped, which is why the slot is re-resolved after the write.
 func (e *Engine) finishCertificateSave(vc VerifiedCertificate, err error) {
-	cert := vc.Certificate()
+	cert := vc.certificate()
 	if err != nil && !errors.Is(err, ErrAlreadySaved) {
 		e.fatal(fmt.Errorf("simplex: certificate journal write: %w", err))
 		return
@@ -399,10 +402,10 @@ func (e *Engine) finishCertificateSave(vc VerifiedCertificate, err error) {
 	e.storeSavedCertificate(slot, vc)
 }
 
-// storeSavedCertificate finishes certificate application after it became
-// durable: records it in the slot, gossips it and runs the typed transition.
+// storeSavedCertificate records the accepted certificate in the slot, gossips
+// it and runs the typed transition.
 func (e *Engine) storeSavedCertificate(slot *poolSlot, vc VerifiedCertificate) {
-	cert := vc.Certificate()
+	cert := vc.certificate()
 	certSlot, saving := slot.certByKind(cert.Vote.Kind)
 	if *certSlot != nil {
 		e.fatal(fmt.Errorf("simplex: duplicate %s certificate for slot %d", cert.Vote.Kind, cert.Vote.Slot()))
@@ -492,7 +495,7 @@ func (e *Engine) onSkipCertificate(slot *poolSlot, cert *Certificate) {
 }
 
 func (e *Engine) onFinalCertificate(slot *poolSlot, vc VerifiedCertificate) {
-	cert := vc.Certificate()
+	cert := vc.certificate()
 	id := cert.Vote.ID
 
 	// A finalize quorum over a skipped slot (or over two different
@@ -595,43 +598,17 @@ func (e *Engine) advancePresent() {
 		}
 		base = *s.availableBase
 	}
-	// The base is snapshotted now, but the window is announced only once the
-	// record is durable: LeaderWindowObserved has to be persisted before the
-	// engine reacts to it. The queue keeps announcements in window order even if
-	// journal completions invert.
 	startSlot := e.now
-	e.windowAnnounces = append(e.windowAnnounces, windowAnnounce{startSlot: startSlot, base: base})
+	// Match the reference bus flow: consumers start resolving the parent and
+	// collating as soon as the window is observed, while DB persists its pool
+	// cursor independently. The cursor is restart progress, not authority; a
+	// failed write is still fatal when its callback returns.
+	e.windowObserved(startSlot, base)
 	e.journal.SaveFirstNonAnnouncedWindow(e.firstNonAnnouncedWindow, e.journalDone(func(err error) {
-		e.finishWindowSave(startSlot, err)
-	}))
-}
-
-// windowAnnounce is a leader-window announcement waiting for its pool-state
-// record to become durable.
-type windowAnnounce struct {
-	startSlot uint32
-	base      ParentID
-	saved     bool
-}
-
-// finishWindowSave marks a window record durable and delivers announcements
-// from the queue head, preserving window order.
-func (e *Engine) finishWindowSave(startSlot uint32, err error) {
-	if err != nil {
-		e.fatal(fmt.Errorf("simplex: pool state journal write: %w", err))
-		return
-	}
-	for i := range e.windowAnnounces {
-		if e.windowAnnounces[i].startSlot == startSlot {
-			e.windowAnnounces[i].saved = true
-			break
+		if err != nil {
+			e.fatal(fmt.Errorf("simplex: pool state journal write: %w", err))
 		}
-	}
-	for len(e.windowAnnounces) > 0 && e.windowAnnounces[0].saved {
-		a := e.windowAnnounces[0]
-		e.windowAnnounces = e.windowAnnounces[1:]
-		e.enqueue(func() { e.windowObserved(a.startSlot, a.base) })
-	}
+	}))
 }
 
 func (e *Engine) windowObserved(startSlot uint32, base ParentID) {
