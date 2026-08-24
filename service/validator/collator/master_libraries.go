@@ -50,7 +50,7 @@ func (c *collation) updateMasterPublicLibraries() error {
 
 	lanes := make([]*accountLane, 0, len(c.lanes))
 	for _, lane := range c.lanes {
-		if lane.transactions != nil {
+		if lane.touched {
 			lanes = append(lanes, lane)
 		}
 	}

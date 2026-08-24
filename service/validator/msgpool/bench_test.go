@@ -9,9 +9,8 @@ import (
 
 // BenchmarkAddNew measures pooling a fresh, already-deserialized message —
 // the real ingress hot path (norm hash outside the lock, one short critical
-// section, no BOC work). Both production callers hand over the root cell
-// without the received bytes, so raw is nil here too: passing a buffer would
-// benchmark a path nothing takes.
+// section, no BOC work). Production callers pass the exact received BOC size
+// without retaining the ingress buffer.
 func BenchmarkAddNew(b *testing.B) {
 	p := New(Config{MempoolLimit: 1 << 30, PerAddressLimit: 1 << 30, MempoolBytesLimit: 1 << 40})
 	b.Cleanup(p.Close)
@@ -24,7 +23,7 @@ func BenchmarkAddNew(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := p.AddExternal(nil, msgs[i].root, nil, 0); err != nil {
+		if _, err := p.AddExternal(len(msgs[i].raw), msgs[i].root, nil, 0); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -52,7 +51,7 @@ func BenchmarkAddNewWithExternalStreams(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if err := p.AddExternal(nil, msgs[i].root, nil, 0); err != nil {
+				if _, err := p.AddExternal(len(msgs[i].raw), msgs[i].root, nil, 0); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -66,16 +65,82 @@ func BenchmarkAddDuplicate(b *testing.B) {
 	p := New(Config{})
 	b.Cleanup(p.Close)
 	m := buildExtMsgBench(testAddr(0x01))
-	if err := p.AddExternal(m.raw, m.root, nil, 0); err != nil {
+	if _, err := p.AddExternal(len(m.raw), m.root, nil, 0); err != nil {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := p.AddExternal(m.raw, m.root, nil, 0); err != nil {
+		if _, err := p.AddExternal(len(m.raw), m.root, nil, 0); err != nil {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkExternalMessageSizeAccounting isolates the ingress-size change on
+// a multi-cell message. The legacy sub-benchmark reproduces the removed DAG
+// walk so the cost stays directly comparable without restoring old production
+// code between runs.
+func BenchmarkExternalMessageSizeAccounting(b *testing.B) {
+	body := cell.BeginCell().EndCell()
+	for i := range 256 {
+		body = cell.BeginCell().
+			MustStoreUInt(uint64(i), 16).
+			MustStoreRef(body).
+			EndCell()
+	}
+	root := cell.BeginCell().
+		MustStoreUInt(0b10, 2).
+		MustStoreUInt(0b00, 2).
+		MustStoreAddr(addrOf(0, testAddr(0x7a))).
+		MustStoreCoins(0).
+		MustStoreUInt(0b01, 2).
+		MustStoreRef(body).
+		EndCell()
+	serializedSize := len(root.ToBOC())
+
+	b.Run("exact-ingress-size", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := newExternalMessage(serializedSize, root, nil); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("legacy-structural-estimate", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			size := benchmarkEstimateBOCSize(root)
+			if _, err := newExternalMessage(size, root, nil); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func benchmarkEstimateBOCSize(root *cell.Cell) int {
+	visited := map[*cell.Cell]struct{}{}
+	stack := []*cell.Cell{root}
+	total := 0
+	for len(stack) > 0 {
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, seen := visited[current]; seen {
+			continue
+		}
+		visited[current] = struct{}{}
+
+		refs := int(current.RefsNum())
+		total += 2 + int((current.BitsSize()+7)/8) + refs
+		for index := range refs {
+			ref, err := current.PeekRef(index)
+			if err == nil {
+				stack = append(stack, ref)
+			}
+		}
+	}
+
+	return total
 }
 
 // BenchmarkSelectForBlock measures batch selection over a full pool.
@@ -86,7 +151,7 @@ func BenchmarkSelectForBlock(b *testing.B) {
 		var addr [32]byte
 		copy(addr[:], fmt.Sprintf("%08d-addr", i))
 		m := buildExtMsgBench(addr)
-		if err := p.AddExternal(m.raw, m.root, nil, i%3); err != nil {
+		if _, err := p.AddExternal(len(m.raw), m.root, nil, i%3); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -110,7 +175,7 @@ func BenchmarkOpenExternalSnapshot(b *testing.B) {
 		var addr [32]byte
 		copy(addr[:], fmt.Sprintf("%08d-snapshot", i))
 		m := buildExtMsgBench(addr)
-		if err := p.AddExternal(m.raw, m.root, nil, i%3); err != nil {
+		if _, err := p.AddExternal(len(m.raw), m.root, nil, i%3); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -145,7 +210,7 @@ func BenchmarkSelectForBlockLimited(b *testing.B) {
 		var addr [32]byte
 		copy(addr[:], fmt.Sprintf("%08d-addr", i))
 		m := buildExtMsgBench(addr)
-		if err := p.AddExternal(m.raw, m.root, nil, 0); err != nil {
+		if _, err := p.AddExternal(len(m.raw), m.root, nil, 0); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -166,7 +231,7 @@ func BenchmarkSelectForBlockLimitedPriorities(b *testing.B) {
 		var addr [32]byte
 		copy(addr[:], fmt.Sprintf("%08d-addr", i))
 		m := buildExtMsgBench(addr)
-		if err := p.AddExternal(m.raw, m.root, nil, i%3); err != nil {
+		if _, err := p.AddExternal(len(m.raw), m.root, nil, i%3); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -190,7 +255,7 @@ func BenchmarkSelectForBlockLimitedParallel(b *testing.B) {
 		var addr [32]byte
 		copy(addr[:], fmt.Sprintf("%08d-addr", i))
 		m := buildExtMsgBench(addr)
-		if err := p.AddExternal(m.raw, m.root, nil, 0); err != nil {
+		if _, err := p.AddExternal(len(m.raw), m.root, nil, 0); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -231,7 +296,7 @@ func BenchmarkEraseAppliedNormalizedVariants(b *testing.B) {
 					MempoolBytesLimit: 1 << 40,
 				})
 				for _, message := range messages {
-					if err = p.AddExternal(message.raw, message.root, nil, 0); err != nil {
+					if _, err = p.AddExternal(len(message.raw), message.root, nil, 0); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -262,4 +327,45 @@ func buildExtMsgBenchFee(wc int32, addr [32]byte, importFee uint64) testMsgB {
 		MustStoreRef(cell.BeginCell().MustStoreSlice(addr[:], 256).EndCell()).
 		EndCell()
 	return testMsgB{raw: c.ToBOC(), root: c}
+}
+
+// BenchmarkTakeReadyFromDeepPool is the shape the collator meets in a slot: a
+// mempool far deeper than the stream buffer, drained a batch at a time.
+//
+// Topping the buffer back up after every batch is a full scan of every slab,
+// under the pool mutex, re-ranking a pool the batch barely moved. With a buffer
+// of thousands and a batch of hundreds the buffer never emptied, so that scan
+// ran on every take rather than on the takes that needed it.
+func BenchmarkTakeReadyFromDeepPool(b *testing.B) {
+	const (
+		pooled   = 8192
+		capacity = 4096
+		batch    = 500
+	)
+	p := New(Config{MempoolLimit: 1 << 30, PerAddressLimit: 1 << 30, MempoolBytesLimit: 1 << 40})
+	b.Cleanup(p.Close)
+	for i := range pooled {
+		var addr [32]byte
+		copy(addr[:], fmt.Sprintf("%016d-deep-take-bench", i))
+		msg := buildExtMsgBench(addr)
+		if _, err := p.AddExternal(len(msg.raw), msg.root, nil, 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+	stream, err := p.OpenExternalStream(allShard, capacity)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = stream.Close() })
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	taken := 0
+	for b.Loop() {
+		taken += len(stream.TakeReady(batch))
+	}
+	b.StopTimer()
+	if taken == 0 {
+		b.Fatal("the stream returned nothing; the fixture is not exercising a take")
+	}
 }

@@ -169,7 +169,7 @@ func setDescr(t testing.TB, dict *cell.AugmentedDictionary, msgHash []byte, valu
 }
 
 // referenceInternalFromEnvelope derives the pooled view through the full
-// tlb.InternalMessage decode — the shape internalFromEnvelope had before it was
+// tlb.InternalMessage decode — the shape InternalMessageFromEnvelope had before it was
 // narrowed to the int_msg_info header the queue key actually needs. It is the
 // oracle the header parser is pinned against.
 func referenceInternalFromEnvelope(t testing.TB, envCell *cell.Cell) *InternalMessage {
@@ -279,7 +279,7 @@ func TestInternalFromEnvelopeMatchesFullDecode(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			want := referenceInternalFromEnvelope(t, tc.env)
-			got, err := internalFromEnvelope(tc.env)
+			got, err := InternalMessageFromEnvelope(tc.env)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -355,7 +355,7 @@ func TestInternalFromEnvelopePreservesDestinationAccount(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			envelope := deltaEnvelope(t, deltaInternalMsg(t, source, tc.destination, 100), regularNext(96))
-			got, err := internalFromEnvelope(envelope)
+			got, err := InternalMessageFromEnvelope(envelope)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -580,7 +580,7 @@ func TestDeltaFromBlockRootTransitAndDeferred(t *testing.T) {
 			delta.Added[2].QueueLT,
 		)
 	}
-	oldRequeue, err := internalFromEnvelope(oldRequeueEnv)
+	oldRequeue, err := InternalMessageFromEnvelope(oldRequeueEnv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -942,11 +942,11 @@ func TestInternalsRebuildEquivalenceTransitAndDeferred(t *testing.T) {
 	requeuedMsg := deltaInternalMsg(t, src, deltaAddr(0, 0x77), 7000)
 	oldEnv := deltaEnvelope(t, requeuedMsg, regularNext(32))
 	newEnv := deltaEnvelope(t, requeuedMsg, regularNext(96))
-	oldParsed, err := internalFromEnvelope(oldEnv)
+	oldParsed, err := InternalMessageFromEnvelope(oldEnv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	newParsed, err := internalFromEnvelope(newEnv)
+	newParsed, err := InternalMessageFromEnvelope(newEnv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -983,7 +983,7 @@ func TestInternalsRebuildEquivalenceTransitAndDeferred(t *testing.T) {
 
 	deferredMsg := deltaInternalMsg(t, src, deltaAddr(0, 0x88), 8000)
 	deferredEnv := deltaEnvelopeWithEmittedLT(t, deferredMsg, regularNext(96), 8100)
-	deferredParsed, err := internalFromEnvelope(deferredEnv)
+	deferredParsed, err := InternalMessageFromEnvelope(deferredEnv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1159,5 +1159,118 @@ func TestSeedFeedsInternalsEndToEnd(t *testing.T) {
 	}
 	if size, _ := n.queueSize(baseSource); size != 2 {
 		t.Fatalf("queue size = %d", size)
+	}
+}
+
+// The prefix filter is a narrowing, and a narrowing that is wrong in one
+// direction is catastrophic and silent. On an unsplit shard the destination owns
+// its whole workchain, so a filter that misparses a prefix cell drops the entire
+// queue: the seed returns nothing, no internal message is ever imported, and the
+// node produces well-formed empty blocks that every validator accepts. Nothing
+// downstream reports it.
+//
+// So the gate is a differential one — the seeded set with the filter must be the
+// set without it — and it is run over a queue big enough to make KeyPrefixes
+// actually split, because the filter is not reached at all below that.
+func TestSeedPrefixFilterNeverChangesTheSeededSet(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		destination ShardIdent
+		others      []ShardIdent
+	}{
+		{
+			// The production topology today: one shard owning the workchain, so
+			// nothing is prunable and everything must survive the filter.
+			name:        "unsplit shard owns the whole workchain",
+			destination: ShardIdent{Workchain: 0, Shard: ShardAll},
+		},
+		{
+			// After a split, where the pruning is supposed to pay.
+			name:        "split shard beside its sibling",
+			destination: ShardIdent{Workchain: 0, Shard: 1 << 62},
+			others:      []ShardIdent{{Workchain: 0, Shard: 3 << 62}},
+		},
+		{
+			// The sibling, and it is not symmetric with the case above. Reaching
+			// it requires the top prefix bit to read as one, so a prefix cell
+			// parsed into the wrong bit position keeps the left shard's whole
+			// queue and drops the right shard's — passing every test that only
+			// ever asks about the left.
+			name:        "the sibling on the far side of the split bit",
+			destination: ShardIdent{Workchain: 0, Shard: 3 << 62},
+			others:      []ShardIdent{{Workchain: 0, Shard: 1 << 62}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := map[QueueKey]tlb.EnqueuedMsg{}
+			for i := range 512 {
+				dst := deltaAddr(0, byte(i))
+				message := deltaInternalMsg(t, deltaAddr(0, 0x11), dst, uint64(1_000+i))
+				envelope := deltaEnvelope(t, message, regularNext(96))
+				hop, err := AccountPrefixFromAddress(dst)
+				if err != nil {
+					t.Fatal(err)
+				}
+				entries[MakeQueueKey(hop, message.HashKey())] = tlb.EnqueuedMsg{
+					EnqueuedLT: uint64(1_000 + i), Msg: envelope,
+				}
+			}
+			state := stateRootWithQueue(t, queueDictCell(t, entries), uint64(len(entries)), true)
+
+			snapshot, err := routingSnapshot(append([]ShardIdent{tc.destination}, tc.others...))
+			if err != nil {
+				t.Fatal(err)
+			}
+			queueInfo, err := StateOutMsgQueueInfo(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prefixes, err := queueInfo.OutQueue.KeyPrefixes(
+				queueKeyWorkchainBits+seedWalkPrefixBits, seedWalkMaxTasks,
+			)
+			if err != nil || len(prefixes) < 2 {
+				t.Fatalf("the fixture does not split (%d prefixes, err %v); the filter is never reached",
+					len(prefixes), err)
+			}
+			// Correctness above, effect here: a change that is safe because it
+			// prunes nothing is not the change that was asked for.
+			kept := len(filterSeedPrefixes(append([]*cell.Cell(nil), prefixes...), snapshot.router, 0))
+			switch {
+			case len(tc.others) == 0 && kept != len(prefixes):
+				t.Errorf("unsplit shard: the filter dropped %d of %d subtrees, and it owns all of them",
+					len(prefixes)-kept, len(prefixes))
+			case len(tc.others) > 0 && kept >= len(prefixes):
+				t.Errorf("split shard: the filter kept all %d subtrees, so it prunes nothing", len(prefixes))
+			}
+
+			filtered := make([]RoutedSeed, len(snapshot.destinations))
+			_, ok, err := routedSeedsFromQueueParallel(
+				queueInfo.OutQueue, ShardIdent{}, SourceRef{}, snapshot, filtered, 0,
+			)
+			if err != nil || !ok {
+				t.Fatalf("filtered walk: ok=%t err=%v", ok, err)
+			}
+
+			whole := make([]RoutedSeed, len(snapshot.destinations))
+			_, ok, err = routedSeedsFromQueueParallel(
+				queueInfo.OutQueue, ShardIdent{}, SourceRef{}, snapshot, whole, -1,
+			)
+			if err != nil || !ok {
+				t.Fatalf("unfiltered walk: ok=%t err=%v", ok, err)
+			}
+
+			if len(whole[0].Messages) == 0 {
+				t.Fatal("the unfiltered walk seeded nothing; the fixture routes to no destination")
+			}
+			if len(filtered[0].Messages) != len(whole[0].Messages) {
+				t.Fatalf("the filter changed the seeded set: %d messages against %d",
+					len(filtered[0].Messages), len(whole[0].Messages))
+			}
+			for i := range whole[0].Messages {
+				if filtered[0].Messages[i].Key != whole[0].Messages[i].Key {
+					t.Fatalf("message %d differs between the filtered and unfiltered walks", i)
+				}
+			}
+		})
 	}
 }

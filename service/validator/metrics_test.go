@@ -111,6 +111,16 @@ func TestPrometheusValidationObserverExportsRuntimeAndSemanticMetrics(t *testing
 	) {
 		t.Fatal("event-driven input wait stage was not exported")
 	}
+	if got := validatorGaugeValue(byName["gton_validator_candidate_size_bytes"], map[string]string{
+		"chain": "masterchain", "part": "block",
+	}); got != 1024 {
+		t.Fatalf("latest validation block size = %v, want 1024", got)
+	}
+	if got := validatorGaugeValue(byName["gton_validator_candidate_size_bytes"], map[string]string{
+		"chain": "masterchain", "part": "collated",
+	}); got != 256 {
+		t.Fatalf("latest validation collated-data size = %v, want 256", got)
+	}
 	if validatorMetricFamilyHasLabels(byName["gton_validator_validation_stage_duration_seconds"], map[string]string{
 		"chain": "masterchain", "stage": "verify_transition",
 	}) {

@@ -106,9 +106,21 @@ func (p *phaseTimer) report(b *testing.B, phases []string) {
 	b.Log(table.String())
 }
 
-// collateWithPhases mirrors Builder.BuildShard so each step can be timed.
-// TestCollationPhaseOrderMatchesBuildShard fails if the two drift apart.
-func collateWithPhases(tb testing.TB, builder *Builder, req ShardRequest, timer *phaseTimer) *Candidate {
+// collateThroughAccounts runs the pipeline up to and including finishAccounts
+// and hands back the collation itself. finish() seals the read set and empties
+// it, so a caller that needs to see what the collation read has to stop here.
+func collateThroughAccounts(tb testing.TB, builder *Builder, req ShardRequest, timer *phaseTimer) *collation {
+	tb.Helper()
+
+	c := collateBeforeAccounts(tb, builder, req, timer)
+	timer.run(tb, "finish-accounts", c.finishAccounts)
+	return c
+}
+
+// collateBeforeAccounts stops one phase earlier, so a caller can bracket
+// finishAccounts itself — what it costs, or what it asks storage for — instead
+// of only seeing the collation after it ran.
+func collateBeforeAccounts(tb testing.TB, builder *Builder, req ShardRequest, timer *phaseTimer) *collation {
 	tb.Helper()
 
 	ctx := context.Background()
@@ -132,7 +144,15 @@ func collateWithPhases(tb testing.TB, builder *Builder, req ShardRequest, timer 
 	})
 	timer.run(tb, "processed-info", c.updateProcessedInfo)
 	timer.run(tb, "claimed-local-cleanup", c.cleanupClaimedLocalDequeues)
-	timer.run(tb, "finish-accounts", c.finishAccounts)
+	return c
+}
+
+// collateWithPhases mirrors Builder.BuildShard so each step can be timed.
+// TestCollationPhaseOrderMatchesBuildShard fails if the two drift apart.
+func collateWithPhases(tb testing.TB, builder *Builder, req ShardRequest, timer *phaseTimer) *Candidate {
+	tb.Helper()
+
+	c := collateThroughAccounts(tb, builder, req, timer)
 
 	var candidate *Candidate
 	timer.run(tb, "finish", func() error {

@@ -186,10 +186,6 @@ func testLibraryCollation(
 	if err != nil {
 		t.Fatal(err)
 	}
-	transactions, err := tlb.NewAccountTransactionsAugDict()
-	if err != nil {
-		t.Fatal(err)
-	}
 	key := [32]byte{}
 	copy(key[:], addr.Data())
 	return &collation{
@@ -197,10 +193,10 @@ func testLibraryCollation(
 		master:   &masterCollation{},
 		lanes: map[[32]byte]*accountLane{
 			key: {
-				key:          key,
-				original:     original,
-				current:      current,
-				transactions: transactions,
+				key:      key,
+				original: original,
+				current:  current,
+				touched:  true,
 			},
 		},
 	}

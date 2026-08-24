@@ -402,10 +402,12 @@ func TestBuildCollatedRootsIncludesOnlyUsedStorageStats(t *testing.T) {
 	}
 	used := storageStatTestDict(t)
 	unused := storageStatTestDict(t)
-	usedProof := cell.NewMerkleProofBuilder(used)
+	usedProofRecord := newAccountStorageProof(used)
+	usedProof := usedProofRecord.builder
 	if _, err := usedProof.Root().AsDict(256).LoadValueByBytesKey(storageStatTestKeys[0][:]); err != nil {
 		t.Fatal(err)
 	}
+	unusedProofRecord := newAccountStorageProof(unused)
 	c := &collation{
 		ctx:     context.Background(),
 		config:  req.Masterchain.Config,
@@ -417,15 +419,19 @@ func TestBuildCollatedRootsIncludesOnlyUsedStorageStats(t *testing.T) {
 			{1}: {
 				initialStorageStat: used,
 				storageProof:       usedProof,
-				transactions:       new(tlb.AccountTransactionsAugDict),
+				touched:            true,
 			},
 			// A committed transaction that never reads its storage-stat dictionary
 			// must not contribute an all-pruned proof.
 			{2}: {
 				initialStorageStat: unused,
-				storageProof:       cell.NewMerkleProofBuilder(unused),
-				transactions:       new(tlb.AccountTransactionsAugDict),
+				storageProof:       unusedProofRecord.builder,
+				touched:            true,
 			},
+		},
+		accountStorageProofs: map[cell.Hash]*accountStorageProof{
+			used.HashKey():   usedProofRecord,
+			unused.HashKey(): unusedProofRecord,
 		},
 		fullCollated:          true,
 		collatedProofEstimate: estimator,
@@ -435,15 +441,13 @@ func TestBuildCollatedRootsIncludesOnlyUsedStorageStats(t *testing.T) {
 		used.HashKey():   used,
 		unused.HashKey(): unused,
 	}
-	// The snapshot the first transaction leaves behind, which only feeds the size
-	// estimate. A second transaction of the same account then reads another
-	// branch of the dictionary — the emitted proof has to carry that one too.
-	if err := c.trackAccountStorageProof(c.lanes[[32]byte{1}]); err != nil {
-		t.Fatal(err)
-	}
+	// A second transaction of the same account reads another branch. The
+	// incremental estimate and the emitted proof both have to carry that one too.
+	c.trackAccountStorageProof(c.lanes[[32]byte{1}])
 	if _, err := usedProof.Root().AsDict(256).LoadValueByBytesKey(storageStatTestKeys[4][:]); err != nil {
 		t.Fatal(err)
 	}
+	c.trackAccountStorageProof(c.lanes[[32]byte{1}])
 	consensusExtra := cell.BeginCell().
 		MustStoreUInt(consensusExtraDataTag, 32).
 		MustStoreUInt(0, 32).
@@ -662,7 +666,7 @@ func TestPreviousStateProofCoversTransactionDispatchLookup(t *testing.T) {
 		},
 		shard: msgpool.ShardIdent{Workchain: req.Shard.Workchain, Shard: uint64(req.Shard.Shard)},
 		lanes: map[[32]byte]*accountLane{
-			transactionAccount: {transactions: new(tlb.AccountTransactionsAugDict)},
+			transactionAccount: {touched: true},
 		},
 	}
 	if err := c.traceDispatchQueueValidationClosure(); err != nil {
@@ -719,7 +723,8 @@ func storageStatTestDict(tb testing.TB) *cell.Cell {
 func TestTrackAccountStorageProofUsesDictionaryReads(t *testing.T) {
 	keys := storageStatTestKeys
 	root := storageStatTestDict(t)
-	builder := cell.NewMerkleProofBuilder(root)
+	record := newAccountStorageProof(root)
+	builder := record.builder
 	if _, err := builder.Root().AsDict(256).LoadValueByBytesKey(keys[0][:]); err != nil {
 		t.Fatal(err)
 	}
@@ -728,15 +733,26 @@ func TestTrackAccountStorageProofUsesDictionaryReads(t *testing.T) {
 		initialStorageStat: root,
 		storageProof:       builder,
 	}
-	c := &collation{fullCollated: true, collatedProofEstimate: newProofSizeEstimator(0)}
-	if err := c.trackAccountStorageProof(lane); err != nil {
+	c := &collation{
+		fullCollated:          true,
+		collatedProofEstimate: newProofSizeEstimator(0),
+		accountStorageProofs:  map[cell.Hash]*accountStorageProof{root.HashKey(): record},
+	}
+	c.trackAccountStorageProof(lane)
+	if c.collatedFixedEstimate == 0 {
+		t.Fatal("used storage dictionary charged no collated bytes")
+	}
+
+	proof, err := builder.CreateProof()
+	if err != nil {
 		t.Fatal(err)
 	}
-	loader := lane.initialStorageProof.MustBeginParse()
+	wrapped := wrapAccountStorageProof(proof)
+	loader := wrapped.MustBeginParse()
 	if tag := loader.MustLoadUInt(32); tag != accountStorageDictProofTag {
 		t.Fatalf("account storage proof tag = %x", tag)
 	}
-	proof, err := loader.LoadRefCell()
+	proof, err = loader.LoadRefCell()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -750,22 +766,29 @@ func TestTrackAccountStorageProofUsesDictionaryReads(t *testing.T) {
 	if _, err = proven.AsDict(256).LoadValueByBytesKey(keys[3][:]); err == nil {
 		t.Fatal("unread account storage branch was included in usage proof")
 	}
+	boc, err := wrapped.ToBOCWithOptionsErr(cell.BOCSerializeOptions{WithCRC32C: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.collatedFixedEstimate < uint64(len(boc)) {
+		t.Fatalf("storage proof estimate = %d, exact wrapped BOC = %d", c.collatedFixedEstimate, len(boc))
+	}
 }
 
 func TestTrackAccountStorageProofSkipsUntouchedDictionary(t *testing.T) {
 	root := storageStatTestDict(t)
+	record := newAccountStorageProof(root)
 	lane := &accountLane{
 		initialStorageStat: root,
-		storageProof:       cell.NewMerkleProofBuilder(root),
+		storageProof:       record.builder,
 	}
-	c := &collation{fullCollated: true, collatedProofEstimate: newProofSizeEstimator(0)}
+	c := &collation{
+		fullCollated:          true,
+		collatedProofEstimate: newProofSizeEstimator(0),
+		accountStorageProofs:  map[cell.Hash]*accountStorageProof{root.HashKey(): record},
+	}
 
-	if err := c.trackAccountStorageProof(lane); err != nil {
-		t.Fatal(err)
-	}
-	if lane.initialStorageProof != nil {
-		t.Fatal("untouched storage dictionary produced a proof")
-	}
+	c.trackAccountStorageProof(lane)
 	if c.collatedFixedEstimate != 0 {
 		t.Fatalf("untouched storage dictionary charged %d collated bytes", c.collatedFixedEstimate)
 	}

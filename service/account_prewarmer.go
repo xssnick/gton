@@ -13,9 +13,9 @@ import (
 )
 
 const (
-	DefaultAccountPrewarmerWorkers   = 32
+	DefaultAccountPrewarmerWorkers   = 64
 	DefaultAccountPrewarmerQueueSize = 512
-	accountPrewarmerQueuedPerWorker  = 16
+	messageRootPrewarmerWorkers      = 8
 )
 
 var ErrAccountPrewarmerClosed = errors.New("account prewarmer is closed")
@@ -32,7 +32,10 @@ type AccountRootResolver interface {
 }
 
 type AccountPrewarmerOptions struct {
-	Workers   int
+	// Workers is the background worker count. Zero uses 64.
+	Workers int
+	// QueueSize is the number of pending hints in each normal lane: accounts
+	// and exact cell roots. Zero uses 512.
 	QueueSize int
 }
 
@@ -55,18 +58,20 @@ type accountPrewarmTaskState uint8
 const (
 	accountPrewarmTaskQueued accountPrewarmTaskState = iota + 1
 	accountPrewarmTaskRunning
-	accountPrewarmTaskImmediate
+	accountPrewarmTaskUrgent
 )
 
 // AccountPrewarmer owns a bounded, best-effort worker pool for account-state
-// cell-record prewarming. Enqueue methods never wait for queue capacity.
+// and exact-root cell-record prewarming. Enqueue methods never wait for queue
+// capacity.
 type AccountPrewarmer struct {
-	log            zerolog.Logger
-	warmer         CellRecordWarmer
-	resolver       AccountRootResolver
-	workers        int
-	tasks          chan accountPrewarmTask
-	immediateSlots chan struct{}
+	log          zerolog.Logger
+	warmer       CellRecordWarmer
+	resolver     AccountRootResolver
+	workers      int
+	accountTasks chan accountPrewarmTask
+	rootTasks    chan accountPrewarmTask
+	urgentTasks  chan accountPrewarmTask
 
 	mu           sync.Mutex
 	started      bool
@@ -101,20 +106,21 @@ func NewAccountPrewarmer(
 
 	queueSize := opts.QueueSize
 	if queueSize == 0 {
-		queueSize = workers * accountPrewarmerQueuedPerWorker
+		queueSize = DefaultAccountPrewarmerQueueSize
 	} else if queueSize < 0 {
 		return nil, fmt.Errorf("account prewarmer queue size must be positive")
 	}
 
 	return &AccountPrewarmer{
-		log:            logger,
-		warmer:         warmer,
-		resolver:       resolver,
-		workers:        workers,
-		tasks:          make(chan accountPrewarmTask, queueSize),
-		immediateSlots: make(chan struct{}, workers),
-		taskStates:     make(map[accountPrewarmTask]accountPrewarmTaskState, queueSize+workers),
-		warmingRoots:   make(map[cell.Hash]struct{}, workers),
+		log:          logger,
+		warmer:       warmer,
+		resolver:     resolver,
+		workers:      workers,
+		accountTasks: make(chan accountPrewarmTask, queueSize),
+		rootTasks:    make(chan accountPrewarmTask, queueSize),
+		urgentTasks:  make(chan accountPrewarmTask, workers),
+		taskStates:   make(map[accountPrewarmTask]accountPrewarmTaskState, 2*queueSize+workers),
+		warmingRoots: make(map[cell.Hash]struct{}, workers),
 	}, nil
 }
 
@@ -122,7 +128,7 @@ func NewAccountPrewarmer(
 // includes work that can start immediately and the bounded backlog that keeps
 // those workers busy while transaction execution advances through the block.
 func (p *AccountPrewarmer) PrewarmCapacity() int {
-	return p.workers + cap(p.tasks)
+	return p.workers + cap(p.accountTasks)
 }
 
 // Start starts the worker pool once. Repeated calls while it is running are
@@ -141,8 +147,11 @@ func (p *AccountPrewarmer) Start(ctx context.Context) error {
 	p.runCtx, p.cancel = context.WithCancel(ctx)
 	p.started = true
 	p.wg.Add(p.workers)
+	// Exact roots make bounded progress without taking every worker away from
+	// account resolution when a pool has more than one worker.
+	rootWorkers := min(messageRootPrewarmerWorkers, max(1, p.workers-1))
 	for worker := 0; worker < p.workers; worker++ {
-		go p.runWorker(p.runCtx)
+		go p.runWorker(p.runCtx, worker < rootWorkers)
 	}
 	return nil
 }
@@ -166,9 +175,10 @@ func (p *AccountPrewarmer) Close() {
 	})
 }
 
-// EnqueueRoot submits an already-resolved account root without waiting for a
-// worker or queue capacity. It returns false when the task is already pending,
-// is currently running, or cannot be queued.
+// EnqueueRoot submits an already-resolved cell-tree root without waiting for a
+// worker or queue capacity. Exact roots use a separate low-priority lane so a
+// stream of message envelopes cannot displace account hints. It returns false
+// when the task is already pending, is currently running, or cannot be queued.
 func (p *AccountPrewarmer) EnqueueRoot(root cell.Hash) bool {
 	task := accountPrewarmTask{kind: accountPrewarmRoot, root: root}
 
@@ -194,10 +204,10 @@ func (p *AccountPrewarmer) EnqueueAccount(workchain int32, account [32]byte) boo
 	return p.enqueueLocked(task)
 }
 
-// PrewarmAccountNow starts one account warm immediately, bypassing the bounded
-// hint queue. Collation uses it as an early hint for generated destinations
-// that may execute in the current block, and deduplication still limits one
-// in-flight goroutine per destination account.
+// PrewarmAccountNow promotes one account into the worker pool's bounded urgent
+// lane. Collation uses it for generated destinations that may execute in the
+// current block; urgent work bypasses the normal hint backlog without creating
+// workers beyond the configured concurrency.
 func (p *AccountPrewarmer) PrewarmAccountNow(workchain int32, account [32]byte) bool {
 	task := accountPrewarmTask{
 		kind:      accountPrewarmAddress,
@@ -216,21 +226,14 @@ func (p *AccountPrewarmer) PrewarmAccountNow(workchain int32, account [32]byte) 
 		return false
 	}
 	select {
-	case p.immediateSlots <- struct{}{}:
+	case p.urgentTasks <- task:
 	default:
 		p.mu.Unlock()
 		return false
 	}
-	p.taskStates[task] = accountPrewarmTaskImmediate
-	ctx := p.runCtx
-	p.wg.Add(1)
+	p.taskStates[task] = accountPrewarmTaskUrgent
 	p.mu.Unlock()
 
-	go func() {
-		defer p.wg.Done()
-		defer func() { <-p.immediateSlots }()
-		p.processTask(ctx, task)
-	}()
 	return true
 }
 
@@ -243,8 +246,12 @@ func (p *AccountPrewarmer) enqueueLocked(task accountPrewarmTask) bool {
 	}
 
 	p.taskStates[task] = accountPrewarmTaskQueued
+	queue := p.accountTasks
+	if task.kind == accountPrewarmRoot {
+		queue = p.rootTasks
+	}
 	select {
-	case p.tasks <- task:
+	case queue <- task:
 		return true
 	default:
 		delete(p.taskStates, task)
@@ -256,27 +263,92 @@ func (p *AccountPrewarmer) acceptingLocked() bool {
 	return p.started && !p.closed && p.runCtx.Err() == nil
 }
 
-func (p *AccountPrewarmer) runWorker(ctx context.Context) {
+func (p *AccountPrewarmer) runWorker(ctx context.Context, roots bool) {
 	defer p.wg.Done()
 
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		case task := <-p.tasks:
-			if !p.beginQueuedTask(ctx, task) {
-				continue
+		}
+
+		select {
+		case task := <-p.urgentTasks:
+			if p.beginPendingTask(ctx, task, accountPrewarmTaskUrgent) {
+				p.processTask(ctx, task)
 			}
+			continue
+		default:
+		}
+
+		if roots {
+			select {
+			case task := <-p.rootTasks:
+				if p.beginPendingTask(ctx, task, accountPrewarmTaskQueued) {
+					p.processTask(ctx, task)
+				}
+				continue
+			default:
+			}
+		}
+
+		select {
+		case task := <-p.accountTasks:
+			if p.beginPendingTask(ctx, task, accountPrewarmTaskQueued) {
+				p.processTask(ctx, task)
+			}
+			continue
+		default:
+		}
+
+		if roots {
+			p.waitForAnyTask(ctx)
+			continue
+		}
+		p.waitForAccountTask(ctx)
+	}
+}
+
+func (p *AccountPrewarmer) waitForAnyTask(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+	case task := <-p.urgentTasks:
+		if p.beginPendingTask(ctx, task, accountPrewarmTaskUrgent) {
+			p.processTask(ctx, task)
+		}
+	case task := <-p.rootTasks:
+		if p.beginPendingTask(ctx, task, accountPrewarmTaskQueued) {
+			p.processTask(ctx, task)
+		}
+	case task := <-p.accountTasks:
+		if p.beginPendingTask(ctx, task, accountPrewarmTaskQueued) {
 			p.processTask(ctx, task)
 		}
 	}
 }
 
-func (p *AccountPrewarmer) beginQueuedTask(ctx context.Context, task accountPrewarmTask) bool {
+func (p *AccountPrewarmer) waitForAccountTask(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+	case task := <-p.urgentTasks:
+		if p.beginPendingTask(ctx, task, accountPrewarmTaskUrgent) {
+			p.processTask(ctx, task)
+		}
+	case task := <-p.accountTasks:
+		if p.beginPendingTask(ctx, task, accountPrewarmTaskQueued) {
+			p.processTask(ctx, task)
+		}
+	}
+}
+
+func (p *AccountPrewarmer) beginPendingTask(
+	ctx context.Context,
+	task accountPrewarmTask,
+	want accountPrewarmTaskState,
+) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.taskStates[task] != accountPrewarmTaskQueued {
+	if p.taskStates[task] != want {
 		return false
 	}
 	if ctx.Err() != nil {
@@ -307,7 +379,7 @@ func (p *AccountPrewarmer) processTask(ctx context.Context, task accountPrewarmT
 	defer p.releaseRoot(root)
 
 	if err := p.warmer.WarmCellRecords(ctx, root); err != nil {
-		p.logTaskError(task, root, "prewarm account cell records", err)
+		p.logTaskError(task, root, "prewarm cell records", err)
 	}
 }
 
@@ -326,7 +398,7 @@ func (p *AccountPrewarmer) claimRoot(task accountPrewarmTask, root cell.Hash) bo
 			}
 			// The address task has already resolved the same root. Supersede the
 			// queued exact-root copy; its channel value will be ignored by
-			// beginQueuedTask when a worker eventually receives it.
+			// beginPendingTask when a worker eventually receives it.
 			delete(p.taskStates, exact)
 		}
 	}

@@ -29,6 +29,11 @@ func (f accountPrewarmerTestResolver) AccountRoot(ctx context.Context, workchain
 }
 
 func TestAccountPrewarmerDefaultsAndLifecycle(t *testing.T) {
+	const (
+		wantWorkers = 64
+		wantQueue   = 512
+	)
+
 	warmer := accountPrewarmerTestWarmer(func(context.Context, cell.Hash) error {
 		return nil
 	})
@@ -39,13 +44,16 @@ func TestAccountPrewarmerDefaultsAndLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new account prewarmer: %v", err)
 	}
-	if prewarmer.workers != DefaultAccountPrewarmerWorkers {
-		t.Fatalf("workers = %d, want %d", prewarmer.workers, DefaultAccountPrewarmerWorkers)
+	if prewarmer.workers != wantWorkers {
+		t.Fatalf("workers = %d, want %d", prewarmer.workers, wantWorkers)
 	}
-	if capacity := cap(prewarmer.tasks); capacity != DefaultAccountPrewarmerQueueSize {
-		t.Fatalf("queue capacity = %d, want %d", capacity, DefaultAccountPrewarmerQueueSize)
+	if capacity := cap(prewarmer.accountTasks); capacity != wantQueue {
+		t.Fatalf("account queue capacity = %d, want %d", capacity, wantQueue)
 	}
-	if capacity := prewarmer.PrewarmCapacity(); capacity != DefaultAccountPrewarmerWorkers+DefaultAccountPrewarmerQueueSize {
+	if capacity := cap(prewarmer.rootTasks); capacity != wantQueue {
+		t.Fatalf("root queue capacity = %d, want %d", capacity, wantQueue)
+	}
+	if capacity := prewarmer.PrewarmCapacity(); capacity != wantWorkers+wantQueue {
 		t.Fatalf("prewarm capacity = %d, want workers plus bounded queue", capacity)
 	}
 	if prewarmer.EnqueueRoot(cell.Hash{1}) {
@@ -69,7 +77,7 @@ func TestAccountPrewarmerDefaultsAndLifecycle(t *testing.T) {
 	}
 }
 
-func TestAccountPrewarmerDefaultQueueScalesWithWorkers(t *testing.T) {
+func TestAccountPrewarmerDefaultQueueIsIndependentOfWorkers(t *testing.T) {
 	warmer := accountPrewarmerTestWarmer(func(context.Context, cell.Hash) error {
 		return nil
 	})
@@ -81,9 +89,12 @@ func TestAccountPrewarmerDefaultQueueScalesWithWorkers(t *testing.T) {
 		t.Fatalf("new account prewarmer: %v", err)
 	}
 
-	wantQueue := 8 * accountPrewarmerQueuedPerWorker
-	if capacity := cap(prewarmer.tasks); capacity != wantQueue {
-		t.Fatalf("queue capacity = %d, want %d", capacity, wantQueue)
+	wantQueue := DefaultAccountPrewarmerQueueSize
+	if capacity := cap(prewarmer.accountTasks); capacity != wantQueue {
+		t.Fatalf("account queue capacity = %d, want %d", capacity, wantQueue)
+	}
+	if capacity := cap(prewarmer.rootTasks); capacity != wantQueue {
+		t.Fatalf("root queue capacity = %d, want %d", capacity, wantQueue)
 	}
 	if capacity := prewarmer.PrewarmCapacity(); capacity != 8+wantQueue {
 		t.Fatalf("prewarm capacity = %d, want %d", capacity, 8+wantQueue)
@@ -178,7 +189,136 @@ func TestAccountPrewarmerEnqueueIsBoundedAndDeduplicated(t *testing.T) {
 	}
 }
 
-func TestAccountPrewarmerImmediateAccountBypassesFullQueue(t *testing.T) {
+func TestAccountPrewarmerRootBacklogDoesNotConsumeAccountQueue(t *testing.T) {
+	started := make(chan cell.Hash, 4)
+	release := make(chan struct{})
+	warmer := accountPrewarmerTestWarmer(func(ctx context.Context, root cell.Hash) error {
+		started <- root
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	resolver := accountPrewarmerTestResolver(func(_ context.Context, _ int32, account [32]byte) (cell.Hash, error) {
+		return cell.Hash{account[0]}, nil
+	})
+	prewarmer, err := NewAccountPrewarmer(zerolog.Nop(), warmer, resolver, AccountPrewarmerOptions{
+		Workers:   1,
+		QueueSize: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = prewarmer.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(prewarmer.Close)
+
+	if !prewarmer.EnqueueRoot(cell.Hash{1}) {
+		t.Fatal("running root was not enqueued")
+	}
+	if got := receivePrewarmHash(t, started); got != (cell.Hash{1}) {
+		t.Fatalf("running root = %x, want 01", got)
+	}
+	if !prewarmer.EnqueueRoot(cell.Hash{2}) {
+		t.Fatal("root backlog was not filled")
+	}
+	if prewarmer.EnqueueRoot(cell.Hash{3}) {
+		t.Fatal("root queue exceeded its bound")
+	}
+	if !prewarmer.EnqueueAccount(0, [32]byte{4}) {
+		t.Fatal("full root queue displaced the account hint")
+	}
+	if prewarmer.EnqueueAccount(0, [32]byte{5}) {
+		t.Fatal("account queue exceeded its independent bound")
+	}
+
+	close(release)
+	if got := receivePrewarmHash(t, started); got != (cell.Hash{2}) {
+		t.Fatalf("next root = %x, want queued root 02", got)
+	}
+	if got := receivePrewarmHash(t, started); got != (cell.Hash{4}) {
+		t.Fatalf("root after backlog = %x, want account root 04", got)
+	}
+}
+
+func TestAccountPrewarmerBoundsRootConcurrencyInsideWorkerLimit(t *testing.T) {
+	const workers = 10
+
+	started := make(chan cell.Hash, 32)
+	release := make(chan struct{})
+	var active atomic.Int32
+	var activeRoots atomic.Int32
+	warmer := accountPrewarmerTestWarmer(func(ctx context.Context, root cell.Hash) error {
+		active.Add(1)
+		if root[0] < 0x80 {
+			activeRoots.Add(1)
+		}
+		started <- root
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		if root[0] < 0x80 {
+			activeRoots.Add(-1)
+		}
+		active.Add(-1)
+		return ctx.Err()
+	})
+	resolver := accountPrewarmerTestResolver(func(_ context.Context, _ int32, account [32]byte) (cell.Hash, error) {
+		return cell.Hash{0x80 + account[0]}, nil
+	})
+	prewarmer, err := NewAccountPrewarmer(zerolog.Nop(), warmer, resolver, AccountPrewarmerOptions{
+		Workers:   workers,
+		QueueSize: 16,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = prewarmer.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(prewarmer.Close)
+
+	for i := byte(1); i <= workers; i++ {
+		if !prewarmer.EnqueueRoot(cell.Hash{i}) {
+			t.Fatalf("enqueue root %d failed", i)
+		}
+	}
+	for range messageRootPrewarmerWorkers {
+		root := receivePrewarmHash(t, started)
+		if root[0] >= 0x80 {
+			t.Fatalf("account root %x started before the root concurrency bound was reached", root)
+		}
+	}
+	if got := activeRoots.Load(); got != messageRootPrewarmerWorkers {
+		t.Fatalf("active root warms = %d, want %d", got, messageRootPrewarmerWorkers)
+	}
+
+	for i := byte(1); i <= workers; i++ {
+		if !prewarmer.EnqueueAccount(0, [32]byte{i}) {
+			t.Fatalf("enqueue account %d failed", i)
+		}
+	}
+	for range workers - messageRootPrewarmerWorkers {
+		root := receivePrewarmHash(t, started)
+		if root[0] < 0x80 {
+			t.Fatalf("root warm %x exceeded the root concurrency bound", root)
+		}
+	}
+	if got := active.Load(); got != workers {
+		t.Fatalf("total active warms = %d, want worker limit %d", got, workers)
+	}
+	if got := activeRoots.Load(); got != messageRootPrewarmerWorkers {
+		t.Fatalf("active root warms = %d, want bound %d", got, messageRootPrewarmerWorkers)
+	}
+
+	close(release)
+}
+
+func TestAccountPrewarmerUrgentAccountBypassesBacklogWithinWorkerLimit(t *testing.T) {
 	started := make(chan cell.Hash, 3)
 	release := make(chan struct{})
 	warmer := accountPrewarmerTestWarmer(func(ctx context.Context, root cell.Hash) error {
@@ -219,19 +359,24 @@ func TestAccountPrewarmerImmediateAccountBypassesFullQueue(t *testing.T) {
 		t.Fatal("queued root was not enqueued")
 	}
 	if !prewarmer.PrewarmAccountNow(0, [32]byte{3}) {
-		t.Fatal("immediate account was not started")
-	}
-	if got := receivePrewarmHash(t, started); got != (cell.Hash{3}) {
-		t.Fatalf("next started root = %x, want immediate 03", got)
+		t.Fatal("urgent account was not scheduled")
 	}
 	if prewarmer.PrewarmAccountNow(0, [32]byte{3}) {
-		t.Fatal("running immediate account was started twice")
+		t.Fatal("pending urgent account was scheduled twice")
 	}
 	if prewarmer.PrewarmAccountNow(0, [32]byte{4}) {
-		t.Fatal("second immediate account exceeded the direct concurrency bound")
+		t.Fatal("second urgent account exceeded the urgent queue bound")
+	}
+	select {
+	case root := <-started:
+		t.Fatalf("urgent root %x exceeded the one-worker concurrency bound", root)
+	default:
 	}
 
 	close(release)
+	if got := receivePrewarmHash(t, started); got != (cell.Hash{3}) {
+		t.Fatalf("next started root = %x, want urgent 03", got)
+	}
 }
 
 func TestAccountPrewarmerImmediateSupersedesQueuedCopy(t *testing.T) {
@@ -301,10 +446,16 @@ func TestAccountPrewarmerImmediateSupersedesQueuedCopy(t *testing.T) {
 				t.Fatal("exact root was not queued")
 			}
 			if !prewarmer.PrewarmAccountNow(0, account) {
-				t.Fatal("immediate account was not started")
+				t.Fatal("urgent account was not scheduled")
 			}
+			select {
+			case root := <-started:
+				t.Fatalf("urgent root %x exceeded the one-worker concurrency bound", root)
+			default:
+			}
+			close(releaseWorker)
 			if got := receivePrewarmHash(t, started); got != (cell.Hash{2}) {
-				t.Fatalf("immediate root = %x, want 02", got)
+				t.Fatalf("urgent root = %x, want 02", got)
 			}
 
 			close(releaseImmediate)
@@ -313,7 +464,6 @@ func TestAccountPrewarmerImmediateSupersedesQueuedCopy(t *testing.T) {
 				workchain: 0,
 				account:   account,
 			})
-			close(releaseWorker)
 			enqueuePrewarmRootEventually(t, prewarmer, cell.Hash{3})
 			if got := receivePrewarmHash(t, started); got != (cell.Hash{3}) {
 				t.Fatalf("root after stale queue copy = %x, want 03", got)
@@ -512,9 +662,6 @@ func TestAccountPrewarmerPromotionRacesClose(t *testing.T) {
 		prewarmer.mu.Unlock()
 		if states != 0 {
 			t.Fatalf("iteration %d: task states after close = %d, want 0", iteration, states)
-		}
-		if slots := len(prewarmer.immediateSlots); slots != 0 {
-			t.Fatalf("iteration %d: immediate slots after close = %d, want 0", iteration, slots)
 		}
 	}
 }

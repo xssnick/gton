@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"math/big"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -480,6 +481,14 @@ func extMsgCell(t testing.TB, addr [32]byte, tag uint64) *cell.Cell {
 		EndCell()
 }
 
+func externalHookEvent(root *cell.Cell, isLocal bool) hooks.ExternalMessageEvent {
+	return hooks.ExternalMessageEvent{
+		IsLocal:        isLocal,
+		SerializedSize: len(root.ToBOC()),
+		MessageRoot:    root,
+	}
+}
+
 // buildAppliedBlockRoot assembles a minimal block root whose BlockExtra
 // carries a real InMsgDescr with msg_import_ext entries for the given
 // messages.
@@ -535,14 +544,10 @@ func TestExternalMessagesArePooledWithPriorities(t *testing.T) {
 	local := extMsgCell(t, testAddr(0x01), 1)
 	remote := extMsgCell(t, testAddr(0x02), 2)
 
-	if err := s.OnExternalMessage(context.Background(), hooks.ExternalMessageEvent{
-		IsLocal: false, MessageRoot: remote,
-	}); err != nil {
+	if err := s.OnExternalMessage(context.Background(), externalHookEvent(remote, false)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.OnExternalMessage(context.Background(), hooks.ExternalMessageEvent{
-		IsLocal: true, MessageRoot: local,
-	}); err != nil {
+	if err := s.OnExternalMessage(context.Background(), externalHookEvent(local, true)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -565,7 +570,7 @@ func TestAppliedBlockCleansPool(t *testing.T) {
 	msgA := extMsgCell(t, testAddr(0x11), 1)
 	msgB := extMsgCell(t, testAddr(0x12), 2)
 	for _, m := range []*cell.Cell{msgA, msgB} {
-		if err := s.OnExternalMessage(context.Background(), hooks.ExternalMessageEvent{MessageRoot: m}); err != nil {
+		if err := s.OnExternalMessage(context.Background(), externalHookEvent(m, false)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -610,7 +615,7 @@ func TestAppliedBlockNormalizedCleanup(t *testing.T) {
 	pooled := build(0)
 	imported := build(777)
 
-	if err := s.OnExternalMessage(context.Background(), hooks.ExternalMessageEvent{MessageRoot: pooled}); err != nil {
+	if err := s.OnExternalMessage(context.Background(), externalHookEvent(pooled, false)); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return s.pool.Stats().Pooled == 1 }, "message not pooled")
@@ -684,9 +689,7 @@ func TestConcurrentHooks(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			msg := extMsgCell(t, testAddr(byte(i)), uint64(i))
-			_ = s.OnExternalMessage(context.Background(), hooks.ExternalMessageEvent{
-				IsLocal: i%2 == 0, MessageRoot: msg,
-			})
+			_ = s.OnExternalMessage(context.Background(), externalHookEvent(msg, i%2 == 0))
 			if i%4 == 0 {
 				root := buildAppliedBlockRoot(t, []*cell.Cell{extMsgCell(t, testAddr(byte(100+i)), uint64(i))})
 				_ = s.OnBlockApplied(context.Background(), appliedEvent(root))
@@ -754,9 +757,10 @@ func TestCloseIsGracefulAndIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Hooks after close are ignored quietly.
-	if err = s.OnExternalMessage(context.Background(), hooks.ExternalMessageEvent{
-		MessageRoot: extMsgCell(t, testAddr(0x31), 1),
-	}); err != nil {
+	if err = s.OnExternalMessage(
+		context.Background(),
+		externalHookEvent(extMsgCell(t, testAddr(0x31), 1), false),
+	); err != nil {
 		t.Fatal(err)
 	}
 	bad := cell.BeginCell().MustStoreUInt(0xbad, 32).EndCell()
@@ -1109,11 +1113,21 @@ func TestServiceCloseLeavesSharedRuntimeToCompositionRoot(t *testing.T) {
 	}
 
 	message := extMsgCell(t, testAddr(0x61), 1)
-	if err = opts.Runtime.Messages.AddExternal(nil, message, nil, msgpool.ExternalPriorityLocal); err != nil {
+	if _, err = opts.Runtime.Messages.AddExternal(
+		len(message.ToBOC()),
+		message,
+		nil,
+		msgpool.ExternalPriorityLocal,
+	); err != nil {
 		t.Fatalf("shared message pool closed with validator service: %v", err)
 	}
 	opts.Runtime.Close()
-	if err = opts.Runtime.Messages.AddExternal(nil, message, nil, msgpool.ExternalPriorityLocal); !errors.Is(err, msgpool.ErrClosed) {
+	if _, err = opts.Runtime.Messages.AddExternal(
+		len(message.ToBOC()),
+		message,
+		nil,
+		msgpool.ExternalPriorityLocal,
+	); !errors.Is(err, msgpool.ErrClosed) {
 		t.Fatalf("runtime close error = %v, want message pool closed", err)
 	}
 }
@@ -1391,13 +1405,16 @@ func feedRef(root *cell.Cell, seqno uint32) msgpool.SourceRef {
 
 func TestInternalsFeedSeedsAppliesAndHealsGaps(t *testing.T) {
 	s := newTestService(t, Options{})
+	warmer := &recordedServiceAccountPrewarmer{}
+	s.accountPrewarmer = warmer
 	internals := s.pool.Internals()
 
 	// Block 1 arrives with its post-state: the source is unseen, the run
 	// seeds from the state queue.
 	msgA := feedInternalMsg(t, 0x22, 1000)
+	envelopeA := feedEnvelope(t, msgA)
 	state1 := feedStateRoot(t, map[msgpool.QueueKey]tlb.EnqueuedMsg{
-		feedQueueKey(t, msgA, 0x22): {EnqueuedLT: 1000, Msg: feedEnvelope(t, msgA)},
+		feedQueueKey(t, msgA, 0x22): {EnqueuedLT: 1000, Msg: envelopeA},
 	})
 	block1 := feedBlockRoot(t, nil)
 	ev1 := appliedEvent(block1)
@@ -1409,11 +1426,13 @@ func TestInternalsFeedSeedsAppliesAndHealsGaps(t *testing.T) {
 		top, err := internals.SourceTop(allShard, allShard)
 		return err == nil && top == feedRef(block1, 1)
 	}, "run not seeded from the first applied block")
+	waitFor(t, func() bool { return len(warmer.snapshot()) == 1 }, "seeded account was not prewarmed")
 
 	// Block 2 extends the run through the delta fast path: no state is
 	// attached, so a reseed fallback would visibly drop the source.
 	msgB := feedInternalMsg(t, 0x44, 2000)
-	block2 := feedBlockRoot(t, map[*cell.Cell]*cell.Cell{msgB: feedEnvelope(t, msgB)})
+	envelopeB := feedEnvelope(t, msgB)
+	block2 := feedBlockRoot(t, map[*cell.Cell]*cell.Cell{msgB: envelopeB})
 	ev2 := appliedEvent(block2)
 	ev2.Meta.ID.SeqNo = 2
 	ev2.CurrentState = nil
@@ -1424,6 +1443,7 @@ func TestInternalsFeedSeedsAppliesAndHealsGaps(t *testing.T) {
 		top, err := internals.SourceTop(allShard, allShard)
 		return err == nil && top.Seqno == 2
 	}, "delta fast path did not advance the run")
+	waitFor(t, func() bool { return len(warmer.snapshot()) == 2 }, "delta account was not prewarmed")
 
 	cut, err := internals.Cut(allShard, msgpool.CutRequest{Sources: map[msgpool.ShardIdent]msgpool.CutSource{
 		allShard: {Visible: feedRef(block2, 2)},
@@ -1439,10 +1459,15 @@ func TestInternalsFeedSeedsAppliesAndHealsGaps(t *testing.T) {
 	// ApplyBlock's own continuity guard still turns it into a reseed from
 	// the attached state.
 	msgC := feedInternalMsg(t, 0x55, 3000)
+	envelopeC := feedEnvelope(t, msgC)
 	state4 := feedStateRoot(t, map[msgpool.QueueKey]tlb.EnqueuedMsg{
-		feedQueueKey(t, msgC, 0x55): {EnqueuedLT: 3000, Msg: feedEnvelope(t, msgC)},
+		feedQueueKey(t, msgC, 0x55): {EnqueuedLT: 3000, Msg: envelopeC},
 	})
-	block4 := feedBlockRoot(t, nil)
+	rejectedDeltaMessage := feedInternalMsg(t, 0x66, 4000)
+	rejectedEnvelope := feedEnvelope(t, rejectedDeltaMessage)
+	block4 := feedBlockRoot(t, map[*cell.Cell]*cell.Cell{
+		rejectedDeltaMessage: rejectedEnvelope,
+	})
 	ev4 := appliedEvent(block4)
 	ev4.Meta.ID.SeqNo = 4
 	ev4.CurrentState = state4
@@ -1453,6 +1478,7 @@ func TestInternalsFeedSeedsAppliesAndHealsGaps(t *testing.T) {
 		top, err := internals.SourceTop(allShard, allShard)
 		return err == nil && top.Seqno == 4
 	}, "gap did not trigger a reseed")
+	waitFor(t, func() bool { return len(warmer.snapshot()) == 3 }, "reseeded account was not prewarmed")
 
 	cut, err = internals.Cut(allShard, msgpool.CutRequest{Sources: map[msgpool.ShardIdent]msgpool.CutSource{
 		allShard: {Visible: feedRef(block4, 4)},
@@ -1465,6 +1491,26 @@ func TestInternalsFeedSeedsAppliesAndHealsGaps(t *testing.T) {
 	}
 	if st := internals.Stats(); st.Seeds != 2 || st.AppliedBlocks != 1 {
 		t.Fatalf("internals stats: %+v", st)
+	}
+	warmed := warmer.snapshot()
+	for index, fill := range []byte{0x22, 0x44, 0x55} {
+		want := pooledAccountPrewarmKey{account: testAddr(fill)}
+		if warmed[index] != want {
+			t.Fatalf("prewarmed account %d = %+v, want %+v", index, warmed[index], want)
+		}
+	}
+	warmedRoots := warmer.rootSnapshot()
+	wantRoots := []cell.Hash{envelopeA.HashKey(), envelopeB.HashKey(), envelopeC.HashKey()}
+	if len(warmedRoots) != len(wantRoots) {
+		t.Fatalf("prewarmed envelope roots = %x, want %x", warmedRoots, wantRoots)
+	}
+	for index := range wantRoots {
+		if warmedRoots[index] != wantRoots[index] {
+			t.Fatalf("prewarmed envelope root %d = %x, want %x", index, warmedRoots[index], wantRoots[index])
+		}
+	}
+	if rejected := rejectedEnvelope.HashKey(); slices.Contains(warmedRoots, rejected) {
+		t.Fatalf("rejected gap-delta envelope %x was prewarmed", rejected)
 	}
 }
 
@@ -1639,7 +1685,7 @@ func TestStaleBlocksSkipPoolProcessing(t *testing.T) {
 	internals := s.pool.Internals()
 
 	pooled := extMsgCell(t, testAddr(0x41), 1)
-	if err := s.OnExternalMessage(context.Background(), hooks.ExternalMessageEvent{MessageRoot: pooled}); err != nil {
+	if err := s.OnExternalMessage(context.Background(), externalHookEvent(pooled, false)); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return s.pool.Stats().Pooled == 1 }, "message not pooled")
@@ -1953,7 +1999,7 @@ func TestSettledStaleHeadCannotRunAfterFreshBlock(t *testing.T) {
 	}
 
 	pooled := extMsgCell(t, testAddr(0x42), 1)
-	if err := s.OnExternalMessage(context.Background(), hooks.ExternalMessageEvent{MessageRoot: pooled}); err != nil {
+	if err := s.OnExternalMessage(context.Background(), externalHookEvent(pooled, false)); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.pool.Stats().Pooled; got != 1 {

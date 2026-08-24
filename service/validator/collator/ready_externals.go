@@ -101,6 +101,29 @@ func (s *readyExternalStats) observe(c *collation, preAdmitted int) {
 // acquisition that waits for predecessor states. Together with a non-zero
 // waitUntil it arms the CPU-bound split heuristic; either being zero leaves it
 // inert, which is what the deterministic tests rely on.
+// paceArmed decides whether the CPU-bound split heuristic may measure this
+// build at all.
+//
+// Three conditions, and the third is the one that is not obvious. The heuristic
+// asks whether collation filled more than three fifths of the time available and
+// waited for external messages less than a fifth of it; neither ratio means
+// anything when the numerator started before the denominator did. A build the
+// producer handed over early does exactly that, and clamping its spans to the
+// schedule instead — which is what this used to do — makes the body span equal
+// the total span, so the three-fifths filter becomes unconditionally true and
+// the shard declares itself overloaded on arithmetic nobody meant. The verdict
+// goes into header.WantSplit, which validators mask, so it would be wrong
+// silently.
+//
+// The cost is stated and accepted: a pipelined shard stops reporting
+// OverloadLongCollation. It is self-correcting — a shard that genuinely cannot
+// collate inside its slot has no spare time to hand a successor and so cannot
+// start one early, which re-arms the heuristic exactly when it matters. The
+// block-limit and force-split overload reasons are untouched.
+func paceArmed(started, scheduled, waitUntil time.Time) bool {
+	return !started.IsZero() && !waitUntil.IsZero() && !started.Before(scheduled)
+}
+
 func (b *Builder) buildShardWithReadyExternals(
 	ctx context.Context,
 	req ShardRequest,
@@ -108,7 +131,12 @@ func (b *Builder) buildShardWithReadyExternals(
 	processUntil time.Time,
 	waitUntil time.Time,
 	batchLimit int,
+	// startedAt is when this node began assembling the candidate; scheduledAt is
+	// when it was due to begin. They differ only for a build the producer started
+	// ahead of its slot, and that difference is the whole of what scheduledAt is
+	// for — see the arming condition below.
 	startedAt time.Time,
+	scheduledAt time.Time,
 ) (*Candidate, readyExternalStats, error) {
 	var live readyExternalStats
 	timer := req.assembly.start(CollationStagePrepareState)
@@ -128,12 +156,11 @@ func (b *Builder) buildShardWithReadyExternals(
 	timer.stop()
 
 	transcript := make([]ExternalInput, 0, len(req.Externals))
-	attempt := 0
 	// A size retry re-enters collation, so the body span restarts with it while
 	// the span that began before acquisition does not — the same asymmetry the
 	// reference collator gets from a member initializer and a per-call
 	// assignment.
-	armed := !startedAt.IsZero() && !waitUntil.IsZero()
+	armed := paceArmed(startedAt, scheduledAt, waitUntil)
 	attemptPace := func() collationPace {
 		if !armed {
 			return collationPace{}
@@ -144,15 +171,13 @@ func (b *Builder) buildShardWithReadyExternals(
 			externalWait: func() time.Duration { return live.wait },
 		}
 	}
-	candidate, err := retryUnderSizeLimit(func(narrowing sizeBudgetCap) (*Candidate, error) {
-		current := attempt
-		attempt++
+	candidate, err := retryUnderSizeLimit(ctx, func(attempt collationAttempt) (*Candidate, error) {
 		live.attempts++
-		if current == 0 {
+		if attempt.index == 0 {
 			return b.buildShardReadyAttempt(
 				ctx,
 				req,
-				narrowing,
+				attempt,
 				stream,
 				processUntil,
 				waitUntil,
@@ -163,13 +188,17 @@ func (b *Builder) buildShardWithReadyExternals(
 			)
 		}
 
+		// A rebuild never returns to the stream. It replays what the first
+		// attempt admitted, in the order it admitted it, so the only difference
+		// between attempts is what this one declines — and once the attempt
+		// declines externals outright the transcript is not offered at all,
+		// which spares the rebuild the prewarm of messages it will not read.
 		replay := req
-		if current < 2 {
-			replay.Externals = transcript
-		} else {
+		replay.Externals = transcript
+		if attempt.skipExternals() {
 			replay.Externals = nil
 		}
-		return b.buildShardAttemptPaced(ctx, replay, narrowing, attemptPace())
+		return b.buildShardAttemptPaced(ctx, replay, attempt, attemptPace())
 	})
 	if candidate != nil {
 		candidate.Stats.ExternalWait = live.wait
@@ -179,6 +208,11 @@ func (b *Builder) buildShardWithReadyExternals(
 	if err == nil {
 		err = sealBuiltCandidate(candidate)
 	}
+	if err != nil {
+		// A block that was handed over and then failed to finish leaves a
+		// successor speculating on a slot that will produce nothing.
+		req.successor.revokeOffered(PipelineHandoffAbandonedFailed)
+	}
 
 	return candidate, live, err
 }
@@ -186,7 +220,7 @@ func (b *Builder) buildShardWithReadyExternals(
 func (b *Builder) buildShardReadyAttempt(
 	ctx context.Context,
 	req ShardRequest,
-	narrowing sizeBudgetCap,
+	attempt collationAttempt,
 	stream readyExternalSource,
 	processUntil time.Time,
 	waitUntil time.Time,
@@ -195,11 +229,12 @@ func (b *Builder) buildShardReadyAttempt(
 	live *readyExternalStats,
 	pace collationPace,
 ) (*Candidate, error) {
-	c, err := b.prepareShardPhases(ctx, req, narrowing)
+	c, err := b.prepareShardPhases(ctx, req, attempt)
 	if err != nil {
 		live.failedAt = externalPhasePrepare
 		return nil, err
 	}
+	defer c.stopWaves()
 	c.pace = pace
 
 	waitCtx := ctx
@@ -240,6 +275,17 @@ func (b *Builder) buildShardReadyAttempt(
 	}
 	for {
 		for stop == ExternalStopUnknown {
+			// A closed intake takes nothing out of the pool at all. Every
+			// message TakeReady returned would get the same skip verdict, at
+			// the price of a snapshot, a parse and an account prewarm each —
+			// and, because a skip does not consume the message, the next block
+			// would pay it all again. Left untaken, the messages keep their
+			// generation and their place, and this build spends nothing on
+			// them. The wait branch below stays live: admissions that arrive
+			// during the slot are answered there with the same cheap skip.
+			if c.externalIntakeClosed() {
+				break
+			}
 			timer := c.req.assembly.start(CollationStageExecuteExternalMessages)
 			snapshots := stream.TakeReady(batchLimit)
 			if len(snapshots) == 0 {
@@ -285,8 +331,25 @@ func (b *Builder) buildShardReadyAttempt(
 		}
 		timer.stop()
 		if waitUntil.IsZero() {
-			stop = ExternalStopReadyDrained
+			stop = externalPhaseStop(c, ExternalStopReadyDrained)
 			break
+		}
+
+		// Before parking. The externals ready now are taken, the generated
+		// messages are drained, and this build is about to wait out the rest of
+		// its slot in case more arrive; if the queue still owes it work and the
+		// reserved half of the budget is going unused, that is where it goes.
+		// The loop is re-entered rather than fallen through, so externals that
+		// landed during the top-up are taken before the wait; topUpInternals is
+		// one-shot, so the re-entry cannot repeat.
+		if !c.toppedUp && c.internalsRemain() {
+			if err = c.topUpInternals(); err != nil {
+				live.failedAt = externalPhaseTopUp
+				return nil, err
+			}
+			if c.toppedUp {
+				continue
+			}
 		}
 
 		started := time.Now()
@@ -294,11 +357,21 @@ func (b *Builder) buildShardReadyAttempt(
 		live.wait += time.Since(started)
 		if nextErr != nil {
 			if errors.Is(nextErr, context.DeadlineExceeded) && errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
-				stop = ExternalStopDeadline
+				stop = externalPhaseStop(c, ExternalStopDeadline)
 				break
 			}
 			live.failedAt = externalPhaseWait
 			return nil, nextErr
+		}
+		// The same closed-intake shortcut as above, for the batch the wait
+		// delivered: the skip verdict is recorded from the snapshot's reference
+		// alone, so the batch is never parsed and never prewarmed. It is not
+		// counted as a consumed batch either — nothing of it entered the block.
+		if c.externalIntakeClosed() {
+			for i := range snapshots {
+				c.recordExternal(snapshots[i].Reference(), msgpool.ExternalSkippedLimit)
+			}
+			continue
 		}
 		timer = c.req.assembly.start(CollationStageExecuteExternalMessages)
 		inputs, prepareErr := prepareExternalSnapshots(snapshots)
@@ -323,6 +396,18 @@ func (b *Builder) buildShardReadyAttempt(
 		live.failedAt = externalPhaseFinish
 	}
 	return candidate, finishErr
+}
+
+// externalPhaseStop is the reason the phase reports when it ends of natural
+// causes — drained or slot deadline — while the outbound-queue brake is closed.
+// Both natural reasons are then technically true and completely misleading: the
+// phase consumed nothing because the intake was refusing everything. Stops that
+// name a positive cause (soft limit, attempt limit) are never rewritten.
+func externalPhaseStop(c *collation, natural ExternalStopReason) ExternalStopReason {
+	if c.externalIntakeClosed() {
+		return ExternalStopQueueBrake
+	}
+	return natural
 }
 
 func prepareExternalSnapshots(snapshots []msgpool.ExternalSnapshot) ([]ExternalInput, error) {
@@ -367,16 +452,13 @@ func (b *Builder) buildMasterWithReadyExternals(
 	timer.stop()
 
 	transcript := make([]ExternalInput, 0, len(req.Externals))
-	attempt := 0
-	candidate, err := retryUnderSizeLimit(func(narrowing sizeBudgetCap) (*Candidate, error) {
-		current := attempt
-		attempt++
+	candidate, err := retryUnderSizeLimit(ctx, func(attempt collationAttempt) (*Candidate, error) {
 		live.attempts++
-		if current == 0 {
+		if attempt.index == 0 {
 			return b.buildMasterReadyAttempt(
 				ctx,
 				req,
-				narrowing,
+				attempt,
 				stream,
 				processUntil,
 				batchLimit,
@@ -386,12 +468,11 @@ func (b *Builder) buildMasterWithReadyExternals(
 		}
 
 		replay := req
-		if current < 2 {
-			replay.Externals = transcript
-		} else {
+		replay.Externals = transcript
+		if attempt.skipExternals() {
 			replay.Externals = nil
 		}
-		return b.buildMasterAttempt(ctx, replay, narrowing)
+		return b.buildMasterAttempt(ctx, replay, attempt)
 	})
 	if candidate != nil {
 		candidate.Stats.ExternalBatches = live.batches
@@ -407,18 +488,19 @@ func (b *Builder) buildMasterWithReadyExternals(
 func (b *Builder) buildMasterReadyAttempt(
 	ctx context.Context,
 	req MasterRequest,
-	narrowing sizeBudgetCap,
+	attempt collationAttempt,
 	stream readyExternalSource,
 	processUntil time.Time,
 	batchLimit int,
 	transcript *[]ExternalInput,
 	live *readyExternalStats,
 ) (*Candidate, error) {
-	c, err := b.prepareMasterPhases(ctx, req, narrowing)
+	c, err := b.prepareMasterPhases(ctx, req, attempt)
 	if err != nil {
 		live.failedAt = externalPhasePrepare
 		return nil, err
 	}
+	defer c.stopWaves()
 
 	stop := ExternalStopUnknown
 	defer func() {
@@ -480,6 +562,7 @@ const (
 	externalPhaseTakeReadyBatch     = "take_ready_batch"
 	externalPhaseProcessNewMessages = "process_new_messages"
 	externalPhaseWait               = "wait"
+	externalPhaseTopUp              = "top_up_internals"
 	externalPhaseWaitedBatch        = "waited_batch"
 	externalPhaseFinish             = "finish"
 )

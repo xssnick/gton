@@ -29,7 +29,14 @@ const (
 	consensusPeerSendTimeout   = 10 * time.Second
 	candidateOutboundQueueSize = 8
 	candidateSenderWorkerCount = 4
+	// C++ detaches candidate sends into the transport actor. Go retains a
+	// bounded worker until all peer sends report, so cap that occupancy: a
+	// candidate still blocked after this budget can no longer help the current
+	// fast-finality round and must not hold later slots behind it.
+	candidateTransportSendTimeout = 750 * time.Millisecond
 )
+
+var errCandidateOutboundQueueFull = errors.New("validator network: candidate outbound queue is full")
 
 type privateOverlay interface {
 	Close() error
@@ -105,9 +112,11 @@ type outboundConsensusMessage struct {
 // Candidate buffers are already immutable runtime-owned encodings. Enqueueing
 // transfers references, not payload copies, to the endpoint worker.
 type outboundCandidateMessage struct {
-	signer adnloverlay.BroadcastSigner
-	data   []byte
-	extra  []byte
+	signer   adnloverlay.BroadcastSigner
+	data     []byte
+	extra    []byte
+	chain    collator.MetricChain
+	queuedAt time.Time
 }
 
 type consensusPeerSender struct {
@@ -810,29 +819,49 @@ func (e *sessionEndpoint) BroadcastCandidate(
 		// per-send signer selects the private-overlay handle's node signer.
 		candidateSigner = nil
 	}
-	if !e.enqueueCandidate(outboundCandidateMessage{
+	enqueueErr := e.enqueueCandidate(outboundCandidateMessage{
 		signer: candidateSigner,
 		data:   broadcast.Data,
 		extra:  broadcast.Extra,
-	}) {
-		e.hub.warn("dropping private candidate broadcast because the outbound queue is unavailable", nil)
+		chain:  candidateTransportChain(spec),
+	})
+	if enqueueErr != nil {
+		reason := CandidateOutboundDropUnavailable
+		if errors.Is(enqueueErr, errCandidateOutboundQueueFull) {
+			reason = CandidateOutboundDropQueueFull
+		}
+		if e.hub.manager.candidateMetrics != nil {
+			e.hub.manager.candidateMetrics.AddCandidateOutboundDrop(
+				candidateTransportChain(spec),
+				reason,
+			)
+		}
+		e.hub.warn("dropping private candidate broadcast because the outbound queue is unavailable", enqueueErr)
 	}
 
 	return nil
 }
 
-func (e *sessionEndpoint) enqueueCandidate(message outboundCandidateMessage) bool {
+func (e *sessionEndpoint) enqueueCandidate(message outboundCandidateMessage) error {
 	e.stateMu.Lock()
 	defer e.stateMu.Unlock()
 	if !e.running || e.retired {
-		return false
+		return ErrSessionInactive
+	}
+	message.queuedAt = time.Now()
+	if e.hub.manager.candidateMetrics != nil {
+		e.hub.manager.candidateMetrics.AddCandidateOutboundQueue(message.chain, 1)
 	}
 
 	select {
 	case e.candidateOutbound <- message:
-		return true
+		return nil
 	default:
-		return false
+		if e.hub.manager.candidateMetrics != nil {
+			e.hub.manager.candidateMetrics.AddCandidateOutboundQueue(message.chain, -1)
+		}
+
+		return errCandidateOutboundQueueFull
 	}
 }
 
@@ -843,10 +872,16 @@ func (e *sessionEndpoint) runCandidateSender(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case message := <-e.candidateOutbound:
+			e.observeCandidateDequeued(message, true)
 			if ctx.Err() != nil {
 				return
 			}
-			if err := e.hub.broadcastTwoStep(ctx, message.signer, message.data, message.extra); err != nil && ctx.Err() == nil {
+			sendCtx, cancel := context.WithTimeout(ctx, candidateTransportSendTimeout)
+			started := time.Now()
+			err := e.hub.broadcastTwoStep(sendCtx, message.signer, message.data, message.extra)
+			cancel()
+			e.observeCandidateSend(message.chain, started, err)
+			if err != nil && ctx.Err() == nil {
 				e.hub.warn("send private candidate broadcast", err)
 			}
 		}
@@ -855,7 +890,14 @@ func (e *sessionEndpoint) runCandidateSender(ctx context.Context) {
 
 func (e *sessionEndpoint) drainOutbound() {
 	drainQueue(e.outbound)
-	drainQueue(e.candidateOutbound)
+	for {
+		select {
+		case message := <-e.candidateOutbound:
+			e.observeCandidateDequeued(message, false)
+		default:
+			return
+		}
+	}
 }
 
 func drainQueue[T any](queue <-chan T) {
@@ -866,6 +908,57 @@ func drainQueue[T any](queue <-chan T) {
 			return
 		}
 	}
+}
+
+func (e *sessionEndpoint) observeCandidateDequeued(
+	message outboundCandidateMessage,
+	observeAge bool,
+) {
+	if e.hub.manager.candidateMetrics == nil {
+		return
+	}
+
+	e.hub.manager.candidateMetrics.AddCandidateOutboundQueue(message.chain, -1)
+	if !observeAge {
+		return
+	}
+	e.hub.manager.candidateMetrics.ObserveCandidateOutboundQueueAge(
+		message.chain,
+		time.Since(message.queuedAt),
+	)
+}
+
+func (e *sessionEndpoint) observeCandidateSend(
+	chain collator.MetricChain,
+	started time.Time,
+	err error,
+) {
+	if e.hub.manager.candidateMetrics == nil {
+		return
+	}
+
+	result := CandidateTransportSendError
+	switch {
+	case err == nil:
+		result = CandidateTransportSendSuccess
+	case errors.Is(err, context.DeadlineExceeded):
+		result = CandidateTransportSendDeadline
+	case errors.Is(err, context.Canceled):
+		result = CandidateTransportSendCanceled
+	}
+	e.hub.manager.candidateMetrics.ObserveCandidateTransportSend(CandidateTransportSendObservation{
+		Chain:    chain,
+		Result:   result,
+		Duration: time.Since(started),
+	})
+}
+
+func candidateTransportChain(spec sessionSpec) collator.MetricChain {
+	if spec.workchain == -1 {
+		return collator.MetricChainMasterchain
+	}
+
+	return collator.MetricChainShardchain
 }
 
 func (e *sessionEndpoint) RequestCandidate(
@@ -1141,13 +1234,12 @@ func (s *session) receiveCandidate(
 		return p2p.PrivateOverlayBroadcastRetry
 	}
 	defer binding.endpoint.endCallback()
-	wire, err := (simplex.CandidateBroadcast{
-		Data: broadcast.Payload, Extra: broadcast.Extra,
-	}).CandidateWire(extra.Delegation)
-	if err != nil {
-		return p2p.PrivateOverlayBroadcastIgnore
-	}
-	artifact, err := binding.receiver.ReceiveCandidate(ctx, extra.Slot, wire)
+	artifact, err := binding.receiver.ReceiveCandidate(
+		ctx,
+		extra.Slot,
+		broadcast.Payload,
+		extra.Delegation,
+	)
 	if err != nil {
 		return p2p.PrivateOverlayBroadcastIgnore
 	}

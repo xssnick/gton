@@ -155,6 +155,16 @@ func TestCandidateWrappedRoundtrip(t *testing.T) {
 	if gotBlock.Slot != 3 || !bytes.Equal(gotBlock.Candidate, blockData.Candidate) {
 		t.Fatalf("block data mismatch: %+v", gotBlock)
 	}
+	bare, err := ParseCandidateData(wantBare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := bare.(ConsensusBlockData); !ok || got.Slot != blockData.Slot {
+		t.Fatalf("bare candidate data = %T %+v", bare, bare)
+	}
+	if _, err = ParseCandidateData(append(bytes.Clone(wantBare), 0)); err == nil {
+		t.Fatal("bare candidate data with trailing bytes was accepted")
+	}
 
 	// With a delegation around an empty candidate payload.
 	deleg := testDelegation(t)
@@ -182,6 +192,9 @@ func TestCandidateWrappedRoundtrip(t *testing.T) {
 		t.Fatalf("empty data mismatch: %+v", gotEmpty)
 	}
 	requireSameDelegation(t, back.Delegation, deleg)
+	if _, err = ParseCandidateData(data); err == nil {
+		t.Fatal("wrapped candidate was accepted as bare broadcast data")
+	}
 
 	// A foreign inner object is rejected even with a valid TL shape.
 	foreign, err := tl.Serialize(ConsensusPleaseCollate{WindowStartSlot: 1, Signature: []byte("sig")}, true)

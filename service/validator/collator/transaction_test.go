@@ -231,7 +231,7 @@ func TestPoolSelectionCandidateFeedbackRoundTrip(t *testing.T) {
 
 	pool := msgpool.New(msgpool.Config{})
 	t.Cleanup(pool.Close)
-	if err = pool.AddExternal(nil, message, nil, 0); err != nil {
+	if _, err = pool.AddExternal(len(message.ToBOC()), message, nil, 0); err != nil {
 		t.Fatal(err)
 	}
 	selection := pool.SelectForBlock(msgpool.ShardIdent{Workchain: 0, Shard: msgpool.ShardAll}, 1)

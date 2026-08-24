@@ -23,6 +23,11 @@ var candidateBlockParses atomic.Int64
 // time; finish() holds all four the moment it returns, and every one of them
 // used to be thrown away and re-derived from the serialized bytes.
 //
+// Validating it needs the parsed block root again, and the collated roots
+// beside it. Consensus asks every validator including the leader to validate
+// this candidate, so the same two BOCs this build wrote were parsed straight
+// back a moment later; the roots travel to that call on the emitted artifact.
+//
 // It is not a cache and it has no fallback of its own. A caller either holds a
 // capsule — which only finish() can create, because the field on Candidate is
 // unexported — or it replays the bytes. The distinction is the type, not a nil
@@ -35,6 +40,16 @@ type builtCandidate struct {
 	// serializeBlockBOC walked every reference to write those bytes, so nothing
 	// here is unmaterialized and reusing it performs no lazy load.
 	root *cell.Cell
+	// collated are the roots CollatedData was serialized from, in wire order.
+	// The same materialization argument as root applies: their BOC was written
+	// by walking every reference.
+	//
+	// Both are trace-inert. finish() seals the collation's read set before it
+	// returns either of them, and a sealed set stops propagating down the cells
+	// it handed out, so the reads this node's own validation performs over these
+	// trees record nothing and allocate no wrapper — which is what makes reusing
+	// them cheaper than the parse they replace rather than merely different.
+	collated []*cell.Cell
 	// startLT is BlockInfo.StartLt, the logical time the message-pool delta is
 	// derived against.
 	startLT uint64
@@ -42,6 +57,10 @@ type builtCandidate struct {
 	// resolved as of. state.go and master_state.go both set it from the same
 	// header field this records.
 	genUTime uint32
+	// genUTimeMS is the exact consensus-extra timestamp. The block header keeps
+	// only seconds, so it cannot be reconstructed from genUTime without losing
+	// the millisecond component state resolution uses for slot pacing.
+	genUTimeMS uint64
 	// parents are the level-0 hashes of the predecessor states the Merkle update
 	// was built over, in the order the update sees them: one state, or the two
 	// merge parents that openPredecessorReadSet combines under a split root.
@@ -206,10 +225,12 @@ type commitDerivation struct {
 func newBuiltCandidate(
 	id ton.BlockIDExt,
 	root *cell.Cell,
+	collated []*cell.Cell,
 	state *cell.Cell,
 	stateUpdate *cell.Cell,
 	startLT uint64,
 	genUTime uint32,
+	genUTimeMS uint64,
 	previous ...*PreviousBlock,
 ) *builtCandidate {
 	if root == nil || state == nil || stateUpdate == nil || len(id.FileHash) != 32 {
@@ -226,8 +247,10 @@ func newBuiltCandidate(
 
 	built := &builtCandidate{
 		root:        root,
+		collated:    collated,
 		startLT:     startLT,
 		genUTime:    genUTime,
+		genUTimeMS:  genUTimeMS,
 		parents:     parents,
 		state:       state.HashKeyAt(0),
 		stateUpdate: stateUpdate.HashKeyAt(0),

@@ -738,9 +738,48 @@ type decodedCellLoadFlight struct {
 // result and may cancel independently. Keeping the leader synchronous preserves
 // I/O backpressure and avoids a goroutine/context allocation for every unique
 // cold cell in a collation.
+//
+// The in-flight table is sharded because it was the process's single largest
+// point of contention. A mutex profile taken on the testnet validator under
+// load — sampled as a delta over a 60 s window, so idle time is not counted —
+// showed one lock accumulating 136 s of goroutine blocking in those 60 seconds,
+// 38% of all contention in the process, on the path
+// loadLazyPrunedRefWithTrace -> Dictionary.findKeySliceInto -> loadDecodedCell.
+// More than two goroutines were waiting here at any instant, and they came from
+// every subsystem at once rather than from one budgeted pool.
 type decodedCellLoadGroup struct {
+	shards [decodedCellLoadShards]decodedCellLoadShard
+}
+
+// decodedCellLoadShards is sized against the machine, not against a worker
+// budget. The collator's proof estimator shards against collationParallelism
+// because only collation lanes enter it; this group is entered by collation,
+// by the validation of every other producer's candidate, by the account
+// prewarmer's workers, by live view and by the persistent state serializer, so
+// the concurrency it must spread is bounded by GOMAXPROCS. Sixty-four is the
+// first power of two above the 48 the validator runs with, and the mask below
+// needs a power of two.
+const decodedCellLoadShards = 64
+
+// decodedCellLoadShard is one independent slice of the in-flight table. The map
+// is built on first use, so a shard that never takes a cold miss costs one
+// mutex and one nil pointer.
+type decodedCellLoadShard struct {
 	mu      sync.Mutex
 	flights map[decodedCellCacheKey]*decodedCellLoadFlight
+	// Padded for the same reason proofEstimatorShard is: neighbouring shards
+	// are locked by different cores at the same moment, and a mutex plus a map
+	// header is 16 bytes, so four shards would otherwise share one cache line
+	// and give back as false sharing part of what the split removes.
+	_ [64]byte
+}
+
+// decodedCellLoadShardOf picks a shard from the LAST byte of the hash. The
+// decoded-cell cache keys its own shards on the FIRST four bytes, and taking a
+// different end keeps a cell's cache shard and its load shard uncorrelated, so
+// a hot cache shard does not imply a hot load shard.
+func (g *decodedCellLoadGroup) shardOf(key decodedCellCacheKey) *decodedCellLoadShard {
+	return &g.shards[int(key.hash[len(key.hash)-1])&(decodedCellLoadShards-1)]
 }
 
 func (g *decodedCellLoadGroup) do(
@@ -748,15 +787,16 @@ func (g *decodedCellLoadGroup) do(
 	key decodedCellCacheKey,
 	load func(context.Context) (*cell.Cell, error),
 ) (*cell.Cell, error) {
+	shard := g.shardOf(key)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		g.mu.Lock()
-		flight := g.flights[key]
+		shard.mu.Lock()
+		flight := shard.flights[key]
 		if flight != nil {
-			g.mu.Unlock()
+			shard.mu.Unlock()
 
 			select {
 			case <-flight.done:
@@ -776,24 +816,24 @@ func (g *decodedCellLoadGroup) do(
 				return nil, ctx.Err()
 			}
 		}
-		if g.flights == nil {
-			g.flights = make(map[decodedCellCacheKey]*decodedCellLoadFlight)
+		if shard.flights == nil {
+			shard.flights = make(map[decodedCellCacheKey]*decodedCellLoadFlight)
 		}
 		flight = &decodedCellLoadFlight{done: make(chan struct{})}
-		g.flights[key] = flight
-		g.mu.Unlock()
+		shard.flights[key] = flight
+		shard.mu.Unlock()
 
 		loaded, err := load(ctx)
-		g.mu.Lock()
+		shard.mu.Lock()
 		flight.loaded = loaded
 		flight.err = err
 		ctxErr := ctx.Err()
 		flight.leaderCancelled = ctxErr != nil && errors.Is(err, ctxErr)
-		if g.flights[key] == flight {
-			delete(g.flights, key)
+		if shard.flights[key] == flight {
+			delete(shard.flights, key)
 		}
 		close(flight.done)
-		g.mu.Unlock()
+		shard.mu.Unlock()
 
 		return loaded, err
 	}

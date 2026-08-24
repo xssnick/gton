@@ -182,3 +182,60 @@ func TestMakeQueueKey(t *testing.T) {
 		t.Fatalf("message hash = %x, want %x", got, hash)
 	}
 }
+
+// The pruning question, asked once per subtree instead of once per entry. Its
+// two halves are easy to get wrong in opposite directions: answering "no" for a
+// subtree that does hold the destination silently drops messages, and answering
+// "yes" for everything makes the whole thing a no-op that still looks like it
+// works.
+func TestRoutesUnderPrunesOnlySubtreesTheDestinationCannotReach(t *testing.T) {
+	var router destinationRouter
+	router.workchains = map[int32]*routeNode{}
+	// A split basechain: destination 0 owns the 0-prefixed half, destination 1
+	// the 1-prefixed half. Masterchain belongs to neither.
+	// Shard ids carry their depth in the position of the lowest set bit: the two
+	// halves of a once-split basechain are 0x4000... and 0xC000....
+	left := ShardIdent{Workchain: 0, Shard: 1 << 62}
+	right := ShardIdent{Workchain: 0, Shard: 3 << 62}
+	router.insert(left, 0)
+	router.insert(right, 1)
+
+	for _, tc := range []struct {
+		name  string
+		route AccountPrefix
+		bits  int
+		index int
+		want  bool
+	}{
+		{name: "left half, left destination", route: AccountPrefix{Workchain: 0, Prefix: 0}, bits: 1, index: 0, want: true},
+		{name: "left half, right destination", route: AccountPrefix{Workchain: 0, Prefix: 0}, bits: 1, index: 1, want: false},
+		{name: "right half, right destination", route: AccountPrefix{Workchain: 0, Prefix: 1 << 63}, bits: 1, index: 1, want: true},
+		{name: "right half, left destination", route: AccountPrefix{Workchain: 0, Prefix: 1 << 63}, bits: 1, index: 0, want: false},
+		{
+			// Nothing known past the workchain: both halves are still reachable,
+			// so nothing may be pruned.
+			name: "workchain only", route: AccountPrefix{Workchain: 0}, bits: 0, index: 1, want: true,
+		},
+		{name: "another workchain entirely", route: AccountPrefix{Workchain: -1}, bits: 0, index: 0, want: false},
+	} {
+		if got := router.routesUnder(tc.route, tc.bits, tc.index); got != tc.want {
+			t.Errorf("%s: routesUnder = %t, want %t", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A destination that owns a node routes everything below it, however many bits
+// the caller happens to know. Losing this makes the filter drop the entire queue
+// on an unsplit shard, which is every shard until it splits.
+func TestRoutesUnderKeepsEverythingBelowAnOwnedNode(t *testing.T) {
+	var router destinationRouter
+	router.workchains = map[int32]*routeNode{}
+	router.insert(ShardIdent{Workchain: 0, Shard: ShardAll}, 0)
+
+	for _, bits := range []int{0, 1, 6, 32, 64} {
+		route := AccountPrefix{Workchain: 0, Prefix: 0xDEADBEEF00000000}
+		if !router.routesUnder(route, bits, 0) {
+			t.Errorf("%d known bits: a destination owning the workchain root did not match", bits)
+		}
+	}
+}

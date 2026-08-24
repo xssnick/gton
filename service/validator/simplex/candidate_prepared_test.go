@@ -140,10 +140,9 @@ func TestPrepareCandidateAsyncMatchesSynchronousPayload(t *testing.T) {
 		fixture.candidate.Block.SeqNo,
 		fixture.blockRoot,
 		fixture.collatedRoots,
-		sha256.Sum256(fixture.blockBOC),
-		fixture.candidate.CollatedFileHash,
 		PayloadCellHint(fixture.blockBOC, fixture.collatedData),
 	)
+	async.DeclareDigests(sha256.Sum256(fixture.blockBOC), fixture.candidate.CollatedFileHash)
 	asyncWire, err := SerializeCandidatePrepared(fixture.candidate, async)
 	if err != nil {
 		t.Fatal(err)
@@ -154,6 +153,42 @@ func TestPrepareCandidateAsyncMatchesSynchronousPayload(t *testing.T) {
 	}
 	if !bytes.Equal(asyncWire, syncWire) {
 		t.Fatal("asynchronously prepared candidate wire differs from the synchronous one")
+	}
+}
+
+// The asynchronous constructor takes no file hashes, because its caller starts
+// the build before the BOCs those hashes are taken over exist. That leaves one
+// window in which a capsule is complete and yet nothing has bound it to a
+// candidate, and a producer that never closed it must not get its payload
+// broadcast unchecked: the two hashes are half of what ComputeID covers, so
+// serving the payload without them would put a candidate's identity on the wire
+// with a body nothing had matched against it.
+func TestPreparedCandidateRefusesUndeclaredDigests(t *testing.T) {
+	fixture := newPreparedCandidateFixture(t, false)
+
+	undeclared := PrepareCandidateAsync(
+		fixture.candidate.Block.SeqNo,
+		fixture.blockRoot,
+		fixture.collatedRoots,
+		PayloadCellHint(fixture.blockBOC, fixture.collatedData),
+	)
+	if _, err := SerializeCandidatePrepared(fixture.candidate, undeclared); !errors.Is(err, ErrPreparedCandidateMismatch) {
+		t.Fatalf("serialized a candidate from a capsule bound to nothing: %v", err)
+	}
+
+	// Declared late is still declared: the same capsule serves the same payload
+	// once its producer has closed the window.
+	undeclared.DeclareDigests(sha256.Sum256(fixture.blockBOC), fixture.candidate.CollatedFileHash)
+	wire, err := SerializeCandidatePrepared(fixture.candidate, undeclared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := SerializeCandidatePrepared(fixture.candidate, fixture.prepare(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(wire, expected) {
+		t.Fatal("a late-declared capsule serialized a different candidate wire")
 	}
 }
 

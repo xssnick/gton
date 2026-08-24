@@ -348,7 +348,7 @@ type PrometheusValidationMetrics struct {
 	stageDuration         *prometheus.HistogramVec
 	semanticStageDuration *prometheus.HistogramVec
 	taskDuration          *prometheus.HistogramVec
-	candidateSize         *prometheus.HistogramVec
+	candidateSize         *prometheus.GaugeVec
 	candidateCacheEntries *prometheus.GaugeVec
 	candidateCacheBytes   *prometheus.GaugeVec
 	retentionCapped       *prometheus.CounterVec
@@ -405,10 +405,12 @@ func NewPrometheusValidationMetrics(registry MetricsRegistry) (*PrometheusValida
 			Namespace: namespace, Subsystem: "validator", Name: "validation_task_duration_seconds",
 			Help: "Duration of the single semantic-validation task by result.", Buckets: durations,
 		}, []string{"chain", "result"}),
-		candidateSize: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		// Candidate payload sizes are gauges because the broad power-of-two
+		// histogram buckets make histogram_quantile noticeably overstate sizes.
+		// Dashboards calculate window quantiles from the exact scraped values.
+		candidateSize: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace, Subsystem: "validator", Name: "candidate_size_bytes",
-			Help:    "Block and collated-data payload sizes entering candidate validation.",
-			Buckets: prometheus.ExponentialBuckets(1_024, 2, 15),
+			Help: "Most recent block and collated-data payload sizes entering candidate validation.",
 		}, []string{"chain", "part"}),
 		candidateCacheEntries: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace, Subsystem: "validator", Name: "candidate_cache_entries",
@@ -511,7 +513,7 @@ type prometheusValidationObserver struct {
 	stageDuration         [2][validationStageCount]prometheus.Observer
 	semanticStageDuration [2][validationSemanticStageCount]prometheus.Observer
 	taskDuration          [2][validationTaskResultCount]prometheus.Observer
-	candidateSize         [2][2]prometheus.Observer
+	candidateSize         [2][2]prometheus.Gauge
 	candidateCacheEntries [2][2]prometheus.Gauge
 	candidateCacheBytes   [2]prometheus.Gauge
 	retentionCapped       [2]prometheus.Counter
@@ -694,8 +696,8 @@ func (o *prometheusValidationObserver) ObserveValidationCandidateSize(
 	collatedBytes int,
 ) {
 	chain = boundedValidationChain(chain)
-	o.candidateSize[chain][0].Observe(float64(max(blockBytes, 0)))
-	o.candidateSize[chain][1].Observe(float64(max(collatedBytes, 0)))
+	o.candidateSize[chain][0].Set(float64(max(blockBytes, 0)))
+	o.candidateSize[chain][1].Set(float64(max(collatedBytes, 0)))
 }
 
 func (o *prometheusValidationObserver) AddCandidateCache(

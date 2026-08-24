@@ -23,8 +23,34 @@ const (
 	beforeSplitBlockMargin   = uint64(11)
 )
 
+// seedingAllowedFor reports whether this build may fall back to walking a whole
+// source queue out of its state when a source is not pinned. See cutViews for
+// what the walk costs and why the two kinds below must not pay it.
+//
+// Both run beside a block that is not finished: the pipelined successor, whose
+// predecessor is about to want this very mutex to commit and then broadcast, and
+// the speculative first slot, which would hold it in front of the
+// AdvanceConsensusBase that opens the window it is betting on. Every other build
+// owns its slot outright and nothing of ours is waiting behind it.
+func seedingAllowedFor(request BuildRequest) bool {
+	return request.PreviousPending == nil && request.speculative == nil
+}
+
 func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildRequest) (ShardRequest, error) {
+	// The substages below are the anatomy of acquire_inputs. Under load that
+	// stage measured 85 ms against ~13 ms of CPU and no blocking profile to
+	// show for the rest, which leaves store reads in syscall — invisible to
+	// every profile and only findable by timing the steps that issue them.
+	const stage = CollationStageAcquireInputs
+	const chain = MetricChainShardchain
+	// Registered before the unlock so it runs after it: defers are LIFO, and
+	// every prewarm hint this acquisition names has to be handed over with the
+	// session mutex released. See prewarmHints.
+	var hints prewarmHints
+	defer a.issuePrewarmHints(&hints)
+	stepStarted := time.Now()
 	managed, err := a.lockRequestSession(request)
+	a.observeSubstage(chain, stage, "lock_session", stepStarted)
 	if err != nil {
 		return ShardRequest{}, err
 	}
@@ -33,14 +59,25 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 	if request.Session.Shard.IsMasterchain() {
 		return ShardRequest{}, fmt.Errorf("%w: shard acquisition received a masterchain session", ErrInvalidInput)
 	}
-	chain, err := a.resolveChain(ctx, managed, request)
+	stepStarted = time.Now()
+	resolved, err := a.resolveChain(ctx, managed, request)
+	a.observeSubstage(chain, stage, "resolve_chain", stepStarted)
 	if err != nil {
 		return ShardRequest{}, err
 	}
-	if err = requirePredecessorMasterchain(managed.master, chain.previous); err != nil {
+	predecessorGenUtime, err := verifyShardPredecessors(managed.master, resolved.previous)
+	if err != nil {
 		return ShardRequest{}, err
 	}
 	header, err := a.requestHeader(request)
+	if err != nil {
+		return ShardRequest{}, err
+	}
+	header, err = clampLocalHeaderTime(
+		header,
+		managed.master.context.Config.globalVersion,
+		max(predecessorGenUtime, managed.master.context.GenUtime),
+	)
 	if err != nil {
 		return ShardRequest{}, err
 	}
@@ -57,38 +94,98 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 	if err != nil {
 		return ShardRequest{}, err
 	}
+	if pending := request.PreviousPending; pending != nil {
+		// The predecessor's queue node has to exist before the cut below asks for
+		// a branch that descends from it — the cut refuses a tip it has never
+		// seen. The node this installs is the same one the predecessor's own
+		// commit will install, so that commit finds identical content and returns
+		// without doing anything.
+		//
+		// Seeding is refused here. It walks the whole out-queue, and this call
+		// holds the session lock the predecessor's commit is about to need; a
+		// successor that cannot get its base cheaply gives the slot back to the
+		// producer instead of standing in front of the block it is speculating on.
+		stepStarted = time.Now()
+		queueID, keyErr := blockRootKey(pending.ID)
+		if keyErr != nil {
+			return ShardRequest{}, keyErr
+		}
+		delta, installErr := a.installCandidateDeltaLocked(
+			managed,
+			localResolvedChain{previous: pending.Previous, candidateTip: pending.CandidateTip},
+			pending.Root,
+			pending.ID,
+			queueID,
+			pending.StartLT,
+			false,
+			&hints,
+		)
+		a.observeSubstage(chain, stage, "install_pending_delta", stepStarted)
+		if installErr != nil {
+			return ShardRequest{}, installErr
+		}
+		a.collectPooledInternals(&hints, delta.Added)
+	}
+	stepStarted = time.Now()
 	messages, err := a.acquireShardMessages(
 		ctx,
 		managed.branch,
 		managed.master,
 		request.Session.Shard,
-		chain.previous,
-		chain.queueBase,
-		chain.candidateTip,
+		resolved.previous,
+		resolved.queueBase,
+		resolved.candidateTip,
+		seedingAllowedFor(request),
+		&hints,
 	)
+	a.observeSubstage(chain, stage, "messages", stepStarted)
 	if err != nil {
 		return ShardRequest{}, err
 	}
-	a.prewarmCurrentInternals(messages.cut)
+	stepStarted = time.Now()
+	a.collectCurrentInternals(&hints, messages.cut)
+	a.observeSubstage(chain, stage, "prewarm_current", stepStarted)
 
 	result := ShardRequest{
 		Shard:               request.Session.Shard,
-		Previous:            chain.previous[0],
+		Previous:            resolved.previous[0],
 		Masterchain:         managed.master.context,
 		Header:              header,
 		BeforeSplit:         beforeSplit,
 		RandSeed:            seed,
 		CreatedBy:           request.Session.Validators[request.Leader].PublicKey,
 		MaxExternalAttempts: a.maxExternalAttempts,
-		StorageStats:        chain.storage,
+		StorageStats:        resolved.storage,
 		Dispatch:            a.dispatch,
 		Internals:           messages.cut,
 		Neighbors:           messages.neighbors,
 		NeighborShardEndLT:  messages.shardEndLT,
 		accountPrewarmer:    a.accountPrewarmer,
 	}
-	if len(chain.previous) == 2 {
-		second := chain.previous[1]
+	if request.onSuccessor != nil {
+		// Assembled here because this is the only place that knows the chain the
+		// offer has to carry, and it is assembled inside the lock it already
+		// holds. The policy's block and seqno are filled in at the handoff, from
+		// the block that will by then exist; what has to come from here is the
+		// split decision, which is a fact about the masterchain view this build
+		// was acquired against.
+		result.successor = &successorPort{
+			offer:  request.onSuccessor,
+			revoke: request.revokeSuccessor,
+			// Without the session lock, deliberately: a revoke happens while the
+			// predecessor is rebuilding and must not stand in front of the commit
+			// that rebuild is racing towards. DropCandidate takes only the
+			// branch's own lock, and the branch pointer outlives the session.
+			discard:      func(root [32]byte) { managed.branch.DropCandidate(root) },
+			previous:     clonePreviousBlocks(resolved.previous),
+			queueBase:    clonePreviousBlocks(resolved.queueBase),
+			candidateTip: cloneHashPointer(resolved.candidateTip),
+			policy:       CandidateState{BeforeSplit: beforeSplit},
+			slot:         request.Slot,
+		}
+	}
+	if len(resolved.previous) == 2 {
+		second := resolved.previous[1]
 		result.Previous2 = &second
 	}
 	if managed.master.context.Config.capabilities&capFullCollatedData != 0 {
@@ -137,6 +234,8 @@ func splitWindowAllowsBeforeSplit(tmpNow, blockNow, start, end uint64) bool {
 }
 
 func (a *LocalAcquisition) AcquireMaster(ctx context.Context, request BuildRequest) (MasterRequest, error) {
+	var hints prewarmHints
+	defer a.issuePrewarmHints(&hints)
 	managed, err := a.lockRequestSession(request)
 	if err != nil {
 		return MasterRequest{}, err
@@ -168,6 +267,14 @@ func (a *LocalAcquisition) AcquireMaster(ctx context.Context, request BuildReque
 		if err != nil {
 			return MasterRequest{}, err
 		}
+	}
+	header, err = clampLocalHeaderTime(
+		header,
+		master.context.Config.globalVersion,
+		master.state.GenUTime,
+	)
+	if err != nil {
+		return MasterRequest{}, err
 	}
 	seed, err := a.requestSeed(managed, request.Slot)
 	if err != nil {
@@ -206,11 +313,12 @@ func (a *LocalAcquisition) AcquireMaster(ctx context.Context, request BuildReque
 		chain.candidateTip,
 		tops,
 		provider,
+		&hints,
 	)
 	if err != nil {
 		return MasterRequest{}, err
 	}
-	a.prewarmCurrentInternals(messages.cut)
+	a.collectCurrentInternals(&hints, messages.cut)
 	result := MasterRequest{
 		Previous:            chain.previous[0],
 		Config:              master.context.Config,
@@ -307,6 +415,54 @@ func (a *LocalAcquisition) resolveChain(
 	managed *localAcquisitionSession,
 	request BuildRequest,
 ) (localResolvedChain, error) {
+	// A predecessor that has been built but not committed. Everything the chain
+	// resolution would look up is carried by value in the offer, because the
+	// state it would look up is not installed yet — that installation is the
+	// wait this whole path exists to remove.
+	//
+	// request.Parent and request.Previous are provisional on this branch and go
+	// unread: the producer binds the lineage when it adopts the offer, against
+	// the predecessor it actually committed.
+	// A build started before its leader window was observed. The candidate it
+	// extends is one this node validated and the network has not notarized, so
+	// it is installed nowhere the resolution below could find it — and must not
+	// be, because installing it would fix a window start whose real StartAt is
+	// still unknown. It travels by value for exactly the reason PreviousPending
+	// does, and resolves to the same shape the observed-base branch produces at
+	// the bottom of this function: a single predecessor, no queue lineage of our
+	// own, and the master view this session already holds.
+	if spec := request.speculative; spec != nil {
+		if request.Previous != nil || request.PreviousPending != nil || spec.state == nil {
+			return localResolvedChain{}, fmt.Errorf(
+				"%w: speculative base does not bind the build request", ErrCandidateConflict)
+		}
+
+		return localResolvedChain{
+			previous: []PreviousBlock{clonePreviousBlock(spec.state.block)},
+			master:   managed.master,
+		}, nil
+	}
+	if pending := request.PreviousPending; pending != nil {
+		if request.Previous != nil || pending.predecessorSlot >= request.Slot {
+			return localResolvedChain{}, fmt.Errorf(
+				"%w: pending predecessor does not bind the build request", ErrCandidateConflict)
+		}
+		tip := [32]byte(pending.ID.RootHash)
+		queueSize := pending.OutQueueSize
+
+		return localResolvedChain{
+			previous: []PreviousBlock{{
+				ID:           cloneBlockID(pending.ID),
+				Block:        pending.Root,
+				State:        pending.State,
+				OutQueueSize: &queueSize,
+			}},
+			storage:      pending.StorageStats,
+			queueBase:    clonePreviousBlocks(pending.QueueBase),
+			candidateTip: &tip,
+			master:       managed.master,
+		}, nil
+	}
 	if request.Previous != nil {
 		if request.Previous.SessionID != request.Session.ID ||
 			request.Previous.Candidate.ID.Slot >= request.Slot ||
@@ -403,22 +559,24 @@ func (a *LocalAcquisition) resolveBlock(
 	return previous, nil, nil
 }
 
-func requirePredecessorMasterchain(master *localMasterView, previous []PreviousBlock) error {
+func verifyShardPredecessors(master *localMasterView, previous []PreviousBlock) (uint32, error) {
+	var genUtime uint32
 	for i := range previous {
 		var state tlb.ShardStateUnsplit
 		if err := parseExact(&state, previous[i].State); err != nil {
-			return fmt.Errorf("%w: decode predecessor %d: %v", ErrInvalidInput, i, err)
+			return 0, fmt.Errorf("%w: decode predecessor %d: %v", ErrInvalidInput, i, err)
 		}
 		var stats tlb.ShardStateStats
 		if err := parseExact(&stats, state.Stats); err != nil {
-			return fmt.Errorf("%w: decode predecessor %d statistics: %v", ErrInvalidInput, i, err)
+			return 0, fmt.Errorf("%w: decode predecessor %d statistics: %v", ErrInvalidInput, i, err)
 		}
 		if err := master.requirePredecessorMasterReference(previous[i].ID, stats.MasterRef); err != nil {
-			return err
+			return 0, err
 		}
+		genUtime = max(genUtime, state.GenUTime)
 	}
 
-	return nil
+	return genUtime, nil
 }
 
 func blockRootKey(id ton.BlockIDExt) ([32]byte, error) {
@@ -441,13 +599,19 @@ func cloneHashPointer(hash *[32]byte) *[32]byte {
 }
 
 func (a *LocalAcquisition) CommitCandidate(ctx context.Context, commit CandidateCommit) error {
+	// Above the unlock, so the hints this commit names are handed to the
+	// prewarmer after the mutex is back. A commit sits between a block's
+	// signature and its broadcast, and it is the last place to spend that mutex
+	// on background warming.
+	var hints prewarmHints
+	defer a.issuePrewarmHints(&hints)
 	managed, err := a.lockRequestSession(commit.Request)
 	if err != nil {
 		return err
 	}
 	defer managed.mu.Unlock()
 
-	return a.commitCandidateLocked(ctx, managed, commit.Request, commit.Built, commit.Artifact)
+	return a.commitCandidateLocked(ctx, managed, commit.Request, commit.Built, commit.Artifact, &hints)
 }
 
 func (a *LocalAcquisition) RestoreCandidate(
@@ -455,6 +619,8 @@ func (a *LocalAcquisition) RestoreCandidate(
 	request BuildRequest,
 	artifact CandidateArtifact,
 ) error {
+	var hints prewarmHints
+	defer a.issuePrewarmHints(&hints)
 	managed, err := a.lockRestoreSession(request)
 	if err != nil {
 		return err
@@ -475,7 +641,7 @@ func (a *LocalAcquisition) RestoreCandidate(
 		return a.restoreFinalizedCandidateAnchor(ctx, managed, request, artifact)
 	}
 	if artifact.Candidate.Empty {
-		return a.commitCandidateLocked(ctx, managed, request, nil, artifact)
+		return a.commitCandidateLocked(ctx, managed, request, nil, artifact, &hints)
 	}
 
 	chain, err := a.resolveChain(ctx, managed, request)
@@ -522,7 +688,7 @@ func (a *LocalAcquisition) RestoreCandidate(
 		},
 	}
 
-	return a.commitDerivedCandidateLocked(ctx, managed, request, built, artifact, ready)
+	return a.commitDerivedCandidateLocked(ctx, managed, request, built, artifact, ready, &hints)
 }
 
 func (a *LocalAcquisition) restoreFinalizedCandidateAnchor(
@@ -535,24 +701,9 @@ func (a *LocalAcquisition) restoreFinalizedCandidateAnchor(
 		artifact.Candidate.Parent != request.Parent {
 		return ErrCandidateConflict
 	}
-	var (
-		previous     PreviousBlock
-		storageStats AccountStorageStats
-		err          error
-	)
-	if request.FinalizedAnchorState != nil {
-		previous, err = finalizedAnchorPrevious(request.FinalizedAnchorState, artifact.Candidate.Block)
-		if err != nil {
-			return err
-		}
-	} else {
-		// Remote collators cannot receive node-resident cells. The in-process
-		// resolver always supplies FinalizedAnchorState, so this read remains a
-		// compatibility path for that separate storage-owning deployment.
-		previous, storageStats, err = a.resolveBlock(ctx, managed, artifact.Candidate.Block)
-		if err != nil {
-			return err
-		}
+	previous, storageStats, err := a.resolveBlock(ctx, managed, artifact.Candidate.Block)
+	if err != nil {
+		return err
 	}
 	if err = managed.branch.Retain(nil); err != nil {
 		return fmt.Errorf("clear candidates preceding finalized anchor: %w", err)
@@ -568,43 +719,6 @@ func (a *LocalAcquisition) restoreFinalizedCandidateAnchor(
 	managed.blocks[key] = state
 
 	return nil
-}
-
-func finalizedAnchorPrevious(anchor *FinalizedAnchorState, id ton.BlockIDExt) (PreviousBlock, error) {
-	if anchor == nil || !sameBlockID(anchor.Block, id) || anchor.State == nil {
-		return PreviousBlock{}, ErrCandidateConflict
-	}
-
-	previous := PreviousBlock{
-		ID:    cloneBlockID(anchor.Block),
-		State: anchor.State,
-	}
-	if id.SeqNo == 0 {
-		if len(anchor.BlockBOC) != 0 {
-			return PreviousBlock{}, ErrCandidateConflict
-		}
-	} else {
-		root, err := cell.FromBOC(anchor.BlockBOC)
-		if err != nil {
-			return PreviousBlock{}, fmt.Errorf("%w: decode finalized anchor block: %v", ErrCandidateConflict, err)
-		}
-		if !bytes.Equal(root.Hash(), id.RootHash) {
-			return PreviousBlock{}, fmt.Errorf("%w: finalized anchor block root differs from its id", ErrCandidateConflict)
-		}
-		previous.Block = root
-	}
-
-	state, err := verifyPredecessor("finalized anchor", &previous)
-	if err != nil {
-		return PreviousBlock{}, err
-	}
-	queueSize, err := exactOutQueueSize(state.OutMsgQueueInfo)
-	if err != nil {
-		return PreviousBlock{}, err
-	}
-	previous.OutQueueSize = uint64Pointer(queueSize)
-
-	return previous, nil
 }
 
 // commitCandidateLocked records one produced or restored candidate as the
@@ -623,8 +737,9 @@ func (a *LocalAcquisition) commitCandidateLocked(
 	request BuildRequest,
 	built *Candidate,
 	artifact CandidateArtifact,
+	hints *prewarmHints,
 ) error {
-	return a.commitDerivedCandidateLocked(ctx, managed, request, built, artifact, nil)
+	return a.commitDerivedCandidateLocked(ctx, managed, request, built, artifact, nil, hints)
 }
 
 // commitDerivedCandidateLocked is commitCandidateLocked with the derivation
@@ -639,6 +754,7 @@ func (a *LocalAcquisition) commitDerivedCandidateLocked(
 	built *Candidate,
 	artifact CandidateArtifact,
 	ready *readyCommit,
+	hints *prewarmHints,
 ) error {
 	if artifact.SessionID != request.Session.ID || artifact.Candidate.ID.Slot != request.Slot ||
 		artifact.Candidate.Parent != request.Parent {
@@ -680,7 +796,7 @@ func (a *LocalAcquisition) commitDerivedCandidateLocked(
 		}
 	}
 
-	return a.recordCandidateLocked(ctx, managed, request, built, artifact, chain, derivation)
+	return a.recordCandidateLocked(ctx, managed, request, built, artifact, chain, derivation, hints)
 }
 
 // readyCommit carries a derivation its caller already produced, together with
@@ -783,6 +899,7 @@ func (a *LocalAcquisition) recordCandidateLocked(
 	artifact CandidateArtifact,
 	chain localResolvedChain,
 	derivation commitDerivation,
+	hints *prewarmHints,
 ) error {
 	previous := PreviousBlock{
 		ID:           cloneBlockID(built.ID),
@@ -824,33 +941,11 @@ func (a *LocalAcquisition) recordCandidateLocked(
 		}
 		state.queueBase = clonePreviousBlocks(parent.queueBase)
 	}
-	if chain.candidateTip == nil {
-		if err = ensureCandidateBase(managed.branch, chain.previous); err != nil {
-			return err
-		}
-	}
-	source := targetShardIdent(groups.ShardID{Workchain: built.ID.Workchain, Shard: built.ID.Shard})
-	delta, err := managed.branch.DeltaFromBlockRoot(
-		source,
-		msgpool.SourceRef{Seqno: built.ID.SeqNo, RootHash: queueID},
-		derivation.root,
-		derivation.startLT,
+	delta, err := a.installCandidateDeltaLocked(
+		managed, chain, derivation.root, built.ID, queueID, derivation.startLT, true, hints,
 	)
 	if err != nil {
-		return fmt.Errorf("derive candidate message delta: %w", err)
-	}
-	queueRequest := msgpool.CandidateRequest{
-		ID:    queueID,
-		Seqno: built.ID.SeqNo,
-		Delta: delta,
-	}
-	if chain.candidateTip != nil {
-		queueRequest.Parent = cloneHashPointer(chain.candidateTip)
-	} else {
-		queueRequest.Base = candidateSources(chain.previous)
-	}
-	if err = managed.branch.AddCandidate(queueRequest); err != nil {
-		return fmt.Errorf("commit candidate message delta: %w", err)
+		return err
 	}
 	if err = a.messages.Complete(derivation.externals); err != nil {
 		managed.branch.DropCandidate(queueID)
@@ -859,6 +954,8 @@ func (a *LocalAcquisition) recordCandidateLocked(
 	}
 	managed.candidates[artifact.Candidate.ID] = state
 	managed.blocks[queueID] = state
+	a.collectPooledInternals(hints, delta.Added)
+	a.enqueueDispatchStatePrewarm(ctx, managed.dispatchPrewarmOwner(), built.ID, derivation.state)
 
 	return nil
 }
@@ -904,6 +1001,16 @@ func clonePreviousBlocks(previous []PreviousBlock) []PreviousBlock {
 	}
 
 	return cloned
+}
+
+func clonePreviousBlock(previous PreviousBlock) PreviousBlock {
+	previous.ID = cloneBlockID(previous.ID)
+	if previous.OutQueueSize != nil {
+		value := *previous.OutQueueSize
+		previous.OutQueueSize = &value
+	}
+
+	return previous
 }
 
 // restoreCandidateState replays one stored candidate: it parses the block and
@@ -1043,9 +1150,69 @@ func candidateSources(previous []PreviousBlock) []msgpool.CandidateSource {
 // A voter restoring a candidate after shared history was compacted derives the
 // same private snapshot from the authenticated predecessor state, without
 // regressing or materializing the process-wide committed feed.
-func ensureCandidateBase(
+// installCandidateDeltaLocked puts one candidate's outbound-queue delta into the
+// session's private message branch. It is the same work whether the candidate is
+// being committed or merely speculated on, which is why it is one function: the
+// commit and the speculative install must produce the same node, or the commit
+// that follows a speculative install would be rejected as a conflicting entry
+// rather than recognised as the same content.
+//
+// AddCandidate is content-idempotent, so the second call — the commit's — is a
+// no-op when a speculative install already put the identical node there.
+func (a *LocalAcquisition) installCandidateDeltaLocked(
+	managed *localAcquisitionSession,
+	chain localResolvedChain,
+	root *cell.Cell,
+	id ton.BlockIDExt,
+	queueID [32]byte,
+	startLT uint64,
+	seedAllowed bool,
+	hints *prewarmHints,
+) (*msgpool.InternalsDelta, error) {
+	if chain.candidateTip == nil {
+		if err := a.ensureCandidateBase(managed.branch, chain.previous, seedAllowed, hints); err != nil {
+			return nil, err
+		}
+	}
+	source := targetShardIdent(groups.ShardID{Workchain: id.Workchain, Shard: id.Shard})
+	delta, err := managed.branch.DeltaFromBlockRoot(
+		source,
+		msgpool.SourceRef{Seqno: id.SeqNo, RootHash: queueID},
+		root,
+		startLT,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("derive candidate message delta: %w", err)
+	}
+	request := msgpool.CandidateRequest{
+		ID:    queueID,
+		Seqno: id.SeqNo,
+		Delta: delta,
+	}
+	if chain.candidateTip != nil {
+		request.Parent = cloneHashPointer(chain.candidateTip)
+	} else {
+		request.Base = candidateSources(chain.previous)
+	}
+	if err = managed.branch.AddCandidate(request); err != nil {
+		return nil, fmt.Errorf("commit candidate message delta: %w", err)
+	}
+
+	return delta, nil
+}
+
+// seedAllowed says whether this caller may fall back to rebuilding the source
+// from the predecessor's state root. That fallback walks the whole out-queue and
+// took 100-250 ms when it was last measured, and every caller here holds the
+// session lock — which is fine for a commit, whose whole job is to hold it, and
+// not fine for a speculative successor that would be holding it in front of the
+// predecessor's own commit. A caller that cannot afford the seed asks for it to
+// be refused instead, and is expected to give up cleanly.
+func (a *LocalAcquisition) ensureCandidateBase(
 	branch *msgpool.Branch,
 	previous []PreviousBlock,
+	seedAllowed bool,
+	hints *prewarmHints,
 ) error {
 	for index := range previous {
 		source := targetShardIdent(groups.ShardID{
@@ -1063,9 +1230,15 @@ func ensureCandidateBase(
 			!errors.Is(err, msgpool.ErrNotFound) {
 			return fmt.Errorf("pin candidate predecessor queue: %w", err)
 		}
-		if _, err = branch.SeedSourceFromStateRoot(source, ref, previous[index].State); err != nil {
+		if !seedAllowed {
+			return fmt.Errorf("%w: candidate predecessor queue is not pinned and may not be seeded here",
+				ErrAcquisitionNotReady)
+		}
+		seeded, _, err := branch.SeedSourceFromStateRoot(source, ref, previous[index].State)
+		if err != nil {
 			return fmt.Errorf("seed candidate predecessor queue: %w", err)
 		}
+		a.collectPooledInternals(hints, seeded)
 	}
 
 	return nil
@@ -1181,7 +1354,11 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 		return candidate, buildErr
 	}
 
-	stream, err := a.messages.OpenExternalStream(targetShardIdent(request.Session.Shard), a.externalLimit)
+	stream, err := a.messages.OpenExternalStreamExcluding(
+		targetShardIdent(request.Session.Shard),
+		a.externalLimit,
+		request.excludeExternals,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("open ready external stream: %w", err)
 	}
@@ -1189,7 +1366,14 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 
 	input, err := a.AcquireShard(ctx, request)
 	if err != nil {
-		a.observeCollationStage(chain, CollationStageAcquireInputs, time.Since(assembly))
+		// A cancelled acquisition is almost always a speculative successor being
+		// withdrawn, and it is most likely somewhere in the middle of AcquireShard
+		// when the cancel lands. Its truncated span is not a measurement of
+		// anything and it drags the stage's percentiles down towards the moment
+		// the producer happened to give up.
+		if !errors.Is(err, context.Canceled) {
+			a.observeCollationStage(chain, CollationStageAcquireInputs, time.Since(assembly))
+		}
 
 		return nil, err
 	}
@@ -1225,12 +1409,34 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 		request.ExternalWaitUntil,
 		a.externalLimit,
 		assembly,
+		request.PaceStartedAt,
 	)
 	elapsed := time.Since(started)
-	a.observeCandidateAssembly(chain, &assemblyDurations, external.wait)
+	if overlap, handed := input.successor.overlap(time.Now()); handed {
+		a.observePipelineOverlap(chain, overlap)
+	}
+	if !errors.Is(buildErr, context.Canceled) {
+		// Same reason as the acquisition stage above: a withdrawn successor's
+		// half-finished assembly is not a sample of how long assembly takes.
+		a.observeCandidateAssembly(chain, &assemblyDurations, external.wait)
+	}
 	a.logCandidateAssembly(request, elapsed, external, candidate, buildErr)
 	a.reportCollationAlarms(chain, request, candidate, buildErr)
 	return candidate, buildErr
+}
+
+// observeSubstage records one span nested inside stage. since is when the span
+// began; the duration is taken here so call sites stay one line.
+func (a *LocalAcquisition) observeSubstage(chain MetricChain, stage CollationStage, substage string, since time.Time) {
+	if a.collationObserver == nil {
+		return
+	}
+	a.collationObserver.ObserveCollationStage(CollationStageObservation{
+		Chain:    chain,
+		Stage:    stage,
+		Duration: time.Since(since),
+		Substage: substage,
+	})
 }
 
 func (a *LocalAcquisition) observeCollationStage(
@@ -1255,9 +1461,20 @@ func (a *LocalAcquisition) observeCandidateAssembly(
 	externalWait time.Duration,
 ) {
 	for _, stage := range candidateAssemblyStages {
-		a.observeCollationStage(chain, stage, durations[stage])
+		a.observeCollationStage(chain, stage, durations.stages[stage])
 	}
 	a.observeCollationStage(chain, CollationStageWaitExternalMessages, externalWait)
+	for _, sub := range durations.substages {
+		if a.collationObserver == nil {
+			break
+		}
+		a.collationObserver.ObserveCollationStage(CollationStageObservation{
+			Chain:    chain,
+			Stage:    sub.stage,
+			Duration: sub.duration,
+			Substage: sub.name,
+		})
+	}
 }
 
 func (a *LocalAcquisition) logCandidateAssembly(
@@ -1363,9 +1580,9 @@ func candidateProcessedScanTraceError(candidate *Candidate) string {
 	return candidate.Stats.ProcessedScanTraceError
 }
 
-// reportCollationAlarms raises the two producer faults that a debug log line
-// cannot carry, because in both cases the node needs an operator and neither
-// shows up in any other series.
+// reportCollationAlarms raises the producer faults that a debug log line cannot
+// carry, because in each case the node needs an operator and none of them shows
+// up in any other series.
 //
 // A short collated proof rides on a build that SUCCEEDED: the block is signed,
 // broadcast and counted as a candidate like any other, and the only trace of
@@ -1377,9 +1594,16 @@ func candidateProcessedScanTraceError(candidate *Candidate) string {
 // failed build among all the other reasons builds fail, indistinguishable in
 // builds_total{result="error"} from a cancelled slot or a bad input.
 //
-// Both are logged at Error and both move a counter, so a node in either state
-// can be found from :8085 without reading anyone else's logs. See
-// gton_collator_alarms_total in METRICS.md.
+// A size-limit retry is the third shape: a block that did fit, eventually, after
+// the collator threw a finished build away because its own size estimate was
+// wrong. It is the only one of the three that can end well, so it is logged at
+// Warn rather than Error when the rebuild produced a block — but it still moves
+// the counter, because a producer that spends part of every slot rebuilding is
+// running on a broken estimate whether or not the blocks come out.
+//
+// All of them move a counter, so a node in any of these states can be found from
+// :8085 without reading anyone else's logs. See gton_collator_alarms_total in
+// METRICS.md.
 func (a *LocalAcquisition) reportCollationAlarms(
 	chain MetricChain,
 	request BuildRequest,
@@ -1399,6 +1623,7 @@ func (a *LocalAcquisition) reportCollationAlarms(
 					"the block was produced and will very likely be rejected as a pruned branch")
 		}
 	}
+	a.reportSizeLimitRetry(chain, request, candidate, buildErr)
 	if !errors.Is(buildErr, ErrMandatoryDequeueOverflow) {
 		return
 	}
@@ -1420,6 +1645,63 @@ func (a *LocalAcquisition) observeCollationAlarm(chain MetricChain, alarm Collat
 		return
 	}
 	a.collationObserver.ObserveCollationAlarm(chain, alarm)
+}
+
+// reportSizeLimitRetry names what the collator gave up to make the block fit.
+// The concessions are a pure function of the attempt index (retryUnderSizeLimit
+// and collationAttempt), so the count on the candidate reconstructs them
+// exactly, and an operator reading the line learns whether this slot merely
+// admitted fewer messages or shipped a block with no external messages in it at
+// all.
+func (a *LocalAcquisition) reportSizeLimitRetry(
+	chain MetricChain,
+	request BuildRequest,
+	candidate *Candidate,
+	buildErr error,
+) {
+	attempts := uint32(0)
+	if candidate != nil {
+		attempts = candidate.Stats.CollationAttempts
+	}
+	spent, counted := collationAttemptsSpent(buildErr)
+	if counted {
+		attempts = uint32(spent)
+	}
+	if attempts <= 1 && !counted {
+		return
+	}
+	a.observeCollationAlarm(chain, CollationAlarmSizeLimitRetry)
+
+	// The last attempt is the one that decided the outcome, and its index is
+	// taken from the count rather than from the bound: a collation abandoned on
+	// the deadline after one overflow made none of the concessions the last
+	// attempt would have made, and saying it did points the operator at the
+	// wrong thing entirely.
+	last := collationAttempt{index: int(attempts) - 1}
+	event := a.log.Warn()
+	if counted {
+		event = a.log.Error()
+	}
+	if event == nil {
+		return
+	}
+	event.
+		Uint32("attempts", attempts).
+		Bool("dispatch_tail_dropped", last.skipDispatchTail()).
+		Bool("externals_dropped", last.skipExternals()).
+		Uint64("limit_divisor", last.limitDivisor()).
+		Hex("session_id", request.Session.ID[:]).
+		Int32("workchain", request.Session.Shard.Workchain).
+		Int64("shard", request.Session.Shard.Shard).
+		Uint32("slot", request.Slot)
+	if counted {
+		event.Err(buildErr).Msg("collation lost the slot: the block did not fit the consensus size limit " +
+			"and no further rebuild was allowed, which means the size estimate admission runs against " +
+			"is wrong")
+		return
+	}
+	event.Msg("collation threw a finished block away and rebuilt it to fit the consensus size limit; " +
+		"the slot paid for every attempt and the size estimate admission runs against is wrong")
 }
 
 // candidateOverloadReason separates a shard that split because a block-limit

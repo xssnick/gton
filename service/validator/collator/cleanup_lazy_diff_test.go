@@ -136,12 +136,15 @@ func buildShardEagerCleanup(b *Builder, ctx context.Context, req ShardRequest) (
 	if err := validateCollationRequest(&common); err != nil {
 		return nil, err
 	}
-	return retryUnderSizeLimit(func(narrowing sizeBudgetCap) (*Candidate, error) {
+	return retryUnderSizeLimit(ctx, func(attempt collationAttempt) (*Candidate, error) {
+		if attempt.skipDispatchTail() {
+			req.Dispatch.AttemptIndex = uint32(attempt.index)
+		}
 		c, err := b.prepare(ctx, req)
 		if err != nil {
 			return nil, err
 		}
-		c.limits.narrowBytes(narrowing)
+		c.limits.applyAttempt(attempt)
 		if err = c.limits.addProof(c.outQueue.RootCell()); err != nil {
 			return nil, err
 		}
@@ -157,8 +160,10 @@ func buildShardEagerCleanup(b *Builder, ctx context.Context, req ShardRequest) (
 		if err = c.processInternals(); err != nil {
 			return nil, err
 		}
-		if err = c.processExternals(); err != nil {
-			return nil, err
+		if !attempt.skipExternals() {
+			if err = c.processExternals(); err != nil {
+				return nil, err
+			}
 		}
 		if err = c.processNewMessages(
 			c.blockFull || c.haveUnprocessedDispatchQueue || req.internalsIncomplete(),

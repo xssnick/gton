@@ -360,12 +360,15 @@ func TestBranchExplicitStateSeedUsesPinnedDestination(t *testing.T) {
 	state := stateRootWithQueue(t, queueDictCell(t, map[QueueKey]tlb.EnqueuedMsg{
 		key: {EnqueuedLT: 1_000, Msg: envelope},
 	}), 1, true)
-	total, err := branch.SeedSourceFromStateRoot(source, visible, state)
+	seeded, total, err := branch.SeedSourceFromStateRoot(source, visible, state)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if total != 1 {
 		t.Fatalf("seed total = %d, want 1", total)
+	}
+	if len(seeded) != 1 || seeded[0].Key != key {
+		t.Fatalf("returned seed messages = %+v, want queue key %x", seeded, key)
 	}
 	tip := sref(11, 0xc1).RootHash
 	if err = branch.AddCandidate(CandidateRequest{
@@ -438,12 +441,15 @@ func TestBranchPinSourceStaleThenExplicitStateSeed(t *testing.T) {
 		t.Fatalf("pin before compacted history floor = %v", err)
 	}
 
-	total, err = branch.SeedSourceFromStateRoot(source, visible, state)
+	seeded, total, err := branch.SeedSourceFromStateRoot(source, visible, state)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if total != count {
 		t.Fatalf("seed total = %d, want %d", total, count)
+	}
+	if len(seeded) != count {
+		t.Fatalf("returned seed messages = %d, want %d", len(seeded), count)
 	}
 	tip := sref(11, 0xc1).RootHash
 	if err = branch.AddCandidate(CandidateRequest{

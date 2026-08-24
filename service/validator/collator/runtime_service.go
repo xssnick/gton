@@ -90,6 +90,9 @@ type Service struct {
 	publicKey ed25519.PublicKey
 	allowed   map[[32]byte]struct{}
 	allowAll  bool
+	// trustedPipeline is fixed at construction because the Pipeline is: a
+	// candidate produced later cannot change which implementation returned it.
+	trustedPipeline bool
 
 	startMu  ctxMutex
 	closeMu  ctxMutex
@@ -139,8 +142,9 @@ type managedCollatorSession struct {
 	progressReady   bool
 	// sessionWritePending records that the pipeline accepted managed.record,
 	// but storage has not confirmed that exact revision yet. The in-memory
-	// record is authoritative from that point: callers advance their mirror,
-	// while production stays closed until the service-owned writer catches up.
+	// record is authoritative from that point: callers advance their mirror.
+	// Consensus progress may arm production immediately; ordinary session
+	// updates keep it closed until the service-owned writer catches up.
 	sessionWritePending     bool
 	progressReadyAfterWrite bool
 	sessionWriteRevision    uint64
@@ -154,9 +158,15 @@ type managedCollatorSession struct {
 	authorizations       map[WindowID]delegatedAuthorization
 	selfWindows          map[WindowID]SelfWindowRequest
 	productions          map[WindowID]*productionJob
-	updating             bool
-	retiring             bool
-	unavailable          bool
+	// speculation holds at most one first-slot build begun before its window was
+	// observed. It is guarded by its own mutex rather than mu: it is installed
+	// from the validation path, collected from the producer goroutine and
+	// settled from consensus progress, and none of those three should have to
+	// take the session lock to reach it.
+	speculation speculationSlot
+	updating    bool
+	retiring    bool
+	unavailable bool
 	// prepareCleanupPending distinguishes a failed tentative-prepare rollback
 	// from a terminal active-session failure. An exact Prepare may retry only
 	// this cleanup; a conflicting descriptor must never retire its generation.
@@ -173,6 +183,11 @@ type managedCollatorSession struct {
 }
 
 func (m *managedCollatorSession) rememberEmitted(id WindowID, artifact CandidateArtifact) {
+	// This map holds every slot of the window until it completes, so it keeps the
+	// retained form. The replay that reads it back re-parses instead, which is
+	// the same work a candidate restored from the store already does.
+	artifact = artifact.retained()
+
 	m.emittedMu.Lock()
 	defer m.emittedMu.Unlock()
 
@@ -315,6 +330,53 @@ func (f *candidateBuildFuture) stop() {
 	<-f.done
 }
 
+// abandon cancels a build whose result nobody will read and lets it unwind on
+// its own goroutine.
+//
+// The cancellation is the half that matters and it is immediate: the build stops
+// making progress the moment this returns. The join is not — a doomed build
+// inside a TVM execution or a store read notices its cancelled context at the
+// next check, and every caller here is on a path where that wait lands
+// somewhere it must not: in front of a size-limit rebuild, in front of the first
+// slot of a window, or inside the barrier a superseding consensus progress
+// waits on. speculativeProduction.abandon has said the same thing since the
+// speculation went in; the pipelined successor simply did not get the same
+// treatment.
+//
+// Nothing observes the join: the slot no longer holds the future, its result
+// channel is buffered, and the goroutine ends on its own.
+func (f *candidateBuildFuture) abandon() {
+	f.cancel()
+	go func() { <-f.done }()
+}
+
+// viable reports whether this future can still be handed to a producer as the
+// build for its slot.
+//
+// It exists for the speculative first slot, which is the one build a producer
+// can adopt without having started it. A build that has already failed, or one
+// whose own deadline has passed while the window it was for had not opened yet,
+// would be adopted as this slot's build and its error returned as the slot's
+// error — and a hard-deadline error is not a retryable production failure, so
+// the window would be lost rather than collated the ordinary way. Refusing the
+// adoption costs the head start and nothing else.
+//
+// A finished result is put back: this runs before the future has an owner, the
+// channel holds exactly one result and the producer is its only consumer.
+func (f *candidateBuildFuture) viable(now time.Time) bool {
+	if !now.Before(f.hardDeadline) {
+		return false
+	}
+	select {
+	case result := <-f.result:
+		f.result <- result
+
+		return result.err == nil
+	default:
+		return true
+	}
+}
+
 // NewService validates dependencies and resolves the collator public key.
 func NewService(opts ServiceOptions) (*Service, error) {
 	if opts.ProductionMode != ProductionModeSelf && opts.ProductionMode != ProductionModeDelegated {
@@ -363,6 +425,7 @@ func NewService(opts ServiceOptions) (*Service, error) {
 		publicKey:       append(ed25519.PublicKey(nil), publicKey...),
 		allowed:         allowed,
 		allowAll:        opts.AllowAllValidators,
+		trustedPipeline: pipelineBuildsOwnCandidates(opts.Pipeline),
 		state:           serviceNew,
 		sessions:        make(map[[32]byte]*managedCollatorSession),
 		retired:         make(map[[32]byte]struct{}),
@@ -1155,6 +1218,14 @@ func (s *Service) UpdateSession(ctx context.Context, update SessionUpdate) (resu
 		managed.mu.Unlock()
 		return err
 	}
+	if pipelineChanged && current.Update.CurrentBase != update.CurrentBase {
+		managed.mu.Unlock()
+
+		return fmt.Errorf(
+			"%w: ordinary session update cannot change the selected consensus base",
+			ErrCandidateConflict,
+		)
+	}
 	managed.updating = true
 	if pipelineChanged && update.HasCurrentWindow && (!current.Update.HasCurrentWindow ||
 		update.CurrentWindowStart > current.Update.CurrentWindowStart) {
@@ -1225,13 +1296,9 @@ func (s *Service) UpdateSession(ctx context.Context, update SessionUpdate) (resu
 	return nil
 }
 
-// ApplyConsensusProgress materializes the authenticated candidate lineage
-// before publishing its observed window. The operation is serialized with
-// all other session mutations. Candidate restoration is idempotent and may
-// retain an exact prefix on error; a later window retries that prefix before
-// advancing the published base. Pipeline updates and exact storage writes are
-// idempotent, so every failed producer-side step remains retryable without
-// making the consensus session unavailable.
+// ApplyConsensusProgress installs the resolver-owned exact selected state and
+// publishes its observed window. The pipeline changes the base and session
+// update atomically; its recoverable NoSync WAL is written independently.
 func (s *Service) ApplyConsensusProgress(
 	ctx context.Context,
 	progress ConsensusProgress,
@@ -1257,21 +1324,6 @@ func (s *Service) ApplyConsensusProgress(
 		managed.mu.Unlock()
 		return err
 	}
-	if len(progress.Candidates) > 0 {
-		first := progress.Candidates[0].Candidate
-		finalizedAnchor := progress.FinalizedAnchor != nil &&
-			sameBlockID(first.Block, *progress.FinalizedAnchor)
-		if first.Parent.Exists && first.Parent != current.Update.CurrentBase && !finalizedAnchor {
-			managed.mu.Unlock()
-			return fmt.Errorf(
-				"%w: first lineage parent %s differs from current base %s",
-				ErrCandidateConflict,
-				first.Parent,
-				current.Update.CurrentBase,
-			)
-		}
-	}
-
 	next := cloneSessionUpdate(current.Update)
 	next.HasCurrentWindow = true
 	next.CurrentWindowStart = progress.Window.StartSlot
@@ -1296,12 +1348,12 @@ func (s *Service) ApplyConsensusProgress(
 
 	managed.updating = true
 	// This progress supersedes production from the previously observed view.
-	// If local restoration fails, C++ drops that producer task; it does not
+	// If local base adoption fails, C++ drops that producer task; it does not
 	// restart an authorization against the older base. A later successfully
 	// materialized progress view arms production again.
 	managed.progressReady = false
 	// A newer progress attempt disarms every older pending WAL revision before
-	// restoration starts. If restoration fails, an older callback must not
+	// adoption starts. If adoption fails, an older callback must not
 	// re-arm production against the superseded base.
 	managed.progressReadyAfterWrite = false
 	if !current.Update.HasCurrentWindow || next.CurrentWindowStart > current.Update.CurrentWindowStart {
@@ -1330,50 +1382,28 @@ func (s *Service) ApplyConsensusProgress(
 	}
 	defer managed.productionMu.Unlock()
 
-	active := activatedSession(current.Session, *current.Activation)
-	restoreUpdate := cloneSessionUpdate(current.Update)
-	if len(progress.Candidates) > 0 {
-		restoreUpdate.CurrentBase = progress.Candidates[0].Candidate.Parent
-	}
-	var finalizedAnchor *ton.BlockIDExt
-	if progress.FinalizedAnchor != nil {
-		anchor := cloneBlockID(*progress.FinalizedAnchor)
-		finalizedAnchor = &anchor
-	}
-	finalizedAnchorState := progress.FinalizedAnchorState
-	var previous *CandidateArtifact
-	for i := range progress.Candidates {
-		artifact := progress.Candidates[i]
-		request := BuildRequest{
-			Session:              active,
-			Update:               restoreUpdate,
-			Slot:                 artifact.Candidate.ID.Slot,
-			Leader:               artifact.Candidate.Leader,
-			Parent:               artifact.Candidate.Parent,
-			Previous:             previous,
-			FinalizedAnchor:      finalizedAnchor,
-			FinalizedAnchorState: finalizedAnchorState,
-		}
-		if err = s.opts.Pipeline.RestoreCandidate(ctx, request, artifact); err != nil {
-			return fmt.Errorf("collator runtime: restore consensus candidate: %w", err)
-		}
-		previous = &progress.Candidates[i]
-		finalizedAnchor = nil
-		finalizedAnchorState = nil
-	}
-
 	if err = s.reserveSessionWrite(managed); err != nil {
 		return err
 	}
-	if err = s.opts.Pipeline.UpdateSession(ctx, current.Session, next); err != nil {
+	if err = s.opts.Pipeline.AdvanceConsensusBase(ctx, ConsensusBaseUpdate{
+		Session: activatedSession(current.Session, *current.Activation),
+		Update:  next,
+		Base:    progress.Base,
+	}); err != nil {
 		s.releaseSessionWriteReservation(managed)
-		return fmt.Errorf("collator runtime: publish consensus progress: %w", err)
+		return fmt.Errorf("collator runtime: advance consensus base: %w", err)
 	}
 
 	changed := writePending || !current.Update.Equal(next)
 	current.Update = cloneSessionUpdate(next)
 	if changed {
 		s.publishSessionWrite(managed, current, true)
+		// The session WAL is a recoverable NoSync checkpoint. Once the opaque
+		// pipeline has accepted this exact progress, it is the producer's live
+		// view and must not wait for the asynchronous storage callback.
+		managed.mu.Lock()
+		managed.progressReady = true
+		managed.mu.Unlock()
 	} else {
 		s.releaseSessionWriteReservation(managed)
 		managed.mu.Lock()
@@ -1382,11 +1412,17 @@ func (s *Service) ApplyConsensusProgress(
 		managed.updating = false
 		managed.mu.Unlock()
 	}
-	if !changed {
-		// The opaque pipeline and session WAL already expose this exact progress.
-		// Cleanup and production scheduling belong to the service lifetime.
-		s.reconcileFinishedSession(managed)
-	}
+	// Settled here, and deliberately before production is scheduled below: this
+	// is the moment the guess a speculative build was started on either became
+	// the selected base or stopped being reachable. A bet that matches is left
+	// parked for the producer this call is about to arm; anything else is taken
+	// down now rather than left running beside the collation that replaces it.
+	// Reported by the bet itself, on this path and on the three that have no
+	// caller to report for them. See speculativeProduction.settle.
+	managed.speculation.dropOutdated(next.CurrentWindowStart, next.CurrentBase)
+	// Cleanup and production scheduling belong to the service lifetime. The
+	// managed session-write worker independently drains the accepted revision.
+	s.reconcileFinishedSession(managed)
 
 	return nil
 }
@@ -1449,6 +1485,8 @@ func (s *Service) RetireSession(ctx context.Context, sessionID [32]byte) error {
 		job.cancel()
 	}
 	managed.mu.Unlock()
+	// A retiring session will never produce the window a bet was placed on.
+	managed.speculation.close()
 	managed.wakeSessionWrite()
 
 	if err = managed.productionMu.LockCtx(ctx); err != nil {
@@ -1727,6 +1765,168 @@ func (s *Service) ActivateSelfWindow(ctx context.Context, request SelfWindowRequ
 	return nil
 }
 
+// SpeculateSelfWindow starts the first slot of the leader window that is about
+// to open, before consensus has observed it.
+//
+// The window opens when the certificate notarizing request.Base arrives. This
+// node has already validated that candidate — that is what makes the bet
+// possible — and by the measurements this exists for, the certificate lands
+// roughly three hundred milliseconds later, which is about what one collation
+// costs. Starting now means the block is in the hands of every other validator
+// when they finish applying the base, instead of three hundred milliseconds
+// after they finish and go idle waiting for it.
+//
+// What it deliberately does NOT do is install anything. The session update, the
+// acquisition's candidate map and the message branch are left exactly as they
+// are; the predecessor travels inside the request. A bet that loses therefore
+// costs one collation's CPU and cannot cost a window: the producer that starts
+// on the real base finds the session in the state it would have been in anyway.
+// See speculativeBase for why installing a guess is not merely wasteful but
+// unrepresentable.
+//
+// The candidate this produces is never published from here. It waits for the
+// producer, which takes it only if the observed window names the same base;
+// publishing before that would be equivocation the moment the guess is wrong,
+// because the leader of a slot may broadcast exactly one candidate for it.
+func (s *Service) SpeculateSelfWindow(ctx context.Context, request SpeculativeWindowRequest) error {
+	if s.opts.ProductionMode != ProductionModeSelf {
+		return ErrUnsupported
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if request.Base == nil {
+		return fmt.Errorf("%w: speculative window carries no base state", ErrInvalidInput)
+	}
+	if request.StartAt.IsZero() || request.Deadline.IsZero() {
+		return fmt.Errorf("%w: speculative window has no schedule", ErrInvalidInput)
+	}
+	if !time.Now().Before(request.Deadline) {
+		return ErrStaleWindow
+	}
+	managed, err := s.runningSession(request.SessionID)
+	if err != nil {
+		return err
+	}
+
+	managed.mu.Lock()
+	record := cloneSessionRecord(managed.record)
+	blocked := managed.retiring || managed.unavailable || !managed.ready ||
+		!managed.pipelineReady || !managed.activationReady || record.Activation == nil
+	_, producing := managed.productions[WindowID{SessionID: request.SessionID, StartSlot: request.StartSlot}]
+	managed.mu.Unlock()
+
+	chain := metricChain(record.Session.Shard.IsMasterchain())
+	decline := func() error {
+		s.observePipelineHandoff(chain, PipelineHandoffSpeculativeDeclined)
+
+		return nil
+	}
+	if blocked || producing {
+		return decline()
+	}
+	// Masterchain is excluded for the reason the pipeline excludes it: its
+	// external source is a snapshot taken when the build opens rather than a
+	// following stream, so a build started early admits a different set of
+	// messages rather than the same set sooner.
+	if record.Session.Shard.IsMasterchain() {
+		return decline()
+	}
+	// The bet is only meaningful for the window immediately after the one the
+	// session is in. Anything else is either a window already observed — whose
+	// producer resolves its own predecessor — or one far enough ahead that the
+	// base it would be built on is not the base consensus will select.
+	if !record.Update.HasCurrentWindow ||
+		request.StartSlot != record.Update.CurrentWindowStart+record.Session.SlotsPerLeaderWindow {
+		return decline()
+	}
+	if request.StartSlot%record.Session.SlotsPerLeaderWindow != 0 {
+		return decline()
+	}
+	if uint64(request.Leader) >= uint64(len(record.Session.Validators)) {
+		return fmt.Errorf("%w: speculative leader index is outside the roster", ErrInvalidInput)
+	}
+	if _, _, exists := managed.speculation.pending(); exists {
+		return decline()
+	}
+	// The same verdict the producer would take at the slot, taken here from the
+	// state the base produced — and safe to take early for the reason the
+	// pipeline documents: the shard predicate is LastMCFinalizedSeqno+8 <
+	// nextSeqno, the watermark only grows and nextSeqno is fixed by this base, so
+	// a verdict of "collate" still reads "collate" at the slot. An early "empty"
+	// only forfeits the head start; the producer reaches the slot and runs the
+	// full check on schedule.
+	if managed.shouldGenerateEmpty(false, request.Base.successor) {
+		return decline()
+	}
+
+	// The request keeps the session's own update, unchanged. That is what lets
+	// the acquisition bind this build to the session it is really in, while the
+	// slot, the predecessor and every deadline below describe the window it is
+	// for.
+	build := BuildRequest{
+		Session: activatedSession(record.Session, *record.Activation),
+		Update:  record.Update,
+		Slot:    request.StartSlot,
+		Leader:  request.Leader,
+		Parent:  simplex.Parent(request.Base.candidate),
+	}
+	build.speculative = &speculativeBase{state: request.Base, at: request.StartAt}
+	// The schedule of the window this is for, derived from the estimate rather
+	// than from the session — which still describes the window before it.
+	//
+	// The two external instants are deliberately different, and the difference is
+	// the whole reason a speculative first slot can carry externals where an
+	// observed one cannot. ExternalWaitUntil is left at the estimate, already
+	// expiring, so this build never idles waiting for messages to arrive — it is
+	// running against a window that may open at any moment. ExternalProcessUntil
+	// gets a real budget, so the messages that are ALREADY in the pool get
+	// executed instead of being refused by a deadline that passed before the
+	// build began.
+	//
+	// The observed first slot cannot do this: its build starts at the window
+	// start and must broadcast at the window start, so there is no interval to
+	// process anything in. A speculative build starts before the window and is
+	// the only first slot with room. Its cost is bounded by the same block limits
+	// every other slot obeys: internals fill to the soft byte limit, externals
+	// carry the block to the medium one, and one ready batch is all it takes
+	// because the wait above never grants a second.
+	build.ExternalWaitUntil = request.StartAt
+	build.ExternalProcessUntil = request.StartAt.Add(record.Update.TargetRate)
+	build.BuildSoftDeadline = request.StartAt.Add(record.Update.TargetRate)
+	build.PaceStartedAt = request.StartAt
+
+	// The build's own deadline is the one the slot would have: the producer
+	// adopts this future as it is, context included, and a future bounded by the
+	// bet's lifetime instead would fail a slow slot with the error the producer
+	// treats as terminal — and lose the window rather than collate it late. The
+	// bet's lifetime, request.Deadline, bounds only how long it waits to be
+	// collected; speculativeProduction.expiry is where it goes.
+	// The bet hands over a successor like any other build; it just has nowhere
+	// to hand it to yet, so the offer waits here for the producer that collects
+	// the bet. See speculativeHandoff.
+	handoff := &speculativeHandoff{}
+	build.onSuccessor = handoff.park
+	build.revokeSuccessor = handoff.withdraw
+
+	future := s.startBuildFuture(s.runCtx, build, speculativeHardDeadline(record, request))
+	if !managed.speculation.install(&speculativeProduction{
+		startSlot: request.StartSlot,
+		base:      request.Base.candidate,
+		future:    future,
+		handoff:   handoff,
+		expiry:    request.Deadline,
+		report:    func(outcome PipelineHandoffOutcome) { s.observePipelineHandoff(chain, outcome) },
+	}) {
+		future.stop()
+
+		return decline()
+	}
+	s.observePipelineHandoff(chain, PipelineHandoffSpeculativeStarted)
+
+	return nil
+}
+
 // Status reports active production and shared-database pressure.
 func (s *Service) Status(ctx context.Context) (Status, error) {
 	storage, err := s.opts.Storage.Status(ctx)
@@ -1998,7 +2198,8 @@ func (s *Service) reconcileWindows(ctx context.Context, managed *managedCollator
 	managed.mu.Lock()
 	defer managed.mu.Unlock()
 
-	if managed.retiring || managed.unavailable || managed.sessionWritePending {
+	if managed.retiring || managed.unavailable ||
+		(managed.sessionWritePending && !managed.progressReady) {
 		return nil
 	}
 	current := managed.record.Update.CurrentWindowStart
@@ -2546,25 +2747,266 @@ func (s *Service) runProduction(job *productionJob) error {
 	parent := record.Update.CurrentBase
 	var previous *CandidateArtifact
 	var future *candidateBuildFuture
+	// successors is where a build that handed itself over early parks the next
+	// slot's build until the loop reaches that slot. It is closed by the same
+	// defer that stops the current future, so a window that ends anywhere takes
+	// its speculative successor with it.
+	var successors successorSlot
+	// producerSlot is where the loop has got to. A build can be committed at a
+	// later slot than the one it was requested for — a soft-timeout carry-over
+	// does exactly that — so the slot a handoff names is the slot its build was
+	// asked for, not the slot its block will occupy. Offering a successor for a
+	// slot the producer has already reached is offering work nobody can adopt.
+	var producerSlot atomic.Uint32
+	producerSlot.Store(job.window.ID.StartSlot)
 	defer func() {
+		// Cancel both before joining either. The two builds then unwind beside
+		// each other rather than one after the other, which matters because this
+		// runs with productionMu held and a superseding consensus progress waits
+		// only waitProductionBarrier for it.
+		parked := successors.closeCancelled()
 		if future != nil {
-			future.stop()
+			future.cancel()
+		}
+		if parked != nil {
+			<-parked.done
+		}
+		if future != nil {
+			<-future.done
 		}
 	}()
 	// advance carries the consensus lineage into the next slot. Every branch
 	// that emits a candidate must go through it: a branch that chains the next
 	// candidate to a stale parent is consensus-visible and nothing else catches it.
 	advance := func(artifact CandidateArtifact) {
-		parent = simplex.Parent(artifact.Candidate.ID)
-		previous = &artifact
+		parent, previous = successorLineage(artifact)
 	}
 	end := job.window.ID.StartSlot + record.Session.SlotsPerLeaderWindow
 	if end < job.window.ID.StartSlot {
 		return errors.New("collator runtime: leader window overflows slot space")
 	}
+	// pipeline starts the next slot's build the instant this slot's candidate
+	// state is installed, while the rest of persistAndEmit — the scheduled
+	// broadcast instant, the marker join and the emission — still runs. Every
+	// input a build reads is written by recordCandidateLocked, which the commit
+	// has already run; nothing below the commit is readable by a build. The
+	// commit itself does not move, and this starts a build, which installs
+	// nothing and emits nothing.
+	//
+	// This is deliberately EARLIER than the reference. C++ advances slot_start at
+	// the bottom of its window loop (window-producer.cpp:135), so the sleep that
+	// opens its next collation targets the same instant buildStartTime returns
+	// here; it issues the next collate_block when the previous candidate is
+	// published, and this issues it when the previous candidate is committed. The
+	// distance between those two points is the whole change.
+	//
+	// Masterchain is excluded. Its external source is a snapshot taken when the
+	// build opens rather than a following stream, and its phase budgets are
+	// measured from now because ExternalWaitUntil is zero for it, so a build
+	// started early would admit a different set of messages rather than the same
+	// set sooner. The reference draws the same line: it starts masterchain
+	// collation at the slot, not before it.
+	//
+	// This runs on the block-BOC branch of the predecessor's own collation, not
+	// on this goroutine, so it touches nothing the producer owns except the slot
+	// it parks its result in — which is mutex-guarded for exactly that reason.
+	// revokeHandoff withdraws a parked successor named by the predecessor root it
+	// was started on. Named rather than blanket: by the time a revoke arrives the
+	// slot may already hold a successor from a later, valid offer, and taking
+	// that one down would turn a recovered retry into a lost slot.
+	revokeHandoff := func(root [32]byte, outcome PipelineHandoffOutcome) {
+		if parked := successors.takeIf(root); parked != nil {
+			// Joined, not merely cancelled: revokeOffered drops the successor's
+			// queue node the moment this returns, and a successor still
+			// unwinding could install that node afterwards and leave the branch
+			// holding one for a block that never existed. revokeOffered is what
+			// keeps the wait off the caller.
+			parked.stop()
+			s.observePipelineHandoff(chain, outcome)
+		}
+	}
+	// The callback is reached through a pointer because it installs itself on the
+	// requests it starts: a successor must be able to hand over in turn, or the
+	// pipeline stops after one slot.
+	type handoffFunc struct{ fn func(SuccessorOffer) }
+	var onHandoffRef atomic.Pointer[handoffFunc]
+	onHandoff := func(offer SuccessorOffer) {
+		outcome := PipelineHandoffDeclinedBusy
+		var started *candidateBuildFuture
+		defer func() {
+			s.observePipelineHandoff(chain, outcome)
+			if started == nil && outcome != PipelineHandoffStarted {
+				return
+			}
+		}()
+
+		if record.Session.Shard.IsMasterchain() {
+			outcome = PipelineHandoffDeclinedMasterchain
+
+			return
+		}
+		next := offer.predecessorSlot + 1
+		if next <= producerSlot.Load() {
+			outcome = PipelineHandoffDeclinedBusy
+
+			return
+		}
+		if next >= end {
+			outcome = PipelineHandoffDeclinedWindowEnd
+
+			return
+		}
+		if job.ctx.Err() != nil {
+			outcome = PipelineHandoffDeclinedWindowEnd
+
+			return
+		}
+		lead := time.Until(buildStartTime(record, next))
+		if lead >= maxPipelinedBuildLead(record) {
+			outcome = PipelineHandoffDeclinedLead
+
+			return
+		}
+		// The only empty-policy evaluation the next slot gets, and it is taken
+		// from the state the predecessor produced rather than resolved again —
+		// resolving would mean taking the session lock in front of the commit
+		// that is about to need it. Safe in one direction only, and it is the
+		// direction that holds: the shard predicate is
+		// LastMCFinalizedSeqno+8 < nextSeqno (simplex/produce_policy.go), the
+		// watermark only ever grows and nextSeqno is fixed by this predecessor,
+		// so the predicate goes from "empty" to "collate" and never back. A
+		// verdict of "collate" taken early still reads "collate" at the slot,
+		// while an early "empty" only forfeits the head start: the loop reaches
+		// the slot and runs the full check on schedule.
+		if managed.shouldGenerateEmpty(false, offer.Policy) {
+			outcome = PipelineHandoffDeclinedEmpty
+
+			return
+		}
+
+		pending := offer
+		request := slotBuildRequest(
+			activeSession, record, job.window, next,
+			simplex.ParentID{}, nil,
+		)
+		request.PreviousPending = &pending
+		request.excludeExternals = offer.Exclude
+		request.onSuccessor = onHandoffRef.Load().fn
+		request.revokeSuccessor = revokeHandoff
+		started = s.startBuildFuture(job.ctx, request, hardBuildDeadline(record, next))
+		if !successors.install(started, [32]byte(offer.ID.RootHash)) {
+			// The slot is closed or already holds a successor; this one was never
+			// anybody's and is cancelled where it was started. This runs on the
+			// predecessor's block-BOC branch, which its own collation joins
+			// before returning a candidate, so a wait here would hold up the
+			// block that made the offer.
+			started.abandon()
+
+			return
+		}
+		outcome = PipelineHandoffStarted
+		if offer.adopt != nil {
+			offer.adopt()
+		}
+		if s.opts.Observer != nil {
+			// Both series, and both for the same reason: every slot must report
+			// its build-start lateness exactly once, or the series stops
+			// describing the producer and starts describing which slots happened
+			// to be pipelined. A build begun at or before its schedule is not
+			// late, which the observer's clamp already says; build_lead is where
+			// the head start itself is readable.
+			s.opts.Observer.ObserveScheduleLateness(
+				chain,
+				ScheduleEventBuildStart,
+				time.Since(buildStartTime(record, next)),
+			)
+			s.opts.Observer.ObserveScheduleLateness(chain, ScheduleEventBuildLead, lead)
+		}
+	}
+	onHandoffRef.Store(&handoffFunc{fn: onHandoff})
+	// A first slot begun before this window was observed, collected only when the
+	// window opened on the very base it was started on. The empty-block verdict
+	// it needed was taken when the bet was placed, from the state that base
+	// produced, exactly as a pipelined successor takes it from its predecessor;
+	// what the loop below skips for an adopted build is the wait for a schedule
+	// that has already passed.
+	//
+	// Collected here rather than at the top of this function because a
+	// speculative build hands over a successor of its own, and the offer it
+	// parked can only be started once onHandoff and revokeHandoff exist. That
+	// offer is the slot 0 to slot 1 boundary — the one boundary in the window
+	// that the pipeline could not cover, because when a speculative build hands
+	// over there is no producer yet to hand to.
+	if adopted, handoff, taken := managed.speculation.takeMatching(job.window.ID.StartSlot, parent); taken {
+		future = adopted
+		s.observePipelineHandoff(chain, PipelineHandoffSpeculativeAdopted)
+		if s.opts.Observer != nil {
+			// The head start actually realized: how long the speculative build had
+			// been running when the window opened. It is the whole quantity this
+			// change exists to produce, and it is reported on the same series a
+			// pipelined build reports its lead on.
+			s.opts.Observer.ObserveScheduleLateness(
+				chain,
+				ScheduleEventBuildLead,
+				time.Since(adopted.started),
+			)
+		}
+		// Ownership of the parked offer moves to this producer along with the
+		// build: from here a withdrawal reaches revokeHandoff, which knows the
+		// successor that was really started and the queue node it installed.
+		if offer := handoff.adopt(revokeHandoff); offer != nil {
+			onHandoff(*offer)
+		}
+	}
 	for slot := job.window.ID.StartSlot; slot < end; slot++ {
+		producerSlot.Store(slot)
+		// Adopt whatever the previous slot handed over, but only if it was built
+		// on the predecessor this producer went on to commit. A size-limit retry
+		// rebuilds that block and moves its root, so a mismatched offer does not
+		// describe a stale state — it describes one that never existed.
+		if future == nil {
+			if parked, root := successors.take(); parked != nil {
+				// Two questions, and both must answer yes. The root is whether
+				// the offer describes the predecessor this producer went on to
+				// commit — a size-limit retry rebuilds that block and moves its
+				// hash, so a mismatched offer does not describe a stale state,
+				// it describes one that never existed.
+				//
+				// Viability is whether the build can still serve at all. A
+				// successor that gave the slot back — its acquisition may not
+				// seed while the predecessor is still finishing, and says so
+				// with ErrAcquisitionNotReady — has already failed by now.
+				// Adopting it would make that refusal the slot's error and send
+				// the whole window back through produceWindowWithRetry, which
+				// re-restores and re-emits every slot already on the wire.
+				// Declining costs the head start and nothing else: the loop
+				// below starts this slot's build on schedule.
+				switch {
+				case previous == nil || len(previous.Candidate.Block.RootHash) != 32 ||
+					root != [32]byte(previous.Candidate.Block.RootHash):
+					parked.abandon()
+					s.observePipelineHandoff(chain, PipelineHandoffAbandonedSuperseded)
+				case !parked.viable(time.Now()):
+					parked.abandon()
+					s.observePipelineHandoff(chain, PipelineHandoffAbandonedFailed)
+				default:
+					future = parked
+					s.observePipelineHandoffPickup(chain, parked.request)
+				}
+			}
+		}
 		stored, err := s.opts.Storage.Candidate(job.ctx, job.window.ID, slot)
 		if err == nil {
+			if future != nil {
+				// Unreachable by construction: this branch emits directly and
+				// never goes through persistAndEmit, so the hook cannot have
+				// fired from a resumed slot, and the markers this reads are
+				// written in slot order by this same goroutine. Kept because
+				// without it a build started for this slot would hold the
+				// acquisition session while the slot is restored instead.
+				future.stop()
+				future = nil
+			}
 			productionStarted := s.metricStageStarted()
 			remembered, found := managed.recallEmitted(job.window.ID, slot)
 			artifact, artifactErr := s.artifactFromRecord(record.Session, job.window, stored, remembered, found)
@@ -2637,17 +3079,9 @@ func (s *Service) runProduction(job *productionJob) error {
 			return fmt.Errorf("collator runtime: load candidate: %w", err)
 		}
 
-		request := BuildRequest{
-			Session:              activeSession,
-			Update:               record.Update,
-			Slot:                 slot,
-			Leader:               job.window.Leader,
-			Parent:               parent,
-			Previous:             previous,
-			ExternalWaitUntil:    externalWaitUntil(record, slot),
-			ExternalProcessUntil: externalProcessUntil(record, slot),
-			BuildSoftDeadline:    softBuildDeadline(record, slot),
-		}
+		request := slotBuildRequest(activeSession, record, job.window, slot, parent, previous)
+		request.onSuccessor = onHandoff
+		request.revokeSuccessor = revokeHandoff
 		// emitEmpty commits this slot as an empty candidate. It deliberately does
 		// not touch future: the soft-timeout path keeps its live build for the
 		// next slot, and the commit always carries the current slot's request
@@ -2810,7 +3244,7 @@ func (s *Service) runProduction(job *productionJob) error {
 		// Pipeline is public and may retain the pointer it returns. Take ownership
 		// before signing so later extension-side mutation cannot change the bytes
 		// being persisted or the metadata consumed by CommitCandidate.
-		built := clonePipelineCandidate(result.candidate)
+		built := s.ownBuiltCandidate(result.candidate)
 		stageStarted := s.metricStageStarted()
 		artifact, err := s.signArtifact(record.Session, job.window, slot, parent, built)
 		s.observeMetricStage(chain, CollationStageSignCandidate, stageStarted)
@@ -2863,20 +3297,43 @@ func (s *Service) startBuildFuture(
 	started := time.Now()
 	future.started = started
 	chain := metricChain(request.Session.Shard.IsMasterchain())
-	if s.opts.Observer != nil {
+	// A speculative build is not a collation of a slot this node owes anyone: it
+	// is a bet, and whether it works out says nothing about the collator's
+	// health. Kept off these series entirely — inflight, result and duration —
+	// because a bet that fails would otherwise read as a failed collation on the
+	// error panel, and a bet running through the rotation gap would read as a
+	// collation in flight while this node is not even in the leader order. The
+	// bet is accounted for in full on gton_collator_pipeline_handoffs_total; see
+	// PipelineHandoffSpeculativeFailed.
+	speculative := request.speculative != nil
+	if s.opts.Observer != nil && !speculative {
 		s.opts.Observer.AddCollationBuildInflight(chain, 1)
 	}
 	go func() {
 		defer close(future.done)
 		candidate, err := s.opts.Pipeline.BuildCandidate(buildCtx, request)
 		elapsed := time.Since(started)
-		if s.opts.Observer != nil {
+		if s.opts.Observer != nil && !speculative {
 			s.opts.Observer.AddCollationBuildInflight(chain, -1)
 			s.opts.Observer.ObserveCollationBuild(CollationBuildObservation{
 				Chain:    chain,
 				Result:   collationResult(err),
 				Duration: elapsed,
 			})
+		}
+		// Said once, at info, under its own message: a failed bet is not a failed
+		// collation, so it must not answer a search for one, and it must not be
+		// silent either — every bet dying at acquisition is exactly how a
+		// speculation that stopped ever being adopted stayed invisible.
+		if speculative && err != nil {
+			if event := s.log.Info(); event != nil {
+				event.
+					Hex("session_id", request.Session.ID[:]).
+					Uint32("slot", request.Slot).
+					Dur("elapsed", elapsed).
+					Err(err).
+					Msg("speculative build discarded")
+			}
 		}
 		// A build that stopped because a local input has not arrived is not a
 		// failure and is deliberately silent here. The window producer retries it
@@ -2886,7 +3343,7 @@ func (s *Service) startBuildFuture(
 		// five hours, which made the collator read as failing 39% of its builds.
 		// The wait is reported once per window by logProductionInputWait, and
 		// counted honestly by gton_collator_retries_total{reason="not_ready"}.
-		if err != nil && !errors.Is(err, ErrAcquisitionNotReady) {
+		if !speculative && err != nil && !errors.Is(err, ErrAcquisitionNotReady) {
 			if event := s.log.Warn(); event != nil {
 				event.
 					Hex("session_id", request.Session.ID[:]).
@@ -3139,13 +3596,29 @@ func (s *Service) signArtifact(
 	// same pointer with every unexported optimization capsule still attached.
 	// Re-derive both digests here before signing; an unexported boolean cannot
 	// prove that mutable bytes still match it.
-	fileHash := sha256.Sum256(built.BlockBOC)
-	if !bytes.Equal(fileHash[:], built.ID.FileHash) {
-		return CandidateArtifact{}, fmt.Errorf("%w: candidate file hash does not match block BOC", ErrCandidateConflict)
-	}
-	collatedFileHash := sha256.Sum256(built.CollatedData)
-	if collatedFileHash != built.CollatedFileHash {
-		return CandidateArtifact{}, fmt.Errorf("%w: collated file hash does not match collated data", ErrCandidateConflict)
+	//
+	// GIVEN UP ON THE TRUSTED PATH, DELIBERATELY. When the pipeline is this
+	// package's own acquisition there is no decorator between finish() and here,
+	// and the candidate's seal states that these two hashes were taken from
+	// these two buffers in the composite literal that carries them — so the
+	// re-derivation compares each digest with itself. Skipping it gives up
+	// detection of a bit flip in the block or collated buffer between
+	// serialization and signature, i.e. local memory corruption, which this node
+	// would then sign and every other validator would reject. The price paid for
+	// it was a sha256 of both payloads on every produced candidate. An unsealed
+	// candidate is not trusted even on that path: without the seal nothing has
+	// stated where its hashes came from.
+	fileHash := [32]byte(built.ID.FileHash)
+	collatedFileHash := built.CollatedFileHash
+	if !s.trustsBuiltCandidate(built) {
+		fileHash = sha256.Sum256(built.BlockBOC)
+		if !bytes.Equal(fileHash[:], built.ID.FileHash) {
+			return CandidateArtifact{}, fmt.Errorf("%w: candidate file hash does not match block BOC", ErrCandidateConflict)
+		}
+		collatedFileHash = sha256.Sum256(built.CollatedData)
+		if collatedFileHash != built.CollatedFileHash {
+			return CandidateArtifact{}, fmt.Errorf("%w: collated file hash does not match collated data", ErrCandidateConflict)
+		}
 	}
 
 	// A foreign Pipeline has no private provenance and therefore takes the
@@ -3174,7 +3647,7 @@ func (s *Service) signArtifact(
 	}
 	candidate.Signature = signature
 
-	return CandidateArtifact{
+	artifact := CandidateArtifact{
 		SessionID:    session.ID,
 		WindowID:     window.ID,
 		Candidate:    candidate,
@@ -3187,7 +3660,70 @@ func (s *Service) signArtifact(
 		// candidate would otherwise re-establish by hashing the collated data
 		// again.
 		digested: true,
-	}, nil
+	}
+	// The roots the two BOCs above were written from, carried to this node's own
+	// validation of this candidate, which would otherwise parse both back.
+	//
+	// What makes that sound is the seal, not the capsule: provenance binds the
+	// two file hashes recomputed above to the ones finish() took of its own
+	// serializations of these roots, so BlockBOC is those bytes and CollatedData
+	// is those bytes, short of a sha256 collision. A foreign Pipeline has no
+	// seal and lost its capsule a few lines up, so it cannot reach here. The
+	// receiving capsule still checks the root hash against the candidate ID on
+	// every path, which is the one thing the dropped parse used to establish
+	// about the block rather than about the serializer.
+	if built.built != nil && len(built.built.collated) != 0 {
+		artifact.blockRoot = built.built.root
+		artifact.collatedRoots = built.built.collated
+		artifact.generationTimeMS = built.built.genUTimeMS
+		artifact.generationTimeKnown = true
+	}
+
+	return artifact, nil
+}
+
+// pipelineBuildsOwnCandidates reports whether Service drives this package's own
+// in-process acquisition rather than an implementation supplied from outside it.
+//
+// The test is on the concrete type on purpose. An unexported marker method would
+// not do: a foreign decorator embedding *LocalAcquisition inherits the promoted
+// method and would answer yes to it, while overriding BuildCandidate — which is
+// exactly the shape the ownership boundary exists to catch.
+func pipelineBuildsOwnCandidates(pipeline Pipeline) bool {
+	_, own := pipeline.(*LocalAcquisition)
+
+	return own
+}
+
+// trustsBuiltCandidate reports whether a produced candidate reached Service
+// without crossing the public Pipeline ownership boundary, so the defenses that
+// boundary requires are answering a question no one here can pose.
+//
+// Both halves are load-bearing. The pipeline must be our own acquisition, which
+// is what says no foreign code held this pointer between finish() and the
+// signature. And the candidate must carry the digested seal together with its
+// provenance, which is the builder's own statement about where the two hashes
+// beside its buffers came from; a Candidate assembled field by field carries
+// neither and takes the defensive route unchanged.
+func (s *Service) trustsBuiltCandidate(candidate *Candidate) bool {
+	return s.trustedPipeline && candidate != nil && candidate.digested && candidate.provenance != nil
+}
+
+// ownBuiltCandidate returns the candidate Service signs, persists and commits.
+//
+// GIVEN UP ON THE TRUSTED PATH, DELIBERATELY. There this is the pipeline's own
+// pointer, so a local producer that kept a reference to the Candidate it
+// returned — or to either of its byte slices — could still change them while the
+// signature and the storage write are in flight. That is a defense against this
+// package's own LocalAcquisition, which retains neither, and it is traded here
+// for the copy of both payloads it cost on every slot. Any other Pipeline — an
+// extension, a decorator wrapping our acquisition, a test double — keeps it.
+func (s *Service) ownBuiltCandidate(source *Candidate) *Candidate {
+	if s.trustsBuiltCandidate(source) {
+		return source
+	}
+
+	return clonePipelineCandidate(source)
 }
 
 // clonePipelineCandidate takes ownership of the mutable fields returned by a
@@ -3349,7 +3885,9 @@ func (s *Service) artifactFromRecord(
 		// persisted marker recorded for the candidate this window already signed.
 		// An empty candidate takes neither of them and carries no payload to
 		// have digested.
-		digested: !candidate.Empty,
+		digested:            !candidate.Empty,
+		generationTimeMS:    remembered.generationTimeMS,
+		generationTimeKnown: remembered.generationTimeKnown,
 	}, nil
 }
 
@@ -3457,6 +3995,60 @@ func waitUntil(ctx context.Context, at time.Time) error {
 	}
 }
 
+// successorLineage is the consensus lineage the slot after this artifact must
+// build on: its parent, and the retained form of the artifact itself.
+//
+// The retained form is what BuildRequest.Previous carries. It lives for the rest
+// of the window and a build future may carry it across a slot, and no consumer
+// of Previous reads the roots — the predecessor is resolved from the committed
+// candidate state, not from this pointer.
+func successorLineage(artifact CandidateArtifact) (simplex.ParentID, *CandidateArtifact) {
+	lineage := artifact.retained()
+
+	return simplex.Parent(artifact.Candidate.ID), &lineage
+}
+
+// slotBuildRequest is the request one slot of a leader window builds from. It
+// exists so the producer loop and anything that starts a build ahead of the loop
+// derive every deadline from the same place: a field set in one and forgotten in
+// the other is a build running to a different schedule than the slot it is for,
+// and nothing downstream would say so.
+func slotBuildRequest(
+	session ActivatedSession,
+	record SessionRecord,
+	window productionWindow,
+	slot uint32,
+	parent simplex.ParentID,
+	previous *CandidateArtifact,
+) BuildRequest {
+	return BuildRequest{
+		Session:              session,
+		Update:               record.Update,
+		Slot:                 slot,
+		Leader:               window.Leader,
+		Parent:               parent,
+		Previous:             previous,
+		ExternalWaitUntil:    externalWaitUntil(record, slot),
+		ExternalProcessUntil: externalProcessUntil(record, slot),
+		BuildSoftDeadline:    softBuildDeadline(record, slot),
+		PaceStartedAt:        buildStartTime(record, slot),
+	}
+}
+
+// maxPipelinedBuildLead caps how far ahead of its schedule a pipelined build may
+// begin.
+//
+// Without it the lead compounds. On a shard whose builds stop on a block limit
+// rather than on the clock, each slot's build ends one commit-to-emission tail
+// earlier than the last, so by the end of a long window the producer would be
+// opening a build several target rates before the slot it is for — holding an
+// external stream open across other slots, and measuring a pace whose head start
+// is larger than the slot it is supposed to describe. When the cap declines a
+// slot, the loop starts that build on schedule and the lead resets to zero.
+func maxPipelinedBuildLead(record SessionRecord) time.Duration {
+	return record.Update.TargetRate
+}
+
 func buildStartTime(record SessionRecord, slot uint32) time.Time {
 	start := slotStartTime(record, slot)
 	if record.Session.Shard.IsMasterchain() {
@@ -3501,4 +4093,17 @@ func hardBuildDeadline(record SessionRecord, slot uint32) time.Time {
 		time.Duration(slot-record.Update.CurrentWindowStart) * record.Update.TargetRate,
 	)
 	return slotStart.Add(max(3*record.Update.TargetRate, 60*time.Second))
+}
+
+// speculativeHardDeadline is hardBuildDeadline for the first slot of a window
+// that has not been observed yet, computed against the schedule the bet
+// predicts rather than the one the session is still in. Same formula, same
+// margin: the build it bounds is the one the producer will run as that slot's
+// build, so it must not be cut shorter than an ordinary slot's would be.
+func speculativeHardDeadline(record SessionRecord, request SpeculativeWindowRequest) time.Time {
+	predicted := record
+	predicted.Update.CurrentWindowStart = request.StartSlot
+	predicted.Update.CurrentWindowStartAt = request.StartAt
+
+	return hardBuildDeadline(predicted, request.StartSlot)
 }

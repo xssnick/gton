@@ -1334,15 +1334,15 @@ func TestCandidateResolverReleasesPeerFetchedPayloadWithNoDurableCopy(t *testing
 
 	resolver.mu.Lock()
 	entry := resolver.entries[id]
-	released := entry.candidate == nil && entry.wire == nil
-	identity := entry.hasWireHash && entry.notarization == certificate
+	released := entry.candidate == nil && entry.wire == nil && entry.lazyWire == nil
+	deferredIdentity := !entry.hasWireHash && entry.notarization == certificate
 	queued := len(resolver.retained)
 	resolver.mu.Unlock()
 	if !released {
 		t.Fatal("a payload consensus never accepted stayed pinned below the watermark")
 	}
-	if !identity {
-		t.Fatal("releasing an unstored payload dropped the identity that keeps a duplicate detectable")
+	if !deferredIdentity {
+		t.Fatal("an unconsumed peer response materialized an exact wire identity before release")
 	}
 	if queued != 0 {
 		t.Fatalf("release queue holds %d entries after releasing everything in it", queued)

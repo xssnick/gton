@@ -278,6 +278,7 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 	if peer := s.peers[pooled.id]; peer != nil {
 		peer.mergeAnnouncement(announced)
 		s.mx.Unlock()
+		s.prewarmQUICPeer(peer)
 		return false
 	}
 
@@ -339,6 +340,7 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 	s.startPeerRebroadcastWorker(state)
 	s.reloadNeighbours()
 	s.startPeerWarmup(state)
+	s.prewarmQUICPeer(state)
 	return true
 }
 

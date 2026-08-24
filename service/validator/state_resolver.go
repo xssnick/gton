@@ -14,10 +14,7 @@ import (
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
-var (
-	errFinalizedLineageAhead        = errors.New("validator runtime: finalized lineage anchor is not an ancestor")
-	errFinalizedCandidateNotApplied = errors.New("validator runtime: finalized candidate state is not applied")
-)
+var errFinalizedLineageAhead = errors.New("validator runtime: finalized lineage anchor is not an ancestor")
 
 const consensusExtraDataTag = uint64(0x638eb292)
 
@@ -26,16 +23,6 @@ const consensusExtraDataTag = uint64(0x638eb292)
 type ResolvedState struct {
 	State    *ChainState
 	GenUtime time.Time
-}
-
-type resolvedLineage struct {
-	Candidates         []*CandidateArtifact
-	AppliedAnchor      *ton.BlockIDExt
-	AppliedAnchorState *ChainState
-	// Walk is what the walk cost, which is not derivable from the result: the
-	// returned lineage is trimmed at the applied anchor, while the walk visited
-	// everything down to it and paid per step.
-	Walk lineageWalkStats
 }
 
 // lineageWalkStats is one walk's depth and the residency of each step.
@@ -69,7 +56,6 @@ type stateResolver struct {
 	maxLeaderWindowDesync uint32
 	genesis               *ChainState
 	startAt               *SessionStart
-	anchor                *resolvedAnchorState
 	states                map[simplex.ParentID]*stateFlight
 	finalized             map[simplex.CandidateID]*finalizedState
 	// applied holds exactly the finalization markers still carrying a loaded
@@ -78,12 +64,10 @@ type stateResolver struct {
 	// release sweep is driven from here instead, and costs what it retains.
 	applied   map[simplex.CandidateID]*finalizedState
 	persisted map[simplex.CandidateID]struct{}
-	// lineageFloor is the oldest slot a leader window's lineage walk has had to
-	// reach, and lineageFloorKnown says whether any walk has happened at all. It
-	// is the producer stating its own retention requirement: the walk descends to
-	// the masterchain-visible finalized anchor, and both sweeps must leave
-	// everything from there up alone. Its monotone maximum is what frees the
-	// slots the anchor has moved past.
+	// lineageFloor is the oldest candidate slot an ancestry guard has had to
+	// reach, and lineageFloorKnown says whether any guarded walk has happened.
+	// Candidate retention keeps parent links from there upward; state retention
+	// is independent because ancestry never materializes historical states.
 	lineageFloor      uint32
 	lineageFloorKnown bool
 	isClosed          bool
@@ -104,26 +88,11 @@ type stateFlight struct {
 type finalizedState struct {
 	isDone     bool
 	reconciled bool
-	// appliedState is the exact immutable state loaded from the ordinary node
-	// store. Keeping it with the finalization marker lets the in-process
-	// collator restore the same anchor without a second storage read.
-	//
-	// It is a whole separately loaded state tree, so it is kept only while a
-	// lineage walk can still reach this slot: past that, notifyFinalized drops
-	// it and loadAppliedCandidateState reloads on demand. The marker beside it
-	// never goes away.
+	// appliedState is the exact immutable state loaded while accepting this
+	// finalization. Parent resolution can reuse it until the retention sweep
+	// releases the tree; the finalization marker itself never goes away.
 	appliedState *ChainState
 	inFlight     *resolverFlight
-}
-
-// resolvedAnchorState is the latest ordinary finalized anchor supplied by an
-// applied session state. It is deliberately separate from finalized: a
-// masterchain update can prove an anchor applied before this session's
-// certificate replay has marked the candidate done.
-type resolvedAnchorState struct {
-	id    simplex.CandidateID
-	block ton.BlockIDExt
-	state *ChainState
 }
 
 func newStateResolver(
@@ -524,12 +493,8 @@ func (r *stateResolver) stateRetainedSlots() uint32 {
 }
 
 // finalizedStateRetainedSlots is the margin of applied finalized states kept in
-// memory. It matches the candidate payload margin deliberately, because the
-// same lineage walk consumes both: a walk that still finds its candidates
-// resident still finds their states, and one that has gone far enough back to
-// reload the bytes reloads the state with them. The anchor of the current
-// leader window is not in this set — resolvedAnchorState is separate for
-// exactly that reason.
+// memory. It matches the candidate payload margin so resolving a recent parent
+// can reuse the state accepted by finalization instead of loading it again.
 func (r *stateResolver) finalizedStateRetainedSlots() uint32 {
 	return candidateRetainedSlots(r.targetRate)
 }
@@ -571,8 +536,8 @@ type retentionFloor struct {
 // ApplyMerkleUpdate returns, and a later caller waits for that cleanup before
 // restarting. That keeps the non-context-aware cell apply single-flight.
 //
-// It returns the floor both sweeps ran under, because the candidate payloads
-// have the same consumer and must be released against the same bound.
+// It returns the ancestry floor for the candidate-payload sweep. State trees
+// are bounded only by their fixed parent-resolution margins.
 //
 // budgetFloor is the oldest slot the session's retention budget still allows,
 // computed from the retained payloads themselves by candidateResolver.
@@ -602,12 +567,10 @@ func (r *stateResolver) notifyFinalized(slot uint32, budgetFloor uint32) retenti
 	}
 
 	// The finalization marker stays; only the state tree behind it goes. A
-	// finalization still being applied keeps its own, and is reconsidered at the
-	// next finalization. The producer's floor bounds this exactly as it bounds
-	// the candidate payloads: the state the next leader window anchors on is the
-	// one at the bottom of the same walk, and reloading it is a whole ChainState
-	// out of the node backend.
-	watermark := min(slot-stateMargin, floor.Slot)
+	// finalization still being applied keeps its own and is reconsidered at the
+	// next finalization. The exact selected base is handed to the producer
+	// directly, so ancestry retention no longer pins historical state trees.
+	watermark := slot - stateMargin
 	for id, state := range r.applied {
 		if id.Slot >= watermark || state.inFlight != nil {
 			continue
@@ -723,238 +686,68 @@ func (r *stateResolver) cacheStats() stateCacheStats {
 	return stats
 }
 
-// lineage walks back from base to the applied anchor.
+// ancestry verifies that the locally applied finalized block is an ancestor of
+// the selected consensus base. The producer receives the exact already-resolved
+// base state directly, so this guard only follows candidate parent links and
+// never loads or applies historical states.
 //
-// Every return carries Walk, including the error ones. The walk stats are the
-// only account of what a failed walk cost — how deep it got, and how many of
-// those steps had to leave memory — and the caller's failure observation exists
-// for exactly that case: an abstain that came from a lineage that could not be
-// assembled. Returning a zero resolvedLineage alongside the error dropped the
-// depth and the step sources on the floor and left the instrumentation dead on
-// the only path it was added for. Nothing else on an error return is meaningful
-// and no caller reads it; Walk is, and callers must be able to.
-func (r *stateResolver) lineage(
+// With no local finalized block there is no constraint to prove and therefore
+// no reason to walk back to genesis.
+func (r *stateResolver) ancestry(
 	ctx context.Context,
 	base simplex.ParentID,
 	finalizedBlock *ton.BlockIDExt,
-) (resolvedLineage, error) {
-	lineage := make([]*CandidateArtifact, 0)
-	matchedAnchor := finalizedBlock == nil
-	appliedIndex := -1
+) (lineageWalkStats, error) {
 	var walk lineageWalkStats
-	var appliedState *ChainState
+	if finalizedBlock == nil {
+		return walk, nil
+	}
+
+	var oldestVisitedSlot uint32
+	visitedCandidate := false
 	for base.Exists {
 		walk.Visited++
 		walk.Steps[r.candidates.payloadResidency(base.ID)]++
 		resolution, err := r.candidates.resolve(ctx, base.ID)
 		if err != nil {
-			return resolvedLineage{Walk: walk}, err
+			return walk, err
 		}
 		artifact := resolution.Candidate
 		if artifact == nil || artifact.Candidate.ID != base.ID {
-			return resolvedLineage{Walk: walk}, errors.New("validator runtime: resolved lineage candidate differs from its id")
+			return walk, errors.New("validator runtime: resolved ancestry candidate differs from its id")
 		}
-		lineage = append(lineage, artifact)
-		attemptedAppliedState := false
-		var appliedStateErr error
-		if appliedIndex < 0 && !artifact.Candidate.Empty &&
-			(finalizedBlock == nil || artifact.Candidate.Block.SeqNo >= finalizedBlock.SeqNo) {
-			attemptedAppliedState = true
-			state, stateErr := r.appliedCandidateState(ctx, base.ID, artifact.Candidate.Block)
-			appliedStateErr = stateErr
-			if stateErr == nil {
-				appliedIndex = len(lineage) - 1
-				appliedState = state
-			} else if !errors.Is(stateErr, errFinalizedCandidateNotApplied) &&
-				!errors.Is(stateErr, ErrBlockNotReady) && !errors.Is(stateErr, context.DeadlineExceeded) {
-				return resolvedLineage{Walk: walk}, stateErr
-			}
-		}
-		if finalizedBlock != nil && sameBlockID(artifact.Candidate.Block, *finalizedBlock) {
-			matchedAnchor = true
-			if appliedIndex < 0 {
-				if !attemptedAppliedState || errors.Is(appliedStateErr, errFinalizedCandidateNotApplied) {
-					state, stateErr := r.finalizedAnchorState(ctx, base.ID, artifact.Candidate.Block)
-					appliedState = state
-					appliedStateErr = stateErr
-				}
-				if appliedStateErr != nil {
-					return resolvedLineage{Walk: walk}, appliedStateErr
-				}
-				appliedIndex = len(lineage) - 1
-			}
-			break
+		oldestVisitedSlot = artifact.Candidate.ID.Slot
+		visitedCandidate = true
+		if sameBlockID(artifact.Candidate.Block, *finalizedBlock) {
+			r.mu.Lock()
+			r.noteLineageFloorLocked(oldestVisitedSlot)
+			r.mu.Unlock()
+
+			return walk, nil
 		}
 		base = artifact.Candidate.Parent
 	}
-	if !matchedAnchor {
-		r.mu.Lock()
-		genesis := r.genesis
-		r.mu.Unlock()
-		if genesis == nil {
-			return resolvedLineage{Walk: walk}, errors.New("validator runtime: state resolver is not started")
-		}
-		for i := range genesis.tips {
-			if sameBlockID(genesis.tips[i].ID, *finalizedBlock) {
-				matchedAnchor = true
-				break
-			}
-		}
-		if !matchedAnchor {
-			return resolvedLineage{Walk: walk}, errFinalizedLineageAhead
-		}
-	}
-	// The walk is the consumer both retention sweeps exist for, so it states what
-	// it needed as soon as it is known to have succeeded: everything from the
-	// slot it stopped at up to the tip, which is the whole visited range and not
-	// only the part trimmed below. Nothing here depends on the trimming, because
-	// a walk that reads a candidate needed that candidate whether or not it ends
-	// up handing it to the producer.
-	if len(lineage) > 0 {
-		r.mu.Lock()
-		r.noteLineageFloorLocked(lineage[len(lineage)-1].Candidate.ID.Slot)
-		r.mu.Unlock()
-	}
-	var appliedAnchor *ton.BlockIDExt
-	if appliedIndex >= 0 {
-		anchor := *lineage[appliedIndex].Candidate.Block.Copy()
-		appliedAnchor = &anchor
-		lineage = lineage[:appliedIndex+1]
-	}
-	for left, right := 0, len(lineage)-1; left < right; left, right = left+1, right-1 {
-		lineage[left], lineage[right] = lineage[right], lineage[left]
-	}
 
-	return resolvedLineage{
-		Candidates:         lineage,
-		AppliedAnchor:      appliedAnchor,
-		AppliedAnchorState: appliedState,
-		Walk:               walk,
-	}, nil
-}
-
-func (r *stateResolver) appliedCandidateState(
-	ctx context.Context,
-	id simplex.CandidateID,
-	block ton.BlockIDExt,
-) (*ChainState, error) {
 	r.mu.Lock()
-	state := r.finalized[id]
-	if state == nil || !state.isDone {
-		r.mu.Unlock()
-
-		return nil, errFinalizedCandidateNotApplied
-	}
-	if state.appliedState != nil {
-		resolved := state.appliedState
-		r.mu.Unlock()
-
-		return resolved, nil
-	}
-	r.mu.Unlock()
-
-	return r.loadAppliedCandidateState(ctx, id, block)
-}
-
-func (r *stateResolver) loadAppliedCandidateState(
-	ctx context.Context,
-	id simplex.CandidateID,
-	block ton.BlockIDExt,
-) (*ChainState, error) {
-	r.mu.Lock()
-	state := r.finalized[id]
-	if state == nil || !state.isDone {
-		r.mu.Unlock()
-
-		return nil, errFinalizedCandidateNotApplied
-	}
-	if state.appliedState != nil {
-		resolved := state.appliedState
-		r.mu.Unlock()
-
-		return resolved, nil
-	}
 	genesis := r.genesis
 	r.mu.Unlock()
 	if genesis == nil {
-		return nil, errors.New("validator runtime: state resolver is not started")
+		return walk, errors.New("validator runtime: state resolver is not started")
+	}
+	for i := range genesis.tips {
+		if !sameBlockID(genesis.tips[i].ID, *finalizedBlock) {
+			continue
+		}
+		if visitedCandidate {
+			r.mu.Lock()
+			r.noteLineageFloorLocked(oldestVisitedSlot)
+			r.mu.Unlock()
+		}
+
+		return walk, nil
 	}
 
-	request := ChainStateRequest{
-		Shard:          r.shard,
-		Blocks:         []ton.BlockIDExt{block},
-		MinMasterchain: genesis.minMasterchain,
-	}
-	data, err := r.backend.LoadChainState(ctx, request)
-	if err != nil {
-		return nil, err
-	}
-	resolved, err := newChainState(request, data)
-	if err != nil {
-		return nil, err
-	}
-	if len(resolved.tips) != 1 || !sameBlockID(resolved.tips[0].ID, block) {
-		return nil, errors.New("validator runtime: applied candidate state is not a normal anchor")
-	}
-
-	r.mu.Lock()
-	state = r.finalized[id]
-	if state != nil && state.isDone {
-		r.rememberAppliedStateLocked(id, state, resolved)
-		resolved = state.appliedState
-	}
-	r.mu.Unlock()
-
-	return resolved, nil
-}
-
-func (r *stateResolver) finalizedAnchorState(
-	ctx context.Context,
-	id simplex.CandidateID,
-	block ton.BlockIDExt,
-) (*ChainState, error) {
-	r.mu.Lock()
-	if r.anchor != nil && r.anchor.id == id && sameBlockID(r.anchor.block, block) {
-		resolved := r.anchor.state
-		r.mu.Unlock()
-
-		return resolved, nil
-	}
-	genesis := r.genesis
-	r.mu.Unlock()
-	if genesis == nil {
-		return nil, errors.New("validator runtime: state resolver is not started")
-	}
-
-	request := ChainStateRequest{
-		Shard:          r.shard,
-		Blocks:         []ton.BlockIDExt{block},
-		MinMasterchain: genesis.minMasterchain,
-	}
-	data, err := r.backend.LoadChainState(ctx, request)
-	if err != nil {
-		return nil, err
-	}
-	resolved, err := newChainState(request, data)
-	if err != nil {
-		return nil, err
-	}
-	if len(resolved.tips) != 1 || !sameBlockID(resolved.tips[0].ID, block) {
-		return nil, errors.New("validator runtime: finalized anchor state is not normal")
-	}
-
-	r.mu.Lock()
-	if r.anchor != nil && r.anchor.id == id && sameBlockID(r.anchor.block, block) {
-		resolved = r.anchor.state
-	} else {
-		r.anchor = &resolvedAnchorState{id: id, block: *block.Copy(), state: resolved}
-	}
-	if state := r.finalized[id]; state != nil && state.isDone && state.appliedState == nil {
-		r.rememberAppliedStateLocked(id, state, resolved)
-	}
-	r.mu.Unlock()
-
-	return resolved, nil
+	return walk, errFinalizedLineageAhead
 }
 
 func (r *stateResolver) resolveLoop(
@@ -998,7 +791,7 @@ func (r *stateResolver) resolveInner(ctx context.Context, id simplex.ParentID) (
 	if artifact.Candidate.Empty {
 		return r.resolve(ctx, artifact.Candidate.Parent)
 	}
-	genUtime, err := candidateGenUtime(artifact.CollatedData)
+	genUtime, err := artifact.generationTime()
 	if err != nil {
 		return ResolvedState{}, err
 	}
@@ -1164,6 +957,15 @@ func candidateGenUtime(collatedData []byte) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, fmt.Errorf("validator runtime: decode collated data time: %w", err)
 	}
+	milliseconds, err := candidateGenUtimeMSFromRoots(roots)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	return time.UnixMilli(int64(milliseconds)), nil
+}
+
+func candidateGenUtimeMSFromRoots(roots []*cell.Cell) (uint64, error) {
 	for _, root := range roots {
 		loader, loadErr := root.BeginParse()
 		if loadErr != nil || loader.BitsLeft() < 128 {
@@ -1181,13 +983,46 @@ func candidateGenUtime(collatedData []byte) (time.Time, error) {
 			continue
 		}
 		if milliseconds > uint64(^uint64(0)>>1) {
-			return time.Time{}, errors.New("validator runtime: candidate generation time overflows int64")
+			return 0, errors.New("validator runtime: candidate generation time overflows int64")
 		}
 
-		return time.UnixMilli(int64(milliseconds)), nil
+		return milliseconds, nil
 	}
 
-	return time.Time{}, errors.New("validator runtime: candidate has no consensus extra data")
+	return 0, errors.New("validator runtime: candidate has no consensus extra data")
+}
+
+// generationTime returns the exact timestamp attached by a trusted producer.
+// The byte fallback preserves compatibility for artifacts assembled inside
+// this package without an optimization capsule.
+func (a *CandidateArtifact) generationTime() (time.Time, error) {
+	if !a.generationTimeKnown {
+		return candidateGenUtime(a.CollatedData)
+	}
+	if a.generationTimeMS > uint64(^uint64(0)>>1) {
+		return time.Time{}, errors.New("validator runtime: candidate generation time overflows int64")
+	}
+
+	return time.UnixMilli(int64(a.generationTimeMS)), nil
+}
+
+// withGenerationTime establishes private timestamp provenance at an admission
+// boundary. Trusted local and decoded candidates return unchanged; a custom
+// artifact pays one collated BOC decode and the resolver retains the derived
+// scalar from then on.
+func (a *CandidateArtifact) withGenerationTime() (*CandidateArtifact, error) {
+	if a.Candidate.Empty || a.generationTimeKnown {
+		return a, nil
+	}
+	milliseconds, err := candidateGenUtime(a.CollatedData)
+	if err != nil {
+		return nil, err
+	}
+	withTime := *a
+	withTime.generationTimeMS = uint64(milliseconds.UnixMilli())
+	withTime.generationTimeKnown = true
+
+	return &withTime, nil
 }
 
 func (r *stateResolver) finalize(

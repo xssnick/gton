@@ -23,6 +23,11 @@ var errQUICDialDeferred = errors.New("QUIC dial retry is deferred")
 const (
 	quicAddressCacheMaxAge      = 30 * time.Second
 	quicPeerDiscoveryRetryDelay = 100 * time.Millisecond
+	// outboundQUICDialParallelism bounds transport setup shared by proactive
+	// route prewarm and cold two-step delivery. Candidate fanout still dials
+	// peers concurrently, while simultaneous overlays cannot multiply the
+	// handshake and DHT load without a bound.
+	outboundQUICDialParallelism = 16
 )
 
 // errQUICPeerOffline reports that a broadcast could not be sent because the peer
@@ -47,10 +52,21 @@ type quicRouteBroadcastPeer struct {
 	envelope *quicOverlayEnvelope
 }
 
+// quicTwoStepSendPeer is used only by source and queued-rebroadcast fanout.
+// Unlike receive-side relay, each bounded tonutils send worker may establish
+// its own route before sending, so one cold peer does not form an all-peer
+// connection barrier.
+type quicTwoStepSendPeer struct {
+	peer     *overlayPeer
+	envelope *quicOverlayEnvelope
+}
+
 var _ overlay.BroadcastPeer = quicBroadcastSource{}
 var _ overlay.BroadcastPeer = quicRouteBroadcastPeer{}
+var _ overlay.BroadcastPeer = quicTwoStepSendPeer{}
 var _ overlay.PreparedBroadcastPeer = quicBroadcastSource{}
 var _ overlay.PreparedBroadcastPeer = quicRouteBroadcastPeer{}
+var _ overlay.PreparedBroadcastPeer = quicTwoStepSendPeer{}
 
 func (p quicBroadcastSource) ID() []byte {
 	return p.id[:]
@@ -128,6 +144,37 @@ func (p quicRouteBroadcastPeer) SendPreparedCustomMessage(ctx context.Context, b
 	return nil
 }
 
+func (p quicTwoStepSendPeer) ID() []byte {
+	return p.peer.id[:]
+}
+
+func (p quicTwoStepSendPeer) SendCustomMessage(ctx context.Context, req tl.Serializable) error {
+	peer, err := p.peer.quicPath().dialBounded(ctx)
+	if err != nil {
+		return err
+	}
+	payload, err := p.envelope.Message(req)
+	if err != nil {
+		return err
+	}
+	if err = peer.SendOutboundMessage(ctx, payload); err != nil {
+		return fmt.Errorf("send quic overlay message: %w", err)
+	}
+	return nil
+}
+
+func (p quicTwoStepSendPeer) SendPreparedCustomMessage(ctx context.Context, body []byte) error {
+	peer, err := p.peer.quicPath().dialBounded(ctx)
+	if err != nil {
+		return err
+	}
+	prefix := p.envelope.state.Load().messagePrefix
+	if err = peer.SendOutboundMessageParts(ctx, prefix, body); err != nil {
+		return fmt.Errorf("send prepared quic overlay message: %w", err)
+	}
+	return nil
+}
+
 // requestBackgroundQUICDial starts at most one asynchronous dial per retry
 // window for this peer's route; once the dial lands, subsequent sends find the
 // live peer through the gateway.
@@ -145,11 +192,42 @@ func (p *overlayPeer) requestBackgroundQUICDial() {
 		defer route.ReleaseBackgroundQUICDial()
 		ctx, cancel := context.WithTimeout(node.runCtx, quicRelayDialTimeout)
 		defer cancel()
-		_, _ = path.dialGated(ctx)
+		_, _ = path.dialBounded(ctx)
 	})
 	if !spawned {
 		route.ReleaseBackgroundQUICDial()
 	}
+}
+
+// prewarmQUICPeers resolves missing routes and opens connections for peers
+// attached before subscription startup. Later peer and route arrivals are
+// handled by prewarmQUICPeer from attachPooledPeer.
+func (s *overlaySubscription) prewarmQUICPeers() {
+	if !s.spec.UseQUIC {
+		return
+	}
+
+	for _, peer := range s.peersSnapshot() {
+		s.prewarmQUICPeer(peer)
+	}
+}
+
+func (s *overlaySubscription) prewarmQUICPeer(peer *overlayPeer) {
+	if !s.spec.UseQUIC {
+		return
+	}
+
+	s.mx.Lock()
+	current := s.cancel != nil && !s.removed && !s.inactive && s.peers[peer.id] == peer
+	s.mx.Unlock()
+	if !current {
+		return
+	}
+
+	if _, err := s.node.quicGateway.OutboundPeerDefaultID(peer.id[:]); err == nil {
+		return
+	}
+	peer.requestBackgroundQUICDial()
 }
 
 func (p *overlayPeer) dialQUIC(ctx context.Context) (*adnlquic.Peer, error) {
@@ -235,6 +313,41 @@ type quicPeerPath struct {
 	route     *peerroute.Route
 }
 
+// quicDialTurn is always one of two valid states: an established peer the
+// caller can use immediately, or ownership of the route dial claim.
+type quicDialTurn struct {
+	peer  *adnlquic.Peer
+	owner bool
+}
+
+// dialBounded shares a node-wide transport-setup budget between background
+// prewarm and cold candidate fanout. A nil limiter is retained for hand-built
+// nodes in narrow package tests; every node created through New has the bound.
+func (p quicPeerPath) dialBounded(ctx context.Context) (*adnlquic.Peer, error) {
+	turn, err := p.awaitQUICDialTurn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !turn.owner {
+		return turn.peer, nil
+	}
+
+	slots := p.node.quicOutboundDialSlots
+	if slots == nil {
+		return p.dialClaimed(ctx)
+	}
+
+	select {
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
+	case <-ctx.Done():
+		p.route.FinishQUICDial()
+		return nil, fmt.Errorf("wait for QUIC dial slot: %w", ctx.Err())
+	}
+
+	return p.dialClaimed(ctx)
+}
+
 func (s *overlaySubscription) quicPeerPath(id PeerID) (quicPeerPath, error) {
 	if peer := s.peerByID(id); peer != nil {
 		return peer.quicPath(), nil
@@ -251,18 +364,54 @@ func (s *overlaySubscription) quicPeerPath(id PeerID) (quicPeerPath, error) {
 // failed attempt defers redials (including the DHT re-resolve) for the retry
 // window.
 func (p quicPeerPath) dialGated(ctx context.Context) (*adnlquic.Peer, error) {
+	turn, err := p.awaitQUICDialTurn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !turn.owner {
+		return turn.peer, nil
+	}
+
+	return p.dialClaimed(ctx)
+}
+
+// awaitQUICDialTurn claims the route before entering tonutils Gateway, whose
+// per-peer dial mutex is not context-aware. Contenders coalesce on the route's
+// completion channel and therefore retain their own deadline while reusing a
+// successful prewarm.
+func (p quicPeerPath) awaitQUICDialTurn(ctx context.Context) (quicDialTurn, error) {
+	for {
+		if peer, err := p.node.quicGateway.OutboundPeerDefaultID(p.id[:]); err == nil {
+			p.route.SucceedQUICDial(false)
+			p.node.noteOutboundQUICPath(p.id)
+
+			return quicDialTurn{peer: peer}, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return quicDialTurn{}, fmt.Errorf("dial QUIC peer: %w", err)
+		}
+		if p.route.BeginQUICDial(time.Now()) {
+			return quicDialTurn{owner: true}, nil
+		}
+		if !p.route.QUICDialInFlight() {
+			return quicDialTurn{}, fmt.Errorf("dial QUIC peer: %w", errQUICDialDeferred)
+		}
+		if err := p.route.WaitQUICDial(ctx); err != nil {
+			return quicDialTurn{}, fmt.Errorf("wait for QUIC peer dial: %w", err)
+		}
+	}
+}
+
+// dialClaimed enters the transport only after this caller owns the route. No
+// second caller for the same peer can now block on tonutils' non-context
+// dialMu; it waits on the route completion channel instead.
+func (p quicPeerPath) dialClaimed(ctx context.Context) (*adnlquic.Peer, error) {
 	endpointChosen := false
-	claimed := false
 	peer, err := p.node.quicGateway.DialDefaultResolvedID(
 		ctx,
 		p.id[:],
 		p.publicKey,
 		func(ctx context.Context) (string, error) {
-			if !p.route.BeginQUICDial(time.Now()) {
-				return "", errQUICDialDeferred
-			}
-			claimed = true
-
 			addr, resolveErr := resolveQUICRoute(
 				ctx,
 				p.node,
@@ -278,29 +427,23 @@ func (p quicPeerPath) dialGated(ctx context.Context) (*adnlquic.Peer, error) {
 		},
 	)
 	if err == nil {
-		p.route.SucceedQUICDial(claimed)
+		p.route.SucceedQUICDial(true)
 		// Queries, two-step broadcasts, Plumtree fanout, repairs and background
 		// relay dials all meet here, so the idle sweep can account for every
 		// outbound path consistently.
 		p.node.noteOutboundQUICPath(p.id)
 		return peer, nil
 	}
-	if errors.Is(err, errQUICDialDeferred) {
-		return nil, fmt.Errorf("dial QUIC peer: %w", err)
-	}
-	if errors.Is(ctx.Err(), context.Canceled) {
-		if claimed {
-			p.route.FinishQUICDial()
-		}
-		return nil, fmt.Errorf("dial QUIC peer: %w", err)
+	if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) {
+		p.route.FinishQUICDial()
+		return nil, fmt.Errorf("dial QUIC peer: %w", ctxErr)
 	}
 	if endpointChosen {
 		p.route.MarkQUICAddressStale()
 	}
-	if claimed {
-		p.route.FailQUICDial(time.Now())
-	} else {
-		p.route.DeferQUICDial(time.Now())
+	p.route.FailQUICDial(time.Now())
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, fmt.Errorf("dial QUIC peer: %w", ctxErr)
 	}
 	return nil, fmt.Errorf("dial QUIC peer: %w", err)
 }

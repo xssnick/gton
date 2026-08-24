@@ -1,7 +1,6 @@
 package collator
 
 import (
-	"github.com/xssnick/gton/service/validator/msgpool"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm"
@@ -12,47 +11,24 @@ type prewarmAccountKey struct {
 	account   [32]byte
 }
 
-// prewarmCurrentInternals fills the prewarmer's bounded look-ahead from the
-// canonical front of the exact cut. The horizon follows the configured worker
-// and queue capacity rather than a message constant: a large block keeps
-// warming later destinations while its earlier transactions execute, while a
-// deeper backlog cannot create unbounded work.
-func (a *LocalAcquisition) prewarmCurrentInternals(cut *msgpool.Cut) {
-	if a.accountPrewarmer == nil || cut == nil {
-		return
+// pooledPrewarmLimit bounds how far into a freshly seeded run the prewarm
+// hints reach: the configured capacity when there is one, otherwise a few
+// blocks' worth of admissions.
+func (a *LocalAcquisition) pooledPrewarmLimit() int {
+	if a.accountPrewarmCapacity > 0 {
+		return a.accountPrewarmCapacity
 	}
-
-	capacity := a.accountPrewarmCapacity
-	if capacity <= 0 {
-		return
-	}
-	seen := make(map[prewarmAccountKey]struct{}, min(capacity, len(cut.Messages)))
-	for _, message := range cut.Messages {
-		if !message.DestinationPrewarmable {
-			continue
-		}
-		key := prewarmAccountKey{
-			workchain: message.DestinationWorkchain,
-			account:   message.DestinationAccount,
-		}
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		if !a.accountPrewarmer.PrewarmAccountNow(key.workchain, key.account) {
-			a.accountPrewarmer.EnqueueAccount(key.workchain, key.account)
-		}
-		if len(seen) == capacity {
-			return
-		}
-	}
+	return pooledPrewarmDefaultLimit
 }
 
+// pooledPrewarmDefaultLimit is about three full blocks of inbound internals.
+const pooledPrewarmDefaultLimit = 1024
+
 // prewarmExternalInputs starts every valid local destination in the batch
-// before the first external transaction executes. Ingress already warms the
-// account root it checked; this address-based hint resolves the current live
-// root again, which matters when the account advanced between admission and
-// this candidate.
+// before the first external transaction executes. Pool admission already
+// schedules the destination in the background; this immediate hint promotes
+// pending work and resolves the current live root again when the account has
+// advanced before this candidate.
 func (c *collation) prewarmExternalInputs(inputs []ExternalInput) {
 	if c.req.accountPrewarmer == nil {
 		return

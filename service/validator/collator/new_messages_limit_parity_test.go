@@ -397,7 +397,10 @@ func TestInternalMsgTimeoutIsCheckedByEveryInternalPhase(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"processInternals":     "imports.go",
+		// The loop lives in processInternalsFrom; processInternals is the
+		// from-zero wrapper and the top-up is the resumed one, and both reach the
+		// budget through it.
+		"processInternalsFrom": "imports.go",
 		"processDispatchQueue": "dispatch.go",
 		"processNewMessages":   "execute.go",
 		"deliverImmediate":     "execute.go",
@@ -509,7 +512,12 @@ func TestProcessedBoundHasExactlyTwoCallSites(t *testing.T) {
 		}
 	}
 
-	want := map[string]int{"importInternal": 1, "deliverImmediate": 1}
+	// retireInternal is the import-side feed: importInternal is planInternal
+	// followed by retireInternal, and the bound advances in the retire half so
+	// that a message executed ahead of its admission (processInternalsInWaves)
+	// moves the floor only once it is actually admitted, in queue order. The
+	// feed count is unchanged; only the function it sits in has a new name.
+	want := map[string]int{"retireInternal": 1, "deliverImmediate": 1}
 	if len(sites) != len(want) {
 		t.Fatalf("%s is called from %v, want exactly %v. A third feed for the processed bound is a "+
 			"consensus-visible change: it moves the floor that every later transaction's lt is "+

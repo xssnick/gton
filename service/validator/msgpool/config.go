@@ -122,6 +122,11 @@ func (SystemClock) Now() time.Time { return time.Now() }
 var (
 	// ErrClosed rejects operations on a closed pool.
 	ErrClosed = errors.New("msgpool: pool is closed")
+	// ErrExternalCapacity reports that an otherwise valid external did not fit
+	// one of the pool's count, byte, or per-address admission limits.
+	ErrExternalCapacity = errors.New("msgpool: external capacity exceeded")
+	// ErrInvalidExternalSize rejects a missing or invalid serialized BOC size.
+	ErrInvalidExternalSize = errors.New("msgpool: invalid external serialized size")
 	// ErrInvalidExternalOutcome rejects feedback the pool cannot interpret.
 	ErrInvalidExternalOutcome = errors.New("msgpool: invalid external outcome")
 )

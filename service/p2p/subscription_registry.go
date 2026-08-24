@@ -23,6 +23,7 @@ func (n *Node) startSubscription(sub *overlaySubscription) {
 		return
 	}
 
+	sub.prewarmQUICPeers()
 	sub.startTwoStepRebroadcastWorker(ctx)
 	n.runAsync(func() {
 		defer sub.clearRunCancel(token)

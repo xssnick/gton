@@ -98,6 +98,7 @@ type localConsensusProgressCollator interface {
 
 type localSelfWindowCollator interface {
 	ActivateSelfWindow(context.Context, collator.SelfWindowRequest) error
+	SpeculateSelfWindow(context.Context, collator.SpeculativeWindowRequest) error
 }
 
 type localWindowRoute struct {
@@ -109,6 +110,11 @@ type localWindowRoute struct {
 type localValidationView struct {
 	session collator.ActivatedSession
 	update  collator.SessionUpdate
+}
+
+type localDeferredWindow struct {
+	window  simplex.Window
+	startAt time.Time
 }
 
 // LocalSessionBackend binds one Simplex runtime to local authenticated state,
@@ -142,8 +148,37 @@ type LocalSessionBackend struct {
 
 	controlMu         sync.Mutex
 	validationChanged chan struct{}
+	// collatorReady is closed once deferred producer recovery resolves. Waiters
+	// then recheck whether it resolved as ready, terminally unavailable, or
+	// closed. The channel is initialized lazily for test-built backends; after
+	// construction its field and Once are owned under controlMu.
+	collatorReady     chan struct{}
+	collatorReadyOnce sync.Once
 	state             SessionState
 	update            collator.SessionUpdate
+	// pendingWindow remembers the authenticated window observed while an
+	// ahead recovered producer waits for the node's masterchain view. Its exact
+	// selected-base capability is deliberately not retained across that state
+	// change: successful catch-up asks the runtime to recheck ancestry and send
+	// a newly bound capability instead.
+	// Guarded by controlMu.
+	pendingWindow *localDeferredWindow
+	// appliedWindow is the latest selected-base proof accepted by the in-process
+	// producer. It becomes stale when the finalized anchor advances, so
+	// UpdateSession can turn it into recheckWindow atomically with the new chain
+	// view. Delegated/observer progress is owned by its remote consumer and does
+	// not participate in this local handshake.
+	appliedWindow *localDeferredWindow
+	// handledWindow aliases the appliedWindow generation whose matching
+	// HandleLeaderWindow successfully crossed the producer boundary. A later
+	// finalized block must not invalidate that running multi-slot snapshot.
+	handledWindow *localDeferredWindow
+	// recheckWindow records the consensus window whose selected-base proof must
+	// be checked again after producer catch-up, or after the finalized anchor
+	// advances in the gap before HandleLeaderWindow. Every matching attempt is
+	// rejected until ObserveConsensusProgress installs a freshly bound
+	// capability for this or a newer window.
+	recheckWindow *localDeferredWindow
 	// collatorUnavailable permanently disables production for this runtime
 	// attachment after the collator reports a terminal lifecycle failure.
 	// Consensus validation keeps using the authenticated session updates; only
@@ -159,21 +194,35 @@ type LocalSessionBackend struct {
 
 var _ SessionBackend = (*LocalSessionBackend)(nil)
 
-func NewLocalSessionBackend(
+// LocalSessionBackendPreparation is the atomic local-backend construction
+// result. RuntimeState keeps the node's applied masterchain view while carrying
+// forward the exact session-local finalized anchor recovered by the producer.
+// The runtime must start from this state so its ancestry guard cannot be weaker
+// than the durable producer view.
+type LocalSessionBackendPreparation struct {
+	Backend      *LocalSessionBackend
+	RuntimeState SessionState
+}
+
+func PrepareLocalSessionBackend(
 	ctx context.Context,
 	options LocalSessionBackendOptions,
-) (*LocalSessionBackend, error) {
+) (LocalSessionBackendPreparation, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return LocalSessionBackendPreparation{}, err
 	}
 	if options.Node == nil {
-		return nil, errors.New("validator local backend: node is required")
+		return LocalSessionBackendPreparation{}, errors.New("validator local backend: node is required")
 	}
 	if !options.Config.Shard.IsMasterchain() && options.Groups == nil {
-		return nil, errors.New("validator local backend: validator-group source is required for a shard session")
+		return LocalSessionBackendPreparation{}, errors.New(
+			"validator local backend: validator-group source is required for a shard session",
+		)
 	}
 	if options.CloseTimeout < 0 {
-		return nil, errors.New("validator local backend: close timeout must not be negative")
+		return LocalSessionBackendPreparation{}, errors.New(
+			"validator local backend: close timeout must not be negative",
+		)
 	}
 	if options.CloseTimeout == 0 {
 		options.CloseTimeout = defaultLocalSessionCloseTimeout
@@ -193,7 +242,7 @@ func NewLocalSessionBackend(
 		Logger:    options.Logger,
 	})
 	if err != nil {
-		return nil, err
+		return LocalSessionBackendPreparation{}, err
 	}
 
 	backend := &LocalSessionBackend{
@@ -212,39 +261,61 @@ func NewLocalSessionBackend(
 		closeAfter:        options.CloseTimeout,
 		validator:         options.Config.Identity.Validator,
 		validationChanged: make(chan struct{}),
+		collatorReady:     make(chan struct{}),
 		state:             initial,
 		update:            update,
 	}
 	if backend.validator == nil {
-		return backend, nil
+		backend.signalCollatorReady()
+
+		return LocalSessionBackendPreparation{
+			Backend:      backend,
+			RuntimeState: cloneSessionState(backend.state),
+		}, nil
 	}
 	if backend.validator.Signer == nil {
-		return nil, errors.New("validator local backend: validator signer is required")
+		return LocalSessionBackendPreparation{}, errors.New(
+			"validator local backend: validator signer is required",
+		)
 	}
 	if int(backend.validator.Index) >= len(options.Config.Validators) {
-		return nil, errors.New("validator local backend: validator index is outside the roster")
+		return LocalSessionBackendPreparation{}, errors.New(
+			"validator local backend: validator index is outside the roster",
+		)
 	}
 	if options.Acquisition == nil {
-		return nil, errors.New("validator local backend: local acquisition is required for a validator")
+		return LocalSessionBackendPreparation{}, errors.New(
+			"validator local backend: local acquisition is required for a validator",
+		)
 	}
 	if options.Storage == nil {
-		return nil, errors.New("validator local backend: validator storage is required for a validator")
+		return LocalSessionBackendPreparation{}, errors.New(
+			"validator local backend: validator storage is required for a validator",
+		)
 	}
 	if options.Collator == nil {
-		return nil, errors.New("validator local backend: collator is required for a validator")
+		return LocalSessionBackendPreparation{}, errors.New(
+			"validator local backend: collator is required for a validator",
+		)
 	}
 	switch options.ProductionMode {
 	case collator.ProductionModeSelf:
 		if options.CandidateRouter == nil {
-			return nil, errors.New("validator local backend: self production requires a candidate router")
+			return LocalSessionBackendPreparation{}, errors.New(
+				"validator local backend: self production requires a candidate router",
+			)
 		}
 		progress, ok := options.Collator.(localConsensusProgressCollator)
 		if !ok {
-			return nil, errors.New("validator local backend: in-process collator does not accept consensus progress")
+			return LocalSessionBackendPreparation{}, errors.New(
+				"validator local backend: in-process collator does not accept consensus progress",
+			)
 		}
 		self, ok := options.Collator.(localSelfWindowCollator)
 		if !ok {
-			return nil, errors.New("validator local backend: in-process collator does not accept self windows")
+			return LocalSessionBackendPreparation{}, errors.New(
+				"validator local backend: in-process collator does not accept self windows",
+			)
 		}
 		backend.progress = progress
 		backend.self = self
@@ -256,29 +327,48 @@ func NewLocalSessionBackend(
 			backend.routeCandidate,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("validator local backend: register candidate route: %w", err)
+			return LocalSessionBackendPreparation{}, fmt.Errorf(
+				"validator local backend: register candidate route: %w",
+				err,
+			)
 		}
 	case collator.ProductionModeDelegated:
 		if options.CandidateRouter != nil {
-			return nil, errors.New("validator local backend: delegated production forbids a candidate router")
+			return LocalSessionBackendPreparation{}, errors.New(
+				"validator local backend: delegated production forbids a candidate router",
+			)
 		}
 		if options.Delegations == nil {
-			return nil, errors.New("validator local backend: delegated production requires authorization storage")
+			return LocalSessionBackendPreparation{}, errors.New(
+				"validator local backend: delegated production requires authorization storage",
+			)
 		}
 	default:
-		return nil, errors.New("validator local backend: production mode is invalid")
+		return LocalSessionBackendPreparation{}, errors.New(
+			"validator local backend: production mode is invalid",
+		)
 	}
 	preparation, err := prepareLocalCollatorSession(ctx, options.Collator, session, update)
 	if err != nil {
 		if backend.releaseRoute != nil {
 			backend.releaseRoute()
 		}
-		return nil, err
+		return LocalSessionBackendPreparation{}, err
 	}
 	backend.update = preparation.update
+	if preparation.update.HasFinalizedBlock {
+		finalized := *preparation.update.FinalizedBlock.Copy()
+		backend.state.FinalizedBlock = &finalized
+	}
 	backend.collatorDeferred.Store(!preparation.ready)
+	if preparation.ready {
+		backend.signalCollatorReady()
+	}
 
-	return backend, nil
+	return LocalSessionBackendPreparation{
+		Backend:      backend,
+		RuntimeState: cloneSessionState(backend.state),
+	}, nil
 }
 
 // ObserveConsensusProgress publishes the exact authenticated Simplex view to
@@ -298,42 +388,46 @@ func (b *LocalSessionBackend) ObserveConsensusProgress(
 		return ErrLocalSessionBackendClosed
 	}
 	if b.progress == nil {
-		applyConsensusWindow(&b.update, progress)
+		applyConsensusWindow(&b.update, progress.Window, progress.StartAt)
 		b.publishValidationView()
+
+		return nil
+	}
+	if b.collatorDeferred.Load() {
+		b.pendingWindow = &localDeferredWindow{
+			window:  progress.Window,
+			startAt: progress.StartAt,
+		}
 
 		return nil
 	}
 
 	converted, err := collatorConsensusProgress(
 		b.config.SessionID,
-		b.config.Protocol.SlotsPerLeaderWindow,
 		progress,
 	)
 	if err != nil {
 		return fmt.Errorf("validator local backend: convert consensus progress: %w", err)
 	}
-	if b.collatorDeferred.Load() {
-		applyConsensusWindow(&b.update, progress)
+	if b.collatorUnavailable {
+		applyConsensusWindow(&b.update, progress.Window, progress.StartAt)
+		b.publishValidationView()
 
 		return nil
 	}
-	if b.collatorUnavailable {
-		return fmt.Errorf(
-			"validator local backend: apply consensus progress: %w",
-			collator.ErrSessionUnavailable,
-		)
-	}
 	if err := b.progress.ApplyConsensusProgress(ctx, converted); err != nil {
 		if errors.Is(err, collator.ErrSessionUnavailable) {
-			b.collatorUnavailable = true
-			b.clearWindowRoute(0)
+			b.quarantineCollator(&b.update)
+			applyConsensusWindow(&b.update, progress.Window, progress.StartAt)
+			b.publishValidationView()
+
+			return nil
 		}
 
 		return fmt.Errorf("validator local backend: apply consensus progress: %w", err)
 	}
 
-	applyConsensusWindow(&b.update, progress)
-	b.publishValidationView()
+	b.applyObservedConsensusWindow(progress)
 
 	return nil
 }
@@ -359,9 +453,13 @@ func (b *LocalSessionBackend) ActivateSession(ctx context.Context, start Session
 
 		return collator.ErrSessionConflict
 	}
-	if b.validator != nil && !b.collatorDeferred.Load() {
+	if b.validator != nil && !b.collatorDeferred.Load() && !b.collatorUnavailable {
 		if err := b.collator.ActivateSession(ctx, activation); err != nil {
-			return fmt.Errorf("validator local backend: activate collator session: %w", err)
+			if !errors.Is(err, collator.ErrSessionUnavailable) {
+				return fmt.Errorf("validator local backend: activate collator session: %w", err)
+			}
+
+			b.quarantineCollator(&b.update)
 		}
 	}
 
@@ -386,6 +484,17 @@ func (b *LocalSessionBackend) UpdateSession(ctx context.Context, state SessionSt
 	}
 	next := localCollatorUpdate(b.config.SessionID, state)
 	next.PreserveProgress(b.update)
+	if err := mergeLocalSessionFinalized(b.config.Shard, &next, b.update); err != nil {
+		return fmt.Errorf("validator local backend: merge finalized progress: %w", err)
+	}
+	if next.HasFinalizedBlock {
+		finalized := *next.FinalizedBlock.Copy()
+		state.FinalizedBlock = &finalized
+	} else {
+		state.FinalizedBlock = nil
+	}
+	finalizedAdvanced := next.HasFinalizedBlock &&
+		(!b.update.HasFinalizedBlock || next.FinalizedBlock.SeqNo > b.update.FinalizedBlock.SeqNo)
 	if b.validator != nil {
 		if b.collatorUnavailable {
 			b.state = state
@@ -395,25 +504,150 @@ func (b *LocalSessionBackend) UpdateSession(ctx context.Context, state SessionSt
 			return nil
 		}
 		if b.collatorDeferred.Load() && b.update.MasterchainBlock.SeqNo > next.MasterchainBlock.SeqNo {
+			if finalizedAdvanced {
+				b.markAppliedWindowRecheck()
+			}
 			b.state = state
 
 			return nil
 		}
 		if err := b.collator.UpdateSession(ctx, next); err != nil {
-			return fmt.Errorf("validator local backend: update collator session: %w", err)
-		}
-		if b.collatorDeferred.Load() && b.activation != nil {
+			if !errors.Is(err, collator.ErrSessionUnavailable) {
+				return fmt.Errorf("validator local backend: update collator session: %w", err)
+			}
+
+			b.quarantineCollator(&next)
+		} else if b.collatorDeferred.Load() && b.activation != nil {
 			if err := b.collator.ActivateSession(ctx, *b.activation); err != nil {
-				return fmt.Errorf("validator local backend: activate recovered collator session: %w", err)
+				if !errors.Is(err, collator.ErrSessionUnavailable) {
+					return fmt.Errorf("validator local backend: activate recovered collator session: %w", err)
+				}
+
+				b.quarantineCollator(&next)
 			}
 		}
-		b.collatorDeferred.Store(false)
+		if !b.collatorUnavailable && finalizedAdvanced {
+			b.markAppliedWindowRecheck()
+		}
+		if b.collatorDeferred.Load() && b.pendingWindow != nil {
+			b.markWindowRecheck(b.pendingWindow)
+			b.pendingWindow = nil
+		}
+		b.endCollatorDefer()
 	}
 
 	b.state = state
 	b.update = next
 	b.publishValidationView()
 	return nil
+}
+
+// quarantineCollator isolates a terminal producer failure without discarding
+// the authenticated consensus view needed by local validation. Callers hold
+// controlMu and commit update after this returns.
+func (b *LocalSessionBackend) quarantineCollator(update *collator.SessionUpdate) {
+	b.collatorUnavailable = true
+	b.clearWindowRoute(0)
+	deferred := b.pendingWindow
+	if b.recheckWindow != nil &&
+		(deferred == nil || windowProgressAdvances(deferred.window, b.recheckWindow.window)) {
+		deferred = b.recheckWindow
+	}
+	if deferred != nil {
+		applyConsensusWindow(update, deferred.window, deferred.startAt)
+	}
+	b.pendingWindow = nil
+	b.appliedWindow = nil
+	b.handledWindow = nil
+	b.recheckWindow = nil
+	b.endCollatorDefer()
+}
+
+// applyObservedConsensusWindow commits one freshly checked selected-base view.
+// Callers hold controlMu. A newer successful view discharges any older proof
+// debt; failed and deferred observations never reach this helper.
+func (b *LocalSessionBackend) applyObservedConsensusWindow(progress sessionConsensusProgress) {
+	applyConsensusWindow(&b.update, progress.Window, progress.StartAt)
+	if b.appliedWindow == nil || windowProgressAdvances(b.appliedWindow.window, progress.Window) {
+		previous := b.appliedWindow
+		wasHandled := previous != nil && b.handledWindow == previous && previous.window == progress.Window
+		b.appliedWindow = &localDeferredWindow{
+			window:  progress.Window,
+			startAt: progress.StartAt,
+		}
+		if wasHandled {
+			b.handledWindow = b.appliedWindow
+		}
+	}
+	if b.recheckWindow != nil && windowProgressAdvances(b.recheckWindow.window, progress.Window) {
+		b.recheckWindow = nil
+	}
+	b.publishValidationView()
+}
+
+// markWindowRecheck preserves the newest selected-base proof debt. The
+// metadata is immutable under controlMu, so sharing the pointer does not copy
+// the Window or create an ownership edge.
+func (b *LocalSessionBackend) markWindowRecheck(window *localDeferredWindow) {
+	if window == nil {
+		return
+	}
+	if b.recheckWindow == nil || windowProgressAdvances(b.recheckWindow.window, window.window) {
+		b.recheckWindow = window
+	}
+}
+
+func windowProgressAdvances(current, next simplex.Window) bool {
+	if next.StartSlot != current.StartSlot {
+		return next.StartSlot > current.StartSlot
+	}
+	if next.ObservedSlot != current.ObservedSlot {
+		return next.ObservedSlot > current.ObservedSlot
+	}
+
+	return next == current
+}
+
+func (b *LocalSessionBackend) markAppliedWindowRecheck() {
+	if b.appliedWindow == nil || b.handledWindow == b.appliedWindow {
+		return
+	}
+
+	b.markWindowRecheck(b.appliedWindow)
+}
+
+func (b *LocalSessionBackend) markWindowHandled(window simplex.Window) {
+	if b.appliedWindow != nil && b.appliedWindow.window == window {
+		b.handledWindow = b.appliedWindow
+	}
+}
+
+// collatorReadinessLocked returns the one lifecycle signal awaited by windows
+// that arrive during recovered producer catch-up. Callers hold controlMu.
+func (b *LocalSessionBackend) collatorReadinessLocked() <-chan struct{} {
+	if b.collatorReady == nil {
+		b.collatorReady = make(chan struct{})
+	}
+
+	return b.collatorReady
+}
+
+// signalCollatorReady wakes every deferred window exactly once. It is called
+// under controlMu after construction; constructor calls happen before publish.
+func (b *LocalSessionBackend) signalCollatorReady() {
+	b.collatorReadyOnce.Do(func() {
+		if b.collatorReady == nil {
+			b.collatorReady = make(chan struct{})
+		}
+		close(b.collatorReady)
+	})
+}
+
+// endCollatorDefer publishes the state transition before waking window waiters.
+// The caller keeps controlMu through the matching state/update commit.
+func (b *LocalSessionBackend) endCollatorDefer() {
+	b.collatorDeferred.Store(false)
+	b.signalCollatorReady()
 }
 
 func (b *LocalSessionBackend) LoadChainState(
@@ -520,7 +754,151 @@ func (b *LocalSessionBackend) ValidateCandidate(
 		return CandidateValidation{}, err
 	}
 
+	b.speculateNextWindow(ctx, view, artifact, next, result.ValidAfter)
+
 	return CandidateValidation{ValidAfter: result.ValidAfter, State: next}, nil
+}
+
+// speculateNextWindow bets that the window about to open will open on the
+// candidate just validated, and starts its first block now.
+//
+// This is the only place in the node that knows both halves at the same time:
+// the successor state of a candidate the network has not notarized yet, and
+// which validator leads the window that its notarization will open. The
+// certificate that opens that window arrives roughly one collation later, so a
+// block started here is in every other validator's hands when they finish
+// applying this base, instead of a collation after they finish.
+//
+// It runs off the validation goroutine on purpose. This function is reached
+// between the semantic verdict and the notarize vote it authorizes, and nothing
+// it does — least of all decoding a state to bind the base capability — belongs
+// in front of that vote.
+func (b *LocalSessionBackend) speculateNextWindow(
+	ctx context.Context,
+	view *localValidationView,
+	artifact *CandidateArtifact,
+	successor *ChainState,
+	validAfter time.Time,
+) {
+	if successor == nil || len(successor.tips) != 1 {
+		return
+	}
+	bet, ok := b.nextWindowBet(view, artifact.Candidate.ID.Slot, validAfter, time.Now())
+	if !ok {
+		return
+	}
+	tip := successor.tips[0]
+	candidate := artifact.Candidate.ID
+	session := b.config.SessionID
+	// Detached from the validation context: that context belongs to a vote which
+	// is about to be cast, and this work outlives it by design.
+	specCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), bet.deadline)
+	go func() {
+		defer cancel()
+		base, err := collator.NewSelectedBaseState(
+			session,
+			candidate,
+			tip.ID,
+			tip.BlockBOC,
+			tip.Block,
+			tip.State,
+		)
+		if err != nil {
+			b.log.Debug().
+				Err(err).
+				Uint32("window_start", bet.startSlot).
+				Msg("skipping speculative window: base capability is not bindable")
+
+			return
+		}
+		if err = b.self.SpeculateSelfWindow(specCtx, collator.SpeculativeWindowRequest{
+			SessionID: session,
+			StartSlot: bet.startSlot,
+			Leader:    b.validator.Index,
+			Base:      base,
+			StartAt:   bet.startAt,
+			Deadline:  bet.deadline,
+		}); err != nil {
+			b.log.Debug().
+				Err(err).
+				Uint32("window_start", bet.startSlot).
+				Msg("speculative window was not started")
+		}
+	}()
+}
+
+// speculativeWindowBet is the decision half of speculateNextWindow: which
+// window a just-validated candidate would open, and on what schedule. It is
+// separated from the binding half so the rule can be read — and gated — without
+// a block to bind.
+type speculativeWindowBet struct {
+	startSlot uint32
+	startAt   time.Time
+	deadline  time.Time
+}
+
+// nextWindowBet reports whether the candidate validated at slot is the one whose
+// notarization opens a window this node leads, and on what schedule its first
+// block should be stamped.
+//
+// Only the last slot of the current window qualifies. It is the candidate whose
+// certificate opens the next window and therefore the base that window will
+// carry unless the network skips it — the 21% of the time it does, the producer
+// falls back to collating on the base consensus really selected.
+func (b *LocalSessionBackend) nextWindowBet(
+	view *localValidationView,
+	slot uint32,
+	validAfter time.Time,
+	now time.Time,
+) (speculativeWindowBet, bool) {
+	if b.self == nil || b.validator == nil || b.productionMode != collator.ProductionModeSelf {
+		return speculativeWindowBet{}, false
+	}
+	if b.config.Shard.IsMasterchain() || view == nil {
+		return speculativeWindowBet{}, false
+	}
+	windowSize := b.config.Protocol.SlotsPerLeaderWindow
+	validators := uint32(len(b.config.Validators))
+	if windowSize == 0 || validators == 0 || slot == math.MaxUint32 {
+		return speculativeWindowBet{}, false
+	}
+	nextStart := slot + 1
+	if nextStart%windowSize != 0 {
+		return speculativeWindowBet{}, false
+	}
+	if nextStart/windowSize%validators != b.validator.Index {
+		return speculativeWindowBet{}, false
+	}
+	if !view.update.HasCurrentWindow || view.update.CurrentWindowStart+windowSize != nextStart {
+		return speculativeWindowBet{}, false
+	}
+	targetRate := view.update.TargetRate
+	if targetRate <= 0 {
+		return speculativeWindowBet{}, false
+	}
+	// The instant the observed window would compute, by the rule it uses
+	// (sessionRuntime.handleWindow): the parent's generation time plus one target
+	// rate, never earlier than now and never more than one rate ahead. It stamps
+	// the block's header and nothing else; the producer's schedule still comes
+	// from the window when it is really observed.
+	startAt := now
+	if !validAfter.IsZero() {
+		if earliest := validAfter.Add(targetRate); earliest.After(startAt) {
+			startAt = earliest
+		}
+		if latest := now.Add(targetRate); startAt.After(latest) {
+			startAt = latest
+		}
+	}
+
+	// Three target rates bounds a bet nobody comes to collect: longer than any
+	// observed gap between this estimate and the window it predicts, and short
+	// enough that a bet lost to a stalled session dies within a window.
+	return speculativeWindowBet{
+		startSlot: nextStart,
+		startAt:   startAt,
+		deadline:  startAt.Add(3 * targetRate),
+	}, true
 }
 
 func (b *LocalSessionBackend) AcceptBlock(ctx context.Context, acceptance BlockAcceptance) error {
@@ -561,27 +939,48 @@ func (b *LocalSessionBackend) HandleLeaderWindow(ctx context.Context, window Lea
 	if b.validator == nil {
 		return nil
 	}
-	if b.collatorDeferred.Load() {
-		b.log.Debug().
-			Uint32("window_start", window.Window.StartSlot).
-			Msg("skipping leader window until recovered collator view catches up")
-
-		return nil
-	}
 	if err := validateLocalLeaderWindow(b.config, window); err != nil {
 		return err
 	}
 
 	b.controlMu.Lock()
-	defer b.controlMu.Unlock()
 	if err := ctx.Err(); err != nil {
+		b.controlMu.Unlock()
 		return err
 	}
 	if b.closed {
+		b.controlMu.Unlock()
 		return ErrLocalSessionBackendClosed
 	}
+	if b.collatorDeferred.Load() {
+		ready := b.collatorReadinessLocked()
+		b.controlMu.Unlock()
+		b.log.Debug().
+			Uint32("window_start", window.Window.StartSlot).
+			Msg("waiting for recovered collator view before handling leader window")
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ready:
+		}
+
+		b.controlMu.Lock()
+		if err := ctx.Err(); err != nil {
+			b.controlMu.Unlock()
+			return err
+		}
+		if b.closed {
+			b.controlMu.Unlock()
+			return ErrLocalSessionBackendClosed
+		}
+	}
+	defer b.controlMu.Unlock()
 	if b.collatorUnavailable {
 		return nil
+	}
+	if b.recheckWindow != nil && b.recheckWindow.window == window.Window {
+		return errLeaderWindowNeedsRecheck
 	}
 	if window.Window.ObservedSlot != window.Window.StartSlot {
 		if !b.update.HasCurrentWindow {
@@ -589,7 +988,12 @@ func (b *LocalSessionBackend) HandleLeaderWindow(ctx context.Context, window Lea
 		}
 		err := b.authorizeUpcomingWindow(ctx, window.Window)
 		if b.ignoreAdvisoryCollatorError("authorize upcoming recovered window", window.Window.EndSlot, err) {
+			b.markWindowHandled(window.Window)
+
 			return nil
+		}
+		if err == nil {
+			b.markWindowHandled(window.Window)
 		}
 
 		return err
@@ -606,6 +1010,14 @@ func (b *LocalSessionBackend) HandleLeaderWindow(ctx context.Context, window Lea
 	next.CurrentWindowStartAt = window.StartAt
 	next.CurrentBase = window.Window.Base
 	if err := b.collator.UpdateSession(ctx, next); err != nil {
+		if errors.Is(err, collator.ErrSessionUnavailable) {
+			b.quarantineCollator(&next)
+			b.update = next
+			b.publishValidationView()
+
+			return nil
+		}
+
 		b.clearWindowRoute(window.Window.StartSlot)
 		return fmt.Errorf("validator local backend: update collator leader window: %w", err)
 	}
@@ -618,12 +1030,16 @@ func (b *LocalSessionBackend) HandleLeaderWindow(ctx context.Context, window Lea
 		}
 	}
 	if !window.Window.LocalLeader {
+		b.markWindowHandled(window.Window)
+
 		return nil
 	}
 
 	if b.productionMode == collator.ProductionModeDelegated {
 		// Delegated authority is committed durably during W-1. There is no
 		// current-window persistence fallback: a missing preauthorization skips W.
+		b.markWindowHandled(window.Window)
+
 		return nil
 	}
 	deadline, ok := ctx.Deadline()
@@ -637,9 +1053,16 @@ func (b *LocalSessionBackend) HandleLeaderWindow(ctx context.Context, window Lea
 		Deadline:  deadline,
 		Signer:    b.validator.Signer,
 	}); err != nil {
+		if errors.Is(err, collator.ErrSessionUnavailable) {
+			b.quarantineCollator(&b.update)
+
+			return nil
+		}
+
 		b.clearWindowRoute(window.Window.StartSlot)
 		return fmt.Errorf("validator local backend: activate self window: %w", err)
 	}
+	b.markWindowHandled(window.Window)
 
 	return nil
 }
@@ -852,6 +1275,11 @@ func (b *LocalSessionBackend) Close() error {
 		b.releaseRoute = nil
 	}
 	b.closed = true
+	b.pendingWindow = nil
+	b.appliedWindow = nil
+	b.handledWindow = nil
+	b.recheckWindow = nil
+	b.signalCollatorReady()
 	b.controlMu.Unlock()
 
 	return nil
@@ -1171,12 +1599,25 @@ func (b *LocalSessionBackend) routeCandidate(
 		return errors.New("validator local backend: local candidate names another leader")
 	}
 
+	// The collator held the parsed roots of both BOCs when it emitted this, so
+	// the validation of our own candidate borrows them exactly as the validation
+	// of a received one borrows the decoder's. Everything that retains an
+	// artifact strips them again; see attachPayloadLocked.
+	var roots *candidateValidationRoots
+	if blockRoot, collatedRoots := artifact.ValidationRoots(); blockRoot != nil && len(collatedRoots) != 0 {
+		roots = &candidateValidationRoots{block: blockRoot, collated: collatedRoots}
+	}
+	generationTimeMS, generationTimeKnown := artifact.GenerationTimeMS()
+
 	return submit(ctx, &CandidateArtifact{
-		Candidate:    candidate,
-		BlockBOC:     artifact.BlockBOC,
-		CollatedData: artifact.CollatedData,
-		prepared:     artifact.Prepared(),
-		digested:     artifact.Digested(),
+		Candidate:           candidate,
+		BlockBOC:            artifact.BlockBOC,
+		CollatedData:        artifact.CollatedData,
+		prepared:            artifact.Prepared(),
+		digested:            artifact.Digested(),
+		validationRoots:     roots,
+		generationTimeMS:    generationTimeMS,
+		generationTimeKnown: generationTimeKnown,
 	})
 }
 
@@ -1349,10 +1790,25 @@ func prepareLocalCollatorSession(
 		// advance the node to this durable collator view. C++ starts the consensus
 		// bus independently and lets CollatorProducer wait for state availability;
 		// retaining the recovered update here provides the same dependency order.
-		return localCollatorPreparation{update: recovered.Update}, nil
+		target := recovered.Update
+		target.PreserveProgress(latest)
+		if err = mergeLocalSessionFinalized(session.Shard, &target, latest); err != nil {
+			return localCollatorPreparation{}, fmt.Errorf(
+				"validator local backend: merge recovered collator progress: %w",
+				err,
+			)
+		}
+
+		return localCollatorPreparation{update: target}, nil
 	}
 
 	latest.PreserveProgress(recovered.Update)
+	if err = mergeLocalSessionFinalized(session.Shard, &latest, recovered.Update); err != nil {
+		return localCollatorPreparation{}, fmt.Errorf(
+			"validator local backend: merge collator progress: %w",
+			err,
+		)
+	}
 	if err = producer.UpdateSession(ctx, latest); err != nil {
 		return localCollatorPreparation{}, fmt.Errorf(
 			"validator local backend: reconcile recovered collator session: %w",
@@ -1363,17 +1819,50 @@ func prepareLocalCollatorSession(
 	return localCollatorPreparation{update: latest, ready: true}, nil
 }
 
-func applyConsensusWindow(update *collator.SessionUpdate, progress sessionConsensusProgress) {
+// mergeLocalSessionFinalized carries the strongest session-local finalized
+// anchor into the selected masterchain update. Masterchain snapshots can move
+// ahead independently of this consensus observation, but neither side may
+// rewrite an exact finalized height or name another shard.
+func mergeLocalSessionFinalized(
+	shard groups.ShardID,
+	target *collator.SessionUpdate,
+	other collator.SessionUpdate,
+) error {
+	if target.HasFinalizedBlock &&
+		(target.FinalizedBlock.Workchain != shard.Workchain || target.FinalizedBlock.Shard != shard.Shard) {
+		return collator.ErrSessionConflict
+	}
+	if !other.HasFinalizedBlock {
+		return nil
+	}
+	if other.FinalizedBlock.Workchain != shard.Workchain || other.FinalizedBlock.Shard != shard.Shard {
+		return collator.ErrSessionConflict
+	}
+	if !target.HasFinalizedBlock || other.FinalizedBlock.SeqNo > target.FinalizedBlock.SeqNo {
+		target.HasFinalizedBlock = true
+		target.FinalizedBlock = *other.FinalizedBlock.Copy()
+
+		return nil
+	}
+	if other.FinalizedBlock.SeqNo == target.FinalizedBlock.SeqNo &&
+		!sameBlockID(other.FinalizedBlock, target.FinalizedBlock) {
+		return collator.ErrSessionConflict
+	}
+
+	return nil
+}
+
+func applyConsensusWindow(update *collator.SessionUpdate, window simplex.Window, observedStart time.Time) {
 	startAt := time.Time{}
-	if update.HasCurrentWindow && update.CurrentWindowStart == progress.Window.StartSlot {
+	if update.HasCurrentWindow && update.CurrentWindowStart == window.StartSlot {
 		startAt = update.CurrentWindowStartAt
-	} else if progress.Window.ObservedSlot == progress.Window.StartSlot {
-		startAt = progress.StartAt
+	} else if window.ObservedSlot == window.StartSlot {
+		startAt = observedStart
 	}
 
 	update.HasCurrentWindow = true
-	update.CurrentWindowStart = progress.Window.StartSlot
-	update.CurrentWindowObservedSlot = progress.Window.ObservedSlot
+	update.CurrentWindowStart = window.StartSlot
+	update.CurrentWindowObservedSlot = window.ObservedSlot
 	update.CurrentWindowStartAt = startAt
-	update.CurrentBase = progress.Window.Base
+	update.CurrentBase = window.Base
 }

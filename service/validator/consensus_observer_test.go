@@ -220,7 +220,9 @@ type observerTestNetwork struct {
 	mu           sync.Mutex
 	startErr     error
 	closeErrors  []error
+	update       func(context.Context, collator.OverlaySession) error
 	prepareCalls int
+	updateCalls  int
 	retireCalls  int
 	closeCalls   int
 }
@@ -254,8 +256,23 @@ func (n *observerTestNetwork) PrepareSession(
 	return n.session, nil
 }
 
-func (*observerTestNetwork) UpdateSession(ctx context.Context, _ collator.OverlaySession) error {
-	return ctx.Err()
+func (n *observerTestNetwork) UpdateSession(
+	ctx context.Context,
+	session collator.OverlaySession,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	n.mu.Lock()
+	n.updateCalls++
+	update := n.update
+	n.mu.Unlock()
+	if update != nil {
+		return update(ctx, session)
+	}
+
+	return nil
 }
 
 func (n *observerTestNetwork) RetireSession(ctx context.Context, _ [32]byte) error {
@@ -305,6 +322,35 @@ type observerFixture struct {
 	collatorKey  ed25519.PrivateKey
 	progress     chan collator.ConsensusProgress
 }
+
+type observerUpdateTestRuntime struct {
+	update func(context.Context, SessionState) error
+}
+
+func (*observerUpdateTestRuntime) Recover(context.Context, SessionStart) error { return nil }
+
+func (*observerUpdateTestRuntime) Run(context.Context, SessionStart) error { return nil }
+
+func (r *observerUpdateTestRuntime) Update(ctx context.Context, state SessionState) error {
+	return r.update(ctx, state)
+}
+
+func (*observerUpdateTestRuntime) Close() error  { return nil }
+func (*observerUpdateTestRuntime) Retire() error { return nil }
+
+func (*observerUpdateTestRuntime) runWithStartup(
+	context.Context,
+	SessionStart,
+	chan<- error,
+) error {
+	return nil
+}
+
+func (*observerUpdateTestRuntime) publishCandidate(context.Context, *CandidateArtifact) error {
+	return nil
+}
+
+func (*observerUpdateTestRuntime) fail(error) {}
 
 func newObserverFixture(
 	t *testing.T,
@@ -558,6 +604,135 @@ func TestConsensusObserverUsesBlockSyncOnlyRuntimeForProtocolOneObserver(t *test
 	}
 }
 
+func TestConsensusObserverUpdateReleasesSessionLockForRuntimeProgress(t *testing.T) {
+	fixture := newObserverFixture(t, nil, nil)
+	t.Cleanup(func() {
+		if err := fixture.observer.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := fixture.observer.PrepareSession(context.Background(), fixture.descriptor); err != nil {
+		t.Fatal(err)
+	}
+	session, err := fixture.observer.session(fixture.descriptor.Overlay.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updateEntered := make(chan struct{})
+	releaseUpdate := make(chan struct{})
+	networkEntered := make(chan struct{})
+	releaseNetwork := make(chan struct{})
+	var releaseUpdateOnce, releaseNetworkOnce sync.Once
+	releaseRuntimeUpdate := func() { releaseUpdateOnce.Do(func() { close(releaseUpdate) }) }
+	releaseNetworkUpdate := func() { releaseNetworkOnce.Do(func() { close(releaseNetwork) }) }
+	t.Cleanup(releaseRuntimeUpdate)
+	t.Cleanup(releaseNetworkUpdate)
+	fixture.network.mu.Lock()
+	fixture.network.update = func(ctx context.Context, _ collator.OverlaySession) error {
+		close(networkEntered)
+		select {
+		case <-releaseNetwork:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	fixture.network.mu.Unlock()
+	runtime := &observerUpdateTestRuntime{
+		update: func(ctx context.Context, _ SessionState) error {
+			close(updateEntered)
+			select {
+			case <-releaseUpdate:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	}
+	session.mu.Lock()
+	original := session.runtime
+	session.runtime = runtime
+	session.phase = observerSessionStarting
+	session.mu.Unlock()
+	if err = original.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	updated := fixture.descriptor
+	updated.Params.TargetRate += time.Millisecond
+	updated.Update.TargetRate = updated.Params.TargetRate
+	updated.Overlay.AllOverlayNodes = slices.Clone(updated.Overlay.AllOverlayNodes)
+	updated.Overlay.AllOverlayNodes[0], updated.Overlay.AllOverlayNodes[1] =
+		updated.Overlay.AllOverlayNodes[1], updated.Overlay.AllOverlayNodes[0]
+	updateResult := make(chan error, 1)
+	go func() {
+		updateResult <- fixture.observer.UpdateSession(context.Background(), updated)
+	}()
+	select {
+	case <-networkEntered:
+	case <-time.After(time.Second):
+		t.Fatal("network update did not start")
+	}
+
+	observeProgress := func(slot uint32, stage string) {
+		t.Helper()
+
+		progressResult := make(chan error, 1)
+		go func() {
+			progressResult <- fixture.observer.handleProgress(
+				context.Background(),
+				session,
+				sessionConsensusProgress{Window: simplex.Window{StartSlot: slot}},
+			)
+		}()
+		select {
+		case progressErr := <-progressResult:
+			if progressErr != nil {
+				t.Fatalf("progress during %s update: %v", stage, progressErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("progress deadlocked behind the %s update", stage)
+		}
+	}
+	observeProgress(43, "network")
+	releaseNetworkUpdate()
+	select {
+	case <-updateEntered:
+	case <-time.After(time.Second):
+		releaseRuntimeUpdate()
+		<-updateResult
+		t.Fatal("runtime update did not start after the network update")
+	}
+	observeProgress(44, "runtime")
+
+	select {
+	case err = <-updateResult:
+		t.Fatalf("session update returned before the runtime commit was released: %v", err)
+	default:
+	}
+	releaseRuntimeUpdate()
+	select {
+	case err = <-updateResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session update did not finish after the runtime commit")
+	}
+
+	session.mu.Lock()
+	pending := session.pending
+	committed := session.descriptor
+	session.mu.Unlock()
+	if pending == nil || pending.Window.StartSlot != 44 {
+		t.Fatalf("concurrent progress = %+v, want pending window 44", pending)
+	}
+	if !committed.Equal(updated) {
+		t.Fatal("session descriptor was not committed after the runtime update")
+	}
+}
+
 func TestConsensusObserverRecoversDesiredAndStaleNamespaces(t *testing.T) {
 	fixture := newObserverFixture(t, nil, nil)
 	input, err := fixture.observer.runtimeInput(fixture.descriptor)
@@ -669,7 +844,7 @@ func TestConsensusObserverPrepareActivateAndAuthenticatedProgress(t *testing.T) 
 		t.Fatal("activation replaced the future session runtime")
 	}
 	initial := waitObserverProgress(t, fixture.progress, 0)
-	if initial.Window.Base != simplex.Genesis() || len(initial.Candidates) != 0 || initial.StartAt.IsZero() {
+	if initial.Window.Base != simplex.Genesis() || initial.Base != nil || initial.StartAt.IsZero() {
 		t.Fatalf("initial progress = %+v", initial)
 	}
 
@@ -699,7 +874,7 @@ func TestConsensusObserverPrepareActivateAndAuthenticatedProgress(t *testing.T) 
 		simplex.SkipVote(1),
 	))
 	advanced := waitObserverProgress(t, fixture.progress, 2)
-	if advanced.Window.Base != simplex.Genesis() || len(advanced.Candidates) != 0 {
+	if advanced.Window.Base != simplex.Genesis() || advanced.Base != nil {
 		t.Fatalf("authenticated skip progress = %+v", advanced)
 	}
 

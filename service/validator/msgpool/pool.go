@@ -149,16 +149,24 @@ func New(cfg Config) *Pool {
 // validated (the emulation on broadcast receive / liteserver submit leaves
 // the caller with the root cell and usually the parsed header — nothing is
 // re-parsed here; parsed may be nil, then the header is decoded from root).
-// raw is the original BOC and is read for its length only — the pool keeps
-// the received size for the byte budget and never retains the buffer. nil is
-// allowed and is what both production callers pass; the size is then derived
-// structurally from root.
+// serializedSize must be the positive, exact received BOC length. The pool
+// keeps that number for its byte budget and never retains the ingress buffer.
 //
 // Duplicates are idempotent no-ops resolved by the cached root-cell hash
 // before any other work; a repeat from a higher-priority source re-pools
 // the message at the new priority without losing it. A message rejected by
-// the caps stays out silently and is observable through Stats.
-func (p *Pool) AddExternal(raw []byte, root *cell.Cell, parsed *tlb.ExternalMessage, priority int) error {
+// the caps stays out with ErrExternalCapacity and is also observable through
+// Stats.
+func (p *Pool) AddExternal(
+	serializedSize int,
+	root *cell.Cell,
+	parsed *tlb.ExternalMessage,
+	priority int,
+) (ExternalAddResult, error) {
+	if serializedSize <= 0 {
+		return ExternalAddResult{}, fmt.Errorf("%w: %d", ErrInvalidExternalSize, serializedSize)
+	}
+
 	hash := root.HashKey()
 	now := p.clock.Now()
 
@@ -167,13 +175,18 @@ func (p *Pool) AddExternal(raw []byte, root *cell.Cell, parsed *tlb.ExternalMess
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		return ErrClosed
+		return ExternalAddResult{}, ErrClosed
 	}
 	p.expireLocked(now)
 	if e := p.byHash[hash]; e != nil && !e.removed {
 		p.dedupOrBumpLocked(e, priority, now)
+		result := ExternalAddResult{
+			Outcome:     ExternalAddExisting,
+			Destination: e.msg.destination(),
+		}
 		p.mu.Unlock()
-		return nil
+
+		return result, nil
 	}
 	p.mu.Unlock()
 
@@ -181,24 +194,34 @@ func (p *Pool) AddExternal(raw []byte, root *cell.Cell, parsed *tlb.ExternalMess
 	// lock, then insert (re-checking the dedup race). Only the received length
 	// is kept — the raw BOC itself is the ingress layer's buffer and nothing
 	// downstream reads it back out of the pool.
-	msg, err := newExternalMessage(len(raw), root, parsed)
+	msg, err := newExternalMessage(serializedSize, root, parsed)
 	if err != nil {
-		return err
+		return ExternalAddResult{}, err
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
-		return ErrClosed
+		return ExternalAddResult{}, ErrClosed
 	}
 	now = p.clock.Now()
 	p.expireLocked(now)
 	if e := p.byHash[msg.Hash]; e != nil && !e.removed {
 		p.dedupOrBumpLocked(e, priority, now)
-		return nil
+
+		return ExternalAddResult{
+			Outcome:     ExternalAddExisting,
+			Destination: e.msg.destination(),
+		}, nil
 	}
-	p.insertLocked(msg, priority, now)
-	return nil
+	if err = p.insertLocked(msg, priority, now); err != nil {
+		return ExternalAddResult{}, err
+	}
+
+	return ExternalAddResult{
+		Outcome:     ExternalAddInserted,
+		Destination: msg.destination(),
+	}, nil
 }
 
 // dedupOrBumpLocked handles a submission whose raw hash is already pooled.
@@ -389,7 +412,7 @@ func (p *Pool) slabHasRoomLocked(priority int, key addrKey) bool {
 	return len(slab.entries) < p.cfg.MempoolLimit && slab.byAddr[key] < p.cfg.PerAddressLimit
 }
 
-func (p *Pool) insertLocked(msg *ExternalMessage, priority int, now time.Time) {
+func (p *Pool) insertLocked(msg *ExternalMessage, priority int, now time.Time) error {
 	key := msg.key()
 	slab := p.slabs[priority]
 	slabCount := 0
@@ -402,19 +425,19 @@ func (p *Pool) insertLocked(msg *ExternalMessage, priority int, now time.Time) {
 		p.stats.overflowMempool++
 		p.log.Debug().Msgf("cannot add message addr=%d:%x prio=%d: mempool is full (limit=%d)",
 			msg.Workchain, msg.Addr[:8], priority, p.cfg.MempoolLimit)
-		return
+		return ErrExternalCapacity
 	}
 	if p.cfg.MempoolBytesLimit > 0 && p.totalBytes+int64(msg.Size) > p.cfg.MempoolBytesLimit {
 		p.stats.overflowBytes++
 		p.log.Debug().Msgf("cannot add message addr=%d:%x prio=%d: mempool bytes budget exceeded",
 			msg.Workchain, msg.Addr[:8], priority)
-		return
+		return ErrExternalCapacity
 	}
 	if addressCount >= p.cfg.PerAddressLimit {
 		p.stats.overflowAddress++
 		p.log.Debug().Msgf("cannot add message addr=%d:%x prio=%d: per address limit reached (limit=%d)",
 			msg.Workchain, msg.Addr[:8], priority, p.cfg.PerAddressLimit)
-		return
+		return ErrExternalCapacity
 	}
 	slab = p.slab(priority)
 
@@ -436,6 +459,8 @@ func (p *Pool) insertLocked(msg *ExternalMessage, priority int, now time.Time) {
 	p.totalBytes += int64(msg.Size)
 	p.stats.added++
 	p.offerExternalLocked(e)
+
+	return nil
 }
 
 func (p *Pool) movePriorityLocked(e *entry, priority int, now time.Time) {

@@ -92,39 +92,29 @@ func (s *overlaySubscription) twoStepIntermediateCandidates() []*overlayPeer {
 }
 
 func (s *overlaySubscription) resolveTwoStepPeerSet(
-	ctx context.Context,
+	_ context.Context,
 	sourcePeerID PeerID,
 ) (overlay.StaticBroadcastPeerSet, []overlay.BroadcastTwoStepPeerError) {
 	candidates := s.twoStepIntermediateCandidates()
 	peers := make(overlay.StaticBroadcastPeerSet, 0, len(candidates))
-	var failed []overlay.BroadcastTwoStepPeerError
 
 	for _, peer := range candidates {
 		if peer.id == sourcePeerID {
 			continue
 		}
 		if s.spec.UseQUIC {
-			_, err := peer.dialQUIC(ctx)
-			if err != nil {
-				failed = append(failed, overlay.BroadcastTwoStepPeerError{
-					PeerID: peer.id[:],
-					Err:    err,
-				})
-				continue
-			}
-			peers = append(peers, quicRouteBroadcastPeer{
+			peers = append(peers, quicTwoStepSendPeer{
 				peer:     peer,
 				envelope: s.quicEnvelope,
 			})
 			continue
 		}
-
 		peers = append(peers, customRLDPBroadcastPeer{
 			id:        peer.id,
 			transport: peer.rldpOverlay,
 		})
 	}
-	return peers, failed
+	return peers, nil
 }
 
 func planCustomRebroadcast(kind string, payloadLen int) rebroadcastPlan {
@@ -272,7 +262,7 @@ func (s *overlaySubscription) sendTwoStepRebroadcast(ctx context.Context, req re
 		Payload:     req.payload,
 		Flags:       plan.flags,
 		PeerSet:     peerSet,
-	})
+	}, overlay.WithBroadcastTwoStepPeerSendTimeout(twoStepPeerSendTimeout))
 	s.markTwoStepPeerFailures(res.Failed)
 
 	if err != nil && res.Sent == 0 {

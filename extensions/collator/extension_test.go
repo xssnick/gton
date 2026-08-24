@@ -27,6 +27,23 @@ type testNodeStore struct {
 	hooks.Store
 }
 
+type testAccountPrewarmer struct {
+	accounts []msgpool.AccountDestination
+}
+
+func (*testAccountPrewarmer) EnqueueRoot(cell.Hash) bool {
+	return true
+}
+
+func (w *testAccountPrewarmer) EnqueueAccount(workchain int32, account [32]byte) bool {
+	w.accounts = append(w.accounts, msgpool.AccountDestination{Workchain: workchain, Account: account})
+	return true
+}
+
+func (*testAccountPrewarmer) PrewarmAccountNow(int32, [32]byte) bool {
+	return true
+}
+
 type testController struct {
 	mu sync.Mutex
 
@@ -144,10 +161,11 @@ func TestExtensionBootstrapsAndAppliesMasterchain(t *testing.T) {
 	controller := &testController{}
 	shardTops := &testShardTopSink{}
 	store := &testNodeStore{}
+	warmer := &testAccountPrewarmer{}
 	extension, err := New(testExtensionOptions(t, Options{
 		Controller: controller,
 		ShardTops:  shardTops,
-	}))(hooks.Node{Store: store})
+	}))(hooks.Node{Store: store, AccountPrewarmer: warmer})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,14 +209,26 @@ func TestExtensionBootstrapsAndAppliesMasterchain(t *testing.T) {
 	}
 	controller.mu.Unlock()
 
-	message := testExternalMessage()
+	message := testExternalMessage(0x42)
 	if err = extension.OnExternalMessage(context.Background(), hooks.ExternalMessageEvent{
-		MessageRoot: message,
+		SerializedSize: len(message.ToBOC()),
+		MessageRoot:    message,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err = extension.OnExternalMessage(context.Background(), hooks.ExternalMessageEvent{
+		IsLocal:        true,
+		SerializedSize: len(message.ToBOC()),
+		MessageRoot:    message,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if pooled := extension.(*Extension).messages.Stats().Pooled; pooled != 1 {
 		t.Fatalf("pooled external messages = %d, want 1", pooled)
+	}
+	destination := msgpool.AccountDestination{Workchain: 0, Account: [32]byte{0x42}}
+	if len(warmer.accounts) != 1 || warmer.accounts[0] != destination {
+		t.Fatalf("prewarmed external accounts = %+v, want %+v", warmer.accounts, destination)
 	}
 	appliedRoot := testAppliedBlockRoot(t, message)
 	appliedExternal := hooks.BlockAppliedEvent{
@@ -243,6 +273,38 @@ func TestExtensionBootstrapsAndAppliesMasterchain(t *testing.T) {
 	controller.mu.Unlock()
 	if closed == nil {
 		t.Fatal("controller was not closed")
+	}
+}
+
+func TestExternalCapacityRejectionDoesNotPrewarm(t *testing.T) {
+	messages := msgpool.New(msgpool.Config{MempoolLimit: 1})
+	t.Cleanup(messages.Close)
+	warmer := &testAccountPrewarmer{}
+	extension, err := New(Options{
+		Controller: &testController{},
+		ShardTops:  &testShardTopSink{},
+		Messages:   messages,
+	})(hooks.Node{Store: &testNodeStore{}, AccountPrewarmer: warmer})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, fill := range []byte{0x51, 0x52} {
+		message := testExternalMessage(fill)
+		if err = extension.OnExternalMessage(context.Background(), hooks.ExternalMessageEvent{
+			SerializedSize: len(message.ToBOC()),
+			MessageRoot:    message,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stats := messages.Stats()
+	if stats.Pooled != 1 || stats.OverflowMempool != 1 {
+		t.Fatalf("external pool stats = %+v, want one pooled and one overflow", stats)
+	}
+	if len(warmer.accounts) != 1 || warmer.accounts[0].Account[0] != 0x51 {
+		t.Fatalf("prewarmed external accounts = %+v, want only admitted destination", warmer.accounts)
 	}
 }
 
@@ -581,9 +643,9 @@ func testBlockID(seqno uint32) ton.BlockIDExt {
 	}
 }
 
-func testExternalMessage() *cell.Cell {
+func testExternalMessage(fill byte) *cell.Cell {
 	destination := make([]byte, 32)
-	destination[0] = 0x42
+	destination[0] = fill
 
 	return cell.BeginCell().
 		MustStoreUInt(0b10, 2).

@@ -371,11 +371,25 @@ func newValidatorStackFactory(composition validatorStackComposition) hooks.Exten
 			return nil, errors.New("validator composition: no validator or collator role is configured")
 		}
 
+		var registry core.MetricsRegistry
+		if node.Metrics != nil {
+			var ok bool
+			registry, ok = node.Metrics.(core.MetricsRegistry)
+			if !ok {
+				return nil, errors.New("validator composition: node metrics registry has an incompatible type")
+			}
+		}
+		candidateTransportMetrics, err := validatornet.NewPrometheusCandidateTransportMetrics(registry)
+		if err != nil {
+			return nil, fmt.Errorf("validator composition: register candidate transport metrics: %w", err)
+		}
+
 		log := node.Logger.With().Str("component", "validator_network").Logger()
 		manager, err := validatornet.NewManager(validatornet.ManagerOptions{
-			PrivateOverlays: node.PrivateOverlays,
-			BlockBroadcasts: node.BlockBroadcasts,
-			Logger:          log,
+			PrivateOverlays:  node.PrivateOverlays,
+			BlockBroadcasts:  node.BlockBroadcasts,
+			CandidateMetrics: candidateTransportMetrics.Observer(),
+			Logger:           log,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("validator composition: create network manager: %w", err)
@@ -393,19 +407,6 @@ func newValidatorStackFactory(composition validatorStackComposition) hooks.Exten
 			)
 		}
 
-		var registry core.MetricsRegistry
-		if node.Metrics != nil {
-			var ok bool
-			registry, ok = node.Metrics.(core.MetricsRegistry)
-			if !ok {
-				closeErr := manager.Close(context.Background())
-
-				return nil, errors.Join(
-					errors.New("validator composition: node metrics registry has an incompatible type"),
-					closeErr,
-				)
-			}
-		}
 		collatorMetrics, err := core.NewPrometheusMetrics(registry)
 		if err != nil {
 			closeErr := manager.Close(context.Background())
@@ -611,7 +612,7 @@ func newLocalValidatorFactory(
 
 				return nil, errors.Join(prepareErr, retireErr)
 			}
-			backend, prepareErr := validator.NewLocalSessionBackend(ctx, validator.LocalSessionBackendOptions{
+			backendPreparation, prepareErr := validator.PrepareLocalSessionBackend(ctx, validator.LocalSessionBackendOptions{
 				Config:          config,
 				Initial:         initial,
 				Node:            localNode,
@@ -637,16 +638,22 @@ func newLocalValidatorFactory(
 					retireErr,
 				)
 			}
+			backend := backendPreparation.Backend
 
-			session, prepareErr := validator.PrepareSessionRuntime(ctx, config, initial, validator.RuntimeOptions{
-				Storage:    composition.options.Storage,
-				Network:    sessionNetwork,
-				Backend:    backend,
-				Limits:     config.CandidateLimits,
-				Observer:   validationObserver,
-				Logger:     &log,
-				CaptureDir: composition.options.CandidateCaptureDir,
-			})
+			session, prepareErr := validator.PrepareSessionRuntime(
+				ctx,
+				config,
+				backendPreparation.RuntimeState,
+				validator.RuntimeOptions{
+					Storage:    composition.options.Storage,
+					Network:    sessionNetwork,
+					Backend:    backend,
+					Limits:     config.CandidateLimits,
+					Observer:   validationObserver,
+					Logger:     &log,
+					CaptureDir: composition.options.CandidateCaptureDir,
+				},
+			)
 			if prepareErr != nil {
 				collatorErr := closeValidatorSessionCollator(production.ownedCollator)
 				retireErr := retireValidatorSession(network, config.SessionID)

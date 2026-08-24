@@ -35,10 +35,35 @@ func TestAddRejectsGarbage(t *testing.T) {
 	env := newPoolEnv(t)
 	// A non ext-in cell must be rejected on assembly.
 	intMsg := cell.BeginCell().MustStoreUInt(0, 4).EndCell()
-	if err := env.pool.AddExternal(intMsg.ToBOC(), intMsg, nil, 0); err == nil {
+	result, err := env.pool.AddExternal(len(intMsg.ToBOC()), intMsg, nil, 0)
+	if err == nil {
 		t.Fatal("non ext-in root must fail")
 	}
+	if result.Outcome != ExternalAddInvalid || result.Destination != (AccountDestination{}) {
+		t.Fatalf("failed add result = %+v, want invalid zero result", result)
+	}
 	requireEqual(t, env.pool.Stats().Pooled, 0, "nothing pooled")
+}
+
+func TestAddRejectsInvalidSerializedSizeBeforeExistingFastPath(t *testing.T) {
+	env := newPoolEnv(t)
+	message := buildExtMsg(t, 0, testAddr(0x01), bodyWithTag(1), msgOpts{})
+	env.mustAdd(message, 0)
+
+	for _, serializedSize := range []int{0, -1} {
+		result, err := env.pool.AddExternal(serializedSize, message.root, nil, 0)
+		if !errors.Is(err, ErrInvalidExternalSize) {
+			t.Fatalf("serialized size %d error = %v, want ErrInvalidExternalSize", serializedSize, err)
+		}
+		if result != (ExternalAddResult{}) {
+			t.Fatalf("serialized size %d result = %+v, want zero result", serializedSize, result)
+		}
+	}
+
+	stats := env.pool.Stats()
+	if stats.Pooled != 1 || stats.DedupSkipped != 0 {
+		t.Fatalf("invalid sizes mutated pool stats: %+v", stats)
+	}
 }
 
 func TestDedupIdempotent(t *testing.T) {
@@ -46,8 +71,13 @@ func TestDedupIdempotent(t *testing.T) {
 	raw := buildExtMsg(t, 0, testAddr(0x02), bodyWithTag(1), msgOpts{})
 
 	env.mustAdd(raw, 0)
-	if err := env.pool.AddExternal(raw.raw, raw.root, nil, 0); err != nil {
+	result, err := env.pool.AddExternal(len(raw.raw), raw.root, nil, 0)
+	if err != nil {
 		t.Fatalf("duplicate add must be a no-op, got %v", err)
+	}
+	wantDestination := AccountDestination{Workchain: 0, Account: testAddr(0x02)}
+	if result.Outcome != ExternalAddExisting || result.Destination != wantDestination {
+		t.Fatalf("existing result = %+v, want existing destination %+v", result, wantDestination)
 	}
 
 	st := env.pool.Stats()
@@ -60,13 +90,17 @@ func TestPriorityBump(t *testing.T) {
 	raw := buildExtMsg(t, 0, testAddr(0x03), bodyWithTag(1), msgOpts{})
 
 	msg := env.mustAdd(raw, 0)
-	if err := env.pool.AddExternal(raw.raw, raw.root, nil, 3); err != nil {
+	result, err := env.pool.AddExternal(len(raw.raw), raw.root, nil, 3)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.Outcome != ExternalAddExisting {
+		t.Fatalf("priority bump outcome = %d, want ExternalAddExisting", result.Outcome)
 	}
 	requireEqual(t, env.pool.Stats().PriorityBumps, uint64(1), "bump counter")
 
 	// Re-adding at a lower priority afterwards is a plain duplicate.
-	if err := env.pool.AddExternal(raw.raw, raw.root, nil, 1); err != nil {
+	if _, err := env.pool.AddExternal(len(raw.raw), raw.root, nil, 1); err != nil {
 		t.Fatal(err)
 	}
 	requireEqual(t, env.pool.Stats().PriorityBumps, uint64(1), "no second bump")
@@ -85,7 +119,7 @@ func TestPriorityBumpKeepsMessageWhenTargetFull(t *testing.T) {
 	env.mustAdd(rawA, 2) // fills level 2
 	env.mustAdd(rawB, 0)
 	// Bumping B into the full level 2 must keep it pooled at level 0.
-	if err := env.pool.AddExternal(rawB.raw, rawB.root, nil, 2); err != nil {
+	if _, err := env.pool.AddExternal(len(rawB.raw), rawB.root, nil, 2); err != nil {
 		t.Fatal(err)
 	}
 	requireEqual(t, env.pool.Stats().PriorityBumps, uint64(0), "bump refused")
@@ -103,30 +137,44 @@ func TestCaps(t *testing.T) {
 	env.mustAdd(buildExtMsg(t, 0, addr, bodyWithTag(1), msgOpts{}), 0)
 	env.mustAdd(buildExtMsg(t, 0, addr, bodyWithTag(2), msgOpts{}), 0)
 	// Third to the same address is refused.
-	env.mustAdd(buildExtMsg(t, 0, addr, bodyWithTag(3), msgOpts{}), 0)
+	rejected := buildExtMsg(t, 0, addr, bodyWithTag(3), msgOpts{})
+	if _, err := env.pool.AddExternal(len(rejected.raw), rejected.root, nil, 0); !errors.Is(err, ErrExternalCapacity) {
+		t.Fatalf("per-address rejection error = %v, want ErrExternalCapacity", err)
+	}
 	st := env.pool.Stats()
 	requireEqual(t, st.OverflowAddress, uint64(1), "per-address overflow")
 	requireEqual(t, st.Pooled, 2, "per-address cap held")
 
 	// Global cap.
 	env.mustAdd(buildExtMsg(t, 0, testAddr(0x07), bodyWithTag(4), msgOpts{}), 0)
-	env.mustAdd(buildExtMsg(t, 0, testAddr(0x08), bodyWithTag(5), msgOpts{}), 0)
+	rejected = buildExtMsg(t, 0, testAddr(0x08), bodyWithTag(5), msgOpts{})
+	if _, err := env.pool.AddExternal(len(rejected.raw), rejected.root, nil, 0); !errors.Is(err, ErrExternalCapacity) {
+		t.Fatalf("mempool rejection error = %v, want ErrExternalCapacity", err)
+	}
 	st = env.pool.Stats()
 	requireEqual(t, st.OverflowMempool, uint64(1), "mempool overflow")
 	requireEqual(t, st.Pooled, 3, "mempool cap held")
 }
 
 func TestBytesBudget(t *testing.T) {
-	env := newPoolEnv(t, func(c *Config) { c.MempoolBytesLimit = 150 })
-	env.mustAdd(buildExtMsg(t, 0, testAddr(0x09), bodyWithTag(1), msgOpts{}), 0)
-	env.mustAdd(buildExtMsg(t, 0, testAddr(0x0a), bodyWithTag(2), msgOpts{}), 0)
-	env.mustAdd(buildExtMsg(t, 0, testAddr(0x0b), bodyWithTag(3), msgOpts{}), 0)
-	st := env.pool.Stats()
-	if st.OverflowBytes == 0 {
-		t.Fatal("bytes budget must trip")
+	first := buildExtMsg(t, 0, testAddr(0x09), bodyWithTag(1), msgOpts{})
+	second := buildExtMsg(t, 0, testAddr(0x0a), bodyWithTag(1), msgOpts{})
+	rejected := buildExtMsg(t, 0, testAddr(0x0b), bodyWithTag(1), msgOpts{})
+	limit := int64(len(first.raw) + len(second.raw))
+	env := newPoolEnv(t, func(c *Config) { c.MempoolBytesLimit = limit })
+
+	env.mustAdd(first, 0)
+	env.mustAdd(second, 0)
+	stats := env.pool.Stats()
+	if stats.PooledBytes != limit || stats.Pooled != 2 {
+		t.Fatalf("pool at exact byte boundary = %+v, want bytes=%d pooled=2", stats, limit)
 	}
-	if st.PooledBytes > 150 {
-		t.Fatalf("pooled bytes %d exceed the budget", st.PooledBytes)
+	if _, err := env.pool.AddExternal(len(rejected.raw), rejected.root, nil, 0); !errors.Is(err, ErrExternalCapacity) {
+		t.Fatalf("byte overflow error = %v, want ErrExternalCapacity", err)
+	}
+	stats = env.pool.Stats()
+	if stats.PooledBytes != limit || stats.Pooled != 2 || stats.OverflowBytes != 1 {
+		t.Fatalf("pool after byte overflow = %+v, want bytes=%d pooled=2 overflow=1", stats, limit)
 	}
 }
 
@@ -498,7 +546,7 @@ func TestSystemClockExpiresIdlePoolWithoutStatsPolling(t *testing.T) {
 	p := New(Config{TTL: 20 * time.Millisecond})
 	t.Cleanup(p.Close)
 	message := buildExtMsg(t, 0, testAddr(0x6a), bodyWithTag(1), msgOpts{})
-	if err := p.AddExternal(message.raw, message.root, nil, 0); err != nil {
+	if _, err := p.AddExternal(len(message.raw), message.root, nil, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -523,7 +571,7 @@ func TestExpiredDuplicateIsFreshAdmission(t *testing.T) {
 	env.mustAdd(raw, 0)
 
 	env.clock.advance(2 * time.Second)
-	if err := env.pool.AddExternal(raw.raw, raw.root, nil, 0); err != nil {
+	if _, err := env.pool.AddExternal(len(raw.raw), raw.root, nil, 0); err != nil {
 		t.Fatal(err)
 	}
 	st := env.pool.Stats()
@@ -556,7 +604,7 @@ func TestExpiryHeapTracksOnlyLiveEntries(t *testing.T) {
 	raw := buildExtMsg(t, 0, testAddr(0x5f), bodyWithTag(1), msgOpts{})
 	env.mustAdd(raw, 0)
 	for priority := 1; priority <= 64; priority++ {
-		if err := env.pool.AddExternal(raw.raw, raw.root, nil, priority); err != nil {
+		if _, err := env.pool.AddExternal(len(raw.raw), raw.root, nil, priority); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -577,7 +625,7 @@ func TestSelectReturnsIndependentSnapshots(t *testing.T) {
 	raw := buildExtMsg(t, 0, testAddr(0x60), bodyWithTag(1), msgOpts{})
 	wantBytes := int64(len(raw.raw))
 	wantHash := raw.root.HashKey()
-	if err := env.pool.AddExternal(raw.raw, raw.root, nil, 0); err != nil {
+	if _, err := env.pool.AddExternal(len(raw.raw), raw.root, nil, 0); err != nil {
 		t.Fatal(err)
 	}
 	// The pool retains no copy of the caller's buffer, so scribbling over it
@@ -620,7 +668,7 @@ func TestPoolClose(t *testing.T) {
 
 	env.pool.Close()
 	closed := buildExtMsg(t, 0, testAddr(0x12), bodyWithTag(2), msgOpts{})
-	if err := env.pool.AddExternal(closed.raw, closed.root, nil, 0); !errors.Is(err, ErrClosed) {
+	if _, err := env.pool.AddExternal(len(closed.raw), closed.root, nil, 0); !errors.Is(err, ErrClosed) {
 		t.Fatalf("closed pool must reject adds, got %v", err)
 	}
 }
@@ -688,7 +736,7 @@ func TestConcurrentAdds(t *testing.T) {
 			wg.Add(1)
 			go func(m testMsg, prio int) {
 				defer wg.Done()
-				if err := env.pool.AddExternal(m.raw, m.root, nil, prio); err != nil {
+				if _, err := env.pool.AddExternal(len(m.raw), m.root, nil, prio); err != nil {
 					t.Errorf("add: %v", err)
 				}
 			}(msgs[i], copies)

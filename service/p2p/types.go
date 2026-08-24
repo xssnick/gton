@@ -90,15 +90,19 @@ const (
 	dhtFindTimeout             = 30 * time.Second
 	peerQueryTimeout           = 10 * time.Second
 	broadcastSignatureTimeout  = 2 * time.Second
-	peerRebroadcastTimeout     = 5 * time.Second
-	peerRebroadcastQueueItems  = 2048
-	peerRebroadcastQueueBytes  = int64(1024 << 20)
-	externalRebroadcastFanout  = 5
-	laggedExternalFanout       = 3
-	minLocalExternalFanout     = 3
-	maxLocalExternalFanout     = maxPeersPerOverlay
-	localRebroadcastAttempts   = 3
-	dhtServerStoreMaxKeys      = 300000
+	// Two-step candidate parts are useful only on the fast consensus path. A
+	// blocked peer must release its bounded sender before it can hold later
+	// candidates behind socket backpressure.
+	twoStepPeerSendTimeout    = 750 * time.Millisecond
+	peerRebroadcastTimeout    = 5 * time.Second
+	peerRebroadcastQueueItems = 2048
+	peerRebroadcastQueueBytes = int64(1024 << 20)
+	externalRebroadcastFanout = 5
+	laggedExternalFanout      = 3
+	minLocalExternalFanout    = 3
+	maxLocalExternalFanout    = maxPeersPerOverlay
+	localRebroadcastAttempts  = 3
+	dhtServerStoreMaxKeys     = 300000
 
 	maxBlockDownloadAnswerSize  = 32 << 20
 	maxKeyBlockLookupAnswerSize = 1 << 20

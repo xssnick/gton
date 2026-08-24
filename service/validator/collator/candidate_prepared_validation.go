@@ -13,7 +13,8 @@ import (
 
 // preparedValidationCandidate is the one decoded representation of one
 // candidate inside one validation call. A network candidate borrows the roots
-// its codec already parsed; every other path parses its BOCs here exactly once.
+// its codec already parsed and a locally produced one the roots its collation
+// serialized; every other path parses its BOCs here exactly once.
 // Everything downstream — the master view selection, the structural pass, the
 // semantic replay — reads the block, the successor state and the collated proof
 // set from here.
@@ -37,8 +38,10 @@ type preparedValidationCandidate struct {
 	// caller on the exported one. State and StateUpdate are filled by stage 2.
 	candidate *Candidate
 	// root is the decoded block, hash-checked against candidate.ID.RootHash and
-	// untraced. It either came directly from the network BOC decoder or from the
-	// byte path below; neither producer attaches a trace listener.
+	// recording nothing. Two of its three producers attach no trace listener at
+	// all — the network BOC decoder and the byte path below — and the third, our
+	// own collation, sealed its read set before it released this tree, which
+	// stops the trace those cells still carry from propagating or recording.
 	root *cell.Cell
 
 	// ---- stage 2: predecessor selection (still no update walk) ----
@@ -239,6 +242,13 @@ func (p *preparedValidationCandidate) prepareBlock(
 	if !bytes.Equal(candidate.ID.FileHash, fileHash[:]) {
 		return fmt.Errorf("%w: candidate block file hash mismatch", ErrInvalidInput)
 	}
+	// A supplied root replaces the decode, never the two hash checks around it:
+	// the digest above says these bytes are the block the ID names, and the root
+	// hash below says this tree is. What the decode also used to establish — that
+	// our own serializer's output parses back — is not a property of the
+	// candidate, and neither producer of a supplied root can offer it: the
+	// network path decodes the wire and re-serializes BlockBOC from the result,
+	// and the local path serializes it from the tree it built.
 	if root == nil {
 		var err error
 		root, err = cell.FromBOC(candidate.BlockBOC)

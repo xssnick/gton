@@ -393,6 +393,47 @@ func TestL3HintBounds(t *testing.T) {
 	}
 }
 
+// The counts entry point is what a producer that has no headers to read uses,
+// and it is fed two numbers of its own rather than two numbers clamped to the
+// buffers they came out of. The byte clamp therefore does not stand behind it,
+// which leaves the ceiling and the floor carrying the whole bound — and leaves
+// the sum itself, taken over inputs that are already near the top of the range,
+// as the one place a bounded hint could turn into an unbounded or negative one.
+func TestL3HintFromCountsBounds(t *testing.T) {
+	for name, counts := range map[string][2]int{
+		"both at the ceiling": {payloadHintMaxPresizedCells, payloadHintMaxPresizedCells},
+		"one over it":         {payloadHintMaxPresizedCells + 1, 0},
+		"both at max int":     {int(^uint(0) >> 1), int(^uint(0) >> 1)},
+		"one at max int":      {int(^uint(0) >> 1), 1},
+	} {
+		if got := PayloadCellHintFromCounts(counts[0], counts[1]); got != payloadHintMaxPresizedCells {
+			t.Fatalf("%s hinted %d, want the %d ceiling", name, got, payloadHintMaxPresizedCells)
+		}
+	}
+
+	// Below the serializer's own initial capacity, and any count that cannot be
+	// one, drop the hint rather than presize to it.
+	for name, counts := range map[string][2]int{
+		"nothing":              {0, 0},
+		"one below the floor":  {payloadHintFloorCells - 1, 0},
+		"negative block":       {-1, payloadHintFloorCells * 4},
+		"negative collated":    {payloadHintFloorCells * 4, -1},
+		"negative both":        {-1, -1},
+		"negative at min int":  {-1 - int(^uint(0)>>1), -1 - int(^uint(0)>>1)},
+		"negative summing low": {payloadHintFloorCells, -payloadHintFloorCells},
+	} {
+		if got := PayloadCellHintFromCounts(counts[0], counts[1]); got != 0 {
+			t.Fatalf("%s hinted %d, want the default sizing", name, got)
+		}
+	}
+
+	// And in between it is the plain sum, which is what makes it the same
+	// |B| + |C| construction the header entry point applies.
+	if got := PayloadCellHintFromCounts(payloadHintFloorCells, payloadHintFloorCells); got != 2*payloadHintFloorCells {
+		t.Fatalf("two floor-sized counts hinted %d, want %d", got, 2*payloadHintFloorCells)
+	}
+}
+
 // The gate one level up from the BOC: compressCandidatePayload is the function
 // the hint was threaded into, and what it returns is the LZ4 frame and the TL
 // box a broadcast carries. Both are pure functions of the combined BOC, so if
@@ -416,8 +457,8 @@ func TestL3HintChangesNoPayloadByte(t *testing.T) {
 				if err != nil {
 					t.Fatalf("hint %d: %v", hint, err)
 				}
-				if !bytes.Equal(want, got) {
-					t.Fatalf("hint %d changed the %d-byte broadcast payload", hint, len(want))
+				if !bytes.Equal(want.bytes(), got.bytes()) {
+					t.Fatalf("hint %d changed the %d-byte broadcast payload", hint, len(want.bytes()))
 				}
 			}
 		})

@@ -41,7 +41,7 @@ func TestExternalMessageRoutingUsesAnycastRewrite(t *testing.T) {
 		MustStoreRef(bodyWithTag(1)).
 		EndCell()
 
-	message, err := newExternalMessage(0, root, nil)
+	message, err := newExternalMessage(len(root.ToBOC()), root, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +51,24 @@ func TestExternalMessageRoutingUsesAnycastRewrite(t *testing.T) {
 	}
 	if message.Addr != want {
 		t.Fatalf("routing address = %x, want rewritten %x", message.Addr, want)
+	}
+
+	pool := New(Config{})
+	t.Cleanup(pool.Close)
+	result, err := pool.AddExternal(len(root.ToBOC()), root, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDestination := AccountDestination{Workchain: 0, Account: want}
+	if result.Outcome != ExternalAddInserted || result.Destination != wantDestination {
+		t.Fatalf("add result = %+v, want inserted destination %+v", result, wantDestination)
+	}
+	result, err = pool.AddExternal(len(root.ToBOC()), root, nil, ExternalPriorityLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != ExternalAddExisting || result.Destination != wantDestination {
+		t.Fatalf("existing result = %+v, want existing destination %+v", result, wantDestination)
 	}
 }
 
@@ -101,59 +119,21 @@ func TestAssembleRejects(t *testing.T) {
 		MustStoreAddr(addrOf(0, addr)).
 		MustStoreCoins(1).
 		EndCell()
-	if _, err := newExternalMessage(0, intMsg, nil); err == nil {
+	if _, err := newExternalMessage(len(intMsg.ToBOC()), intMsg, nil); err == nil {
 		t.Fatal("int_msg_info must fail")
 	}
 }
 
-// TestEstimatedSizeTracksTheBOC pins the structural estimate used when the
-// caller has no received length — which is what both production callers do.
-// The budget it feeds is a heuristic, so the estimate only has to stay close
-// to and never above the real serialization: it counts cell payloads and skips
-// the fixed BOC header.
-func TestEstimatedSizeTracksTheBOC(t *testing.T) {
-	for _, inline := range []bool{false, true} {
-		m := buildExtMsg(t, 0, testAddr(0x41), bodyWithTag(3), msgOpts{inlineBody: inline})
-		estimated := estimateBOCSize(m.root)
-		if estimated <= 0 || estimated > len(m.raw) || estimated < len(m.raw)-32 {
-			t.Fatalf("inline=%v: estimate %d is not close under the BOC length %d", inline, estimated, len(m.raw))
-		}
-	}
+func TestExternalMessageKeepsExactSerializedSize(t *testing.T) {
+	m := buildExtMsg(t, 0, testAddr(0x41), bodyWithTag(3), msgOpts{})
+	const serializedSize = 12345
 
-	// A shared subtree is charged once, exactly as the BOC stores it. The two
-	// trees below differ only in that the second references the same body
-	// twice, so the whole difference must be the one byte of the extra
-	// reference index — the body payload itself may not be charged again.
-	// Asserting the exact delta is what pins the dedup: without it the second
-	// tree would additionally carry the body's own 2+len(body) bytes, and a
-	// bound like "estimate <= len(BOC)" would still pass.
-	body := bodyWithTag(9)
-	once := cell.BeginCell().MustStoreRef(body).EndCell()
-	twice := cell.BeginCell().MustStoreRef(body).MustStoreRef(body).EndCell()
-
-	delta := estimateBOCSize(twice) - estimateBOCSize(once)
-	if delta != 1 {
-		t.Fatalf("shared body charged twice: estimate grew by %d bytes for one extra reference to the same cell, want 1", delta)
+	message, err := newExternalMessage(serializedSize, m.root, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-// TestBytesBudgetWithoutReceivedLength covers the production shape of
-// AddExternal: no raw buffer, so the byte budget runs on the structural
-// estimate alone.
-func TestBytesBudgetWithoutReceivedLength(t *testing.T) {
-	env := newPoolEnv(t, func(c *Config) { c.MempoolBytesLimit = 100 })
-	for _, fill := range []byte{0x51, 0x52, 0x53} {
-		m := buildExtMsg(t, 0, testAddr(fill), bodyWithTag(1), msgOpts{})
-		if err := env.pool.AddExternal(nil, m.root, nil, 0); err != nil {
-			t.Fatal(err)
-		}
-	}
-	st := env.pool.Stats()
-	if st.PooledBytes <= 0 {
-		t.Fatal("pooling without a received length must still account bytes")
-	}
-	if st.OverflowBytes == 0 || st.PooledBytes > 100 {
-		t.Fatalf("bytes budget did not hold: pooled=%d overflow=%d", st.PooledBytes, st.OverflowBytes)
+	if message.Size != serializedSize {
+		t.Fatalf("serialized size = %d, want %d", message.Size, serializedSize)
 	}
 }
 

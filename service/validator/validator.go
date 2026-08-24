@@ -145,6 +145,7 @@ func New(opts Options) hooks.ExtensionFactory {
 			store:            n.Store,
 			validatorStore:   resolved.Storage,
 			pool:             resolved.Runtime.Messages,
+			accountPrewarmer: n.AccountPrewarmer,
 			tracker:          resolved.Runtime.Groups,
 			localCollator:    resolved.LocalCollator,
 			masterchainViews: resolved.MasterchainViews,
@@ -213,11 +214,12 @@ func (s *serviceWithShardTops) OnShardTopBlockDescription(
 // Service is the validator extension. See the package comment for the
 // current scope.
 type Service struct {
-	log            zerolog.Logger
-	opts           Options
-	store          groups.MasterchainHistory
-	validatorStore ValidatorStorage
-	pool           *msgpool.Pool
+	log              zerolog.Logger
+	opts             Options
+	store            groups.MasterchainHistory
+	validatorStore   ValidatorStorage
+	pool             *msgpool.Pool
+	accountPrewarmer hooks.AccountPrewarmer
 
 	internalsTopologyMu sync.RWMutex
 	// internalsTopology is nil until the first exact masterchain projection is
@@ -566,8 +568,16 @@ func (s *Service) OnExternalMessage(_ context.Context, ev hooks.ExternalMessageE
 	if ev.IsLocal {
 		priority = msgpool.ExternalPriorityLocal
 	}
-	if err := s.pool.AddExternal(nil, ev.MessageRoot, ev.MessageParsed, priority); err != nil {
+	result, err := s.pool.AddExternal(
+		ev.SerializedSize,
+		ev.MessageRoot,
+		ev.MessageParsed,
+		priority,
+	)
+	if err != nil {
 		s.log.Debug().Err(err).Msg("external message not pooled")
+	} else if result.Outcome == msgpool.ExternalAddInserted && s.accountPrewarmer != nil {
+		s.accountPrewarmer.EnqueueAccount(result.Destination.Workchain, result.Destination.Account)
 	}
 	return nil
 }
@@ -1065,6 +1075,11 @@ func (s *Service) feedInternals(processing *sourceProcessing, ev hooks.BlockAppl
 
 	applyCount := 0
 	reseedCount := 0
+	var prewarmed pooledInternalsPrewarmSeen
+	if s.accountPrewarmer != nil {
+		prewarmed.accounts = make(map[pooledAccountPrewarmKey]struct{})
+		prewarmed.envelopes = make(map[cell.Hash]struct{})
+	}
 	internals.VisitDestinations(func(destination msgpool.ShardIdent) bool {
 		if !sharddomain.IsNeighbor(
 			destination.Workchain,
@@ -1149,6 +1164,8 @@ func (s *Service) feedInternals(processing *sourceProcessing, ev hooks.BlockAppl
 						Int32("destination_workchain", destination.Workchain).
 						Uint64("destination_shard", destination.Shard).
 						Msg("internals delta not applied, reseeding destination")
+				} else {
+					s.prewarmPooledInternals(routed[index].Delta.Added, &prewarmed)
 				}
 			}
 		} else {
@@ -1207,6 +1224,7 @@ func (s *Service) feedInternals(processing *sourceProcessing, ev hooks.BlockAppl
 				Msg("internals destination reseed failed")
 			continue
 		}
+		s.prewarmPooledInternals(seeds[index].Messages, &prewarmed)
 		seeded++
 	}
 	s.log.Debug().Str("block", storage.FormatBlockRef(id)).

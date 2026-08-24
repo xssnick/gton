@@ -120,33 +120,34 @@ func (b *Branch) PinSource(source ShardIdent, visible SourceRef) error {
 }
 
 // SeedSourceFromStateRoot derives and installs one exact source snapshot with
-// the branch's pinned destination router. Unlike Internals.SeedsFromStateRoot,
-// it cannot be redirected by a newer global split/merge topology.
+// the branch's pinned destination router and returns its immutable messages.
+// Unlike Internals.SeedsFromStateRoot, it cannot be redirected by a newer
+// global split/merge topology.
 func (b *Branch) SeedSourceFromStateRoot(
 	source ShardIdent,
 	visible SourceRef,
 	stateRoot *cell.Cell,
-) (uint64, error) {
+) ([]*InternalMessage, uint64, error) {
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
-		return 0, ErrClosed
+		return nil, 0, ErrClosed
 	}
 	routing := b.routing
 	b.mu.Unlock()
 
 	seeds, total, err := routedSeedsFromStateRoot(stateRoot, source, visible, routing)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	if len(seeds) != 1 || seeds[0].Destination != b.destination {
-		return 0, errors.New("msgpool: branch routing snapshot is invalid")
+		return nil, 0, errors.New("msgpool: branch routing snapshot is invalid")
 	}
 	if err = b.seedSource(source, visible, seeds[0].Messages); err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 
-	return total, nil
+	return seeds[0].Messages, total, nil
 }
 
 // DeltaFromBlockRoot derives one candidate's queue delta using the routing

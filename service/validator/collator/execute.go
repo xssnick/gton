@@ -2,11 +2,17 @@ package collator
 
 import (
 	"bytes"
+	"cmp"
 	"container/heap"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"math"
+	"math/bits"
+	"runtime"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -31,13 +37,17 @@ type accountLane struct {
 	// dictionary, and is owned by collation.accountStorageProofs rather than by
 	// the lane — see sharedAccountStorageProof.
 	storageProof *cell.MerkleProofBuilder
-	// initialStorageProof is that proof as it stood after the first transaction
-	// that used the dictionary. It only seeds the collated size estimate — the
-	// emitted proof is a superset of it, see trackAccountStorageProof.
-	initialStorageProof *cell.Cell
-	transactions        *tlb.AccountTransactionsAugDict
-	key                 [32]byte
-	originallyExists    bool
+	// transactions accumulates what the account executed, in execution order.
+	// The AccountBlock dictionary is built from it once in finishAccounts —
+	// see buildAccountTransactions.
+	transactions []accountTransaction
+	// touched records that the account produced at least one transaction. It is
+	// the question every phase outside execution asks; the slice above is the
+	// build input of finishAccounts, and reading its length instead would tie
+	// those phases to how and when the dictionary gets built.
+	touched          bool
+	key              [32]byte
+	originallyExists bool
 	// accountPath is the predecessor ShardAccounts spine loaded for this key.
 	// Its cells are charged to the block estimate only after the account changes.
 	accountPath      []*cell.Cell
@@ -46,6 +56,19 @@ type accountLane struct {
 	// account lands in take the same key and cells are immutable, so it is
 	// built once instead of once per use.
 	keyCell *cell.Cell
+	// tracer is what every cell of this lane carries instead of the shared
+	// recorders' traces, so the lane can execute ahead of its admission without
+	// writing into the shared record. See laneTracer.
+	tracer *laneTracer
+}
+
+// accountTransaction is one executed transaction of an account, held by its
+// logical time until the AccountBlock dictionary is built. It mirrors the
+// reference's LtCellRef (crypto/block/transaction.h:40), the element type of
+// block::Account::transactions.
+type accountTransaction struct {
+	startLT uint64
+	root    *cell.Cell
 }
 
 // accountStorageProof is the collation-wide record of one initial storage-stat
@@ -53,12 +76,152 @@ type accountLane struct {
 // reads through, and how much of its serialized proof the collated size estimate
 // has already been charged for.
 type accountStorageProof struct {
-	builder *cell.MerkleProofBuilder
-	// charged is the size, in serialized bytes, of the proof this dictionary was
-	// last charged to collatedFixedEstimate for. Accounts that bind the same
-	// dictionary later charge only the growth their own reads added, because
-	// buildCollatedRoots emits one proof for all of them.
+	builder  *cell.MerkleProofBuilder
+	estimate *accountStorageProofSizeEstimator
+	// charged is the conservative standalone-BOC size this dictionary last
+	// charged to collatedFixedEstimate. The estimate can shrink when loading a
+	// small cell replaces its pruned boundary, so this is a high-watermark: bytes
+	// already admitted are never subtracted, and later reads charge only growth
+	// beyond it. buildCollatedRoots emits one proof for all accounts sharing the
+	// dictionary.
 	charged uint64
+}
+
+// accountStorageProofBOCOverhead bounds everything outside the traced proof
+// body in a standalone CRC-protected BOC: the account_storage_dict_proof wrapper,
+// the MerkleProof special cell, the BOC header and its checksum. At the format's
+// maximum four-byte reference index and eight-byte offset they occupy 85 bytes.
+// The final collated BOC shares one header across all roots, so charging the
+// standalone bound preserves the conservative policy the old exact snapshot
+// serialization provided.
+const accountStorageProofBOCOverhead = uint64(85)
+
+// accountStorageProofSizeEstimator incrementally bounds the serialized cells of
+// one ReadSet proof body. A boundary is not always a 38-byte pruned branch:
+// proof generation keeps resident terminal cells in full, including maximum-size
+// leaves, while a high-level boundary can carry several hashes and depths. The
+// estimator therefore remembers the price at which every hash entered, and
+// replaces that exact price if the cell is loaded later.
+//
+// It is safe for concurrent ReadSet callbacks. The current pipeline replays
+// speculative lanes on the collation goroutine, but the recorder contract allows
+// callbacks from several goroutines and a shared storage dictionary must not
+// make admission depend on which account won a race.
+type accountStorageProofSizeEstimator struct {
+	mu    sync.Mutex
+	bytes uint64
+	cells map[cell.Hash]accountStorageProofCellEstimate
+}
+
+type accountStorageProofCellEstimate struct {
+	bytes  uint64
+	loaded bool
+}
+
+type accountStorageProofBoundaryEstimate struct {
+	hash  cell.Hash
+	bytes uint64
+}
+
+func newAccountStorageProofSizeEstimator() *accountStorageProofSizeEstimator {
+	return &accountStorageProofSizeEstimator{
+		cells: make(map[cell.Hash]accountStorageProofCellEstimate),
+	}
+}
+
+func accountStorageProofLoadedCellBytes(loaded *cell.Cell) uint64 {
+	// Two descriptors and at most four bytes per reference are enough for the
+	// exact BOC body. Five keeps the same three-byte per-cell safety margin as
+	// the collated-proof estimator while four-byte refs cover the format maximum.
+	return uint64(5+(loaded.BitsSize()+7)/8) + uint64(loaded.RefsNum())*4
+}
+
+func accountStorageProofBoundaryBytes(boundary *cell.Cell) uint64 {
+	// A pruned boundary stores one hash and depth for every significant level
+	// of the source mask, plus level zero. Applying the proof's virtual level can
+	// only remove mask bits, so the complete source mask is a tight upper bound
+	// without constructing the boundary. Seven is its two-byte payload prefix,
+	// two BOC descriptors, and the same three-byte per-cell safety margin used
+	// for loaded cells.
+	hashes := bits.OnesCount8(boundary.LevelMask().Mask) + 1
+	bytes := uint64(7 + hashes*(sha256.Size+2))
+	if boundary.RefsNum() == 0 {
+		// Proof generation retains an ordinary terminal cell verbatim. A lazy
+		// boundary also has no refs, but exposes the payload of the pruned cell it
+		// will materialize; taking the larger value covers sparse/high level masks
+		// whose payload contains more than one hash and depth.
+		bytes = max(bytes, accountStorageProofLoadedCellBytes(boundary))
+	}
+	return bytes
+}
+
+func (e *accountStorageProofSizeEstimator) addLoadedCell(loaded *cell.Cell) {
+	hash := loaded.HashKey()
+	loadedBytes := accountStorageProofLoadedCellBytes(loaded)
+	var refBuf [4]accountStorageProofBoundaryEstimate
+	refs := refBuf[:loaded.RefsNum()]
+	for i := range refs {
+		boundary := loaded.MustPeekRef(i)
+		refs[i] = accountStorageProofBoundaryEstimate{
+			hash:  boundary.HashKey(),
+			bytes: accountStorageProofBoundaryBytes(boundary),
+		}
+	}
+
+	e.mu.Lock()
+	current, seen := e.cells[hash]
+	if seen && current.loaded {
+		e.mu.Unlock()
+		return
+	}
+	if seen {
+		e.bytes -= current.bytes
+	}
+	e.bytes += loadedBytes
+	e.cells[hash] = accountStorageProofCellEstimate{bytes: loadedBytes, loaded: true}
+	for _, ref := range refs {
+		child, exists := e.cells[ref.hash]
+		if exists && (child.loaded || child.bytes >= ref.bytes) {
+			continue
+		}
+		if exists {
+			e.bytes -= child.bytes
+		}
+		e.cells[ref.hash] = accountStorageProofCellEstimate{bytes: ref.bytes}
+		e.bytes += ref.bytes
+	}
+	e.mu.Unlock()
+}
+
+func (e *accountStorageProofSizeEstimator) size() uint64 {
+	e.mu.Lock()
+	bytes := e.bytes
+	e.mu.Unlock()
+	return bytes
+}
+
+func newAccountStorageProof(root *cell.Cell) *accountStorageProof {
+	proof := &accountStorageProof{
+		builder:  cell.NewMerkleProofBuilder(root),
+		estimate: newAccountStorageProofSizeEstimator(),
+	}
+	// Installed before the traced root can leave this function: no dictionary
+	// read can enter the proof without entering its size estimate as well.
+	proof.builder.ReadSet().SetRecordCallback(proof.estimate.addLoadedCell)
+
+	return proof
+}
+
+func (p *accountStorageProof) estimatedBOCSize() uint64 {
+	body := p.estimate.size()
+	if body == 0 {
+		return 0
+	}
+	if math.MaxUint64-body < accountStorageProofBOCOverhead {
+		return math.MaxUint64
+	}
+
+	return body + accountStorageProofBOCOverhead
 }
 
 // accountPathRecorder observes only the ShardAccounts lookup. The trace is
@@ -91,15 +254,7 @@ func (*accountPathRecorder) PendingError() error {
 }
 
 func (c *collation) prepareAccountPathRecorder() {
-	c.accountPathRecorder = newAccountPathRecorder()
-	for i := range c.accountSources {
-		if c.accountSources[i].accounts == nil {
-			continue
-		}
-		c.accountSources[i].accounts = &tlb.ShardAccountsAugDict{
-			AugmentedDictionary: c.accountSources[i].accounts.Copy().SetTrace(c.accountPathRecorder.trace),
-		}
-	}
+	c.accountSiblings = newAccountSiblingPrefetch(c.ctx)
 }
 
 // laneKey returns the account's dictionary key cell, building it on first use.
@@ -186,10 +341,36 @@ type externalBatchResult struct {
 	consumed int
 }
 
+// externalIntakeClosed reports the outbound-queue brake: past this depth the
+// collation declines every ordinary external it is offered, one verdict per
+// message (SKIP_EXTERNALS_QUEUE_SIZE, collator.cpp:54). The queue only grows
+// once cleanup has run — the sole decrement is the cleanup phase, which
+// precedes externals — so a batch that starts closed stays closed, and the
+// callers below use that to skip the whole batch without paying to prepare it.
+func (c *collation) externalIntakeClosed() bool {
+	return c.queueSize > skipExternalsQueueSize
+}
+
 func (c *collation) processExternalBatch(
 	externals []ExternalInput,
 	deadline time.Time,
 ) (externalBatchResult, error) {
+	// Hoisted from the per-message loop for the batch that starts closed: the
+	// verdicts are already decided, so account prewarm and wave planning for
+	// messages none of which can be taken is pure cost. On the loaded stand this
+	// was the whole external stage of every zero-external block — the pool holds
+	// thousands of messages under spam, and each one was prewarmed from storage
+	// per block just to be declined. The per-message check below stays, for the
+	// batch that crosses the threshold mid-way.
+	if len(externals) != 0 && c.externalIntakeClosed() {
+		for _, skipped := range externals {
+			c.recordExternal(skipped.Ref, msgpool.ExternalSkippedLimit)
+		}
+		return externalBatchResult{consumed: len(externals)}, nil
+	}
+	if workers := c.internalWaveParallelism(); workers > 0 {
+		return c.processExternalBatchInWaves(externals, deadline, workers)
+	}
 	c.prewarmExternalInputs(externals)
 
 	for i, external := range externals {
@@ -235,7 +416,7 @@ func (c *collation) processExternalBatch(
 		// message that would never be executable is still purged from the pool
 		// rather than held behind the brake, and before the attempt counter,
 		// which measures executions this message does not get.
-		if c.queueSize > skipExternalsQueueSize {
+		if c.externalIntakeClosed() {
 			c.recordExternal(external.Ref, msgpool.ExternalSkippedLimit)
 			continue
 		}
@@ -296,11 +477,12 @@ func (c *collation) processNewMessages(enqueueOnly bool) error {
 		// (:377-379, the port of collator.cpp:3727-3731) covers only the
 		// delivery path.
 		c.updateCollatedEstimate()
-		if !c.limits.fits(LoadNormal) {
+		if !c.limits.fits(c.fullMark()) {
 			c.blockFull = true
 		}
 		if !c.blockFull && c.internalMsgExpired() {
 			c.blockFull = true
+			c.blockFullTimeout = true
 			c.stats.InternalMsgTimeouts++
 		}
 		item := c.new.popMin()
@@ -447,7 +629,7 @@ func (c *collation) deliverImmediate(
 	}
 	c.stats.ImmediateDelivered++
 	c.updatePeakLoad()
-	if !c.limits.fits(LoadNormal) {
+	if !c.limits.fits(c.fullMark()) {
 		c.blockFull = true
 	} else if c.internalMsgExpired() {
 		// collator.cpp:3732-3736, the second half of process_one_new_message's
@@ -455,6 +637,7 @@ func (c *collation) deliverImmediate(
 		// which latches enqueue_only for the next heap item; setting c.blockFull
 		// is how the loop-top latch above reaches the same state.
 		c.blockFull = true
+		c.blockFullTimeout = true
 		c.stats.InternalMsgTimeouts++
 	}
 	return nil
@@ -566,23 +749,10 @@ func (c *collation) executePrepared(message *tvm.PreparedMessage, afterLT uint64
 	if message.Message().MsgType == tlb.MsgTypeExternalIn {
 		afterLT = max(afterLT, c.lastProcLT)
 	}
-	if emittedLT, ok := c.lastDispatchEmitted[lane.key]; ok {
-		afterLT = max(afterLT, emittedLT)
-	}
+	afterLT = max(afterLT, c.importAfterLT(lane))
 
-	minLT := max(c.header.StartLt, afterLT)
-	if minLT >= math.MaxInt64 {
-		return nil, nil, fmt.Errorf("%w: transaction lt overflow", ErrInvalidInput)
-	}
-	result, err := c.builder.machine.EmulateTransaction(c.blockCtx, lane.current, message, tvm.TransactionOptions{
-		LogicalTime:        int64(minLT + 1),
-		AccountStorageStat: lane.storageStat,
-		OnCellLoad:         c.recordExecutionRead,
-	})
+	result, err := c.emulate(lane, message, afterLT)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err = c.ctx.Err(); err != nil {
 		return nil, nil, err
 	}
 	if message.Message().MsgType == tlb.MsgTypeExternalIn && !result.Accepted {
@@ -595,6 +765,43 @@ func (c *collation) executePrepared(message *tvm.PreparedMessage, afterLT uint64
 	return result, lane, nil
 }
 
+// importAfterLT is the floor an imported internal message's transaction lt
+// takes from the dispatch phase: the last emission the account made there.
+// It is the only floor an internal import has besides the block start and the
+// account's own chain, which is what makes an import's lt independent of every
+// other account's transactions — the property the wave executor relies on.
+func (c *collation) importAfterLT(lane *accountLane) uint64 {
+	if emittedLT, ok := c.lastDispatchEmitted[lane.key]; ok {
+		return emittedLT
+	}
+	return 0
+}
+
+// emulate runs one transaction against the lane's current state and returns
+// its result without committing it. It mutates nothing shared — the lane's
+// state moves only in commitExecution — and traces every read to the lane's
+// tracer, which is what lets it run off the main goroutine for a lane the
+// collation has not yet admitted. afterLT must already carry every floor the
+// caller applies; see executePrepared.
+func (c *collation) emulate(lane *accountLane, message *tvm.PreparedMessage, afterLT uint64) (*tvm.TransactionExecutionResult, error) {
+	minLT := max(c.header.StartLt, afterLT)
+	if minLT >= math.MaxInt64 {
+		return nil, fmt.Errorf("%w: transaction lt overflow", ErrInvalidInput)
+	}
+	result, err := c.builder.machine.EmulateTransaction(c.blockCtx, lane.current, message, tvm.TransactionOptions{
+		LogicalTime:        int64(minLT + 1),
+		AccountStorageStat: lane.storageStat,
+		OnCellLoad:         lane.tracer.onExecutionRead,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err = c.ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (c *collation) commitExecution(
 	result *tvm.TransactionExecutionResult,
 	lane *accountLane,
@@ -605,25 +812,14 @@ func (c *collation) commitExecution(
 	}
 	var err error
 
-	firstForAccount := lane.transactions == nil
-	if firstForAccount {
-		lane.transactions, err = tlb.NewAccountTransactionsAugDict()
-		if err != nil {
-			return err
-		}
-		if err = c.trackAccountStorageProof(lane); err != nil {
-			return err
-		}
-	}
-	txKey := cell.BeginCell().MustStoreUInt(result.StartLT, 64).EndCell()
-	txValue := cell.BeginCell().MustStoreRef(result.TransactionCell).EndCell()
-	inserted, err := lane.transactions.SetWithMode(txKey, txValue, cell.DictSetModeAdd)
-	if err != nil {
-		return err
-	}
-	if !inserted {
-		return fmt.Errorf("%w: duplicate transaction lt %d", ErrInvalidInput, result.StartLT)
-	}
+	lane.touched = true
+	c.trackAccountStorageProof(lane)
+	// A repeated lt would replace an earlier transaction rather than add one; it
+	// is refused where the keys first meet, in buildAccountTransactions.
+	lane.transactions = append(lane.transactions, accountTransaction{
+		startLT: result.StartLT,
+		root:    result.TransactionCell,
+	})
 
 	if c.master != nil {
 		// Masterchain public-library visibility changes are weighed into the
@@ -668,9 +864,43 @@ func (c *collation) account(addr *address.Address) (*accountLane, error) {
 	if lane := c.lanes[key]; lane != nil {
 		return lane, nil
 	}
+	lane, err := c.resolveLane(key)
+	if err != nil {
+		return nil, err
+	}
+	c.registerLane(lane)
+	return lane, nil
+}
 
+// resolveLane loads the account behind key out of the predecessor and prepares
+// it for execution. It writes nothing the collation shares: the lane it returns
+// is not in c.lanes, its storage dictionary is bound to no shared proof, and its
+// spine has not been handed to the sibling prefetch. All of that is
+// registerLane's, and the split is what lets several lanes be resolved at once
+// by several goroutines while the collation decides, in message order, which
+// of them it will keep.
+//
+// Every read it makes is traced to the lane's own tracer and to nothing else.
+// The ShardAccounts descent goes through a per-lane view of the predecessor
+// dictionary — CopyWithTrace replaces the root's trace rather than adding to
+// it — so the spine is seen by the lane's recorder and the lane's tracer and
+// not by the shared record, and the account payload underneath inherits the
+// tracer alone once the recorder is stripped off the value.
+func (c *collation) resolveLane(key [32]byte) (*accountLane, error) {
+	return c.resolveLaneWith(key, false)
+}
+
+// resolveLaneWith is resolveLane with the tracer's mode chosen up front:
+// buffering for a lane resolved on a worker ahead of its admission,
+// pass-through for one resolved on the main goroutine.
+func (c *collation) resolveLaneWith(key [32]byte, speculative bool) (*accountLane, error) {
+	lane := &accountLane{key: key}
+	lane.tracer = newLaneTracer(c, lane)
+	if speculative {
+		lane.tracer.speculate()
+	}
 	keyCell := cell.BeginCell().MustStoreSlice(key[:], 256).EndCell()
-	value, accountPath, err := c.loadPredecessorAccount(key, keyCell)
+	value, accountPath, err := c.loadPredecessorAccount(lane.tracer, key, keyCell)
 	originallyExists := true
 	var shardAccount tlb.ShardAccount
 	if isMissingKey(err) {
@@ -685,7 +915,7 @@ func (c *collation) account(addr *address.Address) (*accountLane, error) {
 		return nil, fmt.Errorf("decode shard account %x: %w", key, err)
 	}
 
-	effectiveAddr := address.NewAddress(0, byte(addr.Workchain()), key[:])
+	effectiveAddr := address.NewAddress(0, byte(c.shard.Workchain), key[:])
 	prepared, err := tvm.PrepareAccount(&shardAccount, effectiveAddr)
 	if err != nil {
 		return nil, err
@@ -716,58 +946,41 @@ func (c *collation) account(addr *address.Address) (*accountLane, error) {
 	}
 
 	initialStorageStat := storageStat
-	var storageProof *cell.MerkleProofBuilder
 	if storageStat != nil && c.fullCollated {
-		storageProof = c.sharedAccountStorageProof(storageStat)
-		storageStat = storageProof.Root()
+		// The dictionary the transaction walks carries the lane's stat trace.
+		// Before lanes had tracers it carried the shared proof builder's own
+		// trace; the tracer forwards to that builder in pass-through and
+		// buffers for it in speculation, so what the builder records is the
+		// same set of cells either way.
+		storageStat = storageStat.WithTrace(lane.tracer.statTrace)
 	}
 
-	lane := &accountLane{
-		key:                key,
-		keyCell:            keyCell,
-		address:            prepared.Address(),
-		original:           &shardAccount,
-		originallyExists:   originallyExists,
-		current:            prepared,
-		storageStat:        storageStat,
-		initialStorageStat: initialStorageStat,
-		storageProof:       storageProof,
-		accountPath:        accountPath,
-	}
-	c.lanes[key] = lane
+	lane.keyCell = keyCell
+	lane.address = prepared.Address()
+	lane.original = &shardAccount
+	lane.originallyExists = originallyExists
+	lane.current = prepared
+	lane.storageStat = storageStat
+	lane.initialStorageStat = initialStorageStat
+	lane.accountPath = accountPath
 	return lane, nil
 }
 
-// sharedAccountStorageProof returns the traced proof builder for an initial
-// storage-stat dictionary, creating it on first use.
-//
-// The builder is keyed by the dictionary, not by the account, because the wire
-// format is: collated data carries at most one account_storage_dict_proof per
-// dictionary hash (verifyCollatedRoots rejects a second root with the same
-// virtual hash as a duplicate), and a verifier binds it to every account whose
-// state commits to that hash. Two accounts can commit to the same hash whenever
-// their code and data trees are identical — the dictionary is a function of the
-// account storage cell's references, and the address is not among them — and
-// each of them then replays its own update walk against that one proof. So the
-// proof has to cover the union of their reads, and one shared recorder is what
-// makes that true by construction: both accounts read through this builder's
-// traced root, so every node either of them touches is in the read set, whatever
-// order the lanes ran in. Per-account recorders cannot be reconciled at emit
-// time — only one of them can be shipped, and the others' branches would reach
-// the verifier pruned. A C++ validator meeting a pruned branch here does not
-// abstain, it votes to reject.
-//
-// This mirrors collator-impl.h's account_storage_dicts_, which maps a dict hash
-// to one MerkleProofBuilder for exactly this reason.
-//
-// No lock, and the reason is the map's reachability rather than the build's:
-// every access is on the execution goroutine. This constructor is reached only
-// from account(), and the one other site that touches the map —
-// trackAccountStorageProof's charged-bytes update (build.go:1386) — is reached
-// only from commitExecution. A build does fork twice, at traceValidationClosure
-// (proof_closure.go, five concurrent passes) and at the block/collated
-// serialization split, but both begin after the last lane has run and neither
-// reaches either site.
+// registerLane makes a resolved lane part of the collation. It runs on the
+// main goroutine, in message order, and is the only place a lane enters
+// c.lanes, binds its shared storage proof, or hands its spine to the prefetch.
+func (c *collation) registerLane(lane *accountLane) {
+	if lane.initialStorageStat != nil && c.fullCollated {
+		lane.storageProof = c.sharedAccountStorageProof(lane.initialStorageStat)
+	}
+	c.lanes[lane.key] = lane
+	// The earliest point at which the spine is known. A lane that never
+	// transacts is submitted too, deliberately: finishAccounts hands the bulk
+	// write its path as well, so its fork nodes carry the same untouched
+	// siblings.
+	c.accountSiblings.submit(lane.accountPath)
+}
+
 func (c *collation) sharedAccountStorageProof(stat *cell.Cell) *cell.MerkleProofBuilder {
 	hash := stat.HashKey()
 	if shared := c.accountStorageProofs[hash]; shared != nil {
@@ -776,13 +989,14 @@ func (c *collation) sharedAccountStorageProof(stat *cell.Cell) *cell.MerkleProof
 	if c.accountStorageProofs == nil {
 		c.accountStorageProofs = make(map[cell.Hash]*accountStorageProof)
 	}
-	builder := cell.NewMerkleProofBuilder(stat)
-	c.accountStorageProofs[hash] = &accountStorageProof{builder: builder}
+	proof := newAccountStorageProof(stat)
+	c.accountStorageProofs[hash] = proof
 
-	return builder
+	return proof.builder
 }
 
 func (c *collation) loadPredecessorAccount(
+	tracer *laneTracer,
 	key [32]byte,
 	keyCell *cell.Cell,
 ) (*cell.Slice, []*cell.Cell, error) {
@@ -799,13 +1013,21 @@ func (c *collation) loadPredecessorAccount(
 			continue
 		}
 
-		recorder := c.accountPathRecorder
-		recorder.path = recorder.path[:0]
-		value, err := source.accounts.LoadValue(keyCell)
+		// The descent is observed by two listeners and the shared record is
+		// not one of them: the lane's tracer, which carries the reads to the
+		// record when the lane retires, and a recorder that keeps the spine
+		// for the size estimate. The recorder is stripped off the value
+		// before the account is decoded, so the spine stays the spine and the
+		// payload reaches the tracer alone.
+		recorder := newAccountPathRecorder()
+		view := &tlb.ShardAccountsAugDict{
+			AugmentedDictionary: source.accounts.CopyWithTrace(cell.CombineTraces(tracer.trace, recorder.trace)),
+		}
+		value, err := view.LoadValue(keyCell)
 		if value != nil {
 			value.SetTrace(value.Trace().WithoutTrace(recorder.trace))
 		}
-		return value, slices.Clone(recorder.path), err
+		return value, recorder.path, err
 	}
 
 	return nil, nil, fmt.Errorf("%w: account %x is outside predecessor shards", ErrInvalidInput, key)
@@ -941,15 +1163,15 @@ func (c *collation) registerQueueOp() error {
 // dictionaries are filled in one bulk pass each: a per-account write would walk
 // its own root-to-leaf path and recombine the augmentation of every node on the
 // way up, so the nodes near the root — the root's balance total above all —
-// would be rebuilt once per account instead of once per block.
+// would be rebuilt once per account instead of once per block. Each account's
+// own transaction dictionary is built here for the same reason, from what
+// execution accumulated.
 //
 // The size estimator never mutates accounts, so this is the only bulk update of
 // the dictionary during a collation.
 func (c *collation) finishAccounts() error {
-	accounts := make([]cell.AugmentedEntry, 0, len(c.lanes))
 	accountPaths := make([][]*cell.Cell, 0, len(c.lanes))
-	accountDeletes := make([]*cell.Cell, 0)
-	blocks := make([]cell.AugmentedEntry, 0, len(c.lanes))
+	builds := make([]accountLaneBuild, 0, len(c.lanes))
 	for _, lane := range c.lanes {
 		if len(lane.accountPath) != 0 {
 			// Paths from every lookup are useful, including a lane which did not
@@ -957,52 +1179,47 @@ func (c *collation) finishAccounts() error {
 			// root another lane's update would otherwise load again.
 			accountPaths = append(accountPaths, lane.accountPath)
 		}
-		if lane.transactions == nil {
-			continue
+		if lane.touched {
+			builds = append(builds, accountLaneBuild{lane: lane})
 		}
-		entry, deleted, err := accountDictionaryEntry(lane)
-		if err != nil {
-			return err
+	}
+	buildAccountLanes(builds)
+
+	accounts := make([]cell.AugmentedEntry, 0, len(builds))
+	accountDeletes := make([]*cell.Cell, 0)
+	blocks := make([]cell.AugmentedEntry, 0, len(builds))
+	for i := range builds {
+		build := &builds[i]
+		if build.err != nil {
+			return build.err
 		}
 		switch {
-		case deleted:
+		case build.deleted:
 			// Destroyed accounts are rare and shrink the tree, which the
 			// bulk write does not model; they keep the one-by-one path. Apply
 			// them after the batch so a delete cannot compress a label and make
 			// the batch's already-loaded predecessor paths stale.
-			accountDeletes = append(accountDeletes, entry.Key)
-		case entry.Value != nil:
-			accounts = append(accounts, entry)
+			accountDeletes = append(accountDeletes, build.entry.Key)
+		case build.entry.Value != nil:
+			accounts = append(accounts, build.entry)
 		}
-
-		stateUpdate, err := tlb.ToCell(tlb.HashUpdate{
-			OldHash: lane.original.Account.Hash(),
-			NewHash: lane.current.ShardAccount().Account.Hash(),
-		})
-		if err != nil {
-			return err
-		}
-		accountBlock, err := (tlb.AccountBlock{
-			Addr:         lane.key[:],
-			Transactions: lane.transactions,
-			StateUpdate:  stateUpdate,
-		}).ToCell()
-		if err != nil {
-			return err
-		}
-		blocks = append(blocks, cell.AugmentedEntry{
-			Key:   lane.laneKey(),
-			Value: accountBlock,
-			Mode:  cell.DictSetModeAdd,
-		})
-		if lane.storageStat != nil {
-			if _, ok := lane.current.State().StorageInfo.StorageExtra.(tlb.StorageExtraInfo); ok {
-				if c.storageStats == nil {
-					c.storageStats = make(AccountStorageStats)
-				}
-				c.storageStats[lane.storageStat.HashKey()] = lane.storageStat
+		blocks = append(blocks, build.block)
+		// Merged here rather than in the worker: the lanes own nothing of the
+		// collation, and this map is the one thing the loop used to write into it.
+		if build.storageStat != nil {
+			if c.storageStats == nil {
+				c.storageStats = make(AccountStorageStats)
 			}
+			c.storageStats[build.storageStat.HashKey()] = build.storageStat
 		}
+	}
+
+	// The prefetched untouched siblings enter as one more loaded path. The
+	// resolver is a hash index over every cell of every entry and consults it
+	// before it asks the store, so an extra entry can only remove a load; order
+	// and duplicates are irrelevant to it.
+	if siblings := c.accountSiblings.join(); len(siblings) != 0 {
+		accountPaths = append(accountPaths, siblings)
 	}
 
 	if c.fullCollated && c.master == nil && len(accountDeletes) == 0 {
@@ -1035,6 +1252,105 @@ func (c *collation) finishAccounts() error {
 	return nil
 }
 
+// accountLaneBuild is one touched lane's share of the final account stage: the
+// two dictionary entries it contributes and the storage stat it declares. It
+// exists so the work can be done off the collation goroutine — a worker reads
+// only its own lane and writes only its own element.
+type accountLaneBuild struct {
+	lane        *accountLane
+	entry       cell.AugmentedEntry
+	deleted     bool
+	block       cell.AugmentedEntry
+	storageStat *cell.Cell
+	err         error
+}
+
+// buildAccountLanes renders every touched lane, in parallel when there is more
+// than one worker's worth of them.
+//
+// The lanes are independent: each one reads its own accountLane and the
+// predecessor cells hanging off it, and cell hashes are computed at creation
+// rather than memoised on first read, so nothing shared is written. The one
+// collation-wide effect the loop used to have — the storage-stat map — is
+// merged by the caller instead.
+//
+// Order is not a correctness question here. c.lanes is a Go map, so the batches
+// this feeds have always been assembled in an arbitrary order, and both bulk
+// writes sort what they are given. The index still matters for one thing: the
+// lowest failing index is the error a sequential pass over the same snapshot
+// would have reported, so a malformed lane names itself the same way whether or
+// not the batch was split.
+func buildAccountLanes(builds []accountLaneBuild) {
+	workers := min(collationParallelism, runtime.GOMAXPROCS(0), len(builds))
+	if workers < 2 {
+		for i := range builds {
+			buildAccountLane(&builds[i])
+		}
+		return
+	}
+
+	var wg sync.WaitGroup
+	var next atomic.Int64
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for {
+				i := next.Add(1) - 1
+				if i >= int64(len(builds)) {
+					return
+				}
+				buildAccountLane(&builds[i])
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func buildAccountLane(build *accountLaneBuild) {
+	lane := build.lane
+	entry, deleted, err := accountDictionaryEntry(lane)
+	if err != nil {
+		build.err = err
+		return
+	}
+	build.entry, build.deleted = entry, deleted
+
+	stateUpdate, err := tlb.ToCell(tlb.HashUpdate{
+		OldHash: lane.original.Account.Hash(),
+		NewHash: lane.current.ShardAccount().Account.Hash(),
+	})
+	if err != nil {
+		build.err = err
+		return
+	}
+	transactions, err := buildAccountTransactions(lane)
+	if err != nil {
+		build.err = err
+		return
+	}
+	accountBlock, err := (tlb.AccountBlock{
+		Addr:         lane.key[:],
+		Transactions: transactions,
+		StateUpdate:  stateUpdate,
+	}).ToCell()
+	if err != nil {
+		build.err = err
+		return
+	}
+	build.block = cell.AugmentedEntry{
+		Key:   lane.laneKey(),
+		Value: accountBlock,
+		Mode:  cell.DictSetModeAdd,
+	}
+	if lane.storageStat != nil {
+		if _, ok := lane.current.State().StorageInfo.StorageExtra.(tlb.StorageExtraInfo); ok {
+			build.storageStat = lane.storageStat
+		}
+	}
+}
+
 func dispatchDiffAccount(valueExtra *cell.Slice) (*tlb.AccountDispatchQueue, error) {
 	value := valueExtra.Copy()
 	if err := (tlb.AugDispatchQueue{}).SkipExtra(value); err != nil {
@@ -1045,6 +1361,48 @@ func dispatchDiffAccount(valueExtra *cell.Slice) (*tlb.AccountDispatchQueue, err
 		return nil, err
 	}
 	return &account, nil
+}
+
+// buildAccountTransactions renders the lane's executed transactions as the
+// AccountBlock dictionary in a single bulk write. SetMany produces the
+// dictionary repeated Set would have produced — same cells, same augmentations
+// (aug_dict_bulk.go) — but visits the union of the key paths once, where a Set
+// per transaction walks its own root-to-leaf path and recombines the
+// augmentation of every node on the way back up, rebuilding the nodes an
+// account's chain shares once per transaction.
+//
+// This is the shape of the reference: block::Account::transactions is a plain
+// vector appended to by push_transaction while the account executes, and
+// Account::create_account_block (crypto/block/transaction.cpp:4176) turns it
+// into the dictionary once, from Collator::combine_account_transactions
+// (validator/impl/collator.cpp:3020). A repeated logical time is refused there
+// at build time as well, not where the transaction was pushed.
+func buildAccountTransactions(lane *accountLane) (*tlb.AccountTransactionsAugDict, error) {
+	// Sorted so the duplicate check below can name the offending lt; SetMany
+	// orders the batch itself and does not require it.
+	slices.SortFunc(lane.transactions, func(left, right accountTransaction) int {
+		return cmp.Compare(left.startLT, right.startLT)
+	})
+	entries := make([]cell.AugmentedEntry, len(lane.transactions))
+	for i, transaction := range lane.transactions {
+		if i > 0 && transaction.startLT == lane.transactions[i-1].startLT {
+			return nil, fmt.Errorf("%w: duplicate transaction lt %d", ErrInvalidInput, transaction.startLT)
+		}
+		entries[i] = cell.AugmentedEntry{
+			Key:   cell.BeginCell().MustStoreUInt(transaction.startLT, 64).EndCell(),
+			Value: cell.BeginCell().MustStoreRef(transaction.root).EndCell(),
+			Mode:  cell.DictSetModeAdd,
+		}
+	}
+
+	transactions, err := tlb.NewAccountTransactionsAugDict()
+	if err != nil {
+		return nil, err
+	}
+	if err = transactions.SetMany(entries); err != nil {
+		return nil, fmt.Errorf("%w: transactions of account %x did not apply: %v", ErrInvalidInput, lane.key, err)
+	}
+	return transactions, nil
 }
 
 // accountDictionaryEntry renders one lane as a dictionary write. A lane whose
@@ -1115,21 +1473,43 @@ func currencyZero(value tlb.CurrencyCollection) bool {
 // bounded by the message size limit. Cells the transaction built are recorded
 // too and are simply inert: the proof selects by hash over the predecessor tree
 // and never finds them.
+// It runs on the goroutine that retires a transaction, once per emitted message,
+// so both of its costs are paid serially in the middle of a phase: the visited
+// set is scratch reused across messages rather than allocated per message, and
+// the descent starts from a detached root.
+//
+// Detached because PeekRef on a traced cell copies the cell and creates a trace
+// node for every reference it hands back (tvm/cell/cell.go, PeekRef), and this
+// walk wants none of it. What it records, it records explicitly through
+// recordExecutionRead; propagating the lane's trace down an emitted message
+// would instead record the same cells a second way — billed, through the
+// traversal record — which is exactly what recording them unbilled is avoiding.
+// Only the root is copied; PeekRef on an untraced cell returns the reference
+// itself.
 func (c *collation) recordOutboundMessageReads(root *cell.Cell) {
 	if root == nil {
 		return
 	}
-	var visited map[cell.Hash]struct{}
+	// Cleared per message, though recording is idempotent and a stale set would
+	// mostly just skip cells already in the record. The one place it would not
+	// is the depth bound: a subtree truncated at maxOutboundMessageRecordDepth
+	// in one message and reachable shallowly in the next would stay truncated.
+	// Clearing a map of tens of entries is cheaper than reasoning about that.
+	if c.outboundVisited == nil {
+		c.outboundVisited = make(map[cell.Hash]struct{}, 64)
+	} else {
+		clear(c.outboundVisited)
+	}
 	var walk func(cur *cell.Cell, depth int)
 	walk = func(cur *cell.Cell, depth int) {
 		if cur == nil || depth > maxOutboundMessageRecordDepth {
 			return
 		}
 		hash := cur.HashKey()
-		if _, seen := visited[hash]; seen {
+		if _, seen := c.outboundVisited[hash]; seen {
 			return
 		}
-		visited[hash] = struct{}{}
+		c.outboundVisited[hash] = struct{}{}
 		c.recordExecutionRead(cur)
 		if cur.IsSpecial() {
 			return
@@ -1142,8 +1522,7 @@ func (c *collation) recordOutboundMessageReads(root *cell.Cell) {
 			walk(ref, depth+1)
 		}
 	}
-	visited = make(map[cell.Hash]struct{}, 16)
-	walk(root, 0)
+	walk(root.WithoutTrace(), 0)
 }
 
 // maxOutboundMessageRecordDepth bounds the walk at the cell depth limit, so a

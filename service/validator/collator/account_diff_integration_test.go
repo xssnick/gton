@@ -126,7 +126,7 @@ func finishAccountReceiptCandidate(tb testing.TB, req ShardRequest) (*collation,
 	tb.Helper()
 
 	builder := testBuilder()
-	c, err := builder.prepareShardPhases(context.Background(), req, 0)
+	c, err := builder.prepareShardPhases(context.Background(), req, collationAttempt{})
 	if err != nil {
 		tb.Fatalf("prepare account-receipt collation: %v", err)
 	}

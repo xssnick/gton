@@ -1,6 +1,8 @@
 package peerroute
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -106,6 +108,49 @@ func TestSerializesQUICDialAttempts(t *testing.T) {
 	route.FinishQUICDial()
 	if route.QUICReady(now) {
 		t.Fatal("successful cleanup erased a concurrent failure deadline")
+	}
+}
+
+func TestWaitQUICDialHonorsContext(t *testing.T) {
+	route := NewRoute("", testRetryPolicy())
+	if !route.BeginQUICDial(time.Now()) {
+		t.Fatal("idle route rejected dial ownership")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := route.WaitQUICDial(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait error = %v, want context deadline", err)
+	}
+	if !route.QUICDialInFlight() {
+		t.Fatal("waiter deadline released the owner's dial claim")
+	}
+
+	route.FinishQUICDial()
+}
+
+func TestWaitQUICDialWakesOnCompletion(t *testing.T) {
+	route := NewRoute("", testRetryPolicy())
+	if !route.BeginQUICDial(time.Now()) {
+		t.Fatal("idle route rejected dial ownership")
+	}
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- route.WaitQUICDial(context.Background())
+	}()
+	route.FinishQUICDial()
+
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("wait for completed dial: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dial completion did not wake waiter")
+	}
+	if route.QUICDialInFlight() {
+		t.Fatal("completed dial remains in flight")
 	}
 }
 

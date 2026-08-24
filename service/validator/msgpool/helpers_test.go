@@ -258,8 +258,12 @@ func (e *poolEnv) mustAdd(m testMsg, priority int) *ExternalMessage {
 	if err != nil {
 		e.t.Fatalf("assemble: %v", err)
 	}
-	if err = e.pool.AddExternal(m.raw, m.root, nil, priority); err != nil {
+	result, err := e.pool.AddExternal(len(m.raw), m.root, nil, priority)
+	if err != nil {
 		e.t.Fatalf("add: %v", err)
+	}
+	if result.Outcome != ExternalAddInserted || result.Destination != msg.destination() {
+		e.t.Fatalf("add result = %+v, want inserted destination %+v", result, msg.destination())
 	}
 	return msg
 }

@@ -27,6 +27,11 @@ const defaultLocalExternalLimit = 500
 // by local acquisition. msgpool.Pool implements it directly.
 type LocalMessageSource interface {
 	OpenExternalStream(msgpool.ShardIdent, int) (*msgpool.ExternalStream, error)
+	// OpenExternalStreamExcluding is OpenExternalStream with a set of messages
+	// the stream must never offer. A build started before its predecessor
+	// reported what it consumed has to be told directly, or it executes those
+	// messages a second time and its feedback for them is dropped as stale.
+	OpenExternalStreamExcluding(msgpool.ShardIdent, int, [][32]byte) (*msgpool.ExternalStream, error)
 	OpenExternalSnapshot(msgpool.ShardIdent, int) (*msgpool.ExternalStream, error)
 	Complete([]msgpool.ExternalFeedback) error
 	Internals() *msgpool.Internals
@@ -36,10 +41,11 @@ type LocalShardTopSource interface {
 	Select(context.Context, ShardTopSelection) ([]ShardTop, error)
 }
 
-// AccountPrewarmer accepts best-effort account-state cache hints. EnqueueAccount
-// must not wait for I/O; candidate acquisition and collation do not depend on
-// warming for correctness.
+// AccountPrewarmer accepts best-effort account-state and exact cell-tree cache
+// hints. Enqueue methods must not wait for I/O; candidate acquisition and
+// collation do not depend on warming for correctness.
 type AccountPrewarmer interface {
+	EnqueueRoot(cell.Hash) bool
 	EnqueueAccount(workchain int32, account [32]byte) bool
 	PrewarmAccountNow(workchain int32, account [32]byte) bool
 }
@@ -83,9 +89,11 @@ type LocalAcquisition struct {
 	maxExternalAttempts int
 	dispatch            DispatchPolicy
 
-	configs localConfigCache
-	master  localMasterViewCache
-	blocks  localBlockCache
+	configs                   localConfigCache
+	master                    localMasterViewCache
+	blocks                    localBlockCache
+	dispatchPrewarm           dispatchPrewarmScheduler
+	dispatchPrewarmGeneration atomic.Uint64
 
 	// builtBindMisses counts commits of a candidate this node built whose
 	// derivation capsule did not bind the chain being committed, and which
@@ -124,12 +132,13 @@ type localMasterViewCache struct {
 type localAcquisitionSession struct {
 	mu sync.Mutex
 
-	session    Session
-	branch     *msgpool.Branch
-	activation *SessionActivation
-	update     SessionUpdate
-	master     *localMasterView
-	retired    bool
+	session                   Session
+	branch                    *msgpool.Branch
+	activation                *SessionActivation
+	update                    SessionUpdate
+	master                    *localMasterView
+	retired                   bool
+	dispatchPrewarmGeneration uint64
 
 	seeds      map[uint32][32]byte
 	candidates map[simplex.CandidateID]localCandidateState
@@ -252,6 +261,7 @@ func (a *LocalAcquisition) PrepareSession(ctx context.Context, session Session, 
 		return fmt.Errorf("open session internal-message branch: %w", err)
 	}
 	a.sessions[session.ID] = staged
+	a.enqueueRegisteredDispatchPrewarm(ctx, staged.dispatchPrewarmOwner(), session.Shard, update.Registered)
 	a.mu.Unlock()
 
 	return nil
@@ -297,6 +307,9 @@ func (a *LocalAcquisition) ActivateSession(
 	clonedActivation := cloneSessionActivation(activation)
 	managed.activation = &clonedActivation
 	managed.master = master
+	if activated.Shard.IsMasterchain() {
+		a.enqueueDispatchStatePrewarm(ctx, managed.dispatchPrewarmOwner(), master.previous.ID, master.previous.State)
+	}
 
 	return nil
 }
@@ -319,6 +332,11 @@ func (a *LocalAcquisition) UpdateSession(ctx context.Context, session Session, u
 	}
 	if err = ValidateSessionUpdateAdvance(managed.update, update); err != nil {
 		return err
+	}
+	if managed.update.CurrentBase != update.CurrentBase && update.CurrentBase.Exists {
+		if _, exists := managed.candidates[update.CurrentBase.ID]; !exists {
+			return fmt.Errorf("%w: selected consensus base is not materialized", ErrCandidateConflict)
+		}
 	}
 	var master *localMasterView
 	if managed.activation != nil {
@@ -387,8 +405,157 @@ func (a *LocalAcquisition) UpdateSession(ctx context.Context, session Session, u
 			delete(managed.seeds, slot)
 		}
 	}
+	if update.CurrentBase.Exists {
+		if base, exists := managed.candidates[update.CurrentBase.ID]; exists && base.block.State != nil {
+			a.enqueueDispatchStatePrewarm(ctx, managed.dispatchPrewarmOwner(), base.block.ID, base.block.State)
+		}
+	} else {
+		a.enqueueRegisteredDispatchPrewarm(
+			ctx,
+			managed.dispatchPrewarmOwner(),
+			managed.session.Shard,
+			update.Registered,
+		)
+	}
 
 	return nil
+}
+
+// AdvanceConsensusBase atomically re-roots speculative acquisition at the
+// full state selected by Simplex and publishes the matching session update.
+// The old private queue branch remains intact if staging or Retain fails.
+func (a *LocalAcquisition) AdvanceConsensusBase(
+	ctx context.Context,
+	request ConsensusBaseUpdate,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	managed, err := a.session(request.Session.ID)
+	if err != nil {
+		return err
+	}
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.retired {
+		return ErrSessionRetired
+	}
+	if managed.activation == nil || !sameActivatedSession(
+		activatedSession(managed.session, *managed.activation),
+		request.Session,
+	) {
+		return ErrSessionConflict
+	}
+	if err = validateSessionUpdate(managed.session, request.Update); err != nil {
+		return err
+	}
+	if err = ValidateSessionUpdateAdvance(managed.update, request.Update); err != nil {
+		return err
+	}
+	if request.Update.CurrentBase.Exists != (request.Base != nil) ||
+		(request.Base != nil && !request.Base.matches(request.Session.ID, request.Update.CurrentBase.ID)) {
+		return ErrCandidateConflict
+	}
+	if managed.update.Equal(request.Update) && selectedBaseInstalled(managed, request.Base) {
+		return nil
+	}
+
+	var (
+		baseState localCandidateState
+		baseKey   [32]byte
+	)
+	if request.Base != nil {
+		if request.Base.block.ID.Workchain != managed.session.Shard.Workchain ||
+			request.Base.block.ID.Shard != managed.session.Shard.Shard {
+			return ErrCandidateConflict
+		}
+		baseKey, err = blockRootKey(request.Base.block.ID)
+		if err != nil {
+			return err
+		}
+		baseState = localCandidateState{block: clonePreviousBlock(request.Base.block)}
+		if existing, exists := managed.candidates[request.Base.candidate]; exists {
+			if !sameSelectedBase(existing, request.Base) {
+				return ErrCandidateConflict
+			}
+			baseState = existing
+		} else if existing, exists = managed.blocks[baseKey]; exists {
+			if !sameSelectedBase(existing, request.Base) {
+				return ErrCandidateConflict
+			}
+			baseState = existing
+		}
+	}
+
+	var master *localMasterView
+	_, master, err = a.stageMaster(
+		ctx,
+		request.Session,
+		request.Update,
+		true,
+		managed.master,
+	)
+	if err != nil {
+		return err
+	}
+
+	if !selectedBaseInstalled(managed, request.Base) {
+		if err = managed.branch.Retain(baseState.queueTip); err != nil {
+			return fmt.Errorf("retain selected consensus base: %w", err)
+		}
+		clear(managed.candidates)
+		clear(managed.blocks)
+		if request.Base != nil {
+			managed.candidates[request.Base.candidate] = baseState
+			managed.blocks[baseKey] = baseState
+		}
+	}
+
+	managed.update = cloneSessionUpdate(request.Update)
+	managed.master = master
+	for slot := range managed.seeds {
+		if slot < request.Update.CurrentWindowStart {
+			delete(managed.seeds, slot)
+		}
+	}
+	if request.Base != nil {
+		a.enqueueDispatchStatePrewarm(ctx, managed.dispatchPrewarmOwner(), baseState.block.ID, baseState.block.State)
+	} else {
+		a.enqueueRegisteredDispatchPrewarm(
+			ctx,
+			managed.dispatchPrewarmOwner(),
+			request.Session.Shard,
+			request.Update.Registered,
+		)
+	}
+
+	return nil
+}
+
+func selectedBaseInstalled(managed *localAcquisitionSession, base *SelectedBaseState) bool {
+	if base == nil {
+		return len(managed.candidates) == 0 && len(managed.blocks) == 0
+	}
+	state, exists := managed.candidates[base.candidate]
+	if !exists || len(managed.candidates) != 1 || len(managed.blocks) != 1 ||
+		!sameSelectedBase(state, base) {
+		return false
+	}
+	key, err := blockRootKey(state.block.ID)
+	if err != nil {
+		return false
+	}
+	blockState, exists := managed.blocks[key]
+
+	return exists && sameSelectedBase(blockState, base)
+}
+
+func sameSelectedBase(state localCandidateState, base *SelectedBaseState) bool {
+	return sameBlockID(state.block.ID, base.block.ID) && state.block.Block != nil && state.block.State != nil &&
+		state.block.OutQueueSize != nil && base.block.OutQueueSize != nil &&
+		*state.block.OutQueueSize == *base.block.OutQueueSize &&
+		state.block.Block.HashKeyAt(0) == base.block.Block.HashKeyAt(0) &&
+		state.block.State.HashKeyAt(0) == base.block.State.HashKeyAt(0)
 }
 
 func (a *LocalAcquisition) RetireSession(ctx context.Context, sessionID [32]byte) error {
@@ -402,12 +569,17 @@ func (a *LocalAcquisition) RetireSession(ctx context.Context, sessionID [32]byte
 		return nil
 	}
 	managed.mu.Lock()
+	if managed.retired {
+		managed.mu.Unlock()
+		return nil
+	}
 	managed.branch.Close()
 	managed.retired = true
 	managed.seeds = nil
 	managed.candidates = nil
 	managed.blocks = nil
 	managed.mu.Unlock()
+	a.cancelSessionDispatchPrewarms(managed.dispatchPrewarmOwner())
 
 	a.mu.Lock()
 	if a.sessions[sessionID] == managed {
@@ -424,11 +596,12 @@ func (a *LocalAcquisition) stageSession(session Session, update SessionUpdate) (
 	}
 
 	return &localAcquisitionSession{
-		session:    cloneSession(session),
-		update:     cloneSessionUpdate(update),
-		seeds:      make(map[uint32][32]byte),
-		candidates: make(map[simplex.CandidateID]localCandidateState),
-		blocks:     make(map[[32]byte]localCandidateState),
+		session:                   cloneSession(session),
+		update:                    cloneSessionUpdate(update),
+		dispatchPrewarmGeneration: a.dispatchPrewarmGeneration.Add(1),
+		seeds:                     make(map[uint32][32]byte),
+		candidates:                make(map[simplex.CandidateID]localCandidateState),
+		blocks:                    make(map[[32]byte]localCandidateState),
 	}, nil
 }
 
@@ -553,6 +726,16 @@ func equalShardDescriptions(left, right []groups.ShardDescription) bool {
 }
 
 func (a *LocalAcquisition) requestHeader(request BuildRequest) (HeaderParams, error) {
+	// A speculative build is for the window after the one the session is in, so
+	// the slot offset below would measure from the wrong start. The caller
+	// supplies the instant instead — the same one the observed window computes
+	// from the parent's generation time — and the block is stamped with it.
+	// clampLocalHeaderTime still raises it to the predecessor and masterchain
+	// bounds afterwards, which is what keeps an estimate that turns out early
+	// from producing a block the reference rejects as non-monotonic.
+	if spec := request.speculative; spec != nil {
+		return headerParamsAt(spec.at)
+	}
 	if !request.Update.HasCurrentWindow || request.Slot < request.Update.CurrentWindowStart {
 		return HeaderParams{}, fmt.Errorf("%w: build slot is outside the current window", ErrInvalidInput)
 	}
@@ -561,7 +744,13 @@ func (a *LocalAcquisition) requestHeader(request BuildRequest) (HeaderParams, er
 	if offset != 0 && rate > math.MaxInt64/offset {
 		return HeaderParams{}, fmt.Errorf("%w: slot time overflows", ErrInvalidInput)
 	}
-	at := request.Update.CurrentWindowStartAt.Add(time.Duration(offset * rate))
+	return headerParamsAt(request.Update.CurrentWindowStartAt.Add(time.Duration(offset * rate)))
+}
+
+// headerParamsAt is the slot instant expressed as the two header fields the
+// protocol carries. Both come from one instant so gen_utime_ms/1000 == gen_utime
+// by construction, which the reference validator checks (validate-query.cpp:2464).
+func headerParamsAt(at time.Time) (HeaderParams, error) {
 	seconds := at.Unix()
 	milliseconds := at.UnixMilli()
 	if seconds < 0 || seconds > math.MaxUint32 || milliseconds < 0 {
@@ -569,6 +758,33 @@ func (a *LocalAcquisition) requestHeader(request BuildRequest) (HeaderParams, er
 	}
 
 	return HeaderParams{GenUtime: uint32(seconds), GenUtimeMS: uint64(milliseconds)}, nil
+}
+
+// clampLocalHeaderTime mirrors Collator::init_utime: consensus supplies the
+// preferred slot time, while the authenticated predecessor and masterchain
+// states supply its lower bound. This belongs to local acquisition rather than
+// Builder so externally supplied requests still have to satisfy the protocol
+// checks without being silently rewritten.
+func clampLocalHeaderTime(
+	header HeaderParams,
+	globalVersion uint32,
+	minGenUtime uint32,
+) (HeaderParams, error) {
+	bound := uint64(minGenUtime)
+	if globalVersion < 13 {
+		bound++
+	}
+	if bound > math.MaxUint32 {
+		return HeaderParams{}, fmt.Errorf("%w: candidate time exceeds the protocol range", ErrInvalidInput)
+	}
+	boundMS := bound * 1000
+	if header.GenUtimeMS >= boundMS {
+		return header, nil
+	}
+	header.GenUtime = uint32(bound)
+	header.GenUtimeMS = boundMS
+
+	return header, nil
 }
 
 func (a *LocalAcquisition) requestSeed(managed *localAcquisitionSession, slot uint32) ([32]byte, error) {

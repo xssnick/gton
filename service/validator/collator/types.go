@@ -257,6 +257,17 @@ type ShardRequest struct {
 
 	accountPrewarmer AccountPrewarmer
 	assembly         *candidateAssemblyDurations
+	// internalWaveWorkers overrides the worker count of the inbound internal
+	// message phase; see collation.internalWaveParallelism. Tests use it to
+	// compare the sequential loop, the inline wave arm and the concurrent one.
+	internalWaveWorkers int
+
+	// successor is the door through which this build hands its result to the
+	// next slot before serializing it. Installed by the acquisition layer, which
+	// is the only party that knows the chain the handoff has to carry; nil
+	// everywhere else, and a nil port is what keeps every deterministic entry
+	// point on the sequential path.
+	successor *successorPort
 }
 
 // MasterRequest contains the previous masterchain state and the deterministic
@@ -445,6 +456,15 @@ type collationRequest struct {
 	internalMsgUntil time.Time
 	accountPrewarmer AccountPrewarmer
 	assembly         *candidateAssemblyDurations
+	// internalWaveWorkers is ShardRequest's override, carried through; a
+	// masterchain build has no inbound internal phase and leaves it zero.
+	internalWaveWorkers int
+	// successor is ShardRequest's port, carried through. A masterchain build
+	// leaves it nil: its external source is a snapshot taken when the build
+	// opens and its phase budgets are measured from its own start, so a
+	// masterchain successor started early would admit a different set of
+	// messages rather than the same set sooner.
+	successor *successorPort
 }
 
 func shardCollationRequest(req ShardRequest) collationRequest {
@@ -466,6 +486,8 @@ func shardCollationRequest(req ShardRequest) collationRequest {
 		internalMsgUntil:    req.InternalMsgUntil,
 		accountPrewarmer:    req.accountPrewarmer,
 		assembly:            req.assembly,
+		internalWaveWorkers: req.internalWaveWorkers,
+		successor:           req.successor,
 	}
 }
 
@@ -541,16 +563,32 @@ type Stats struct {
 	ExternalStop         ExternalStopReason
 	InternalsImported    uint32
 	InternalsSkipped     uint32
-	ImmediateDelivered   uint32
-	NewMessages          uint32
-	EnqueuedMessages     uint32
-	DeferredMessages     uint32
-	DispatchedMessages   uint32
-	GasUsed              uint64
-	EndLT                uint64
-	OutQueueSize         uint64
-	QueueCleaned         uint32
-	QueueCleanupStop     CleanupStopReason
+	// InternalsSpeculated counts inbound internal transactions that were
+	// emulated ahead of their admission by the wave executor, and
+	// InternalsDiscarded those among them the block turned out to have no room
+	// for, whose work was thrown away. They describe the producer's scheduling
+	// and nothing about the block: a sequential run reports zero for both and
+	// produces the same block.
+	InternalsSpeculated uint32
+	InternalsDiscarded  uint32
+	// CollationAttempts is how many passes through the collator this block took,
+	// counting the one that produced it: 1 for a block that fit at once, more
+	// for one rebuilt after ErrSizeLimit under retryUnderSizeLimit's escalating
+	// concessions. It is the only trace a successful retry leaves — the block
+	// itself is indistinguishable from one that never overflowed — and every
+	// value above 1 means the size estimate was wrong by enough to cost the slot
+	// a full rebuild.
+	CollationAttempts  uint32
+	ImmediateDelivered uint32
+	NewMessages        uint32
+	EnqueuedMessages   uint32
+	DeferredMessages   uint32
+	DispatchedMessages uint32
+	GasUsed            uint64
+	EndLT              uint64
+	OutQueueSize       uint64
+	QueueCleaned       uint32
+	QueueCleanupStop   CleanupStopReason
 	// InternalMsgTimeouts counts the internal phases that stopped admitting work
 	// because the ported internal_msg_timeout_ had passed rather than because a
 	// limit axis filled. Non-zero means the block was truncated by wall clock,
@@ -644,6 +682,14 @@ const (
 	ExternalStopSoftLimit
 	ExternalStopDeadline
 	ExternalStopAttemptLimit
+	// ExternalStopQueueBrake is a phase that ended while the outbound-queue
+	// brake (skipExternalsQueueSize) was closed. The stop the phase would
+	// otherwise report — drained or deadline — is true but useless then: the
+	// intake was refusing every message whatever arrived. This reason is what
+	// makes a load period where blocks carry zero externals attributable from
+	// the stop metric alone, instead of reading as ordinary slot-boundary
+	// deadlines the way it did on the test stand.
+	ExternalStopQueueBrake
 )
 
 func (r ExternalStopReason) String() string {
@@ -656,6 +702,8 @@ func (r ExternalStopReason) String() string {
 		return "deadline"
 	case ExternalStopAttemptLimit:
 		return "attempt_limit"
+	case ExternalStopQueueBrake:
+		return "queue_brake"
 	default:
 		return "unknown"
 	}

@@ -9,6 +9,8 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -51,6 +53,16 @@ func SupportedSoftware() tlb.GlobalVersion {
 }
 
 type collation struct {
+	// waves is the inbound-internal wave loop's reusable state: the plan arena,
+	// the wave map and the worker pool, built once per collation instead of once
+	// per wave.
+	waves         waveState
+	externalWaves externalWaveState
+	// outboundVisited is recordOutboundMessageReads' dedup set, kept across the
+	// messages of a collation rather than allocated per message. Only the retire
+	// goroutine walks emitted messages, so one scratch set serves them all.
+	outboundVisited map[cell.Hash]struct{}
+
 	ctx      context.Context
 	builder  *Builder
 	req      collationRequest
@@ -73,11 +85,24 @@ type collation struct {
 	hardLTDelta         uint64
 	peakLoad            LoadClass
 	queueSize           uint64
-	oldQueueSize        uint64
-	queueOps            uint64
-	dispatchOps         uint64
-	inDescr             descriptorBatch
-	outDescr            descriptorBatch
+	// mediumMark raises this block's full mark from the soft boundary to the
+	// medium one. See escalateToMediumMark.
+	mediumMark bool
+	// blockFullTimeout records that blockFull was latched by the internal
+	// message timeout rather than by a limit, which is the one reason a raised
+	// mark may not clear.
+	blockFullTimeout bool
+	// internalsCursor is the index of the first inbound internal this block has
+	// not imported, so a later pass can resume the queue's canonical order
+	// exactly where the first one stopped.
+	internalsCursor int
+	// toppedUp makes the top-up one-shot; see topUpInternals.
+	toppedUp     bool
+	oldQueueSize uint64
+	queueOps     uint64
+	dispatchOps  uint64
+	inDescr      descriptorBatch
+	outDescr     descriptorBatch
 
 	accounts *tlb.ShardAccountsAugDict
 	// accountMutationDiff is the exact closure captured by the one final
@@ -108,7 +133,7 @@ type collation struct {
 	// sharedAccountStorageProof for why the sharing is what makes the emitted
 	// proof serve all of them.
 	accountStorageProofs map[cell.Hash]*accountStorageProof
-	accountPathRecorder  *accountPathRecorder
+	accountSiblings      *accountSiblingPrefetch
 	new                  newMessageHeap
 	prewarmedAccounts    map[prewarmAccountKey]struct{}
 
@@ -132,6 +157,9 @@ type collation struct {
 	processedClaim   semanticMessageBound
 	processedClaimed bool
 	localCleanup     *localCleanupFrontier
+	// claimedPrefix hands the cells cleanupClaimedLocalDequeues parsed over that
+	// same prefix to the closure, which is the only pass allowed to record them.
+	claimedPrefix claimedPrefixCells
 	// processedRecords caches the parsed parent ProcessedInfo entries; both
 	// constructors seed it from the parse they already do for processedMinMC.
 	// updateProcessedInfo hands the slice to InsertProcessedUpto and
@@ -195,10 +223,14 @@ func (b *Builder) BuildShard(ctx context.Context, req ShardRequest) (*Candidate,
 	if err := validateCollationRequest(&common); err != nil {
 		return nil, err
 	}
-	candidate, err := retryUnderSizeLimit(func(narrowing sizeBudgetCap) (*Candidate, error) {
-		return b.buildShardAttempt(ctx, req, narrowing)
+	candidate, err := retryUnderSizeLimit(ctx, func(attempt collationAttempt) (*Candidate, error) {
+		return b.buildShardAttempt(ctx, req, attempt)
 	})
 	if err != nil {
+		// A block that was handed over and then failed to finish leaves a
+		// successor speculating on a slot that will produce nothing.
+		req.successor.revokeOffered(PipelineHandoffAbandonedFailed)
+
 		return candidate, err
 	}
 	if err = sealBuiltCandidate(candidate); err != nil {
@@ -208,31 +240,54 @@ func (b *Builder) BuildShard(ctx context.Context, req ShardRequest) (*Candidate,
 	return candidate, nil
 }
 
-func (b *Builder) buildShardAttempt(ctx context.Context, req ShardRequest, narrowing sizeBudgetCap) (*Candidate, error) {
-	return b.buildShardAttemptPaced(ctx, req, narrowing, collationPace{})
+func (b *Builder) buildShardAttempt(ctx context.Context, req ShardRequest, attempt collationAttempt) (*Candidate, error) {
+	return b.buildShardAttemptPaced(ctx, req, attempt, collationPace{})
 }
 
 func (b *Builder) buildShardAttemptPaced(
 	ctx context.Context,
 	req ShardRequest,
-	narrowing sizeBudgetCap,
+	attempt collationAttempt,
 	pace collationPace,
 ) (*Candidate, error) {
-	c, err := b.prepareShardPhases(ctx, req, narrowing)
+	if attempt.index > 0 {
+		// This block is being rebuilt, so the root the previous attempt handed
+		// over is one no candidate will carry. Withdraw it, and hand nothing over
+		// from here: a rebuild is already the slot's last chance, and a successor
+		// speculating on it would be competing with it for the same cores.
+		req.successor.revokeOffered(PipelineHandoffAbandonedRetry)
+		req.successor = nil
+	}
+	c, err := b.prepareShardPhases(ctx, req, attempt)
 	if err != nil {
 		return nil, err
 	}
+	defer c.stopWaves()
 	c.pace = pace
 	timer := c.req.assembly.start(CollationStageExecuteExternalMessages)
 	defer func() {
 		timer.stop()
 	}()
-	if err = c.processExternals(); err != nil {
-		return nil, err
+	// The stage is still entered and still measured when the attempt declines
+	// externals, because the assembly guard asks whether every stage was reached
+	// and an attempt that skipped one would read as a broken build rather than a
+	// narrowed one.
+	if !attempt.skipExternals() {
+		if err = c.processExternals(); err != nil {
+			return nil, err
+		}
 	}
 	timer.stop()
 
 	timer = c.req.assembly.start(CollationStageExecuteInternalMessages)
+	// Only on the first attempt. A size retry exists to make the block smaller,
+	// and it replays what attempt zero admitted; topping it up again would grow
+	// the very block the retry was called to shrink.
+	if attempt.index == 0 {
+		if err = c.topUpInternals(); err != nil {
+			return nil, err
+		}
+	}
 	if err = c.processNewMessages(c.blockFull || c.haveUnprocessedDispatchQueue || req.internalsIncomplete()); err != nil {
 		return nil, err
 	}
@@ -244,17 +299,24 @@ func (b *Builder) buildShardAttemptPaced(
 func (b *Builder) prepareShardPhases(
 	ctx context.Context,
 	req ShardRequest,
-	narrowing sizeBudgetCap,
+	attempt collationAttempt,
 ) (*collation, error) {
 	timer := req.assembly.start(CollationStagePrepareState)
 	defer func() {
 		timer.stop()
 	}()
+	// req is this attempt's own copy, so the index reaches the dispatch queue
+	// without any attempt writing into the caller's request. Assigned every
+	// attempt and not only the ones that concede something: the field is exported
+	// on an operator-supplied policy, and leaving a non-zero value in place would
+	// let a composition root switch the dispatch tail off for every block a node
+	// ever produces, with nothing downstream to notice.
+	req.Dispatch.AttemptIndex = uint32(attempt.index)
 	c, err := b.prepare(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	c.limits.narrowBytes(narrowing)
+	c.limits.applyAttempt(attempt)
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -354,6 +416,12 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 	fullCollated := req.Masterchain.Config.capabilities&capFullCollatedData != 0
 	var collatedProofEstimate *proofSizeEstimator
 	if fullCollated {
+		// The estimator and the callback are one unit: every insert into the
+		// read record has to report to this estimator, because the collated
+		// proof is selected from what the estimator was told. An estimator
+		// opened without the callback would silently lose those hashes from the
+		// proof, which peers report back as a pruned branch while the block
+		// still verifies locally. collated_proof_selection_test.go pins it.
 		collatedProofEstimate = newProofSizeEstimator(b.readSetHint())
 		usage.SetRecordCallback(collatedProofEstimate.addLoadedCell)
 	}
@@ -536,11 +604,11 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 			fixedRoots = append(fixedRoots, c.previousBlockProofs[i])
 		}
 		fixedRoots = append(fixedRoots, c.fullCollatedProofs...)
-		fixed, err := cell.ToBOCWithOptionsErr(fixedRoots, cell.BOCSerializeOptions{WithCRC32C: true})
+		fixedSize, err := collatedBOCSize(fixedRoots)
 		if err != nil {
 			return nil, fmt.Errorf("estimate fixed collated data: %w", err)
 		}
-		c.collatedFixedEstimate = uint64(len(fixed))
+		c.collatedFixedEstimate = fixedSize
 		c.updateCollatedEstimate()
 	}
 
@@ -835,27 +903,12 @@ func (c *collation) finish() (*Candidate, error) {
 		return nil, fmt.Errorf("final state proof: %w", err)
 	}
 	timer.stop()
-	timer = c.req.assembly.start(CollationStageValidationClosure)
-	// The validation-closure shims run here, after the state update exists, and
-	// the position is the whole point. The update's source graph descends only
-	// through cells the read set recorded, so a read taken before this line ends
-	// up inside the block: it widens the update's old side with cells the
-	// reference collator never puts there, costing block bytes and breaking
-	// bit-parity with it. Taken after, the same read still reaches the collated
-	// proof — that one is selected from collatedProofEstimate, a separate hash
-	// set the record callback keeps filling — and reaches nothing else.
-	//
-	// This is the split Collator has: prepare_proofs is called from
-	// create_collated_data (collator.cpp:6297), after create_shard_state has
-	// generated the update at :5806 and after create_block.
-	if err = c.traceValidationClosure(); err != nil {
-		return nil, err
-	}
-	if err = c.ctx.Err(); err != nil {
-		return nil, err
-	}
-	timer.stop()
 	timer = c.req.assembly.start(CollationStageSerializeBlock)
+	// The block root is built before the validation closure rather than after it,
+	// so the branch that serializes it can start while the closure runs. The move
+	// is inert with respect to the record: tlb.ToCell writes, it never parses, so
+	// it takes no traced read and the closure still sees exactly the set it saw
+	// when it ran second. The stage order in METRICS.md follows this order.
 	var blockRoot *cell.Cell
 	if parts.extraRoot == nil {
 		blockRoot, err = tlb.ToCell(&tlb.Block{
@@ -888,52 +941,120 @@ func (c *collation) finish() (*Candidate, error) {
 	if err = c.ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	timer.stop()
-	timer = c.req.assembly.start(CollationStageSerializeCandidate)
-
-	// The two serialization tails are independent and both expensive, so they
-	// overlap. The collated branch only reads the read set, which stops
-	// recording once buildStateAndBlockParts has run, and the block branch
-	// performs no traced load at all because BOC serialization never parses a
-	// cell. Cell hashes are precomputed at finalization exactly so overlapping
-	// read walks are safe. c.limits must stay off both branches, so the cell
-	// hint is taken before the fork and the collated size is recorded after the
-	// join, before classify() reads it.
+	// c.limits must stay off every branch, so the hint is taken before the fork
+	// and the collated size is recorded after the join, before classify() reads
+	// it.
 	cellHint := int(c.limits.storage.TotalStat().Cells + candidateBOCHeadroom)
+	timer.stop()
+
+	// The block BOC moves to its own branch and everything that follows on this
+	// goroutine — the validation closure, then the collated serialization —
+	// overlaps it. The branch performs no traced load at all, because BOC
+	// serialization never parses a cell, and cell hashes are precomputed at
+	// finalization exactly so overlapping read walks are safe.
+	//
+	// The branch outlives the two returns inside the closure section below, so
+	// the joins are deferred and their order is load-bearing: wg.Wait is
+	// registered first and signalInert second, which by LIFO closes the gate and
+	// only then waits. Registered the other way round a failed closure would park
+	// the branch on <-inert for ever.
 	var (
-		collatedData  []byte
-		collatedRoots []*cell.Cell
-		collatedErr   error
-		wg            sync.WaitGroup
+		boc      []byte
+		bocErr   error
+		fileHash [sha256.Size]byte
+		bocSpan  time.Duration
+		wg       sync.WaitGroup
 	)
+	// The block size limit is measured on the branch and consulted by the
+	// collated serialization, where the broadcast payload is started against a
+	// block that has to fit. Buffered and sent exactly once: the reader may
+	// return before it reads, and this send must never block the branch the
+	// verdict is about.
+	blockFits := make(chan bool, 1)
+	// inert is closed once this collation has stopped recording, which is the
+	// only thing the branch has to wait for before anything may be handed to a
+	// successor. permit says whether there is anything to hand over: it is set on
+	// the success path alone, so a build that failed after the fork hands off
+	// nothing even though the gate opens.
+	inert := make(chan struct{})
+	signalInert := sync.OnceFunc(func() { close(inert) })
+	var permit atomic.Bool
 	wg.Add(1)
+	defer wg.Wait()
+	defer signalInert()
 	go func() {
 		defer wg.Done()
-		collatedData, collatedRoots, collatedErr = c.serializeCollatedData(parts.stateUpdate)
+		bocStart := time.Now()
+		boc, bocErr = c.serializeBlockBOC(blockRoot, cellHint)
+		// Published the instant it is known, ahead of the hash below, because the
+		// reader is racing towards the point where it decides whether to start a
+		// payload nothing can afterwards stop.
+		blockFits <- bocErr == nil
+		// Hashed on the branch, not after the join: the block bytes are final the
+		// moment serializeBlockBOC returns and the digest is a pure function of
+		// them, so this millisecond of sha256 runs alongside work that is still
+		// going instead of being added to the serial tail.
+		if bocErr == nil {
+			fileHash = sha256.Sum256(boc)
+		}
+		bocSpan = time.Since(bocStart)
+		// The fence, and the only thing the handoff waits for. Past it this
+		// collation records nothing, so the state and the roots below can be read
+		// by another collation without either of them touching the other's
+		// record. permit is what distinguishes "the fence opened" from "the fence
+		// opened because the build failed" — a deferred close opens it on every
+		// return, and only the success path sets the flag.
+		<-inert
+		if bocErr == nil && permit.Load() {
+			c.handOffSuccessor(fileHash, blockRoot, &parts)
+		}
 	}()
-	boc, err := c.serializeBlockBOC(blockRoot, cellHint)
-	// Hashed before the join, not after. The block bytes are final the moment
-	// serializeBlockBOC returns and the digest is a pure function of them, so
-	// this millisecond of sha256 runs alongside a collated branch that is still
-	// working instead of being added to the serial tail once it has finished.
-	// Same bytes, same hash, earlier moment.
+
+	timer = c.req.assembly.start(CollationStageValidationClosure)
+	// The validation-closure shims run here, after the state update exists, and
+	// the position is the whole point. The update's source graph descends only
+	// through cells the read set recorded, so a read taken before this line ends
+	// up inside the block: it widens the update's old side with cells the
+	// reference collator never puts there, costing block bytes and breaking
+	// bit-parity with it. Taken after, the same read still reaches the collated
+	// proof — that one is selected from collatedProofEstimate, a separate hash
+	// set the record callback keeps filling — and reaches nothing else.
 	//
-	// The serialization error is checked first — hashing a nil buffer would
-	// digest emptiness and hide it — but the wait still happens on every path,
-	// so a failed block branch cannot leave the collated goroutine running past
-	// finish() and into whatever the caller does next.
-	var fileHash [sha256.Size]byte
-	if err == nil {
-		fileHash = sha256.Sum256(boc)
-	}
-	wg.Wait()
-	if err != nil {
+	// This is the split Collator has: prepare_proofs is called from
+	// create_collated_data (collator.cpp:6297), after create_shard_state has
+	// generated the update at :5806 and after create_block.
+	if err = c.traceValidationClosure(); err != nil {
 		return nil, err
+	}
+	if err = c.ctx.Err(); err != nil {
+		return nil, err
+	}
+	// The fence. Reading is over — the closure was the last thing that could
+	// record — so the recorder is detached and every lane tracer standing in
+	// front of it goes inert with it. The table itself stays: the collated proof
+	// below is selected out of it, and resolving those cells again would mean
+	// reading them from disk on the hot path. Seal, which does drop the table,
+	// still happens where it always did, after the proof has been built.
+	c.usage.Detach()
+	for _, lane := range c.lanes {
+		lane.tracer.seal()
+	}
+	permit.Store(true)
+	signalInert()
+	timer.stop()
+
+	timer = c.req.assembly.start(CollationStageSerializeCandidate)
+	collatedData, collatedRoots, prepared, collatedErr := c.serializeCollatedData(
+		parts.stateUpdate, blockRoot, parts.header.SeqNo, cellHint, blockFits,
+	)
+	wg.Wait()
+	if bocErr != nil {
+		return nil, bocErr
 	}
 	if collatedErr != nil {
 		return nil, collatedErr
 	}
+	c.req.assembly.substage(CollationStageSerializeCandidate, "block_boc", bocSpan)
 	timer.stop()
 	timer = c.req.assembly.start(CollationStageFinalizeCandidate)
 
@@ -941,24 +1062,12 @@ func (c *collation) finish() (*Candidate, error) {
 	collatedFileHash := sha256.Sum256(collatedData)
 	rootHash := blockRoot.HashKey()
 
-	// The broadcast payload is a third serialization of these same roots, and
-	// nothing between here and the broadcast needs it: it overlaps signing, the
-	// candidate marker fsync, the state commit and the scheduled broadcast wait
-	// instead of running after all of them. The roots are final by now, and BOC
-	// serialization never parses a cell, so this walk cannot disturb the two
-	// that just finished or the commit that reads the state.
-	//
-	// The two BOCs it will hold the union of are both finished by now, so the
-	// hint that sizes its dedup structures is an upper bound taken off their
-	// headers rather than an estimate carried over from anywhere.
-	prepared := simplex.PrepareCandidateAsync(
-		parts.header.SeqNo,
-		blockRoot,
-		collatedRoots,
-		fileHash,
-		collatedFileHash,
-		simplex.PayloadCellHint(boc, collatedData),
-	)
+	// The broadcast payload has been compressing since the collated goroutine
+	// had its roots; these two hashes are the last thing it is missing. They are
+	// what the serializer checks the payload against, so declaring them here —
+	// before the candidate below exists, and therefore before anything can reach
+	// the capsule through it — is what makes that check possible at all.
+	prepared.DeclareDigests(fileHash, collatedFileHash)
 
 	// Recorded only for a build that produced a candidate, so a run abandoned
 	// part-way cannot shrink the next recorder to the size it stopped at. These
@@ -985,6 +1094,12 @@ func (c *collation) finish() (*Candidate, error) {
 	// parses a cell, so the broadcast payload still being compressed in the
 	// background cannot reach it.
 	c.usage.Seal()
+	// The lanes' tracers stand in front of the record on every cell a lane
+	// read, and a block embeds such cells. Sealed together with the record,
+	// for the same reason and with the same effect.
+	for _, lane := range c.lanes {
+		lane.tracer.seal()
+	}
 
 	c.stats.EndLT = c.maxLT
 	c.stats.OutQueueSize = c.queueSize
@@ -1026,10 +1141,12 @@ func (c *collation) finish() (*Candidate, error) {
 	candidate.built = newBuiltCandidate(
 		candidate.ID,
 		blockRoot,
+		collatedRoots,
 		parts.state,
 		parts.stateUpdate,
 		parts.header.StartLt,
 		parts.header.GenUtime,
+		c.req.header.GenUtimeMS,
 		c.builtPredecessors()...,
 	)
 
@@ -1077,27 +1194,119 @@ func (c *collation) serializeBlockBOC(blockRoot *cell.Cell, cellHint int) ([]byt
 
 // serializeCollatedData runs on a second goroutine during finish. It must stay
 // read-only over c.limits: the collated size is recorded by the caller after
-// the join so that classify() still observes it.
-// It returns the roots alongside their serialization: the broadcast payload is
-// a second BOC over the same roots, and rebuilding them from these bytes would
-// parse back what this call just wrote.
-func (c *collation) serializeCollatedData(stateUpdate *cell.Cell) ([]byte, []*cell.Cell, error) {
+// the join so that classify() still observes it. blockCells is the caller's
+// sizing for the block BOC, taken off c.limits before the fork for that reason.
+//
+// The broadcast payload is started here rather than returned to be started by
+// the caller, because the roots it is a BOC of are final here and nowhere
+// earlier: handing them back instead would delay it by this call's own
+// serialization, and rebuilding them from the returned bytes would parse back
+// what this call just wrote.
+//
+// The roots themselves are returned for that same reason, one consumer later:
+// this node validates the candidate it produced, and the alternative there is
+// parsing back the bytes written below.
+//
+// blockFits is the other branch's verdict on the block size limit, readable
+// once. A nil capsule is returned when it says no; the caller returns that
+// branch's error before anything reaches the capsule.
+func (c *collation) serializeCollatedData(
+	stateUpdate, blockRoot *cell.Cell,
+	seqNo uint32,
+	blockCells int,
+	blockFits <-chan bool,
+) ([]byte, []*cell.Cell, *simplex.PreparedCandidate, error) {
 	collatedRoots, err := c.buildCollatedRoots(consensusExtraRoot(c.req.header.GenUtimeMS), stateUpdate)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
+	collatedCells := max(1, c.usage.Size()+len(collatedRoots))
+	startPayload := func() *simplex.PreparedCandidate {
+		return simplex.PrepareCandidateAsync(
+			seqNo,
+			blockRoot,
+			collatedRoots,
+			simplex.PayloadCellHintFromCounts(blockCells, collatedCells),
+		)
+	}
+
+	// The broadcast payload is a third serialization of these same roots and
+	// nothing before the broadcast reads it, so it starts at the first instant
+	// both root sets are final rather than after the two component BOCs have
+	// been written. From here it overlaps the collated serialization below, the
+	// tail of the block serialization on the other goroutine, and everything the
+	// caller does afterwards: signing, the candidate marker fsync, the state
+	// commit and the scheduled broadcast wait. Started after the join it
+	// overlapped only that last group, and delivery paid the rest.
+	//
+	// A third concurrent walk over these trees rests on the same argument the
+	// two already running do: BOC serialization never parses a cell, so it
+	// records nothing into the read set — which c.usage.Seal is about to empty
+	// under it — and mutates nothing the others read.
+	//
+	// Neither BOC exists yet, so the hint cannot be the two counts read back out
+	// of their headers. It is instead the sum of the two counts those
+	// serializations are presized with, over the same two cell sets: the same
+	// construction, with each half an estimate rather than a finished count. The
+	// hint sizes scratch only and no byte of the payload depends on it.
+	//
+	// The two file hashes the payload is checked against do not exist yet
+	// either; the caller declares them on this capsule as soon as it has hashed
+	// both BOCs, which is before the candidate carrying it exists.
+	//
+	// Nothing can stop the payload once it runs — it takes no context, and the
+	// candidate that is the only way to reach it is never built when this
+	// collation fails — so it is started only if nothing already known says
+	// this candidate is lost. Three things can say so, and all three are cheap
+	// here:
+	//
+	//   - the deadline, read here as well as below;
+	//   - the block size limit, measured on the sibling goroutine against the
+	//     finished block BOC. Its verdict is taken without blocking: it
+	//     normally lands about a millisecond before the roots above are
+	//     finished, and waiting for the times it does not would put a block
+	//     serialization in front of the collated one these two branches were
+	//     forked to overlap;
+	//   - the collated size limit, which cannot be measured yet because its
+	//     bytes are written below. The collation's own estimate answers for it
+	//     — the same figure admission stopped on, which stands above the bytes
+	//     a collation actually produces, so an estimate already over the limit
+	//     is a collation the check below cannot pass.
+	//
+	// Only that last one is an approximation, and it errs by starting the
+	// payload late rather than by starting one that is thrown away. Retries are
+	// what the whole gate is for: a size failure rebuilds the block up to four
+	// more times under escalating concessions, on the largest blocks and against
+	// the tightest
+	// deadline, which is the worst moment to hand a core to a full candidate
+	// compression for a block that no longer exists.
+	var (
+		prepared     *simplex.PreparedCandidate
+		blockVerdict bool
+		verdictTaken bool
+	)
+	select {
+	case blockVerdict = <-blockFits:
+		verdictTaken = true
+	default:
+	}
+	if verdictTaken && blockVerdict && c.ctx.Err() == nil &&
+		c.limits.collatedData <= uint64(c.config.maxCollatedBytes) {
+		prepared = startPayload()
+	}
+
 	collatedData, err := cell.ToBOCWithOptionsErr(collatedRoots, cell.BOCSerializeOptions{
 		WithCRC32C:     true,
-		CellsCountHint: max(1, c.usage.Size()+len(collatedRoots)),
+		CellsCountHint: collatedCells,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("serialize collated data: %w", err)
+		return nil, nil, nil, fmt.Errorf("serialize collated data: %w", err)
 	}
 	if err = c.ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if uint64(len(collatedData)) > uint64(c.config.maxCollatedBytes) {
-		return nil, nil, sizeLimitError{
+		return nil, nil, nil, sizeLimitError{
 			what:     "collated data",
 			produced: uint64(len(collatedData)),
 			limit:    uint64(c.config.maxCollatedBytes),
@@ -1105,7 +1314,20 @@ func (c *collation) serializeCollatedData(stateUpdate *cell.Cell) ([]byte, []*ce
 		}
 	}
 
-	return collatedData, collatedRoots, nil
+	// Both limits are settled now, so a payload held back above starts here,
+	// still ahead of the two file hashes, the candidate assembly, the signature
+	// and the commit. The verdict is waited for this time: there is nothing
+	// left on this branch for it to delay.
+	if prepared == nil {
+		if !verdictTaken {
+			blockVerdict = <-blockFits
+		}
+		if blockVerdict {
+			prepared = startPayload()
+		}
+	}
+
+	return collatedData, collatedRoots, prepared, nil
 }
 
 // buildCollatedRoots runs on the collated-data goroutine, so it must stay
@@ -1168,7 +1390,7 @@ func (c *collation) buildCollatedRoots(consensusExtra, stateUpdate *cell.Cell) (
 		// table ends up holding and discards the rest. Capacity only: the hash
 		// predicate above is what decides the bytes.
 		previousStateProof, err := c.oldRoot.WithoutTrace().CreateHashUsageProofResolvedSized(func(hash cell.Hash) bool {
-			return loaded.loaded(hash) || updateSource.loaded(hash)
+			return loaded.loaded(hash) || updateSource.emitted(hash)
 		}, c.usage.RecordedCell, c.usage.Size())
 		if err != nil {
 			return nil, fmt.Errorf("build previous state proof: %w", err)
@@ -1193,7 +1415,7 @@ func (c *collation) buildCollatedRoots(consensusExtra, stateUpdate *cell.Cell) (
 	var storageProofs map[cell.Hash]*cell.Cell
 	var storageBuilders map[cell.Hash]*cell.MerkleProofBuilder
 	for _, lane := range c.lanes {
-		if lane.transactions == nil || lane.initialStorageStat == nil {
+		if !lane.touched || lane.initialStorageStat == nil {
 			continue
 		}
 		// The emitted proof has to cover every dictionary node that any
@@ -1201,11 +1423,10 @@ func (c *collation) buildCollatedRoots(consensusExtra, stateUpdate *cell.Cell) (
 		// verifier binds one proof per account and then replays the whole
 		// sequence against it, so a branch a later transaction descends into
 		// would meet a pruned boundary and the executor would refuse the
-		// dictionary outright. lane.initialStorageProof is the snapshot taken
-		// after the first transaction and exists only to seed the size estimate;
-		// the builder itself stays live for the whole collation, and CreateProof
-		// only reads its read set, so re-creating the proof here yields the
-		// union of every read the account made.
+		// dictionary outright. The builder stays live for the whole collation;
+		// its record callback accounts for proof growth without constructing an
+		// intermediate proof, and this one CreateProof yields the union of every
+		// read the account made.
 		//
 		// It also has to cover every OTHER account bound to the same dictionary,
 		// for the same reason one step out: the collated data carries one proof
@@ -1342,70 +1563,39 @@ func (c *collation) fullCollatedQueueScan() *FullCollatedQueueScan {
 	}
 }
 
-// trackAccountStorageProof charges the account's storage-stat proof to the
-// collated size estimate once its transactions first use the dictionary.
+// trackAccountStorageProof charges growth of the account's shared storage-stat
+// proof after every committed transaction. Reads feed the estimator directly
+// from ReadSet's first-record callback, so this path neither walks the proof nor
+// serializes it. The estimate prices every loaded cell with the BOC format's
+// maximum reference width, every unread child as the boundary proof generation
+// emits (a full terminal cell or a pruned branch), and the fixed wrapper/header
+// overhead; it is therefore no smaller than the standalone wrapped proof BOC
+// this function used to build.
 //
-// The charged size is a FLOOR, not the final one: buildCollatedRoots emits the
-// proof re-created from the fully traced builder, which covers every dictionary
-// node the account's whole transaction sequence read, while this snapshot covers
-// only what the first transaction reached. Measured on a real mainnet block the
-// gap is 1.4 KiB over 333 KiB of collated data (3.0 KiB over 422 KiB when the
-// same traffic runs three times over), against a whole-collation estimate that
-// already stands ~11% above the bytes actually produced — the pruned-branch and
-// per-cell constants are deliberately generous — so the floor is swallowed by
-// slack that is an order of magnitude larger.
-//
-// Under-charging cannot produce an invalid block either way: serializeCollatedData
-// measures the real bytes against maxCollatedBytes and raises a size limit error,
-// which retryUnderSizeLimit rebuilds under a narrower budget. Feeding the lane's
-// own read set into the estimator would track the growth exactly, but it would
-// push an already conservative estimate further up and tighten admission for
-// every full-collated block, buying accuracy the hard check already provides.
-//
-// Accounts sharing an initial dictionary share the recorder and are emitted as
-// one proof, so what is charged is the growth this account's first transaction
-// added to that one proof, not a second copy of it. Charging each account the
-// whole proof would count bytes the block never carries — over-estimating, so
-// never unsafe, but the over-count is the whole proof per extra account and it
-// tightens admission against bytes that do not exist. The floor-versus-final
-// relationship above is unchanged by the sharing: what is charged is still the
-// proof as it stood at a first transaction (the last such account's), and what
-// is emitted is still the union at the end of collation.
-func (c *collation) trackAccountStorageProof(lane *accountLane) error {
-	if !c.fullCollated || lane.initialStorageStat == nil || lane.initialStorageProof != nil {
-		return nil
+// Accounts with the same initial dictionary share both recorder and estimator.
+// charged is their common high-watermark, so a later account or transaction pays
+// only growth of the one proof buildCollatedRoots will emit, never another copy.
+func (c *collation) trackAccountStorageProof(lane *accountLane) {
+	if !c.fullCollated || lane.initialStorageStat == nil {
+		return
 	}
 	if !accountStorageProofUsed(lane.storageProof) {
-		return nil
+		return
 	}
 	hash := lane.initialStorageStat.HashKey()
-	proof, err := lane.storageProof.CreateProof()
-	if err != nil {
-		return fmt.Errorf("build account storage stat proof %x: %w", hash, err)
+	shared := c.accountStorageProofs[hash]
+	estimate := shared.estimatedBOCSize()
+	if estimate <= shared.charged {
+		return
 	}
-	proof = wrapAccountStorageProof(proof)
-	boc, err := proof.ToBOCWithOptionsErr(cell.BOCSerializeOptions{WithCRC32C: true})
-	if err != nil {
-		return fmt.Errorf("estimate account storage stat proof: %w", err)
-	}
-	lane.initialStorageProof = proof
-
-	charge := uint64(len(boc))
-	if shared := c.accountStorageProofs[hash]; shared != nil {
-		if charge <= shared.charged {
-			// This account read nothing the dictionary was not already charged
-			// for, so the emitted proof has not grown.
-			return nil
-		}
-		charge, shared.charged = charge-shared.charged, charge
-	}
+	charge := estimate - shared.charged
+	shared.charged = estimate
 	if math.MaxUint64-c.collatedFixedEstimate < charge {
 		c.collatedFixedEstimate = math.MaxUint64
 	} else {
 		c.collatedFixedEstimate += charge
 	}
 	c.updateCollatedEstimate()
-	return nil
 }
 
 func accountStorageProofUsed(builder *cell.MerkleProofBuilder) bool {
@@ -1521,4 +1711,97 @@ func consensusExtraRoot(genUtimeMS uint64) *cell.Cell {
 
 func isMissingKey(err error) bool {
 	return errors.Is(err, cell.ErrNoSuchKeyInDict)
+}
+
+// consumedExternals is the set a successor must not be offered: the messages
+// this block took out of the pool's reach. Only the three outcomes that end a
+// message's life in this window count.
+//
+// ExternalSkippedLimit is deliberately absent. A message skipped for a limit was
+// never executed and its generation is untouched, so it is exactly the kind of
+// message the next slot should pick up — excluding it would strand it for the
+// rest of the window for no reason.
+func consumedExternals(feedback []msgpool.ExternalFeedback) [][32]byte {
+	if len(feedback) == 0 {
+		return nil
+	}
+	consumed := make([][32]byte, 0, len(feedback))
+	for i := range feedback {
+		switch feedback[i].Outcome {
+		case msgpool.ExternalIncluded, msgpool.ExternalInvalid, msgpool.ExternalNotAccepted:
+			consumed = append(consumed, feedback[i].Ref.Hash)
+		}
+	}
+	if len(consumed) == 0 {
+		return nil
+	}
+
+	return consumed
+}
+
+// handOffSuccessor gives the next slot everything it needs to start building on
+// this block, at the earliest instant it can be given: the record has just gone
+// inert and nothing has been serialized yet. The whole of the tail below —
+// the collated proof, both BOCs, the signature, the commit, the marker and the
+// emission — then runs beside the successor instead of in front of it.
+//
+// It runs on the block-BOC branch rather than on the main goroutine because the
+// main goroutine is already inside the collated serialization by the time the
+// fence opens, and a handoff that waited for that would give away most of what
+// it is for.
+//
+// Nothing here is speculative about the block: every value is final. What is
+// speculative is that this block will be the one committed for its slot — a
+// size-limit retry rebuilds it and moves its root — and that is settled by the
+// producer, which adopts an offer only against the predecessor it went on to
+// commit.
+func (c *collation) handOffSuccessor(fileHash [32]byte, blockRoot *cell.Cell, parts *blockParts) {
+	port := c.req.successor
+	if port == nil || port.offer == nil {
+		return
+	}
+	rootHash := blockRoot.HashKey()
+
+	// The queue lineage the successor inherits, by the same rule
+	// recordCandidateLocked applies when it installs this candidate: a block
+	// whose predecessor was itself a candidate keeps that candidate's base,
+	// while the first block of a chain becomes the base.
+	queueBase := port.queueBase
+	if port.candidateTip == nil {
+		queueBase = port.previous
+	}
+
+	id := ton.BlockIDExt{
+		Workchain: parts.header.Shard.WorkchainID,
+		Shard:     int64(parts.header.Shard.GetShardID()),
+		SeqNo:     parts.header.SeqNo,
+		RootHash:  rootHash[:],
+		FileHash:  fileHash[:],
+	}
+	port.noteOffered(rootHash)
+	port.offer(SuccessorOffer{
+		adopt: port.noteAdopted,
+		successorPayload: successorPayload{
+			ID:           id,
+			Root:         blockRoot,
+			State:        parts.state,
+			StateUpdate:  parts.stateUpdate,
+			StartLT:      parts.header.StartLt,
+			GenUTime:     parts.header.GenUtime,
+			OutQueueSize: c.queueSize,
+			StorageStats: c.storageStats,
+			Externals:    c.externals,
+		},
+		QueueBase:    clonePreviousBlocks(queueBase),
+		CandidateTip: cloneHashPointer(port.candidateTip),
+		Previous:     clonePreviousBlocks(port.previous),
+		Policy: CandidateState{
+			Block:       cloneBlockID(id),
+			NextSeqno:   parts.header.SeqNo + 1,
+			BeforeSplit: port.policy.BeforeSplit,
+		},
+		Exclude:         consumedExternals(c.externals),
+		predecessorSlot: port.slot,
+		handoffAt:       time.Now(),
+	})
 }

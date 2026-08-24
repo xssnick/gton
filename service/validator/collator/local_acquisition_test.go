@@ -243,6 +243,8 @@ func TestLocalInternalCutUsesRequestLocalOlderPredecessor(t *testing.T) {
 		map[msgpool.ShardIdent]*localNeighborView{destination: view},
 		nil,
 		nil,
+		true,
+		&prewarmHints{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -388,7 +390,9 @@ func TestLocalCandidateCutKeepsSpeculativeQueueChain(t *testing.T) {
 	acquisition := &LocalAcquisition{messages: pool}
 	if _, err = acquisition.cutCommittedViews(branch, destination, map[msgpool.ShardIdent]*localNeighborView{
 		destination: {previous: speculative},
-	}, []PreviousBlock{fixture.request.Previous}, &tip); err != nil {
+	}, []PreviousBlock{fixture.request.Previous}, &tip,
+		true,
+		&prewarmHints{}); err != nil {
 		t.Fatalf("cut chained speculative candidate: %v", err)
 	}
 
@@ -447,6 +451,8 @@ func TestLocalCandidateCutTracksPromotedPoolBase(t *testing.T) {
 		map[msgpool.ShardIdent]*localNeighborView{destination: {previous: applied}},
 		[]PreviousBlock{fixture.request.Previous},
 		&child.RootHash,
+		true,
+		&prewarmHints{},
 	); err != nil {
 		t.Fatalf("cut after parent promotion: %v", err)
 	}
@@ -649,6 +655,8 @@ func TestContinuedMergeCutReadsMergedPredecessorQueue(t *testing.T) {
 		effectiveShardMessageViews(target, []PreviousBlock{request.Previous}, registered),
 		nil,
 		nil,
+		true,
+		&prewarmHints{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -714,6 +722,7 @@ func TestLocalMasterMessagesIgnoreUnselectedReadyViews(t *testing.T) {
 		nil,
 		fixture.request.ShardTops,
 		provider,
+		&prewarmHints{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1772,6 +1781,34 @@ func TestLocalSessionUpdateRetainsSpeculationWithinLeaderWindow(t *testing.T) {
 	}
 }
 
+func TestLocalSessionUpdateRejectsUnmaterializedConsensusBase(t *testing.T) {
+	acquisition, pool, session, update := localRotationFixture(t)
+	defer pool.Close()
+
+	next := cloneSessionUpdate(update)
+	next.CurrentWindowStart += session.SlotsPerLeaderWindow
+	next.CurrentWindowObservedSlot = next.CurrentWindowStart
+	next.CurrentWindowStartAt = update.CurrentWindowStartAt.Add(update.TargetRate)
+	next.CurrentBase = simplex.Parent(simplex.CandidateID{
+		Slot: update.CurrentWindowStart,
+		Hash: [32]byte{0x73},
+	})
+	if err := acquisition.UpdateSession(context.Background(), session.Session, next); !errors.Is(err, ErrCandidateConflict) {
+		t.Fatalf("unmaterialized selected-base error = %v, want ErrCandidateConflict", err)
+	}
+
+	managed, err := acquisition.session(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed.mu.Lock()
+	current := cloneSessionUpdate(managed.update)
+	managed.mu.Unlock()
+	if !current.Equal(update) {
+		t.Fatalf("rejected selected base mutated session update: %+v", current)
+	}
+}
+
 func TestLocalSessionWindowAdvanceCheckpointsCommittedBranch(t *testing.T) {
 	acquisition, pool, session, update := localRotationFixture(t)
 	defer pool.Close()
@@ -1870,6 +1907,8 @@ func TestLocalSessionWindowAdvanceCheckpointsCommittedBranch(t *testing.T) {
 		effectiveShardMessageViews(destination, []PreviousBlock{checkpoint.block}, registered),
 		nil,
 		nil,
+		true,
+		&prewarmHints{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -2139,76 +2178,63 @@ func TestLocalRestoreAcceptsFinalizedAnchorAfterParentPruned(t *testing.T) {
 	}
 }
 
-func TestLocalRestoreFinalizedAnchorUsesResolverStateWithoutStoreRead(t *testing.T) {
-	build, err := testBuilder().BuildShard(context.Background(), emptyCandidateRequest(t))
+func TestLocalAdvanceConsensusBaseUsesSelectedStateWithoutStoreRead(t *testing.T) {
+	buildFixture := newMasterBuildFixture(t, false)
+	built, err := testBuilder().BuildMaster(context.Background(), buildFixture.request)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	sessionID := [32]byte{0x79}
-	session := Session{
-		ID:                   sessionID,
-		Shard:                groups.ShardID{Workchain: build.ID.Workchain, Shard: build.ID.Shard},
-		SlotsPerLeaderWindow: 1,
-		Validators:           []SessionValidator{{Weight: 1}},
-	}
-	activation := SessionActivation{SessionID: sessionID}
-	update := SessionUpdate{
-		SessionID:         sessionID,
-		HasFinalizedBlock: true,
-		FinalizedBlock:    build.ID,
-	}
-	pool := msgpool.New(msgpool.Config{})
+	acquisition, pool, session, update := localRotationFixture(t)
 	defer pool.Close()
-	destination := targetShardIdent(session.Shard)
-	if err = pool.Internals().ReconcileDestinations([]msgpool.ShardIdent{destination}); err != nil {
+	store := &finalizedAnchorNoReadStore{}
+	acquisition.store = store
+
+	candidateID := simplex.CandidateID{
+		Slot: update.CurrentWindowStart,
+		Hash: [32]byte{0x7a},
+	}
+	base, err := NewSelectedBaseState(
+		session.ID,
+		candidateID,
+		built.ID,
+		built.BlockBOC,
+		candidateBlock(t, built),
+		built.State,
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
-	managed := &localAcquisitionSession{
-		session:    session,
-		branch:     openLocalTestBranch(t, pool, destination),
-		activation: &activation,
-		update:     update,
-		candidates: make(map[simplex.CandidateID]localCandidateState),
-		blocks:     make(map[[32]byte]localCandidateState),
-	}
-	store := &finalizedAnchorNoReadStore{}
-	acquisition := &LocalAcquisition{
-		store:    store,
-		messages: pool,
-		sessions: map[[32]byte]*localAcquisitionSession{sessionID: managed},
-	}
-	parent := simplex.Parent(simplex.CandidateID{Slot: 6, Hash: [32]byte{0x7a}})
-	candidate := simplex.Candidate{Parent: parent, Leader: 0, Block: build.ID}
-	candidate.ID = candidate.ComputeID(7)
-	artifact := CandidateArtifact{SessionID: sessionID, Candidate: candidate}
-	anchor := build.ID
-	err = acquisition.RestoreCandidate(context.Background(), BuildRequest{
-		Session:         activatedSession(session, activation),
-		Update:          update,
-		Slot:            candidate.ID.Slot,
-		Leader:          candidate.Leader,
-		Parent:          parent,
-		FinalizedAnchor: &anchor,
-		FinalizedAnchorState: &FinalizedAnchorState{
-			Block:    build.ID,
-			BlockBOC: build.BlockBOC,
-			State:    build.State,
-		},
-	}, artifact)
-	if err != nil {
+	next := update
+	next.CurrentWindowObservedSlot++
+	next.CurrentBase = simplex.Parent(candidateID)
+	if err = acquisition.AdvanceConsensusBase(context.Background(), ConsensusBaseUpdate{
+		Session: session,
+		Update:  next,
+		Base:    base,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if store.calls != 0 {
-		t.Fatalf("resolver anchor caused %d local state reads", store.calls)
+		t.Fatalf("selected base caused %d local state reads", store.calls)
 	}
 
+	managed, err := acquisition.session(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	managed.mu.Lock()
-	restored, exists := managed.candidates[candidate.ID]
+	adopted, exists := managed.candidates[candidateID]
+	installedUpdate := cloneSessionUpdate(managed.update)
+	candidateCount := len(managed.candidates)
+	blockCount := len(managed.blocks)
 	managed.mu.Unlock()
-	if !exists || restored.block.State != build.State || restored.block.Block == nil ||
-		!restored.block.ID.Equals(&build.ID) {
-		t.Fatal("resolver anchor was not retained as the exact finalized predecessor")
+	if !exists || candidateCount != 1 || blockCount != 1 || adopted.block.Block == nil ||
+		adopted.block.State == nil || !adopted.block.ID.Equals(&built.ID) ||
+		adopted.block.State.HashKeyAt(0) != built.State.HashKeyAt(0) {
+		t.Fatal("selected base was not retained as the exact acquisition root")
+	}
+	if !installedUpdate.Equal(next) {
+		t.Fatalf("installed update = %+v, want %+v", installedUpdate, next)
 	}
 }
 
@@ -2312,7 +2338,8 @@ func TestLocalCommitRollsBackCandidateWhenExternalCompletionFails(t *testing.T) 
 	}
 	completeErr := errors.New("complete externals failed")
 	messages := &localAcquisitionFailingMessages{pool: pool, completeErr: completeErr}
-	acquisition := &LocalAcquisition{messages: messages}
+	warmer := &recordedAccountPrewarmer{}
+	acquisition := &LocalAcquisition{messages: messages, accountPrewarmer: warmer}
 	sessionID := [32]byte{0x61}
 	session := ActivatedSession{
 		Session: Session{
@@ -2346,7 +2373,7 @@ func TestLocalCommitRollsBackCandidateWhenExternalCompletionFails(t *testing.T) 
 		},
 		BlockBOC: built.BlockBOC,
 	}
-	err = acquisition.commitCandidateLocked(context.Background(), managed, build, built, artifact)
+	err = acquisition.commitCandidateLocked(context.Background(), managed, build, built, artifact, &prewarmHints{})
 	if !errors.Is(err, completeErr) {
 		t.Fatalf("commit error = %v, want external completion failure", err)
 	}
@@ -2360,6 +2387,17 @@ func TestLocalCommitRollsBackCandidateWhenExternalCompletionFails(t *testing.T) 
 	}
 	if _, cutErr := managed.branch.Cut(msgpool.CutRequest{CandidateTip: &queueID}); !errors.Is(cutErr, msgpool.ErrCutStale) {
 		t.Fatalf("rolled-back candidate cut error = %v, want ErrCutStale", cutErr)
+	}
+	if len(warmer.accounts) != 0 || len(warmer.roots) != 0 {
+		t.Fatalf("failed candidate scheduled account/envelope prewarms: accounts=%v roots=%x",
+			warmer.accounts, warmer.roots)
+	}
+	acquisition.dispatchPrewarm.mu.Lock()
+	running := acquisition.dispatchPrewarm.running
+	pending := len(acquisition.dispatchPrewarm.pending)
+	acquisition.dispatchPrewarm.mu.Unlock()
+	if running || pending != 0 {
+		t.Fatalf("failed candidate scheduled dispatch prewarm: running=%t pending=%d", running, pending)
 	}
 }
 
@@ -2585,6 +2623,14 @@ func (m *localAcquisitionFailingMessages) OpenExternalStream(
 	return m.pool.OpenExternalStream(shard, capacity)
 }
 
+func (m *localAcquisitionFailingMessages) OpenExternalStreamExcluding(
+	shard msgpool.ShardIdent,
+	capacity int,
+	exclude [][32]byte,
+) (*msgpool.ExternalStream, error) {
+	return m.pool.OpenExternalStreamExcluding(shard, capacity, exclude)
+}
+
 func (m *localAcquisitionFailingMessages) OpenExternalSnapshot(
 	shard msgpool.ShardIdent,
 	capacity int,
@@ -2783,4 +2829,75 @@ func localRotationFixture(
 	}
 
 	return acquisition, pool, session, update
+}
+
+// A build that runs beside a block its producer is still finishing may not fall
+// back to walking a whole source queue out of its state. That walk is thousands
+// of entries deep and it runs with the acquisition session's mutex held — the
+// same mutex AdvanceConsensusBase takes to open a window, and the one
+// CommitCandidate takes between signing a block and putting it on the wire. A
+// successor speculating on a block must not stand in front of that block, so it
+// gives the slot back and the producer collates it the ordinary way.
+//
+// The refusal is invisible to a behavioural test that only checks the resulting
+// cut, because seeding produces the right answer either way — just far too late
+// and holding the wrong lock. What it produces instead is ErrAcquisitionNotReady,
+// which the producer's adoption check turns into "start this slot myself".
+func TestUnpinnedSourceIsSeededOnlyWhenSeedingIsAllowed(t *testing.T) {
+	request := emptyCandidateRequest(t)
+	destination := blockShardIdent(request.Previous.ID)
+	queued, enqueued := queuedInternal(
+		t,
+		address.NewAddress(0, 0, bytes.Repeat([]byte{0x41}, 32)),
+		address.NewAddress(0, 0, bytes.Repeat([]byte{0x42}, 32)),
+		1,
+		request.Header.GenUtime,
+		tlb.FromNanoTONU(100_000),
+		tlb.FromNanoTONU(100_000),
+		0,
+		destination,
+	)
+	request.Previous.State = stateWithQueueMessage(t, request.Previous.State, queued.Key, enqueued)
+
+	// The source is never seeded into the pool, so PinSource misses and the
+	// walk is the only way to a cut. That is exactly the state a successor
+	// finds when its predecessor has not been committed yet.
+	newCut := func(t *testing.T, seedAllowed bool) (*msgpool.Cut, error) {
+		t.Helper()
+		pool := msgpool.New(msgpool.Config{})
+		t.Cleanup(pool.Close)
+		if err := pool.Internals().ReconcileDestinations([]msgpool.ShardIdent{destination}); err != nil {
+			t.Fatal(err)
+		}
+		view, err := localViewFromPrevious(request.Previous, true, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		acquisition := &LocalAcquisition{messages: pool}
+
+		return acquisition.cutCommittedViews(
+			openLocalTestBranch(t, pool, destination),
+			destination,
+			map[msgpool.ShardIdent]*localNeighborView{destination: view},
+			nil,
+			nil,
+			seedAllowed,
+			&prewarmHints{},
+		)
+	}
+
+	// Allowed: the walk runs and the queued message is in the cut.
+	cut, err := newCut(t, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cut.Messages) != 1 || cut.Messages[0].EnvHash != queued.EnvHash {
+		t.Fatalf("seeded cut returned %+v, want envelope %x", cut.Messages, queued.EnvHash)
+	}
+
+	// Refused: the slot goes back to the producer, and it must be recognisable
+	// as that rather than as a collation failure.
+	if _, err = newCut(t, false); !errors.Is(err, ErrAcquisitionNotReady) {
+		t.Fatalf("refused cut error = %v, want ErrAcquisitionNotReady", err)
+	}
 }

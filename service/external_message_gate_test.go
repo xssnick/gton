@@ -102,7 +102,8 @@ func TestExternalMessageAdmissionChecksParsedMessageWithoutCopies(t *testing.T) 
 	if gate.calls != 1 || gate.ctx != ctx {
 		t.Fatalf("gate calls/context: calls=%d same_context=%t, want 1 and true", gate.calls, gate.ctx == ctx)
 	}
-	if !gate.event.IsLocal || gate.event.MessageRoot != checkedRoot || gate.event.MessageParsed != checkedMessage {
+	if !gate.event.IsLocal || gate.event.SerializedSize != len(body) ||
+		gate.event.MessageRoot != checkedRoot || gate.event.MessageParsed != checkedMessage {
 		t.Fatal("gate did not receive the checker result unchanged")
 	}
 }
@@ -131,7 +132,8 @@ func TestExternalMessageAdmissionChecksBOCWithoutCopy(t *testing.T) {
 	if len(checker.body) != len(body) || &checker.body[0] != &body[0] {
 		t.Fatal("checker received a copied body")
 	}
-	if gate.event.MessageRoot != checkedRoot || gate.event.MessageParsed != checkedMessage {
+	if gate.event.SerializedSize != len(body) ||
+		gate.event.MessageRoot != checkedRoot || gate.event.MessageParsed != checkedMessage {
 		t.Fatal("gate did not receive the parsed BOC result unchanged")
 	}
 }
@@ -146,9 +148,10 @@ func TestExternalMessageAdmissionAcceptsCheckedMessageWithoutChecker(t *testing.
 	admission := NewExternalMessageAdmission(zerolog.Nop(), checker, gate)
 	ctx := t.Context()
 
+	body := []byte{7, 8, 9}
 	err := admission.AcceptCheckedExternalMessage(ctx, p2p.ExternalMessageEvent{
 		IsLocal: true,
-		Body:    []byte{7, 8, 9},
+		Body:    body,
 		Root:    root,
 		Message: message,
 	})
@@ -161,7 +164,8 @@ func TestExternalMessageAdmissionAcceptsCheckedMessageWithoutChecker(t *testing.
 	if gate.calls != 1 || gate.ctx != ctx {
 		t.Fatalf("gate calls/context: calls=%d same_context=%t, want 1 and true", gate.calls, gate.ctx == ctx)
 	}
-	if !gate.event.IsLocal || gate.event.MessageRoot != root || gate.event.MessageParsed != message {
+	if !gate.event.IsLocal || gate.event.SerializedSize != len(body) ||
+		gate.event.MessageRoot != root || gate.event.MessageParsed != message {
 		t.Fatal("gate received different checked message pointers")
 	}
 }
@@ -207,8 +211,10 @@ func TestExternalMessageAdmissionPropagatesGateError(t *testing.T) {
 	gate := &externalMessageGateStub{err: wantErr}
 	admission := NewExternalMessageAdmission(zerolog.Nop(), &externalMessageCheckerStub{}, gate)
 
+	body := []byte{1, 2, 3, 4}
 	err := admission.AcceptCheckedExternalMessage(t.Context(), p2p.ExternalMessageEvent{
 		IsLocal: true,
+		Body:    body,
 		Root:    root,
 		Message: message,
 	})
@@ -218,7 +224,8 @@ func TestExternalMessageAdmissionPropagatesGateError(t *testing.T) {
 	if gate.calls != 1 {
 		t.Fatalf("gate calls = %d, want 1", gate.calls)
 	}
-	if !gate.event.IsLocal || gate.event.MessageRoot != root || gate.event.MessageParsed != message {
+	if !gate.event.IsLocal || gate.event.SerializedSize != len(body) ||
+		gate.event.MessageRoot != root || gate.event.MessageParsed != message {
 		t.Fatal("gate error path changed event pointers")
 	}
 }

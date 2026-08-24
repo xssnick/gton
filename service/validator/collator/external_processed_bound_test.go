@@ -259,7 +259,7 @@ func collateWithWaves(
 		time.Now().Add(boundWaveExitBudget),
 		4,
 		time.Time{},
-	)
+		time.Time{})
 	if err != nil {
 		t.Fatalf("collation failed: %v (phase %q)", err, live.failedAt)
 	}
@@ -573,7 +573,7 @@ func TestFailedWaveAttemptReportsItsPhaseAndShape(t *testing.T) {
 	var live readyExternalStats
 	transcript := []ExternalInput{}
 	candidate, err := testBuilder().buildShardReadyAttempt(
-		t.Context(), req, 0, stream,
+		t.Context(), req, collationAttempt{}, stream,
 		time.Now().Add(time.Second), time.Time{}, 4,
 		&transcript, &live, collationPace{},
 	)
@@ -647,7 +647,7 @@ func TestFailedWaveAttemptReportsItsPhaseAndShape(t *testing.T) {
 		// waitUntil far enough out that the deadline branch cannot win the race
 		// with the cancellation below; the pool is empty, so stream.Next blocks.
 		_, buildErr := testBuilder().buildShardReadyAttempt(
-			ctx, failing, 0, failStream,
+			ctx, failing, collationAttempt{}, failStream,
 			time.Now().Add(time.Minute), time.Now().Add(time.Minute), 4,
 			&failTranscript, &failLive, collationPace{},
 		)

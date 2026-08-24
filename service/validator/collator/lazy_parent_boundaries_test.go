@@ -520,3 +520,74 @@ func TestLazyParentChangesRootAndFileHash(t *testing.T) {
 		}
 	}
 }
+
+// The block must not be a function of the memo hint the previous build left
+// behind. The hint is a capacity estimate carried on the Builder, and one
+// Builder serves both chains, so a masterchain build's figure sizes the next
+// shard build; a hint that reached the output would make the block depend on
+// what was collated before it, and on which chain.
+//
+// It did. The hint gates the state update's worker count at hint+hint/8 >= 256,
+// and over a store-shaped parent the forked source-proof build gave the branch
+// its own build memo: a subtree reached from both sides was then built twice,
+// once from the resolved instance and once from the placeholder, and those are
+// not the same cell. The update's OLD side took different values either side of
+// the gate — 0/228/255 gave one and 200/227 another — while the destination
+// side, the collated data, the boundary set and the block's length were
+// identical, which is why nothing else noticed. The fork is now withheld over a
+// lazy source (readset_update.go), and the value below is the one the
+// sequential build has always produced.
+//
+// The sweep straddles the gate on purpose: 200 and 227 derive to 225 and 255,
+// below it, and 228 and 255 to 256 and 286, above. A hint of 0 means "no
+// estimate" and sizes from the read set instead, which is a third path through
+// the same code. A fresh parent per run holds the parent SHAPE fixed, which is
+// a different variable and one that legitimately moves the hash — see
+// TestLazyParentChangesRootAndFileHash.
+func TestLazyParentBlockDoesNotDependOnTheCarriedMemoHint(t *testing.T) {
+	for _, parent := range []struct {
+		name  string
+		build func(testing.TB) ShardRequest
+	}{
+		{"lazy", func(tb testing.TB) ShardRequest {
+			return lazyParentPredecessor(tb, lazyParentRequest(tb, benchMainnetFiller, 1, true))
+		}},
+		{"resident", func(tb testing.TB) ShardRequest {
+			return lazyParentRequest(tb, benchMainnetFiller, 1, true)
+		}},
+	} {
+		t.Run(parent.name, func(t *testing.T) {
+			var want [2][32]byte
+			for i, hint := range []int{0, 200, 227, 228, 255, 4096, 1 << 20} {
+				builder := testBuilder()
+				builder.observeBuildSizes(0, 0, 0, hint)
+				candidate, err := builder.BuildShard(context.Background(), parent.build(t))
+				if err != nil {
+					t.Fatalf("hint %d: collate: %v", hint, err)
+				}
+				if len(candidate.CollatedData) <= 33 {
+					t.Fatalf("hint %d: collated data is %d bytes: the capability is not in effect",
+						hint, len(candidate.CollatedData))
+				}
+				got := [2][32]byte{
+					sha256.Sum256(candidate.BlockBOC),
+					sha256.Sum256(candidate.CollatedData),
+				}
+				if i == 0 {
+					want = got
+					t.Logf("%s parent: block %s collated %s", parent.name,
+						hex.EncodeToString(got[0][:8]), hex.EncodeToString(got[1][:8]))
+					continue
+				}
+				if got[0] != want[0] {
+					t.Errorf("hint %d moved the block: %s against %s", hint,
+						hex.EncodeToString(got[0][:8]), hex.EncodeToString(want[0][:8]))
+				}
+				if got[1] != want[1] {
+					t.Errorf("hint %d moved the collated data: %s against %s", hint,
+						hex.EncodeToString(got[1][:8]), hex.EncodeToString(want[1][:8]))
+				}
+			}
+		})
+	}
+}

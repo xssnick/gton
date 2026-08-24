@@ -389,7 +389,8 @@ func (r *blockSyncObserverRuntime) PrecheckCandidateBroadcast(
 func (r *blockSyncObserverRuntime) ReceiveCandidate(
 	ctx context.Context,
 	expectedSlot uint32,
-	wire []byte,
+	payload []byte,
+	delegation *simplex.Delegation,
 ) (CandidateArtifact, error) {
 	if err := ctx.Err(); err != nil {
 		return CandidateArtifact{}, err
@@ -407,12 +408,9 @@ func (r *blockSyncObserverRuntime) ReceiveCandidate(
 		return CandidateArtifact{}, context.Canceled
 	}
 
-	artifact, _, err := r.codec.decodeCanonical(wire, nil)
+	artifact, err := r.codec.decodeBroadcast(payload, delegation, expectedSlot)
 	if err != nil {
 		return CandidateArtifact{}, err
-	}
-	if artifact.Candidate.ID.Slot != expectedSlot {
-		return CandidateArtifact{}, errors.New("validator block-sync observer: candidate broadcast slot mismatch")
 	}
 
 	r.lifecycleMu.Lock()

@@ -75,11 +75,23 @@ type CandidateArtifact struct {
 	// metadata without parsing and hashing BlockBOC again.
 	preparedBlock *tnstore.PreparedBlockCandidate
 
-	// validationRoots is the parsed payload the network codec already verified
-	// while decoding this candidate. A voting resolver moves it out of the
+	// validationRoots is the parsed payload of this candidate, from whoever
+	// already held it: the network codec that decoded a received candidate, or
+	// the collator that built one here. A voting resolver moves it out of the
 	// retained artifact and hands it to at most one validation; observers and
 	// long-lived candidate storage keep only the canonical bytes.
 	validationRoots *candidateValidationRoots
+
+	// generationTimeMS is the exact millisecond timestamp carried by the
+	// consensus-extra root. generationTimeKnown is set only by code that already
+	// held the roots from which CollatedData was serialized, or by the one
+	// boundary that decoded CollatedData itself. Keeping the scalar lets state
+	// resolution avoid deserializing the whole collated BOC for one uint64.
+	//
+	// Both fields are unexported so an externally assembled artifact cannot
+	// claim a timestamp that is not bound to its collated file hash.
+	generationTimeMS    uint64
+	generationTimeKnown bool
 }
 
 type candidateValidationRoots struct {
@@ -205,26 +217,167 @@ func (c *candidateCodec) decodeCanonical(
 	return c.decodeWith(wire, expected, true)
 }
 
+// decodeVerified parses, binds and signature-checks a candidate and builds no
+// wire. It is the part of a decode every caller needs, and it is everything the
+// receive path needs: the canonical bytes used to be built right after it, for
+// every received candidate, at a combined BOC serialization plus an LZ4 pass —
+// measured on the testnet validator at 3.27 s of CPU per minute, more than the
+// node spent collating — and nothing on that path read them. They are built
+// after the signature check now, so an unsigned forgery costs a parse and a
+// verify and no more; and on the receive path they are deferred past that, to
+// the first consumer that asks, by decodeDeferred or decodeBroadcastDeferred.
+func (c *candidateCodec) decodeVerified(wire []byte, expected *simplex.CandidateID) (*CandidateArtifact, error) {
+	wrapped, err := simplex.ParseCandidateWrapped(wire)
+	if err != nil {
+		return nil, fmt.Errorf("validator runtime: decode candidate: %w", err)
+	}
+
+	return c.decodeVerifiedData(wrapped.Data, wrapped.Delegation, expected)
+}
+
+// decodeBroadcast verifies the bare candidate data delivered by the private
+// overlay together with the delegation already authenticated from its extra.
+// The delegation is copied before it becomes part of the artifact: transport
+// buffers are owned only for this callback, while a lazy canonical wire may
+// retain the candidate until a later store or request.
+func (c *candidateCodec) decodeBroadcast(
+	payload []byte,
+	delegation *simplex.Delegation,
+	expectedSlot uint32,
+) (*CandidateArtifact, error) {
+	data, err := simplex.ParseCandidateData(payload)
+	if err != nil {
+		return nil, fmt.Errorf("validator runtime: decode candidate broadcast: %w", err)
+	}
+	slot, err := candidateDataSlot(data)
+	if err != nil {
+		return nil, err
+	}
+	if slot != expectedSlot {
+		return nil, errors.New("validator runtime: candidate broadcast slot mismatch")
+	}
+	artifact, err := c.decodeData(data)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.verifyDecodedCandidate(artifact, cloneDelegation(delegation), nil)
+}
+
+func (c *candidateCodec) decodeVerifiedData(
+	data any,
+	delegation *simplex.Delegation,
+	expected *simplex.CandidateID,
+) (*CandidateArtifact, error) {
+	artifact, err := c.decodeData(data)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.verifyDecodedCandidate(artifact, delegation, expected)
+}
+
+func (c *candidateCodec) verifyDecodedCandidate(
+	artifact *CandidateArtifact,
+	delegation *simplex.Delegation,
+	expected *simplex.CandidateID,
+) (*CandidateArtifact, error) {
+	artifact.Candidate.Delegation = delegation
+	artifact.Candidate.Leader = c.schedule.ExpectedLeader(artifact.Candidate.ID.Slot)
+	if expected != nil && artifact.Candidate.ID != *expected {
+		return nil, errors.New("validator runtime: candidate id mismatch")
+	}
+	if err := c.verifyCandidate(&artifact.Candidate); err != nil {
+		return nil, err
+	}
+
+	return artifact, nil
+}
+
+func cloneDelegation(delegation *simplex.Delegation) *simplex.Delegation {
+	if delegation == nil {
+		return nil
+	}
+
+	return &simplex.Delegation{
+		CollatorKey: append(ed25519.PublicKey(nil), delegation.CollatorKey...),
+		Signature:   append([]byte(nil), delegation.Signature...),
+	}
+}
+
+// decodeDeferred is decodeCanonical for the receive path. It returns the
+// decoded artifact together with a lazy wire that builds the canonical bytes
+// and their digest on first use, so a received candidate that is never stored
+// and never requested never pays for them. lazyCandidateWire says why the
+// deferral is sound.
+//
+// An empty candidate has no payload and its wire is a few bytes, so it comes
+// back already built — the lazy form would cost more than the bytes.
+func (c *candidateCodec) decodeDeferred(
+	wire []byte,
+	expected *simplex.CandidateID,
+) (*CandidateArtifact, *lazyCandidateWire, error) {
+	artifact, err := c.decodeVerified(wire, expected)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	lazy, err := deferredCandidateWire(artifact)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return artifact, lazy, nil
+}
+
+func (c *candidateCodec) decodeBroadcastDeferred(
+	payload []byte,
+	delegation *simplex.Delegation,
+	expectedSlot uint32,
+) (*CandidateArtifact, *lazyCandidateWire, error) {
+	artifact, err := c.decodeBroadcast(payload, delegation, expectedSlot)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	lazy, err := deferredCandidateWire(artifact)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return artifact, lazy, nil
+}
+
+func deferredCandidateWire(artifact *CandidateArtifact) (*lazyCandidateWire, error) {
+	lazy := &lazyCandidateWire{candidate: artifact.Candidate}
+	if artifact.validationRoots == nil || artifact.validationRoots.block == nil {
+		lazy.once.Do(func() {
+			lazy.wire, lazy.err = simplex.SerializeCandidate(artifact.Candidate, artifact.BlockBOC, artifact.CollatedData)
+			if lazy.err == nil {
+				lazy.hash = sha256.Sum256(lazy.wire)
+			}
+		})
+		if lazy.err != nil {
+			return nil, lazy.err
+		}
+
+		return lazy, nil
+	}
+	lazy.blockRoot = artifact.validationRoots.block
+	lazy.collatedRoots = artifact.validationRoots.collated
+	lazy.blockBOC = artifact.BlockBOC
+	lazy.collatedData = artifact.CollatedData
+
+	return lazy, nil
+}
+
 func (c *candidateCodec) decodeWith(
 	wire []byte,
 	expected *simplex.CandidateID,
 	canonical bool,
 ) (*CandidateArtifact, []byte, error) {
-	wrapped, err := simplex.ParseCandidateWrapped(wire)
+	artifact, err := c.decodeVerified(wire, expected)
 	if err != nil {
-		return nil, nil, fmt.Errorf("validator runtime: decode candidate: %w", err)
-	}
-
-	artifact, err := c.decodeData(wrapped.Data, canonical)
-	if err != nil {
-		return nil, nil, err
-	}
-	artifact.Candidate.Delegation = wrapped.Delegation
-	artifact.Candidate.Leader = c.schedule.ExpectedLeader(artifact.Candidate.ID.Slot)
-	if expected != nil && artifact.Candidate.ID != *expected {
-		return nil, nil, errors.New("validator runtime: candidate id mismatch")
-	}
-	if err = c.verifyCandidate(&artifact.Candidate); err != nil {
 		return nil, nil, err
 	}
 	if !canonical {
@@ -232,9 +385,26 @@ func (c *candidateCodec) decodeWith(
 	}
 
 	// An empty candidate has no payload to prepare; its wire is the cheap
-	// path either way.
-	prepared := artifact.prepared
-	artifact.prepared = nil
+	// path either way. A decoded artifact never arrives with a prepared payload
+	// of its own — only local production attaches one, through Prepared() — so
+	// for a block candidate it is built here, from the roots the decode already
+	// parsed.
+	var prepared *simplex.PreparedCandidate
+	if artifact.validationRoots != nil && artifact.validationRoots.block != nil {
+		var fileHash [32]byte
+		copy(fileHash[:], artifact.Candidate.Block.FileHash)
+		prepared, err = simplex.PrepareCandidate(
+			artifact.Candidate.Block.SeqNo,
+			artifact.validationRoots.block,
+			artifact.validationRoots.collated,
+			fileHash,
+			artifact.Candidate.CollatedFileHash,
+			simplex.PayloadCellHint(artifact.BlockBOC, artifact.CollatedData),
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	var canonicalWire []byte
 	if prepared != nil {
 		canonicalWire, err = simplex.SerializeCandidatePrepared(artifact.Candidate, prepared)
@@ -252,12 +422,16 @@ func (c *candidateCodec) decodeWith(
 	return artifact, canonicalWire, nil
 }
 
-func (c *candidateCodec) decodeData(data any, prepare bool) (*CandidateArtifact, error) {
+func (c *candidateCodec) decodeData(data any) (*CandidateArtifact, error) {
+	if _, err := candidateDataSlot(data); err != nil {
+		return nil, err
+	}
+
 	switch candidate := data.(type) {
 	case simplex.ConsensusBlockData:
-		return c.decodeBlock(candidate, prepare)
+		return c.decodeBlock(candidate)
 	case *simplex.ConsensusBlockData:
-		return c.decodeBlock(*candidate, prepare)
+		return c.decodeBlock(*candidate)
 	case simplex.ConsensusEmptyData:
 		return c.decodeEmpty(candidate)
 	case *simplex.ConsensusEmptyData:
@@ -267,16 +441,36 @@ func (c *candidateCodec) decodeData(data any, prepare bool) (*CandidateArtifact,
 	}
 }
 
+func candidateDataSlot(data any) (uint32, error) {
+	var slot int32
+	switch candidate := data.(type) {
+	case simplex.ConsensusBlockData:
+		slot = candidate.Slot
+	case *simplex.ConsensusBlockData:
+		slot = candidate.Slot
+	case simplex.ConsensusEmptyData:
+		slot = candidate.Slot
+	case *simplex.ConsensusEmptyData:
+		slot = candidate.Slot
+	default:
+		return 0, fmt.Errorf("validator runtime: unexpected candidate data type %T", data)
+	}
+	if slot < 0 {
+		return 0, errors.New("validator runtime: candidate slot is negative")
+	}
+
+	return uint32(slot), nil
+}
+
 func (c *candidateCodec) decodeBlock(
 	data simplex.ConsensusBlockData,
-	prepare bool,
 ) (*CandidateArtifact, error) {
 	parent, err := candidateParentFromTL(data.Parent)
 	if err != nil {
 		return nil, err
 	}
 
-	payload, err := c.decodePayload(data.Candidate, prepare)
+	payload, err := c.decodePayload(data.Candidate)
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +493,6 @@ func (c *candidateCodec) decodeBlock(
 		Candidate:    candidate,
 		BlockBOC:     payload.blockBOC,
 		CollatedData: payload.collatedData,
-		prepared:     payload.prepared,
 		// block.FileHash and candidate.CollatedFileHash immediately above are
 		// payload.fileHash and payload.collatedFileHash, which decodePayload
 		// took of these exact two buffers. The candidate id the signature covers
@@ -312,6 +505,8 @@ func (c *candidateCodec) decodeBlock(
 			block:    payload.blockRoot,
 			collated: payload.collatedRoots,
 		},
+		generationTimeMS:    payload.generationTimeMS,
+		generationTimeKnown: true,
 	}, nil
 }
 
@@ -339,13 +534,13 @@ type decodedCandidatePayload struct {
 	collatedData     []byte
 	fileHash         [32]byte
 	collatedFileHash [32]byte
-	prepared         *simplex.PreparedCandidate
 	preparedBlock    *tnstore.PreparedBlockCandidate
 	blockRoot        *cell.Cell
 	collatedRoots    []*cell.Cell
+	generationTimeMS uint64
 }
 
-func (c *candidateCodec) decodePayload(data []byte, prepare bool) (decodedCandidatePayload, error) {
+func (c *candidateCodec) decodePayload(data []byte) (decodedCandidatePayload, error) {
 	var payload tl.Serializable
 	rest, err := tl.Parse(&payload, data, true)
 	if err != nil {
@@ -374,6 +569,14 @@ func (c *candidateCodec) decodePayload(data []byte, prepare bool) (decodedCandid
 	var source, rootHash []byte
 	var round int32
 	var roots []*cell.Cell
+	// The cell count the receiver gets for free. The combined payload holds the
+	// union of the block and collated cell sets, so its declared count is an
+	// upper bound on each of the two serializations finishPayload runs — the
+	// only such number available before either of them has produced a header of
+	// its own. PayloadCellHint reads it off the buffer and clamps it; see
+	// simplex/candidate_payload_hint.go for why a count read out of an untrusted
+	// header cannot presize an unbounded table.
+	var combinedCellsHint int
 	switch compressed := payload.(type) {
 	case simplex.ValidatorSessionCompressedCandidate:
 		source, round, rootHash = compressed.Source, compressed.Round, compressed.RootHash
@@ -388,12 +591,18 @@ func (c *candidateCodec) decodePayload(data []byte, prepare bool) (decodedCandid
 		if written != len(decompressed) {
 			return decodedCandidatePayload{}, errors.New("validator runtime: decompressed candidate size mismatch")
 		}
+		combinedCellsHint = simplex.PayloadCellHint(decompressed, nil)
 		roots, err = cell.FromBOCMultiRoot(decompressed)
 	case simplex.ValidatorSessionCompressedCandidateV2:
 		source, round, rootHash = compressed.Source, compressed.Round, compressed.RootHash
 		if uint64(len(compressed.Data)) > maxCombined {
 			return decodedCandidatePayload{}, errors.New("validator runtime: compressed candidate is too large")
 		}
+		// The structural form never materializes a combined BOC, so there is no
+		// header to read a count off and the serializers size themselves as they
+		// always did. Nothing in this project emits this form — it is decoded
+		// because a peer may send it — so the hinted path is the one production
+		// takes.
 		roots, err = cell.DecompressBOC(compressed.Data, int(maxCombined), nil)
 	default:
 		return decodedCandidatePayload{}, fmt.Errorf("validator runtime: unexpected compressed candidate type %T", payload)
@@ -402,15 +611,42 @@ func (c *candidateCodec) decodePayload(data []byte, prepare bool) (decodedCandid
 		return decodedCandidatePayload{}, fmt.Errorf("validator runtime: decode combined candidate boc: %w", err)
 	}
 
-	return c.finishPayload(source, round, rootHash, roots, prepare)
+	return c.finishPayload(source, round, rootHash, roots, combinedCellsHint)
 }
 
+// finishPayload rebuilds the two canonical BOCs of a received candidate and the
+// two digests that identify it. It runs inside decodeVerified, so it runs before
+// the signature check on every candidate a validator is offered — about fourteen
+// of them for every one it produces — and the notarization quorum cannot form
+// until it is done.
+//
+// The two serializations are given the combined cell count and are run
+// concurrently. They are independent levers and were measured as such: on a
+// real mainnet candidate the presizing alone is worth 19% of the wall time and
+// 48% of the allocated bytes, the overlap alone 31%, and the pair takes the
+// whole call from 4.23 ms to 2.37 ms. candidate_receive_serialize_test.go holds
+// the fixture, the full table and the two shapes it was taken in.
+//
+// Both are safe over one already-parsed DAG whose two halves share cells:
+//
+//   - The hint reaches only newBOCHashIndex's initial capacity and the bag's
+//     cell-list capacity (tvm/cell/serialize_options.go). The index is open
+//     addressed and verifies the full hash on a fingerprint match, so which
+//     entry a lookup finds cannot depend on the table size, and cell indices come
+//     from DFS visit order either way. Hinted and unhinted output are the same
+//     bytes, which is a gate here and not an expectation.
+//   - The concurrency touches nothing on the cells. Hashes are precomputed at
+//     parse (tvm/cell/proof.go calculateHashes, "for safe read parallel access
+//     later"), all per-cell serializer bookkeeping lives in the bag's own
+//     bocSerializeItem, and the one lazily cached field, Cell.typ, is written
+//     only by resolveType(), which the serializer never calls — it reads through
+//     GetType(), which computes without caching when the field is unset.
 func (c *candidateCodec) finishPayload(
 	source []byte,
 	round int32,
 	rootHash []byte,
 	roots []*cell.Cell,
-	prepare bool,
+	combinedCellsHint int,
 ) (decodedCandidatePayload, error) {
 	if len(source) != 32 || !allZeroBytes(source) {
 		return decodedCandidatePayload{}, errors.New("validator runtime: candidate source must be zero")
@@ -424,13 +660,45 @@ func (c *candidateCodec) finishPayload(
 	if !bytes.Equal(roots[0].Hash(), rootHash) {
 		return decodedCandidatePayload{}, errors.New("validator runtime: candidate root hash mismatch")
 	}
+	generationTimeMS, err := candidateGenUtimeMSFromRoots(roots[1:])
+	if err != nil {
+		return decodedCandidatePayload{}, err
+	}
+
+	// The collated half is started first and joined below, so it overlaps the
+	// block half whatever branch that takes. Its size check stays ahead of its
+	// digest, as it is on the block side: a candidate whose serialization
+	// overflows the consensus limit is rejected without paying for a sha256 pass
+	// over it.
+	var collatedData []byte
+	var collatedFileHash [32]byte
+	var collatedErr error
+	collatedDone := make(chan struct{})
+	go func() {
+		defer close(collatedDone)
+
+		data, err := cell.ToBOCWithOptionsErr(
+			roots[1:],
+			cell.BOCSerializeOptions{WithCRC32C: true, CellsCountHint: combinedCellsHint},
+		)
+		if err != nil {
+			collatedErr = fmt.Errorf("validator runtime: serialize candidate collated data: %w", err)
+
+			return
+		}
+		if uint64(len(data)) > uint64(c.limits.MaxCollatedDataBytes) {
+			collatedErr = errors.New("validator runtime: candidate collated data is too large")
+
+			return
+		}
+		collatedData, collatedFileHash = data, sha256.Sum256(data)
+	}()
 
 	// Protocol 1 hands the block to the node cache immediately after consensus
 	// decode. Build a sealed root+BOC artifact here, while the parsed graph is in
 	// hand, so that worker does not deserialize and hash the same block again.
 	// Later protocols do not use that cache route and keep the allocation-free
 	// direct serialization.
-	var err error
 	var preparedBlock *tnstore.PreparedBlockCandidate
 	var blockBOC []byte
 	if c.protocolVersion == 1 {
@@ -441,75 +709,82 @@ func (c *candidateCodec) finishPayload(
 			roots[0],
 		)
 		if err != nil {
-			return decodedCandidatePayload{}, fmt.Errorf("validator runtime: prepare candidate block: %w", err)
+			err = fmt.Errorf("validator runtime: prepare candidate block: %w", err)
+		} else {
+			blockBOC = preparedBlock.BlockBOC()
 		}
-		blockBOC = preparedBlock.BlockBOC()
 	} else {
 		// This is the byte form emitted by reference std_boc_serialize(root, 31):
 		// its root marker is not set, so WithTopHash must remain disabled.
 		blockBOC, err = roots[0].ToBOCWithOptionsErr(cell.BOCSerializeOptions{
-			WithCRC32C:    true,
-			WithIndex:     true,
-			WithCacheBits: true,
-			WithIntHashes: true,
+			WithCRC32C:     true,
+			WithIndex:      true,
+			WithCacheBits:  true,
+			WithIntHashes:  true,
+			CellsCountHint: combinedCellsHint,
 		})
 		if err != nil {
-			return decodedCandidatePayload{}, fmt.Errorf("validator runtime: serialize candidate block boc: %w", err)
+			err = fmt.Errorf("validator runtime: serialize candidate block boc: %w", err)
 		}
 	}
-	collatedData, err := cell.ToBOCWithOptionsErr(
-		roots[1:],
-		cell.BOCSerializeOptions{WithCRC32C: true},
-	)
-	if err != nil {
-		return decodedCandidatePayload{}, fmt.Errorf("validator runtime: serialize candidate collated data: %w", err)
-	}
-	if uint64(len(blockBOC)) > uint64(c.limits.MaxBlockBytes) {
-		return decodedCandidatePayload{}, errors.New("validator runtime: candidate block is too large")
-	}
-	if uint64(len(collatedData)) > uint64(c.limits.MaxCollatedDataBytes) {
-		return decodedCandidatePayload{}, errors.New("validator runtime: candidate collated data is too large")
+
+	// Both of these are finished the instant the block branch is, and neither
+	// reads anything the collated goroutine writes, so they belong above the
+	// join rather than after it — this function runs on every candidate a
+	// validator is offered, before the signature check, and the notarization
+	// quorum cannot form until it returns. Size before digest, the same order
+	// the collated side uses: a block that overflows the consensus limit is
+	// rejected without paying for a sha256 pass over it.
+	//
+	// The failure is recorded rather than returned. The goroutine writes the
+	// three collated variables, so no path out of this function may leave it
+	// running, and that is what keeps every return below the join.
+	var fileHash [32]byte
+	var blockErr error
+	if err == nil {
+		switch {
+		case uint64(len(blockBOC)) > uint64(c.limits.MaxBlockBytes):
+			blockErr = errors.New("validator runtime: candidate block is too large")
+		case preparedBlock != nil:
+			preparedID := preparedBlock.ID()
+			copy(fileHash[:], preparedID.FileHash)
+		default:
+			fileHash = sha256.Sum256(blockBOC)
+		}
 	}
 
-	var fileHash [32]byte
-	if preparedBlock != nil {
-		preparedID := preparedBlock.ID()
-		copy(fileHash[:], preparedID.FileHash)
-	} else {
-		fileHash = sha256.Sum256(blockBOC)
+	// Joined before anything is returned: see above.
+	<-collatedDone
+	if err != nil {
+		return decodedCandidatePayload{}, err
 	}
+	if blockErr != nil {
+		return decodedCandidatePayload{}, blockErr
+	}
+	if collatedErr != nil {
+		return decodedCandidatePayload{}, collatedErr
+	}
+
 	result := decodedCandidatePayload{
 		round:            uint32(round),
 		blockBOC:         blockBOC,
 		collatedData:     collatedData,
 		fileHash:         fileHash,
-		collatedFileHash: sha256.Sum256(collatedData),
+		collatedFileHash: collatedFileHash,
 		preparedBlock:    preparedBlock,
 		blockRoot:        roots[0],
 		collatedRoots:    roots[1:],
+		generationTimeMS: generationTimeMS,
 	}
 	copy(result.rootHash[:], rootHash)
-	if prepare {
-		// Built here rather than from the two BOCs above, which is the same
-		// combined serialization plus a parse of the bytes these roots just
-		// produced. The size limits above have already bounded both halves.
-		result.prepared, err = simplex.PrepareCandidate(
-			result.round,
-			roots[0],
-			roots[1:],
-			result.fileHash,
-			result.collatedFileHash,
-			simplex.PayloadCellHint(blockBOC, collatedData),
-		)
-		if err != nil {
-			return decodedCandidatePayload{}, err
-		}
-	}
 
 	return result, nil
 }
 
 func (c *candidateCodec) verifyCandidate(candidate *simplex.Candidate) error {
+	if err := candidate.ValidateShape(); err != nil {
+		return fmt.Errorf("validator runtime: candidate shape: %w", err)
+	}
 	leader := c.schedule.ExpectedLeader(candidate.ID.Slot)
 	if int(leader) >= len(c.validators) {
 		return fmt.Errorf("validator runtime: leader %d is out of range", leader)

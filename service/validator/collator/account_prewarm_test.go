@@ -12,8 +12,14 @@ import (
 
 type recordedAccountPrewarmer struct {
 	accounts        []prewarmAccountKey
+	roots           []cell.Hash
 	immediate       int
 	rejectImmediate bool
+}
+
+func (w *recordedAccountPrewarmer) EnqueueRoot(root cell.Hash) bool {
+	w.roots = append(w.roots, root)
+	return true
 }
 
 func (w *recordedAccountPrewarmer) EnqueueAccount(workchain int32, account [32]byte) bool {
@@ -27,6 +33,50 @@ func (w *recordedAccountPrewarmer) PrewarmAccountNow(workchain int32, account [3
 		return false
 	}
 	return w.EnqueueAccount(workchain, account)
+}
+
+func TestLocalAcquisitionPrewarmsPooledCandidateInternals(t *testing.T) {
+	warmer := &recordedAccountPrewarmer{}
+	acquisition := &LocalAcquisition{accountPrewarmer: warmer}
+	first := [32]byte{0x11}
+	second := [32]byte{0x22}
+	firstEnvelope := cell.Hash{0xa1}
+	secondEnvelope := cell.Hash{0xa2}
+	variableEnvelope := cell.Hash{0xa3}
+
+	var hints prewarmHints
+	acquisition.collectPooledInternals(&hints, []*msgpool.InternalMessage{
+		{DestinationWorkchain: 0, DestinationAccount: first, DestinationPrewarmable: true, EnvHash: firstEnvelope},
+		{DestinationWorkchain: 0, DestinationAccount: first, DestinationPrewarmable: true, EnvHash: firstEnvelope},
+		{DestinationWorkchain: -1, DestinationAccount: second, DestinationPrewarmable: true, EnvHash: secondEnvelope},
+		{DestinationWorkchain: 0, DestinationAccount: [32]byte{0x33}, EnvHash: variableEnvelope},
+	})
+	acquisition.issuePrewarmHints(&hints)
+
+	want := []prewarmAccountKey{
+		{workchain: 0, account: first},
+		{workchain: -1, account: second},
+	}
+	if len(warmer.accounts) != len(want) {
+		t.Fatalf("prewarmed accounts = %+v, want %+v", warmer.accounts, want)
+	}
+	for index := range want {
+		if warmer.accounts[index] != want[index] {
+			t.Fatalf("prewarmed account %d = %+v, want %+v", index, warmer.accounts[index], want[index])
+		}
+	}
+	if warmer.immediate != 0 {
+		t.Fatalf("candidate pool admission used %d immediate warms, want background queue", warmer.immediate)
+	}
+	wantRoots := []cell.Hash{firstEnvelope, secondEnvelope, variableEnvelope}
+	if len(warmer.roots) != len(wantRoots) {
+		t.Fatalf("prewarmed envelope roots = %x, want %x", warmer.roots, wantRoots)
+	}
+	for index := range wantRoots {
+		if warmer.roots[index] != wantRoots[index] {
+			t.Fatalf("prewarmed envelope root %d = %x, want %x", index, warmer.roots[index], wantRoots[index])
+		}
+	}
 }
 
 func TestLocalAcquisitionPrewarmsAdaptiveCanonicalLookahead(t *testing.T) {
@@ -51,7 +101,11 @@ func TestLocalAcquisitionPrewarmsAdaptiveCanonicalLookahead(t *testing.T) {
 		})
 	}
 
-	acquisition.prewarmCurrentInternals(cut)
+	func() {
+		var hints prewarmHints
+		acquisition.collectCurrentInternals(&hints, cut)
+		acquisition.issuePrewarmHints(&hints)
+	}()
 
 	if len(warmer.accounts) != capacity {
 		t.Fatalf("prewarmed accounts = %d, want capacity %d", len(warmer.accounts), capacity)
@@ -76,7 +130,11 @@ func TestLocalAcquisitionPrewarmsFiveHundredDistinctDestinations(t *testing.T) {
 		}
 	}
 
-	acquisition.prewarmCurrentInternals(cut)
+	func() {
+		var hints prewarmHints
+		acquisition.collectCurrentInternals(&hints, cut)
+		acquisition.issuePrewarmHints(&hints)
+	}()
 
 	if len(warmer.accounts) != len(cut.Messages) {
 		t.Fatalf("prewarmed accounts = %d, want all %d block destinations", len(warmer.accounts), len(cut.Messages))
@@ -97,7 +155,11 @@ func BenchmarkLocalAcquisitionPrewarmCurrentInternals(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		warmer.accounts = warmer.accounts[:0]
-		acquisition.prewarmCurrentInternals(cut)
+		func() {
+			var hints prewarmHints
+			acquisition.collectCurrentInternals(&hints, cut)
+			acquisition.issuePrewarmHints(&hints)
+		}()
 	}
 }
 

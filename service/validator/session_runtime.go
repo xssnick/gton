@@ -19,9 +19,13 @@ import (
 )
 
 var (
-	ErrSessionRuntimeStarted = errors.New("validator runtime: session already started")
-	ErrSessionRuntimeClosed  = errors.New("validator runtime: session closed")
-	ErrLeaderWindowClosed    = errors.New("validator runtime: leader window closed")
+	ErrSessionRuntimeStarted    = errors.New("validator runtime: session already started")
+	ErrSessionRuntimeClosed     = errors.New("validator runtime: session closed")
+	ErrLeaderWindowClosed       = errors.New("validator runtime: leader window closed")
+	errWindowFinalizedChanged   = errors.New("validator runtime: finalized block changed while opening window")
+	errLeaderWindowNeedsRecheck = errors.New(
+		"validator runtime: leader window needs recheck after producer catch-up",
+	)
 )
 
 // SessionReceiver is the inbound half of one private-overlay session. Network
@@ -30,11 +34,18 @@ var (
 type SessionReceiver interface {
 	ReceiveConsensusMessage(source simplex.PeerID, sourceValidator int, data []byte)
 	PrecheckCandidateBroadcast(slot uint32, broadcastID [32]byte, signatureChecked bool) error
-	// ReceiveCandidate verifies and installs one private-overlay candidate. A
-	// successful return transfers an immutable decoded view to the transport so
-	// it can relay the non-empty block into public/custom overlays without a
-	// second candidate decompression pass.
-	ReceiveCandidate(ctx context.Context, expectedSlot uint32, wire []byte) (CandidateArtifact, error)
+	// ReceiveCandidate accepts the bare candidate payload carried by the
+	// private overlay and the parsed delegation from its extra. It verifies both
+	// again and installs the candidate without first copying the payload into a
+	// resolver-only wrapper. A successful return transfers an immutable decoded
+	// view to the transport so it can relay the non-empty block into
+	// public/custom overlays without a second candidate decompression pass.
+	ReceiveCandidate(
+		ctx context.Context,
+		expectedSlot uint32,
+		payload []byte,
+		delegation *simplex.Delegation,
+	) (CandidateArtifact, error)
 	ServeCandidate(
 		ctx context.Context,
 		source simplex.PeerID,
@@ -70,11 +81,9 @@ type SessionNetwork interface {
 }
 
 type sessionConsensusProgress struct {
-	Window             simplex.Window
-	StartAt            time.Time
-	FinalizedAnchor    *ton.BlockIDExt
-	AppliedAnchorState *ChainState
-	Candidates         []*CandidateArtifact
+	Window    simplex.Window
+	StartAt   time.Time
+	BaseState *ChainState
 }
 
 type consensusProgressObserver func(context.Context, sessionConsensusProgress) error
@@ -733,6 +742,24 @@ func (r *sessionRuntime) Update(ctx context.Context, state SessionState) error {
 		return err
 	}
 	state = cloneSessionState(state)
+	r.stateMu.RLock()
+	currentFinalized := r.state.FinalizedBlock
+	switch {
+	case currentFinalized == nil:
+	case state.FinalizedBlock == nil || state.FinalizedBlock.SeqNo < currentFinalized.SeqNo:
+		// Missing and older shard descriptors cannot revoke the session-local
+		// anchor already accepted by consensus. LocalSessionBackend preserves the
+		// same progress in its collator update, so the runtime keeps both views
+		// aligned before the backend sees this masterchain snapshot.
+		finalized := *currentFinalized.Copy()
+		state.FinalizedBlock = &finalized
+	case state.FinalizedBlock.SeqNo == currentFinalized.SeqNo &&
+		!sameBlockID(*state.FinalizedBlock, *currentFinalized):
+		r.stateMu.RUnlock()
+
+		return errors.New("validator runtime: finalized block conflicts with current state")
+	}
+	r.stateMu.RUnlock()
 
 	switch r.phase {
 	case sessionRuntimePrepared, sessionRuntimeRunning:
@@ -950,19 +977,21 @@ func (r *sessionRuntime) PrecheckCandidateBroadcast(
 func (r *sessionRuntime) ReceiveCandidate(
 	ctx context.Context,
 	expectedSlot uint32,
-	wire []byte,
+	payload []byte,
+	delegation *simplex.Delegation,
 ) (received CandidateArtifact, err error) {
 	err = r.execute(ctx, func(context.Context) error {
-		// decodeCanonical derives the wire from the roots it just parsed, so the
-		// signature is verified once and neither BOC is parsed a second time.
-		artifact, canonical, err := r.codec.decodeCanonical(wire, nil)
+		// The canonical wire is not built here. Nothing on this path reads it:
+		// the candidate is stored when the engine says so, served when a peer
+		// asks, and the admission check stands on the signed id. The lazy wire
+		// builds the bytes for the first of those that comes, and a candidate
+		// none of them comes for — most of them, on a node that is not the
+		// leader — never pays the serialization and the LZ4 pass at all.
+		artifact, lazy, err := r.codec.decodeBroadcastDeferred(payload, delegation, expectedSlot)
 		if err != nil {
 			return err
 		}
-		if artifact.Candidate.ID.Slot != expectedSlot {
-			return errors.New("validator runtime: candidate broadcast slot mismatch")
-		}
-		if err = r.candidates.stage(artifact, canonical); err != nil {
+		if err = r.candidates.stageDeferred(artifact, lazy); err != nil {
 			return err
 		}
 
@@ -1395,11 +1424,6 @@ func (r *sessionRuntime) clearLeaderWindowRecord() {
 func (r *sessionRuntime) handleWindow(ctx context.Context, window simplex.Window) {
 	r.stateMu.RLock()
 	targetRate := r.state.Params.TargetRate
-	var finalizedBlock *ton.BlockIDExt
-	if r.observe != nil && r.state.FinalizedBlock != nil {
-		value := *r.state.FinalizedBlock.Copy()
-		finalizedBlock = &value
-	}
 	r.stateMu.RUnlock()
 	windowCtx, finishWindow := r.beginWindowProgress(ctx, window, targetRate)
 	defer finishWindow()
@@ -1426,67 +1450,89 @@ func (r *sessionRuntime) handleWindow(ctx context.Context, window simplex.Window
 			startAt = latest
 		}
 	}
-	if r.observe != nil {
-		lineage, lineageErr := r.resolveWindowLineage(windowCtx, window, finalizedBlock)
-		if lineageErr != nil {
-			if windowCtx.Err() != nil {
-				return
+	for {
+		if r.observe != nil {
+			progressStartAt := time.Time{}
+			if window.ObservedSlot == window.StartSlot {
+				progressStartAt = startAt
 			}
-			if errors.Is(lineageErr, errFinalizedLineageAhead) {
-				// A restarted validator can have a locally applied block ahead of
-				// the Simplex state restored from its session WAL. C++ keeps the
-				// consensus actor alive and lets it learn the missing certificates;
-				// block production for that stale view is merely not started.
-				if r.log != nil {
-					r.log.Debug().
-						Hex("session_id", r.config.SessionID[:]).
-						Uint32("window_start", window.StartSlot).
-						Msg("skipping consensus window behind locally finalized state")
+			var baseState *ChainState
+			if window.Base.Exists {
+				baseState = base.State
+			}
+			progress := sessionConsensusProgress{
+				Window:    window,
+				StartAt:   progressStartAt,
+				BaseState: baseState,
+			}
+			for {
+				finalizedBlock := r.currentFinalizedBlock()
+				lineageErr := r.verifyWindowAncestry(windowCtx, window, finalizedBlock)
+				if lineageErr != nil {
+					if windowCtx.Err() != nil {
+						return
+					}
+					if errors.Is(lineageErr, errFinalizedLineageAhead) {
+						// A restarted validator can have a locally applied block ahead of
+						// the Simplex state restored from its session WAL. C++ keeps the
+						// consensus actor alive and lets it learn the missing certificates;
+						// block production for that stale view is merely not started.
+						if r.log != nil {
+							r.log.Debug().
+								Hex("session_id", r.config.SessionID[:]).
+								Uint32("window_start", window.StartSlot).
+								Msg("skipping consensus window behind locally finalized state")
+						}
+
+						return
+					}
+					r.fail(fmt.Errorf("validator runtime: resolve consensus lineage: %w", lineageErr))
+
+					return
 				}
 
-				return
-			}
-			r.fail(fmt.Errorf("validator runtime: resolve consensus lineage: %w", lineageErr))
+				progressErr := r.observeWindowProgress(windowCtx, progress, finalizedBlock)
+				if progressErr == errWindowFinalizedChanged {
+					continue
+				}
+				if progressErr != nil {
+					if windowCtx.Err() == nil && r.log != nil {
+						r.log.Warn().
+							Err(progressErr).
+							Hex("session_id", r.config.SessionID[:]).
+							Uint32("window_start", window.StartSlot).
+							Msg("local producer rejected consensus progress; skipping window")
+					}
 
-			return
+					return
+				}
+
+				break
+			}
 		}
-		progressStartAt := time.Time{}
-		if window.ObservedSlot == window.StartSlot {
-			progressStartAt = startAt
+		submitter := r.openWindow(window)
+		err = r.backend.HandleLeaderWindow(windowCtx, LeaderWindow{
+			Window:  window,
+			StartAt: startAt,
+			Submit:  submitter.submit,
+		})
+		if errors.Is(err, errLeaderWindowNeedsRecheck) {
+			r.detachWindow(submitter, err)
+
+			continue
 		}
-		progress := sessionConsensusProgress{
-			Window:             window,
-			StartAt:            progressStartAt,
-			FinalizedAnchor:    lineage.AppliedAnchor,
-			AppliedAnchorState: lineage.AppliedAnchorState,
-			Candidates:         lineage.Candidates,
-		}
-		if progressErr := r.observeWindowProgress(windowCtx, progress); progressErr != nil {
+		if err != nil {
+			submitter.close(err)
 			if windowCtx.Err() == nil && r.log != nil {
 				r.log.Warn().
-					Err(progressErr).
+					Err(err).
 					Hex("session_id", r.config.SessionID[:]).
 					Uint32("window_start", window.StartSlot).
-					Msg("local producer rejected consensus progress; skipping window")
+					Msg("local producer rejected leader window; skipping window")
 			}
+		}
 
-			return
-		}
-	}
-	submitter := r.openWindow(window)
-	if err = r.backend.HandleLeaderWindow(windowCtx, LeaderWindow{
-		Window:  window,
-		StartAt: startAt,
-		Submit:  submitter.submit,
-	}); err != nil {
-		submitter.close(err)
-		if windowCtx.Err() == nil && r.log != nil {
-			r.log.Warn().
-				Err(err).
-				Hex("session_id", r.config.SessionID[:]).
-				Uint32("window_start", window.StartSlot).
-				Msg("local producer rejected leader window; skipping window")
-		}
+		return
 	}
 }
 
@@ -1561,9 +1607,22 @@ func windowProgressDeadline(window simplex.Window, targetRate time.Duration) tim
 func (r *sessionRuntime) observeWindowProgress(
 	ctx context.Context,
 	progress sessionConsensusProgress,
+	finalizedBlock *ton.BlockIDExt,
 ) error {
 	for {
+		r.lifecycleMu.Lock()
+		if err := ctx.Err(); err != nil {
+			r.lifecycleMu.Unlock()
+
+			return err
+		}
+		if !r.finalizedBlockMatches(finalizedBlock) {
+			r.lifecycleMu.Unlock()
+
+			return errWindowFinalizedChanged
+		}
 		err := r.observe(ctx, progress)
+		r.lifecycleMu.Unlock()
 		if err == nil || !isTransientProgressError(err) {
 			return err
 		}
@@ -1572,6 +1631,30 @@ func (r *sessionRuntime) observeWindowProgress(
 			return err
 		}
 	}
+}
+
+func (r *sessionRuntime) currentFinalizedBlock() *ton.BlockIDExt {
+	r.stateMu.RLock()
+	defer r.stateMu.RUnlock()
+
+	if r.state.FinalizedBlock == nil {
+		return nil
+	}
+	finalized := *r.state.FinalizedBlock.Copy()
+
+	return &finalized
+}
+
+func (r *sessionRuntime) finalizedBlockMatches(finalizedBlock *ton.BlockIDExt) bool {
+	r.stateMu.RLock()
+	defer r.stateMu.RUnlock()
+
+	current := r.state.FinalizedBlock
+	if current == nil || finalizedBlock == nil {
+		return current == nil && finalizedBlock == nil
+	}
+
+	return sameBlockID(*current, *finalizedBlock)
 }
 
 func (r *sessionRuntime) resolveWindowBase(
@@ -1605,27 +1688,27 @@ func isTransientProgressError(err error) bool {
 	return errors.Is(err, ErrBlockNotReady) || errors.Is(err, collator.ErrAcquisitionNotReady)
 }
 
-func (r *sessionRuntime) resolveWindowLineage(
+func (r *sessionRuntime) verifyWindowAncestry(
 	ctx context.Context,
 	window simplex.Window,
 	finalizedBlock *ton.BlockIDExt,
-) (resolvedLineage, error) {
+) error {
 	loggedNotReady := false
 	started := time.Now()
 	for {
-		lineage, err := r.states.lineage(ctx, window.Base, finalizedBlock)
+		walk, err := r.states.ancestry(ctx, window.Base, finalizedBlock)
 		if err == nil {
-			r.observeLineageWalk(LineageWalkSuccess, lineage.Walk, started)
+			r.observeLineageWalk(LineageWalkSuccess, walk, started)
 
-			return lineage, nil
+			return nil
 		}
 		if !errors.Is(err, ErrBlockNotReady) {
-			r.observeLineageWalk(LineageWalkFailure, lineage.Walk, started)
+			r.observeLineageWalk(LineageWalkFailure, walk, started)
 
-			return resolvedLineage{}, err
+			return err
 		}
 		if ctx.Err() != nil {
-			return resolvedLineage{}, ctx.Err()
+			return ctx.Err()
 		}
 		r.markWindowProgressRetrying(window.StartSlot)
 		if !loggedNotReady && r.log != nil {
@@ -1633,16 +1716,14 @@ func (r *sessionRuntime) resolveWindowLineage(
 				Err(err).
 				Hex("session_id", r.config.SessionID[:]).
 				Uint32("window_start", window.StartSlot).
-				Msg("consensus window is waiting for finalized state")
+				Msg("consensus window is waiting for an ancestry candidate")
 			loggedNotReady = true
 		}
 
-		// A masterchain shard descriptor can become visible before its exact
-		// block state is available locally. C++ ChainState::from_manager waits
-		// for that state without stopping the consensus actor. Keep this ordered
-		// production worker pending as well; session retirement cancels the wait.
+		// The parent link may arrive after the window notification. Keep this
+		// ordered worker pending; session retirement cancels the wait.
 		if err = waitDuration(ctx, consensusProgressRetryInterval); err != nil {
-			return resolvedLineage{}, err
+			return err
 		}
 	}
 }
@@ -1690,10 +1771,9 @@ func (r *sessionRuntime) OnFinalized(id simplex.CandidateID, certificate simplex
 	// because a released payload is either durable or one consensus never
 	// accepted.
 	//
-	// Both sweeps run under one floor. The margins below the finalized slot are
-	// fixed, and the leader window that consumes what they retain is not: it
-	// walks back to the applied anchor, so the state resolver reports how far
-	// that is and neither sweep releases above it.
+	// Candidate payloads run under the ancestry floor. The state resolver reports
+	// how far the latest guarded walk reached, while resolved and applied state
+	// trees use their fixed parent-resolution margins.
 	//
 	// What bounds that request is measured first, off the candidate resolver's
 	// own retained payloads, and handed to the state resolver: the two never
@@ -1930,6 +2010,19 @@ func (r *sessionRuntime) closeWindow(err error) {
 	}
 }
 
+// detachWindow clears one rechecked opening without disturbing a newer window
+// which may already have replaced it. The same StartSlot can then install a
+// fresh submitter after the runtime revalidates its finalized anchor.
+func (r *sessionRuntime) detachWindow(submitter *windowSubmitter, err error) {
+	r.windowMu.Lock()
+	if r.window == submitter {
+		r.window = nil
+	}
+	r.windowMu.Unlock()
+
+	submitter.close(err)
+}
+
 type windowSubmitter struct {
 	mu       sync.Mutex
 	runtime  *sessionRuntime
@@ -2014,6 +2107,11 @@ func (s *windowSubmitter) submit(ctx context.Context, artifact *CandidateArtifac
 // to alert on and, on that runtime, an Error naming what was lost.
 func (r *sessionRuntime) publishCandidate(ctx context.Context, artifact *CandidateArtifact) error {
 	return r.execute(ctx, func(commandCtx context.Context) error {
+		var err error
+		artifact, err = artifact.withGenerationTime()
+		if err != nil {
+			return err
+		}
 		wire, broadcast, err := r.codec.encodeForBroadcast(artifact)
 		if err != nil {
 			return err

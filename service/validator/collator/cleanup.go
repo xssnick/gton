@@ -265,10 +265,11 @@ func (c *collation) cleanupClaimedLocalDequeues() error {
 	// queue prefix rather than with the work it finds.
 	//
 	// Nothing is lost by ignoring them. traceProcessedQueueValidationClosure
-	// (proof_closure.go) replays walkSemanticQueuePrefix over this identical
-	// region — same queue, same target shard, same claimed bound — after the
-	// update exists, which is where these cells belong: in the collated proof
-	// and nowhere else.
+	// (proof_closure.go) records this identical region — same queue, same target
+	// shard, same claimed bound — after the update exists, which is where these
+	// cells belong: in the collated proof and nowhere else. It records the very
+	// cells this walk parses, kept in claimedPrefixCells, so the split that has
+	// to stay split is the recording and not the traversal.
 	//
 	// Recording is switched back on around the dequeue itself. An entry this
 	// block actually removes is block content, and its cells have to reach both
@@ -277,7 +278,27 @@ func (c *collation) cleanupClaimedLocalDequeues() error {
 	c.usage.IgnoreReads(true)
 	defer c.usage.IgnoreReads(false)
 
+	// Installed inside the scope and cleared before it closes — the deferred
+	// order above is what guarantees the second half — so the observer fires at
+	// this nesting depth only, and a dictionary opening its own ignore scope
+	// underneath still drops its reads to nobody.
+	//
+	// The same answer gates the stamp below, out of one variable rather than two
+	// calls. A stamp left on a collection nothing filled would tell the closure
+	// to record an empty set, which is the under-recording that makes every
+	// validator reject the candidate.
+	collecting := c.closureRecordsPredecessorReads()
+	if collecting {
+		c.usage.SetIgnoredObserver(c.claimedPrefix.collect)
+		defer c.usage.SetIgnoredObserver(nil)
+	}
+
 	err := walkSemanticQueuePrefix(c.oldOutQueue, c.shard, c.processedClaim, func(entry semanticQueueEntry) error {
+		// Everything below is cleanup's own work and the closure's walk does
+		// none of it, so its reads are not part of the set the closure records.
+		c.claimedPrefix.suspend()
+		defer c.claimedPrefix.resume()
+
 		if err := c.ctx.Err(); err != nil {
 			return err
 		}
@@ -306,6 +327,11 @@ func (c *collation) cleanupClaimedLocalDequeues() error {
 	if err != nil {
 		return fmt.Errorf("close claimed local queue prefix to (%d,%x): %w",
 			c.processedClaim.lt, c.processedClaim.hash, err)
+	}
+	// Stamped only here, so a walk that stopped anywhere above leaves the
+	// collection unusable and the closure walks for itself.
+	if collecting {
+		c.claimedPrefix.stamp(c.oldOutQueue, c.shard, c.processedClaim)
 	}
 
 	return nil
@@ -703,7 +729,7 @@ func (c *collation) dequeueDelivered(entry queueEntry, importBlockLT uint64) err
 		return err
 	}
 	c.updatePeakLoad()
-	if !c.limits.fits(LoadNormal) {
+	if !c.limits.fits(c.fullMark()) {
 		c.blockFull = true
 	}
 	return nil

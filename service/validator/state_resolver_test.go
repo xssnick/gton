@@ -933,14 +933,23 @@ func TestStateResolverPropagatesFinalCertificateAcrossEmptyCandidate(t *testing.
 	}
 }
 
-func TestStateResolverLineageStopsAtNewestExactFinalizedBlock(t *testing.T) {
+func TestStateResolverAncestryStopsAtExactFinalizedBlockWithoutLoadingState(t *testing.T) {
 	t.Run("ordinary anchor", func(t *testing.T) {
 		resolver, candidates, artifacts := lineageResolverForTest(t, false)
 		defer resolver.close()
 		defer candidates.close()
 
+		stateLoads := 0
+		backend := newRuntimeTestBackend()
+		backend.load = func(context.Context, ChainStateRequest) (ChainStateData, error) {
+			stateLoads++
+
+			return ChainStateData{}, errors.New("unexpected chain-state load")
+		}
+		resolver.backend = backend
+
 		anchor := artifacts[0].Candidate.Block
-		got, err := resolver.lineage(
+		got, err := resolver.ancestry(
 			context.Background(),
 			simplex.Parent(artifacts[2].Candidate.ID),
 			&anchor,
@@ -948,9 +957,9 @@ func TestStateResolverLineageStopsAtNewestExactFinalizedBlock(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertArtifactIdentity(t, got.Candidates, artifacts)
-		if got.AppliedAnchor == nil || !sameBlockID(*got.AppliedAnchor, anchor) {
-			t.Fatalf("applied anchor = %v, want %v", got.AppliedAnchor, anchor)
+		assertAncestryStats(t, got, 3, 3, 0, 0)
+		if stateLoads != 0 {
+			t.Fatalf("ancestry loaded %d chain states, want none", stateLoads)
 		}
 	})
 
@@ -959,8 +968,17 @@ func TestStateResolverLineageStopsAtNewestExactFinalizedBlock(t *testing.T) {
 		defer resolver.close()
 		defer candidates.close()
 
+		stateLoads := 0
+		backend := newRuntimeTestBackend()
+		backend.load = func(context.Context, ChainStateRequest) (ChainStateData, error) {
+			stateLoads++
+
+			return ChainStateData{}, errors.New("unexpected chain-state load")
+		}
+		resolver.backend = backend
+
 		anchor := artifacts[0].Candidate.Block
-		got, err := resolver.lineage(
+		got, err := resolver.ancestry(
 			context.Background(),
 			simplex.Parent(artifacts[2].Candidate.ID),
 			&anchor,
@@ -968,14 +986,14 @@ func TestStateResolverLineageStopsAtNewestExactFinalizedBlock(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertArtifactIdentity(t, got.Candidates, artifacts[1:])
-		if got.AppliedAnchor == nil || !sameBlockID(*got.AppliedAnchor, anchor) {
-			t.Fatalf("applied anchor = %v, want %v", got.AppliedAnchor, anchor)
+		assertAncestryStats(t, got, 2, 2, 0, 0)
+		if stateLoads != 0 {
+			t.Fatalf("ancestry loaded %d chain states, want none", stateLoads)
 		}
 	})
 }
 
-func TestStateResolverLineageStartsAtNewestAppliedCandidate(t *testing.T) {
+func TestStateResolverAncestryUsesTheExactSuppliedFinalizedBlock(t *testing.T) {
 	resolver, candidates, artifacts := lineageResolverForTest(t, false)
 	defer resolver.close()
 	defer candidates.close()
@@ -988,7 +1006,7 @@ func TestStateResolverLineageStartsAtNewestAppliedCandidate(t *testing.T) {
 	resolver.mu.Unlock()
 
 	masterchainAnchor := artifacts[0].Candidate.Block
-	got, err := resolver.lineage(
+	got, err := resolver.ancestry(
 		context.Background(),
 		simplex.Parent(artifacts[2].Candidate.ID),
 		&masterchainAnchor,
@@ -996,92 +1014,55 @@ func TestStateResolverLineageStartsAtNewestAppliedCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertArtifactIdentity(t, got.Candidates, artifacts[1:])
-	if got.AppliedAnchor == nil || !sameBlockID(*got.AppliedAnchor, artifacts[1].Candidate.Block) {
-		t.Fatalf("applied anchor = %v, want newest finalized candidate %v", got.AppliedAnchor, artifacts[1].Candidate.Block)
-	}
+	// The newer local finalization marker is not the caller's ancestry
+	// constraint. The walk must follow exact parent links until it reaches the
+	// block supplied by the selected-base contract.
+	assertAncestryStats(t, got, 3, 3, 0, 0)
 }
 
-func TestStateResolverLineageWaitsForExactFinalizedState(t *testing.T) {
+func TestStateResolverAncestryWithoutFinalizedBlockDoesNotWalk(t *testing.T) {
 	resolver, candidates, artifacts := lineageResolverForTest(t, false)
 	defer resolver.close()
 	defer candidates.close()
 
-	resolver.mu.Lock()
-	resolver.finalized[artifacts[0].Candidate.ID] = &finalizedState{isDone: true, reconciled: true}
-	resolver.mu.Unlock()
-	ready := false
-	calls := 0
+	stateLoads := 0
 	backend := newRuntimeTestBackend()
 	backend.load = func(
-		_ context.Context,
-		request ChainStateRequest,
+		context.Context,
+		ChainStateRequest,
 	) (ChainStateData, error) {
-		calls++
-		if !ready {
-			return ChainStateData{}, ErrBlockNotReady
-		}
+		stateLoads++
 
-		tips := make([]ChainTip, len(request.Blocks))
-		for i := range request.Blocks {
-			tips[i] = ChainTip{
-				ID:       request.Blocks[i],
-				State:    backend.stateRoot,
-				BlockBOC: testTipBOCFor(request.Blocks[i]),
-				Block:    testTipBlockFor(request.Blocks[i]),
-			}
-		}
-
-		return ChainStateData{Tips: tips}, nil
+		return ChainStateData{}, errors.New("unexpected chain-state load")
 	}
 	resolver.backend = backend
 
-	masterchainAnchor := artifacts[0].Candidate.Block
-	if _, err := resolver.lineage(
+	base := simplex.Parent(artifacts[len(artifacts)-1].Candidate.ID)
+	before := candidates.cacheStats()
+	got, err := resolver.ancestry(
 		context.Background(),
-		simplex.Parent(artifacts[2].Candidate.ID),
-		&masterchainAnchor,
-	); !errors.Is(err, ErrBlockNotReady) {
-		t.Fatalf("unavailable finalized state error = %v, want %v", err, ErrBlockNotReady)
-	}
-
-	ready = true
-	got, err := resolver.lineage(
-		context.Background(),
-		simplex.Parent(artifacts[2].Candidate.ID),
-		&masterchainAnchor,
+		base,
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertArtifactIdentity(t, got.Candidates, artifacts)
-	if got.AppliedAnchor == nil || !sameBlockID(*got.AppliedAnchor, masterchainAnchor) {
-		t.Fatalf("applied anchor = %v, want masterchain anchor %v", got.AppliedAnchor, masterchainAnchor)
+	assertAncestryStats(t, got, 0, 0, 0, 0)
+	if stateLoads != 0 {
+		t.Fatalf("nil-finalized ancestry loaded %d chain states, want none", stateLoads)
 	}
-	if got.AppliedAnchorState == nil || len(got.AppliedAnchorState.tips) != 1 ||
-		!sameBlockID(got.AppliedAnchorState.tips[0].ID, masterchainAnchor) ||
-		got.AppliedAnchorState.tips[0].State != backend.stateRoot {
-		t.Fatal("lineage did not retain the exact applied anchor state")
-	}
-	if _, err = resolver.lineage(
-		context.Background(),
-		simplex.Parent(artifacts[2].Candidate.ID),
-		&masterchainAnchor,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if calls != 2 {
-		t.Fatalf("cached applied anchor loaded %d times, want 2 total attempts", calls)
+	if after := candidates.cacheStats(); after != before {
+		t.Fatalf("nil-finalized ancestry changed candidate cache from %+v to %+v", before, after)
 	}
 }
 
-func TestStateResolverLineageAllowsGenesisAnchorOnly(t *testing.T) {
+func TestStateResolverAncestryAllowsGenesisAndRejectsForeignBlock(t *testing.T) {
 	resolver, candidates, artifacts := lineageResolverForTest(t, false)
 	defer resolver.close()
 	defer candidates.close()
 
 	genesis := runtimeTestStart().Genesis[0]
-	got, err := resolver.lineage(
+	got, err := resolver.ancestry(
 		context.Background(),
 		simplex.Parent(artifacts[2].Candidate.ID),
 		&genesis,
@@ -1089,25 +1070,20 @@ func TestStateResolverLineageAllowsGenesisAnchorOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertArtifactIdentity(t, got.Candidates, artifacts)
-	if got.AppliedAnchor != nil {
-		t.Fatalf("genesis lineage has candidate anchor %v", got.AppliedAnchor)
-	}
+	assertAncestryStats(t, got, 3, 3, 0, 0)
 
-	unrelated := ton.BlockIDExt{
-		Workchain: genesis.Workchain,
-		Shard:     genesis.Shard,
-		SeqNo:     genesis.SeqNo + 10,
-		RootHash:  testTipRootHash(0xe1),
-		FileHash:  testTipFileHash(0xe1),
-	}
-	if _, err = resolver.lineage(
+	// Another valid block already present in this fixture is still foreign to
+	// the exact parent chain below the chosen base.
+	unrelated := artifacts[2].Candidate.Block
+	foreignStats, err := resolver.ancestry(
 		context.Background(),
-		simplex.Parent(artifacts[2].Candidate.ID),
+		simplex.Parent(artifacts[1].Candidate.ID),
 		&unrelated,
-	); !errors.Is(err, errFinalizedLineageAhead) {
+	)
+	if !errors.Is(err, errFinalizedLineageAhead) {
 		t.Fatalf("unrelated finalized anchor error = %v, want %v", err, errFinalizedLineageAhead)
 	}
+	assertAncestryStats(t, foreignStats, 2, 2, 0, 0)
 }
 
 func TestStateResolverFinalizationReleasesOnlyCompletedStatesBelowWatermark(t *testing.T) {
@@ -1238,6 +1214,10 @@ func TestStateResolverFinalizationReleasesAppliedStatesBelowWatermark(t *testing
 	// A finalization still being applied keeps its state until it completes.
 	applying := resolver.finalized[id(1)]
 	applying.inFlight = &resolverFlight{done: make(chan struct{})}
+	// An ancestry guard reaching the oldest candidate only constrains candidate
+	// payload retention. The selected base carries its resolved state directly,
+	// so this floor must not pin historical applied-state trees.
+	resolver.noteLineageFloorLocked(0)
 	resolver.mu.Unlock()
 
 	resolver.notifyFinalized(finalized, retentionFloorNone)
@@ -1271,28 +1251,12 @@ func TestStateResolverFinalizationReleasesAppliedStatesBelowWatermark(t *testing
 		}
 	}
 	resolver.mu.Unlock()
-
-	// The released state is reloaded on demand, which is the path a lineage walk
-	// reaching that far back would take anyway.
-	reloaded, err := resolver.appliedCandidateState(context.Background(), id(0), block(0))
-	if err != nil {
-		t.Fatalf("reload released applied state: %v", err)
-	}
-	if reloaded == nil || len(reloaded.tips) != 1 || !sameBlockID(reloaded.tips[0].ID, block(0)) {
-		t.Fatal("reloaded applied state is not the anchor that was released")
-	}
-
-	resolver.mu.Lock()
-	defer resolver.mu.Unlock()
-	if resolver.applied[id(0)] == nil || resolver.finalized[id(0)].appliedState != reloaded {
-		t.Fatal("the reloaded state was not queued for the next release")
-	}
 }
 
-// The lineage walk reaches back to the masterchain-visible finalized block,
+// The ancestry guard reaches back to the masterchain-visible finalized block,
 // which lags this session's own finalized slot, so it routinely asks for
 // candidates the finalization sweep has already released.
-func TestStateResolverLineageReloadsReleasedAncestors(t *testing.T) {
+func TestStateResolverAncestryReloadsReleasedAncestors(t *testing.T) {
 	storage := newRuntimeTestStorage()
 	runtime, privateKey := prepareRuntimeTest(
 		t,
@@ -1338,26 +1302,11 @@ func TestStateResolverLineageReloadsReleasedAncestors(t *testing.T) {
 	runtime.candidates.notifyFinalized(uint32(len(artifacts))+candidateCacheRetainedSlots, retentionFloorNone)
 
 	anchor := artifacts[0].Candidate.Block
-	lineage, err := runtime.states.lineage(context.Background(), parent, &anchor)
+	walk, err := runtime.states.ancestry(context.Background(), parent, &anchor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lineage.Candidates) != len(artifacts) {
-		t.Fatalf("lineage length = %d, want %d", len(lineage.Candidates), len(artifacts))
-	}
-	for i := range artifacts {
-		if lineage.Candidates[i].Candidate.ID != artifacts[i].Candidate.ID {
-			t.Fatalf(
-				"lineage[%d] = slot %d, want slot %d",
-				i,
-				lineage.Candidates[i].Candidate.ID.Slot,
-				artifacts[i].Candidate.ID.Slot,
-			)
-		}
-		if lineage.Candidates[i] == artifacts[i] {
-			t.Fatalf("lineage[%d] was answered from a payload the sweep should have released", i)
-		}
-	}
+	assertAncestryStats(t, walk, len(artifacts), 0, len(artifacts), 0)
 	if storage.loadCount() != len(artifacts) {
 		t.Fatalf("candidate reloads = %d, want one per released ancestor", storage.loadCount())
 	}
@@ -1441,33 +1390,33 @@ func lineageResolverForTest(
 	return resolver, candidates, artifacts
 }
 
-func assertArtifactIdentity(
+func assertAncestryStats(
 	t *testing.T,
-	got []*CandidateArtifact,
-	want []*CandidateArtifact,
+	got lineageWalkStats,
+	visited int,
+	memory int,
+	storage int,
+	peer int,
 ) {
 	t.Helper()
 
-	if len(got) != len(want) {
-		t.Fatalf("lineage length = %d, want %d", len(got), len(want))
+	if got.Visited != visited {
+		t.Fatalf("ancestry visited %d candidates, want %d", got.Visited, visited)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("lineage[%d] = %p, want original %p", i, got[i], want[i])
-		}
-		if &got[i].BlockBOC[0] != &want[i].BlockBOC[0] ||
-			&got[i].CollatedData[0] != &want[i].CollatedData[0] {
-			t.Fatalf("lineage[%d] copied immutable payloads", i)
-		}
+	want := [lineageStepSourceCount]int{
+		LineageStepMemory:  memory,
+		LineageStepStorage: storage,
+		LineageStepPeer:    peer,
+	}
+	if got.Steps != want {
+		t.Fatalf("ancestry step sources = %v, want %v", got.Steps, want)
 	}
 }
 
-// laggingSession is a consensus session whose own finalization has run ahead of
-// the node it feeds: every candidate is durable and finalized, and the ordinary
-// apply pipeline has stopped at appliedThrough. It is the shape both retention
-// sweeps exist to survive, because it is the one where the fixed margins below
-// the finalized slot and the lineage walk the local producer runs stop meaning
-// the same thing.
+// laggingSession is a consensus session whose selected base reaches farther
+// back than the fixed candidate-retention margin. Every candidate is durable
+// and finalized, so it exercises whether a completed ancestry guard moves the
+// payload floor without pinning historical state trees.
 type laggingSession struct {
 	storage    *runtimeTestStorage
 	backend    *runtimeTestBackend
@@ -1479,11 +1428,8 @@ type laggingSession struct {
 	stride int
 
 	mu sync.Mutex
-	// loads counts the state loads that returned a state. The ones that report
-	// the block not applied yet are counted apart: those are the walk finding
-	// out where apply stopped, which it does once per step whatever any cache
-	// holds, while a load that succeeds is a whole ChainState coming back out of
-	// the node because retention let go of it.
+	// State loads stay observable here solely as a regression guard: ancestry
+	// follows candidate parent links and must never reach this backend.
 	loads    int
 	notReady int
 	capped   bool
@@ -1612,22 +1558,22 @@ func (s *laggingSession) slotOf(index int) uint32 {
 	return uint32(index * s.stride)
 }
 
-// walk is one leader window's lineage resolution, from the tip back to the
+// walk is one leader window's ancestry guard, from the tip back to the
 // masterchain-visible finalized anchor.
-func (s *laggingSession) walk(t *testing.T, tip int, anchorIndex int) resolvedLineage {
+func (s *laggingSession) walk(t *testing.T, tip int, anchorIndex int) lineageWalkStats {
 	t.Helper()
 
 	anchor := s.artifacts[anchorIndex].Candidate.Block
-	lineage, err := s.states.lineage(
+	walk, err := s.states.ancestry(
 		context.Background(),
 		simplex.Parent(s.artifacts[tip].Candidate.ID),
 		&anchor,
 	)
 	if err != nil {
-		t.Fatalf("lineage from slot %d back to slot %d: %v", tip, anchorIndex, err)
+		t.Fatalf("ancestry from slot %d back to slot %d: %v", tip, anchorIndex, err)
 	}
 
-	return lineage
+	return walk
 }
 
 func (s *laggingSession) counts() (int, int) {
@@ -1666,7 +1612,7 @@ func TestRetentionFloorLeavesALaggingLeaderWindowNothingToReload(t *testing.T) {
 			// the next window opens.
 			session.sweep(uint32(tip))
 			candidateReads, stateLoads := session.counts()
-			lineage := session.walk(t, tip, tip-lag)
+			walk := session.walk(t, tip, tip-lag)
 			reads, loads := session.counts()
 			if got := reads - candidateReads; got != 0 {
 				t.Fatalf("a leader window %d slots behind read %d candidates back from storage", lag, got)
@@ -1674,13 +1620,9 @@ func TestRetentionFloorLeavesALaggingLeaderWindowNothingToReload(t *testing.T) {
 			if got := loads - stateLoads; got != 0 {
 				t.Fatalf("a leader window %d slots behind reloaded %d chain states from the node", lag, got)
 			}
-			if len(lineage.Candidates) != lag+1 {
+			if walk.Visited != lag+1 {
 				t.Fatalf("the walk covered %d candidates, want the %d of this lag: "+
-					"the test is not exercising what it claims", len(lineage.Candidates), lag+1)
-			}
-			if lineage.AppliedAnchorState == nil ||
-				!sameBlockID(*lineage.AppliedAnchor, session.artifacts[tip-lag].Candidate.Block) {
-				t.Fatal("the walk did not anchor on the block the node last applied")
+					"the test is not exercising what it claims", walk.Visited, lag+1)
 			}
 		})
 	}
@@ -1734,14 +1676,14 @@ func TestRetentionFloorIgnoresSkippedSlots(t *testing.T) {
 
 	// And the walk the floor exists for still costs nothing.
 	candidateReads, stateLoads := session.counts()
-	lineage := session.walk(t, tip, 0)
+	walk := session.walk(t, tip, 0)
 	reads, loads := session.counts()
 	if reads != candidateReads || loads != stateLoads {
 		t.Fatalf("a window over %d skipped slots read %d candidates and %d states back from storage",
 			session.slotOf(tip), reads-candidateReads, loads-stateLoads)
 	}
-	if len(lineage.Candidates) != length {
-		t.Fatalf("the walk covered %d candidates, want %d", len(lineage.Candidates), length)
+	if walk.Visited != length {
+		t.Fatalf("the walk covered %d candidates, want %d", walk.Visited, length)
 	}
 }
 
@@ -1799,14 +1741,14 @@ func TestRetentionFloorResumesPruningPastTheBudget(t *testing.T) {
 			// Pruning past the walk is a cost, never a failure: the window still
 			// opens, out of storage.
 			before, _ := session.counts()
-			lineage := session.walk(t, tip, tip-lag)
+			walk := session.walk(t, tip, tip-lag)
 			after, _ := session.counts()
 			if after == before {
 				t.Fatal("the capped sweep released nothing the next window had to read back")
 			}
-			if len(lineage.Candidates) != lag+1 {
+			if walk.Visited != lag+1 {
 				t.Fatalf("the walk past the budget covered %d candidates, want %d",
-					len(lineage.Candidates), lag+1)
+					walk.Visited, lag+1)
 			}
 		})
 	}
@@ -1852,19 +1794,19 @@ func TestLineageWalkFailureIsObservedWithItsStats(t *testing.T) {
 	}
 	base := simplex.Parent(session.artifacts[length-1].Candidate.ID)
 
-	got, err := session.states.lineage(context.Background(), base, &foreign)
+	got, err := session.states.ancestry(context.Background(), base, &foreign)
 	if !errors.Is(err, errFinalizedLineageAhead) {
-		t.Fatalf("lineage against a foreign anchor: err = %v, want %v", err, errFinalizedLineageAhead)
+		t.Fatalf("ancestry against a foreign anchor: err = %v, want %v", err, errFinalizedLineageAhead)
 	}
-	if got.Walk.Visited != length {
-		t.Fatalf("failed walk reported %d visited candidates, want %d", got.Walk.Visited, length)
+	if got.Visited != length {
+		t.Fatalf("failed walk reported %d visited candidates, want %d", got.Visited, length)
 	}
 	steps := 0
-	for _, count := range got.Walk.Steps {
+	for _, count := range got.Steps {
 		steps += count
 	}
-	if steps != got.Walk.Visited {
-		t.Fatalf("failed walk step sources sum to %d, want %d", steps, got.Walk.Visited)
+	if steps != got.Visited {
+		t.Fatalf("failed walk step sources sum to %d, want %d", steps, got.Visited)
 	}
 
 	// And the runtime observation those stats exist for actually fires. The
@@ -1876,7 +1818,7 @@ func TestLineageWalkFailureIsObservedWithItsStats(t *testing.T) {
 	runtime.candidates = session.candidates
 	runtime.metrics = recorder
 
-	if _, err = runtime.resolveWindowLineage(
+	if err = runtime.verifyWindowAncestry(
 		context.Background(),
 		simplex.Window{StartSlot: length},
 		&foreign,
@@ -1897,7 +1839,7 @@ func TestLineageWalkFailureIsObservedWithItsStats(t *testing.T) {
 		t.Fatalf("no-base walk observed as %+v, want a failure at depth 0", empty)
 	}
 
-	if _, err = runtime.resolveWindowLineage(
+	if err = runtime.verifyWindowAncestry(
 		context.Background(),
 		simplex.Window{StartSlot: length, Base: base},
 		&foreign,

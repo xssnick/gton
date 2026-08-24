@@ -75,13 +75,14 @@ func New(options Options) hooks.ExtensionFactory {
 		}
 
 		extension := &Extension{
-			controller: options.Controller,
-			history:    node.Store,
-			shardTops:  options.ShardTops,
-			messages:   options.Messages,
-			log:        node.Logger.With().Str("component", "collator").Logger(),
-			state:      extensionNew,
-			buffered:   nil,
+			controller:       options.Controller,
+			history:          node.Store,
+			shardTops:        options.ShardTops,
+			messages:         options.Messages,
+			accountPrewarmer: node.AccountPrewarmer,
+			log:              node.Logger.With().Str("component", "collator").Logger(),
+			state:            extensionNew,
+			buffered:         nil,
 		}
 		if err := registerStatusCollector(node.Metrics, options.Controller); err != nil {
 			return nil, fmt.Errorf("register collator status metrics: %w", err)
@@ -112,11 +113,12 @@ const (
 // only masterchain states observed before Start, then bootstraps exact history
 // before the controller opens its delegated-collation endpoint.
 type Extension struct {
-	controller Controller
-	history    groups.MasterchainHistory
-	shardTops  ShardTopDescriptionSink
-	messages   *msgpool.Pool
-	log        zerolog.Logger
+	controller       Controller
+	history          groups.MasterchainHistory
+	shardTops        ShardTopDescriptionSink
+	messages         *msgpool.Pool
+	accountPrewarmer hooks.AccountPrewarmer
+	log              zerolog.Logger
 
 	mu       sync.Mutex
 	state    extensionState
@@ -398,8 +400,16 @@ func (e *Extension) OnExternalMessage(_ context.Context, event hooks.ExternalMes
 	if event.IsLocal {
 		priority = msgpool.ExternalPriorityLocal
 	}
-	if err := e.messages.AddExternal(nil, event.MessageRoot, event.MessageParsed, priority); err != nil {
+	result, err := e.messages.AddExternal(
+		event.SerializedSize,
+		event.MessageRoot,
+		event.MessageParsed,
+		priority,
+	)
+	if err != nil {
 		e.log.Debug().Err(err).Msg("external message not pooled")
+	} else if result.Outcome == msgpool.ExternalAddInserted && e.accountPrewarmer != nil {
+		e.accountPrewarmer.EnqueueAccount(result.Destination.Workchain, result.Destination.Account)
 	}
 
 	return nil

@@ -390,10 +390,9 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 
 	externalMessageLogger := baseLogger.With().Str("component", "external_message").Logger()
 	externalMessageChecker, err := externalmsg.NewChecker(externalmsg.Options{
-		Logger:    &externalMessageLogger,
-		Store:     liveStore,
-		TVM:       tvmInstance,
-		Prewarmer: accountPrewarmer,
+		Logger: &externalMessageLogger,
+		Store:  liveStore,
+		TVM:    tvmInstance,
 	})
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to initialize external message checker")

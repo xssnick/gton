@@ -69,9 +69,39 @@ var bocSerializedMagic = [4]byte{0xB5, 0xEE, 0x9C, 0x72}
 // producer already holds. Both callers have them: the collator has just written
 // them, and the codec has just re-serialized them from the roots it decoded.
 func PayloadCellHint(blockBOC, collatedData []byte) int {
-	hint := bocDeclaredCells(blockBOC) + bocDeclaredCells(collatedData)
+	return PayloadCellHintFromCounts(bocDeclaredCells(blockBOC), bocDeclaredCells(collatedData))
+}
+
+// PayloadCellHintFromCounts is the same hint for a producer that starts the
+// payload before either BOC exists — the collator, which launches it the moment
+// its roots are final — and so has no header to read a count out of. It takes
+// instead the two counts those component serializations are themselves presized
+// with, which is the only pair of numbers describing these same two cell sets
+// available that early.
+//
+// The |B| + |C| construction and both clamps carry over unchanged. What does not
+// carry over is exactness: a declared count is what a finished serializer wrote,
+// while these two are the producer's own sizing estimates, so the sum bounds the
+// union only as well as they bound their own halves. That costs nothing, because
+// a hint sizes scratch structures and the payload bytes are identical for every
+// value of it, including zero. The byte-consistency clamp has no counterpart
+// here and needs none: these numbers are the producer's own, not a length read
+// out of a buffer it did not write.
+func PayloadCellHintFromCounts(blockCells, collatedCells int) int {
+	if blockCells < 0 || collatedCells < 0 {
+		return 0
+	}
+
+	// Each half is clamped to the ceiling before the two are summed. Clamping
+	// only the sum would be enough for the two declared counts PayloadCellHint
+	// derives, which the byte clamp has already bounded by the buffers they came
+	// out of, but not for two counts a producer computed: near the top of the int
+	// range their sum wraps negative, drops under the floor and yields "no hint"
+	// where the ceiling was meant. Clamped first, the sum is at most twice the
+	// ceiling and cannot wrap.
+	hint := min(blockCells, payloadHintMaxPresizedCells) + min(collatedCells, payloadHintMaxPresizedCells)
 	if hint > payloadHintMaxPresizedCells {
-		hint = payloadHintMaxPresizedCells
+		return payloadHintMaxPresizedCells
 	}
 	if hint < payloadHintFloorCells {
 		return 0

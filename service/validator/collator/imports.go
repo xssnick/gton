@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm"
@@ -30,15 +31,111 @@ func internalOrderAdvances(prev, next *msgpool.InternalMessage) bool {
 	return msgpool.CompareLtHash(prev, next) < 0
 }
 
+// fullMark is the limit class this block calls full. It is the soft boundary
+// while the byte budget above it is still reserved for external messages, and
+// the medium one once that reserve has been released to the drain. See
+// escalateToMediumMark.
+func (c *collation) fullMark() LoadClass {
+	if c.mediumMark {
+		return LoadSoft
+	}
+
+	return LoadNormal
+}
+
+// escalateToMediumMark releases the reserve. Internals stop at the soft
+// boundary (collator.cpp:4141, our LoadNormal) so that externals may carry the
+// block from there to the medium one (collator.cpp:4276, our LoadSoft); the
+// half between the two marks belongs to externals and to nothing else. When
+// the external phase has taken what it can and left some of it, the block would
+// otherwise ship short — with the queue it exists to drain untouched — so the
+// remainder goes back to internal work.
+//
+// The latch is cleared with the mark, or raising it would change nothing: every
+// consumer of blockFull reads the latch, not the class, and a block that stayed
+// latched would enqueue its generated messages instead of delivering them —
+// feeding the very queue this pass drains. The one latch that must survive is
+// the internal-message timeout, which is a statement about the age of the
+// traffic rather than about how full the block is, and no mark makes it false.
+func (c *collation) escalateToMediumMark() {
+	c.mediumMark = true
+	if !c.blockFullTimeout && c.limits.fits(c.fullMark()) {
+		c.blockFull = false
+	}
+}
+
 // processInternals imports the inbound internal message slice: messages are
 // consumed in
 // (lt, hash) order until the normal limit class is exhausted; the remainder
 // stays unimported and forces generated messages into the queue.
 func (c *collation) processInternals() error {
+	return c.processInternalsFrom(0)
+}
+
+// internalsRemain reports whether the canonical order has messages the block
+// has not imported yet.
+func (c *collation) internalsRemain() bool {
+	return c.internalsCursor < len(c.req.internalMessages())
+}
+
+// topUpInternals resumes the inbound import against the raised mark, once per
+// block, with whatever of the external phase's own time budget is left.
+//
+// It is called where the build would otherwise idle: the ready externals are
+// drained (or refused outright by the outbound-queue brake) and the phase is
+// about to park until the slot boundary in case more arrive. That wait is the
+// only slack a loaded shard has, and spending it on the queue costs the
+// externals nothing they were going to use — a message that arrives during the
+// top-up is still taken on the next pass, under the same medium mark it would
+// have been taken under anyway.
+//
+// The time budget is the INTERNAL one — InternalMsgUntil, enforced per message
+// by internalMsgExpired inside the import — and deliberately not the external
+// phase's. That distinction is the whole reason the first slot of a window used
+// to get nothing out of this: its external deadlines are both
+// slotStartTime(slot), which for the first slot is the instant the window
+// opened, so both are already in the past when the build starts. Bounding the
+// top-up by them made it return on its first line exactly where it was needed
+// most, while every other internal phase of the same block went on running
+// against the soft deadline. Same budget as the import it resumes, and no
+// other.
+func (c *collation) topUpInternals() error {
+	if c.toppedUp || c.haveUnprocessedDispatchQueue || !c.internalsRemain() {
+		return nil
+	}
+	// Only while the shard is in backlog. A bigger block is not free: it lands
+	// on the reference validators' notarization chain, which is what bounds the
+	// leader window, and lifting the block limits by half on the test stand cost
+	// the network a third of its throughput. So the reserve is released for the
+	// one thing that pays for the bytes — a queue deep enough that the brake is
+	// already refusing the externals it was reserved for. Read live, after this
+	// block's own cleanup and imports have moved it, because that is the depth
+	// the next block inherits.
+	if !c.externalIntakeClosed() {
+		return nil
+	}
+	c.updateCollatedEstimate()
+	if !c.limits.fits(LoadSoft) {
+		return nil
+	}
+	if c.internalMsgExpired() {
+		return nil
+	}
+	c.toppedUp = true
+	c.escalateToMediumMark()
+
+	return c.processInternalsFrom(c.internalsCursor)
+}
+
+func (c *collation) processInternalsFrom(from int) error {
 	if c.haveUnprocessedDispatchQueue {
 		return nil
 	}
-	inputs := c.req.internalMessages()
+	all := c.req.internalMessages()
+	if from >= len(all) {
+		return nil
+	}
+	inputs := all[from:]
 	if len(inputs) == 0 {
 		return nil
 	}
@@ -46,11 +143,15 @@ func (c *collation) processInternals() error {
 	if err != nil {
 		return err
 	}
+	if workers := c.internalWaveParallelism(); workers > 0 {
+		return c.processInternalsInWaves(inputs, records, workers, from)
+	}
 
-	for _, msg := range inputs {
+	for i, msg := range inputs {
 		c.updateCollatedEstimate()
-		if !c.limits.fits(LoadNormal) {
+		if !c.limits.fits(c.fullMark()) {
 			c.blockFull = true
+			c.internalsCursor = from + i
 			return nil
 		}
 		// collator.cpp:4141-4146: the reference stops importing at the soft
@@ -59,7 +160,9 @@ func (c *collation) processInternals() error {
 		// enqueued rather than delivered — and the block still publishes.
 		if c.internalMsgExpired() {
 			c.blockFull = true
+			c.blockFullTimeout = true
 			c.stats.InternalMsgTimeouts++
+			c.internalsCursor = from + i
 			return nil
 		}
 		if err = c.ctx.Err(); err != nil {
@@ -68,18 +171,89 @@ func (c *collation) processInternals() error {
 		if err = c.importInternal(msg, records); err != nil {
 			return err
 		}
+		c.internalsCursor = from + i + 1
 		c.updatePeakLoad()
 	}
 	return nil
 }
 
-// importInternal handles one queued message: validate the envelope against its queue key, skip if the
-// parent ProcessedUpto already covers it, execute the destination
-// transaction and record the msg_import_fin descriptor — plus the
+// importInternal handles one queued message: validate the envelope against its
+// queue key, skip if the parent ProcessedUpto already covers it, execute the
+// destination transaction and record the msg_import_fin descriptor — plus the
 // msg_export_deq_imm dequeue when the message comes from our own out-queue.
+//
+// It is planInternal followed by retireInternal. The split exists for
+// processInternalsInWaves, which plans several messages, executes the
+// transactions they call for on several goroutines, and retires them in order;
+// this sequential form is the same two steps with the execution done inside
+// retireInternal.
 func (c *collation) importInternal(msg *msgpool.InternalMessage, records []tlb.ProcessedUptoRecord) error {
+	plan := c.planInternal(msg, records)
+	return c.retireInternal(plan)
+}
+
+// internalAction is what planInternal decided a message needs.
+type internalAction uint8
+
+const (
+	// internalSkip: the parent's ProcessedUpto already covers the message.
+	internalSkip internalAction = iota
+	// internalRelay: the destination is outside this shard; transit only.
+	internalRelay
+	// internalExecute: the destination is ours and a transaction runs.
+	internalExecute
+)
+
+// internalPlan is one inbound message taken as far as it can be taken without
+// touching the collation: validated, classified, and — when it executes —
+// resolved to its account and emulated. Everything that writes into the
+// collation, from advancing the processed bound to committing the
+// transaction, happens in retireInternal, in message order.
+type internalPlan struct {
+	msg      *msgpool.InternalMessage
+	hash     cell.Hash
+	prepared *tvm.PreparedMessage
+	cur      msgpool.AccountPrefix
+	next     msgpool.AccountPrefix
+	action   internalAction
+	key      [32]byte
+	// err is a planning failure. It is not returned by planInternal, because a
+	// sequential collation never examines a message the block filled before;
+	// raising it at retirement keeps that order, so a wave reports exactly the
+	// error, or the full block, a sequential run would have reported.
+	err error
+
+	// executes marks a plan a wave will emulate off the main goroutine. It is
+	// what tells retirement whether to run the transaction itself or to wait for
+	// the worker that already did.
+	executes bool
+
+	// Set by speculateInternal, read by retireInternal.
+	lane    *accountLane
+	fresh   bool
+	result  *tvm.TransactionExecutionResult
+	execErr error
+	// wg is one worker's completion, not a wave's. A WaitGroup rather than a
+	// channel because a plan is reused across the waves of one collation and a
+	// closed channel cannot be: at a thousand inbound messages a block that is a
+	// thousand channel allocations, for a signal that is raised once and awaited
+	// once.
+	wg sync.WaitGroup
+}
+
+// planInternal validates one queued message and decides what it needs. It
+// reads the collation and writes nothing into it.
+func (c *collation) planInternal(msg *msgpool.InternalMessage, records []tlb.ProcessedUptoRecord) *internalPlan {
+	plan := &internalPlan{msg: msg}
+	plan.err = c.planInternalInto(plan, records)
+	return plan
+}
+
+func (c *collation) planInternalInto(plan *internalPlan, records []tlb.ProcessedUptoRecord) error {
+	msg := plan.msg
 	env := &msg.Envelope
 	hash := msg.Root.HashKey()
+	plan.hash = hash
 	if msg.EnvelopeCell.Level() != 0 {
 		return fmt.Errorf("%w: inbound message %x envelope has a non-zero level", ErrInvalidInput, hash)
 	}
@@ -133,15 +307,10 @@ func (c *collation) importInternal(msg *msgpool.InternalMessage, records []tlb.P
 	if env.CurAddr.UseDestBits >= env.NextAddr.UseDestBits && env.NextAddr.UseDestBits < routingAddressBits {
 		return fmt.Errorf("%w: inbound message %x next hop is not nearer to the destination", ErrInvalidInput, hash)
 	}
+	plan.prepared = prepared
+	plan.cur = cur
+	plan.next = next
 
-	// The bound advances BEFORE the covered-check: messages skipped as already
-	// covered still participate in the ProcessedUpto record, and a validator
-	// replaying the block has to arrive at the same bound. The queue-entry lt
-	// feeds the shard-end-lt branch of the coverage check; the canonical lt
-	// bounds the processing order.
-	if err = c.advanceProcessedBound("imported", msg.EnqueuedLT, hash); err != nil {
-		return err
-	}
 	descr := tlb.ProcessedMsgDescr{
 		CurWorkchain:  cur.Workchain,
 		CurPrefix:     cur.Prefix,
@@ -160,19 +329,68 @@ func (c *collation) importInternal(msg *msgpool.InternalMessage, records []tlb.P
 	if err != nil {
 		return fmt.Errorf("%w: check processed info for inbound message %x: %v", ErrInvalidInput, hash, err)
 	}
-	if processed {
+	switch {
+	case processed:
+		plan.action = internalSkip
+	case !c.shard.ContainsPrefix(destination):
+		plan.action = internalRelay
+		plan.key = [32]byte{}
+	default:
+		plan.action = internalExecute
+		key, err := accountIDFromAddress(internal.DstAddr)
+		if err != nil {
+			// The same wrapping executePrepared's caller applies, since that is
+			// where a sequential run meets this failure.
+			return fmt.Errorf("execute inbound message %x: %w", hash, err)
+		}
+		plan.key = key
+	}
+	return nil
+}
+
+// retireInternal applies one planned message to the collation, in the order
+// the messages were queued. A plan that was speculated carries its lane and
+// result and is committed from them; one that was not is executed here.
+func (c *collation) retireInternal(plan *internalPlan) error {
+	if plan.err != nil {
+		return plan.err
+	}
+	msg := plan.msg
+	env := &msg.Envelope
+	hash := plan.hash
+
+	// The bound advances BEFORE the covered-check: messages skipped as already
+	// covered still participate in the ProcessedUpto record, and a validator
+	// replaying the block has to arrive at the same bound. The queue-entry lt
+	// feeds the shard-end-lt branch of the coverage check; the canonical lt
+	// bounds the processing order.
+	if err := c.advanceProcessedBound("imported", msg.EnqueuedLT, hash); err != nil {
+		return err
+	}
+	switch plan.action {
+	case internalSkip:
 		c.stats.InternalsSkipped++
 		return nil
-	}
-	if !c.shard.ContainsPrefix(destination) {
-		if err = c.relayInternal(msg, cur, next, destination); err != nil {
+	case internalRelay:
+		destination, err := accountPrefixFromAddress(plan.prepared.Message().AsInternal().DstAddr)
+		if err != nil {
+			return fmt.Errorf("%w: inbound message %x destination: %v", ErrInvalidInput, hash, err)
+		}
+		if err = c.relayInternal(msg, plan.cur, plan.next, destination); err != nil {
 			return err
 		}
 		c.stats.InternalsImported++
 		return nil
 	}
 
-	result, lane, err := c.executePrepared(prepared, 0)
+	var result *tvm.TransactionExecutionResult
+	var lane *accountLane
+	var err error
+	if plan.executes {
+		result, lane, err = c.commitSpeculated(plan)
+	} else {
+		result, lane, err = c.executePrepared(plan.prepared, 0)
+	}
 	if err != nil {
 		return fmt.Errorf("execute inbound message %x: %w", hash, err)
 	}
@@ -188,7 +406,7 @@ func (c *collation) importInternal(msg *msgpool.InternalMessage, records []tlb.P
 	// Both descriptor dictionaries key this message by the same hash, so the
 	// key cell is built once for the pair.
 	messageKey := descriptorKey(msg.Root)
-	if c.shard.ContainsPrefix(cur) {
+	if c.shard.ContainsPrefix(plan.cur) {
 		// The message originates from our own out-queue: dequeue it with a
 		// msg_export_deq_imm$100 record referencing the import.
 		out, err := descriptor(0b100, 3, msg.EnvelopeCell, in) // msg_export_deq_imm$100
@@ -208,6 +426,27 @@ func (c *collation) importInternal(msg *msgpool.InternalMessage, records []tlb.P
 
 	c.stats.InternalsImported++
 	return c.registerOutputs(result, lane, env.Metadata, false)
+}
+
+// commitSpeculated takes a plan whose transaction already ran off the main
+// goroutine and makes it part of the collation: the lane is registered if it
+// is new, its buffered reads are replayed into the shared recorders, and the
+// result is committed. After this the collation is in the state a sequential
+// executePrepared would have left it in.
+func (c *collation) commitSpeculated(plan *internalPlan) (*tvm.TransactionExecutionResult, *accountLane, error) {
+	plan.wg.Wait()
+	if plan.execErr != nil {
+		return nil, nil, plan.execErr
+	}
+	lane := plan.lane
+	if plan.fresh {
+		c.registerLane(lane)
+	}
+	lane.tracer.replay()
+	if err := c.commitExecution(plan.result, lane, true); err != nil {
+		return nil, nil, err
+	}
+	return plan.result, lane, nil
 }
 
 func (c *collation) relayInternal(

@@ -128,9 +128,10 @@ func TestEventHandlersPreserveBorrowedValues(t *testing.T) {
 		t.Fatalf("process block applied: %v", err)
 	}
 	if err := handlers.ExternalMessage.AcceptExternalMessage(context.Background(), service.ExternalMessageEvent{
-		IsLocal:       true,
-		MessageRoot:   externalRoot,
-		MessageParsed: externalMessage,
+		IsLocal:        true,
+		SerializedSize: 123,
+		MessageRoot:    externalRoot,
+		MessageParsed:  externalMessage,
 	}); err != nil {
 		t.Fatalf("accept external message: %v", err)
 	}
@@ -152,7 +153,8 @@ func TestEventHandlersPreserveBorrowedValues(t *testing.T) {
 		extension.applied.InclusionMasterRef != inclusionRef || extension.applied.InclusionMasterState != inclusionState {
 		t.Fatal("block event adapter changed borrowed pointers")
 	}
-	if !extension.external.IsLocal || extension.external.MessageRoot != externalRoot || extension.external.MessageParsed != externalMessage {
+	if !extension.external.IsLocal || extension.external.SerializedSize != 123 ||
+		extension.external.MessageRoot != externalRoot || extension.external.MessageParsed != externalMessage {
 		t.Fatal("external-message event adapter changed borrowed values")
 	}
 	if !extension.received.IsSigned || &extension.received.BlockBOC[0] != &blockBOC[0] ||

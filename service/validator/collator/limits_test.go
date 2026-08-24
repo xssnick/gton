@@ -141,8 +141,13 @@ func TestProofSizeEstimatorTracksLoadedHashesSeparatelyFromReferences(t *testing
 	if loaded.loaded(child.HashKey()) {
 		t.Fatal("referenced-only child is marked loaded")
 	}
-	estimator.addLoadedCell(child)
-	if !estimator.loadedHashes().loaded(child.HashKey()) {
+	// A second estimator for the promote, because loadedHashes seals the one it
+	// was asked of: what the selector holds cannot move, so the same estimator
+	// cannot be fed again to show the child turning loaded.
+	promoted := newProofSizeEstimator(0)
+	promoted.addLoadedCell(root)
+	promoted.addLoadedCell(child)
+	if !promoted.loadedHashes().loaded(child.HashKey()) {
 		t.Fatal("loaded child hash is absent")
 	}
 }
@@ -169,12 +174,12 @@ func TestCollatedHashUsageProofKeepsStateUpdateSourceRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !updateSource.loaded(oldBranch.HashKey()) {
+	if !updateSource.emitted(oldBranch.HashKey()) {
 		t.Fatal("state update source shape omitted the logical level-zero branch hash")
 	}
 	loaded := estimator.loadedHashes()
 	proof, err := oldRoot.CreateHashUsageProof(func(hash cell.Hash) bool {
-		return loaded.loaded(hash) || updateSource.loaded(hash)
+		return loaded.loaded(hash) || updateSource.emitted(hash)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -218,11 +223,11 @@ func TestMerkleUpdateSourceShapeUsesPredecessorVisibleHashes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !shape.loaded(branch.HashKey()) {
+	if !shape.emitted(branch.HashKey()) {
 		t.Fatal("source shape omitted the predecessor-visible level-zero branch hash")
 	}
 
-	predecessorProof, err := oldRoot.CreateHashUsageProof(shape.loaded)
+	predecessorProof, err := oldRoot.CreateHashUsageProof(shape.emitted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +260,7 @@ func TestProofSeenHashSetMatchesTheMapItReplaced(t *testing.T) {
 	for step := 0; step < 3; step++ {
 		for i, hash := range hashes {
 			loaded := (i+step)%3 == 0
-			seen, wasLoaded := set.observe(hash, loaded)
+			seen, wasLoaded := set.observeLegacy(hash, loaded)
 			refLoaded, refSeen := reference[hash]
 			if seen != refSeen || wasLoaded != refLoaded {
 				t.Fatalf("observe(%x, %v) = (%v, %v), want (%v, %v)",
@@ -269,7 +274,7 @@ func TestProofSeenHashSetMatchesTheMapItReplaced(t *testing.T) {
 
 	// Everything that went in is still findable, with the bit it ended on.
 	for hash, want := range reference {
-		seen, wasLoaded := set.observe(hash, false)
+		seen, wasLoaded := set.observeLegacy(hash, false)
 		if !seen || wasLoaded != want {
 			t.Fatalf("re-observe %x = (%v, %v), want (true, %v)", hash[:4], seen, wasLoaded, want)
 		}
@@ -277,7 +282,7 @@ func TestProofSeenHashSetMatchesTheMapItReplaced(t *testing.T) {
 	// A hash that never went in is absent even though the table is full of
 	// neighbours — the fingerprint alone must not answer.
 	absent := cell.BeginCell().MustStoreUInt(entries, 32).EndCell().HashKey()
-	if seen, _ := set.observe(absent, false); seen {
+	if seen, _ := set.observeLegacy(absent, false); seen {
 		t.Fatal("an unobserved hash was reported as seen")
 	}
 }
@@ -303,10 +308,10 @@ func TestProofSeenHashSetComparesEveryByte(t *testing.T) {
 	}
 
 	var set proofSeenHashSet
-	if seen, wasLoaded := set.observe(first, true); seen || wasLoaded {
+	if seen, wasLoaded := set.observeLegacy(first, true); seen || wasLoaded {
 		t.Fatalf("first observe = (%v, %v), want (false, false)", seen, wasLoaded)
 	}
-	seen, wasLoaded := set.observe(second, false)
+	seen, wasLoaded := set.observeLegacy(second, false)
 	if seen {
 		t.Fatal("a different hash sharing the fingerprint was reported as already seen")
 	}
@@ -314,10 +319,10 @@ func TestProofSeenHashSetComparesEveryByte(t *testing.T) {
 		t.Fatal("a different hash sharing the fingerprint inherited the loaded bit")
 	}
 	// Both are now present and keep their own bits.
-	if seen, wasLoaded := set.observe(first, false); !seen || !wasLoaded {
+	if seen, wasLoaded := set.observeLegacy(first, false); !seen || !wasLoaded {
 		t.Fatalf("re-observe first = (%v, %v), want (true, true)", seen, wasLoaded)
 	}
-	if seen, wasLoaded := set.observe(second, false); !seen || wasLoaded {
+	if seen, wasLoaded := set.observeLegacy(second, false); !seen || wasLoaded {
 		t.Fatalf("re-observe second = (%v, %v), want (true, false)", seen, wasLoaded)
 	}
 }
@@ -392,7 +397,7 @@ func TestPrepareUsesAdjustedSlowBlockHardLTDelta(t *testing.T) {
 // but counts a cell once.
 func TestCollationEstimateIncludesFinishedState(t *testing.T) {
 	req, _ := benchMainnetRequest(t, benchMainnetFiller)
-	c, err := testBuilder().prepareShardPhases(context.Background(), req, 0)
+	c, err := testBuilder().prepareShardPhases(context.Background(), req, collationAttempt{})
 	if err != nil {
 		t.Fatal(err)
 	}

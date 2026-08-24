@@ -425,7 +425,7 @@ func (o *PrivateOverlay) BroadcastTwoStep(
 		Extra:       []byte(extra),
 		Flags:       flags,
 		PeerSet:     peerSet,
-	})
+	}, overlay.WithBroadcastTwoStepPeerSendTimeout(twoStepPeerSendTimeout))
 	result.Attempted += len(resolveFailed)
 	result.Failed = append(result.Failed, resolveFailed...)
 	o.sub.markTwoStepPeerFailures(result.Failed)

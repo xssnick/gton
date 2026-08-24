@@ -8,24 +8,14 @@ import (
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
-// TestFinalizedCandidateStillNeedsItsCollatedData is a guard, not a test of new
-// behaviour. It exists so a later pass does not re-derive the appealing but
-// wrong conclusion that a finalized candidate's collated half is dead weight
-// and can be dropped to halve the durable record.
+// TestDurableCandidateRestoresGenerationTimeProvenance guards the recovery
+// path: a released artifact keeps no process-local scalar, so its durable wire
+// is decoded once and the roots from that decode must seed the replacement.
 //
-// The block half becomes reachable through ordinary block storage once the
-// candidate is accepted, so it is tempting to read the collated half as
-// validation-only — and nobody re-validates a finalized block. But the state
-// resolver reads it on every finalized parent it resolves, to recover the
-// exact millisecond generation time that the block header does not carry, and
-// it does so before it ever looks at whether the candidate is finalized. The
-// reference does the same thing in the same order, calling
-// get_candidate_gen_utime_exact — which deserializes collated_data — ahead of
-// its own is_finalized branch. Dropping the collated half would break parent
-// resolution for any finalized candidate still inside the lineage floor, and
-// would leave us unable to answer a lagging peer's candidate request for a
-// block the reference can always serve.
-func TestFinalizedCandidateStillNeedsItsCollatedData(t *testing.T) {
+// CollatedData remains part of the canonical candidate served to peers, but
+// state resolution must use the recovered scalar instead of decoding those
+// bytes a second time.
+func TestDurableCandidateRestoresGenerationTimeProvenance(t *testing.T) {
 	storage := newRuntimeTestStorage()
 	resolver := newResolverForTest(
 		storage,
@@ -42,7 +32,7 @@ func TestFinalizedCandidateStillNeedsItsCollatedData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := candidateGenUtime(artifact.CollatedData)
+	want, err := artifact.generationTime()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,9 +69,14 @@ func TestFinalizedCandidateStillNeedsItsCollatedData(t *testing.T) {
 	if !bytes.Equal(resolution.Candidate.CollatedData, collated) {
 		t.Fatal("the durable record no longer carries the finalized candidate's collated data")
 	}
-	got, err := candidateGenUtime(resolution.Candidate.CollatedData)
+	if !resolution.Candidate.generationTimeKnown {
+		t.Fatal("durable decode did not restore generation time provenance")
+	}
+	withoutBOC := *resolution.Candidate
+	withoutBOC.CollatedData = []byte("not a BOC")
+	got, err := withoutBOC.generationTime()
 	if err != nil {
-		t.Fatalf("exact generation time is unrecoverable after finalization: %v", err)
+		t.Fatalf("recovered generation time re-decoded CollatedData: %v", err)
 	}
 	if !got.Equal(want) {
 		t.Fatalf("generation time after finalization = %v, want %v", got, want)

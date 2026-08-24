@@ -1,10 +1,12 @@
 package collator
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"testing"
 
+	"github.com/xssnick/gton/service/validator/msgpool"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -27,6 +29,27 @@ func BenchmarkMinimumDispatchAccount(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func BenchmarkDispatchPrewarmPhaseZero512(b *testing.B) {
+	queue := benchDispatchQueue(b, dispatchPrewarmFrontLimit, 1_900_000_000, 1_000)
+	state := previousStateWithDispatchQueue(b, emptyCandidateRequest(b).Previous.State, queue)
+	warmer := &recordedAccountPrewarmer{
+		accounts: make([]prewarmAccountKey, 0, dispatchPrewarmFrontLimit),
+		roots:    make([]cell.Hash, 0, dispatchPrewarmFrontLimit),
+	}
+	acquisition := &LocalAcquisition{accountPrewarmer: warmer}
+	shard := msgpool.ShardIdent{Workchain: 0, Shard: msgpool.ShardAll}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		warmer.accounts = warmer.accounts[:0]
+		warmer.roots = warmer.roots[:0]
+		if err := acquisition.prewarmDispatchFront(context.Background(), shard, state); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

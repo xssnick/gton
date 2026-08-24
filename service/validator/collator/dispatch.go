@@ -77,7 +77,7 @@ func (c *collation) processDispatchQueue() error {
 
 		for !current.IsEmpty() {
 			c.updateCollatedEstimate()
-			if !c.limits.fits(LoadNormal) {
+			if !c.limits.fits(c.fullMark()) {
 				c.blockFull = true
 				c.updatePeakLoad()
 				return c.registerDispatchOp(true)
@@ -86,6 +86,7 @@ func (c *collation) processDispatchQueue() error {
 			// on the timeout exactly as it does on the block-full one.
 			if c.internalMsgExpired() {
 				c.blockFull = true
+				c.blockFullTimeout = true
 				c.stats.InternalMsgTimeouts++
 				c.updatePeakLoad()
 				return c.registerDispatchOp(true)
@@ -172,12 +173,21 @@ func (c *collation) nextDispatchAccount(
 	priorities *[]DispatchAccount,
 	priorityIndex *int,
 ) (DispatchAccount, *tlb.AccountDispatchQueue, error) {
+	return nextDispatchAccount(queue, priorities, priorityIndex, c.shard)
+}
+
+func nextDispatchAccount(
+	queue *tlb.DispatchQueueAugDict,
+	priorities *[]DispatchAccount,
+	priorityIndex *int,
+	shard msgpool.ShardIdent,
+) (DispatchAccount, *tlb.AccountDispatchQueue, error) {
 	for len(*priorities) != 0 {
 		if *priorityIndex == len(*priorities) {
 			*priorityIndex = 0
 		}
 		candidate := (*priorities)[*priorityIndex]
-		if !c.dispatchAccountInShard(candidate) {
+		if !dispatchAccountInShard(shard, candidate) {
 			*priorities = append((*priorities)[:*priorityIndex], (*priorities)[*priorityIndex+1:]...)
 			continue
 		}
@@ -199,7 +209,7 @@ func (c *collation) nextDispatchAccount(
 	if err != nil {
 		return DispatchAccount{}, nil, err
 	}
-	account.Workchain = c.shard.Workchain
+	account.Workchain = shard.Workchain
 	accountQueue, err := loadAccountDispatchQueue(queue, account.AccountID)
 	if err != nil {
 		return DispatchAccount{}, nil, fmt.Errorf("%w: load minimum dispatch account %x: %v", ErrInvalidInput, account.AccountID, err)
@@ -207,9 +217,9 @@ func (c *collation) nextDispatchAccount(
 	return account, accountQueue, nil
 }
 
-func (c *collation) dispatchAccountInShard(account DispatchAccount) bool {
+func dispatchAccountInShard(shard msgpool.ShardIdent, account DispatchAccount) bool {
 	prefix := binary.BigEndian.Uint64(account.AccountID[:8])
-	return c.shard.Contains(account.Workchain, prefix)
+	return shard.Contains(account.Workchain, prefix)
 }
 
 func minimumDispatchAccount(queue *tlb.DispatchQueueAugDict) (DispatchAccount, error) {

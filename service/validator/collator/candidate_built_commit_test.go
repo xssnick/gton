@@ -102,6 +102,7 @@ func (f *builtCommitFixture) commit(t *testing.T) localCandidateState {
 		f.request,
 		f.built,
 		f.artifact,
+		&prewarmHints{},
 	); err != nil {
 		t.Fatalf("commit candidate: %v", err)
 	}

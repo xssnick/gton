@@ -123,6 +123,35 @@ type ExternalMessage struct {
 	AddrPrefix uint64
 }
 
+// AccountDestination identifies the canonical 256-bit account address used by
+// the pool after applying anycast rewriting.
+type AccountDestination struct {
+	Workchain int32
+	Account   [32]byte
+}
+
+// ExternalAddOutcome describes whether AddExternal inserted a new message or
+// resolved the submission from the existing root-hash index.
+type ExternalAddOutcome uint8
+
+const (
+	// ExternalAddInvalid is the zero value and is never returned with a nil error.
+	ExternalAddInvalid ExternalAddOutcome = iota
+	// ExternalAddInserted means this call inserted a new root hash.
+	ExternalAddInserted
+	// ExternalAddExisting means the root hash was already pooled. Its priority
+	// may have been raised by this call, but no new message was inserted.
+	ExternalAddExisting
+)
+
+// ExternalAddResult is valid whenever AddExternal returns a nil error.
+// Destination is the canonical address stored by the pool after anycast
+// rewriting, including on the existing-message fast path.
+type ExternalAddResult struct {
+	Outcome     ExternalAddOutcome
+	Destination AccountDestination
+}
+
 // addrKey identifies a destination account.
 type addrKey struct {
 	wc   int32
@@ -131,6 +160,13 @@ type addrKey struct {
 
 func (m *ExternalMessage) key() addrKey {
 	return addrKey{wc: m.Workchain, addr: m.Addr}
+}
+
+func (m *ExternalMessage) destination() AccountDestination {
+	return AccountDestination{
+		Workchain: m.Workchain,
+		Account:   m.Addr,
+	}
 }
 
 func (m *ExternalMessage) snapshot(generation uint64, expiresAt int64) ExternalSnapshot {
@@ -145,9 +181,8 @@ func (m *ExternalMessage) snapshot(generation uint64, expiresAt int64) ExternalS
 // newExternalMessage assembles the pooled view of a message the ingress layer
 // already deserialized (and emulated): routing fields and the normalized
 // hash. parsed may be nil, then the header is decoded from root — a cheap
-// slice walk, no BOC work. size is the received serialized length; 0 means the
-// caller does not have it and the budget figure is estimated from the tree.
-func newExternalMessage(size int, root *cell.Cell, parsed *tlb.ExternalMessage) (*ExternalMessage, error) {
+// slice walk, no BOC work. serializedSize is the exact received BOC length.
+func newExternalMessage(serializedSize int, root *cell.Cell, parsed *tlb.ExternalMessage) (*ExternalMessage, error) {
 	if parsed == nil {
 		var err error
 		if parsed, err = parseExtIn(root); err != nil {
@@ -157,58 +192,23 @@ func newExternalMessage(size int, root *cell.Cell, parsed *tlb.ExternalMessage) 
 		return nil, err
 	}
 
-	if size == 0 {
-		size = estimateBOCSize(root)
-	}
-	m := &ExternalMessage{
-		Size:      size,
-		Root:      root,
-		Workchain: parsed.DstAddr.Workchain(),
-	}
-	m.Hash = root.HashKey()
-	copy(m.Addr[:], parsed.DstAddr.Data())
-	if err := RewriteAnycast(m.Addr[:], parsed.DstAddr); err != nil {
+	destination := AccountDestination{Workchain: parsed.DstAddr.Workchain()}
+	copy(destination.Account[:], parsed.DstAddr.Data())
+	if err := RewriteAnycast(destination.Account[:], parsed.DstAddr); err != nil {
 		return nil, err
 	}
+
+	m := &ExternalMessage{
+		Size:      serializedSize,
+		Root:      root,
+		Workchain: destination.Workchain,
+		Addr:      destination.Account,
+	}
+	m.Hash = root.HashKey()
 	m.AddrPrefix = binary.BigEndian.Uint64(m.Addr[:8])
 	copy(m.HashNorm[:], parsed.NormalizedHash())
 
 	return m, nil
-}
-
-// estimateBOCSize approximates the serialized length of a resident cell tree
-// without serializing it: every unique cell costs its two descriptor bytes,
-// its data bytes and one index byte per reference. The number only feeds the
-// mempool byte budget — a heuristic admission cap — so the BOC header and the
-// exact index width are not worth a ToBOC round trip and the copy it returns.
-// Uniqueness is by cell identity, which is what deserialization produces for a
-// shared subtree, so a wide DAG cannot make the walk blow up.
-func estimateBOCSize(root *cell.Cell) int {
-	visited := map[*cell.Cell]struct{}{}
-	stack := []*cell.Cell{root}
-	total := 0
-	for len(stack) > 0 {
-		current := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if _, seen := visited[current]; seen {
-			continue
-		}
-		visited[current] = struct{}{}
-
-		refs := int(current.RefsNum())
-		total += 2 + int((current.BitsSize()+7)/8) + refs
-		for index := range refs {
-			ref, err := current.PeekRef(index)
-			if err != nil {
-				// An unresolvable reference cannot be charged for; the budget
-				// is a heuristic and assembly fails elsewhere on real garbage.
-				continue
-			}
-			stack = append(stack, ref)
-		}
-	}
-
-	return total
 }
 
 func checkExtIn(parsed *tlb.ExternalMessage) error {

@@ -1,9 +1,11 @@
 package collator
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"sync"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -30,10 +32,112 @@ const (
 // rather than a per-cell size. The callback fires on every first cell load of
 // the whole collation — around 28k entries for a full block — which is why it
 // holds no more state than it must.
+//
+// It is sharded because those calls arrive from parallel lanes: the dictionary
+// batches replay account and queue paths on collationParallelism goroutines and
+// traceValidationClosure walks five predecessor views at once, all recording
+// through one read set into this one estimator. Held on a single mutex the
+// callback was the largest source of blocking anywhere in a collated collation:
+// two thirds of the whole build's aggregate mutex delay, and sharding leaves it
+// at three percent of a total that is itself a third of what it was. The read
+// set beside it answered the identical problem the identical way, and its shard
+// is the model for this one (tonutils tvm/cell/readset.go, readSetShard).
+//
+// Sharding splits the state; it does not split the two answers this estimator
+// gives, and both of them decide consensus values. The byte total decides which
+// messages the block admits, and the seen set decides which predecessor cells
+// enter the collated proof. Each is read as a whole, so each is read under every
+// shard lock at once — a reader that walked the shards one at a time could
+// return a mixture of two instants, which is a block whose contents depend on
+// goroutine timing. For the same reason a charge holds every shard its cell and
+// that cell's children land in, rather than one shard at a time: parent counted,
+// children not, is one of those mixtures. Every acquisition of more than one
+// shard goes in ascending index order, which is what keeps holding several of
+// them deadlock-free.
+//
+// None of that puts the recording lanes back on a shared lock. A charge takes
+// the shards its own cell lands in, which two lanes rarely both need, and the
+// readers run on the collation goroutine between the parallel phases rather than
+// inside them.
 type proofSizeEstimator struct {
-	mu    sync.Mutex
-	seen  proofSeenHashSet
+	shards [proofEstimatorShards]proofEstimatorShard
+
+	// sealed stops the estimator recording once the collated-proof selector has
+	// taken its view of the seen set. See loadedHashes. Written under every
+	// shard lock and read under the lock of whatever shard a record lands in, so
+	// no record can straddle it.
+	sealed bool
+}
+
+// proofEstimatorShards is chosen against collationParallelism rather than
+// against the core count: the worker budget is what bounds how many lanes can be
+// inside the estimator at once.
+const proofEstimatorShards = 16
+
+// proofEstimatorShard is one independent slice of the estimator: the dedup memo
+// for the hashes that land in it, and the bytes those hashes contributed.
+//
+// The byte total splits across shards without changing, because every term of it
+// belongs to exactly one hash: a cell is charged its loaded size when its own
+// hash is first observed as loaded, a child is charged a pruned branch when the
+// child's hash is first observed at all, and the promote that replaces the
+// second by the first observes that same child hash again. No term depends on
+// two hashes at once, so the shard that owns a hash owns every byte that hash
+// ever moves, and the sum over shards is the number the single counter held.
+type proofEstimatorShard struct {
+	mu sync.Mutex
+	// bytes and seen are read and written under mu alone — never atomically,
+	// never lock-free. A lock-free total would be summed across shards while a
+	// charge was part-way through them.
 	bytes uint64
+	seen  proofSeenHashSet
+	// Parallel lanes write neighbouring shards at the same moment, and without
+	// the padding they share a cache line: the shards then give back as false
+	// sharing part of what they removed as contention, measured at 16% of the
+	// estimator's own time on a ten-goroutine feed of 20k cells.
+	_ [64]byte
+}
+
+// proofEstimatorShardOf picks a shard from the LAST byte of the hash, because
+// proofCellFingerprint reads the first four. Sharding on a byte the fingerprint
+// reads would leave every fingerprint within a shard sharing its low bits, and
+// the slot index is the fingerprint masked: the table would use one slot in
+// sixteen and probe runs would grow without bound. The read set makes the same
+// split the other way round, sharding on byte 0 and fingerprinting bytes 1-4
+// (readset.go readSetFingerprint).
+func proofEstimatorShardOf(hash cell.Hash) int {
+	return int(hash[len(hash)-1]) & (proofEstimatorShards - 1)
+}
+
+// proofEstimatorAllShards is the mask a reader of the whole estimator takes.
+const proofEstimatorAllShards = uint32(1)<<proofEstimatorShards - 1
+
+// lockShards takes the shards named by mask in ascending index order, and
+// unlockShards gives them back. Ascending is the one order every caller uses —
+// a charge over a subset and a reader over all sixteen alike — so no two
+// acquisitions can hold what the other is waiting for.
+func (e *proofSizeEstimator) lockShards(mask uint32) {
+	for rest := mask; rest != 0; rest &= rest - 1 {
+		e.shards[bits.TrailingZeros32(rest)].mu.Lock()
+	}
+}
+
+func (e *proofSizeEstimator) unlockShards(mask uint32) {
+	for rest := mask; rest != 0; rest &= rest - 1 {
+		e.shards[bits.TrailingZeros32(rest)].mu.Unlock()
+	}
+}
+
+// proofEstimatorChargeMask names every shard one charge touches: the cell's own
+// and its children's. Duplicates collapse into the one bit they share, which is
+// also what keeps a child landing in its parent's shard from being the same lock
+// twice.
+func proofEstimatorChargeMask(hash cell.Hash, refs []cell.Hash) uint32 {
+	mask := uint32(1) << proofEstimatorShardOf(hash)
+	for _, ref := range refs {
+		mask |= uint32(1) << proofEstimatorShardOf(ref)
+	}
+	return mask
 }
 
 // newProofSizeEstimator opens an estimator sized for a block whose read set is
@@ -43,9 +147,16 @@ type proofSizeEstimator struct {
 // read count, so the table is asked for 1.4x and doubled for the half-full rule
 // the probe relies on. It is a capacity and nothing else: a wrong estimate costs
 // only the growth it avoided, and the set is dropped with the collation.
+//
+// The share is split evenly over the shards. Cells are spread by a byte of a
+// cryptographic hash, so an even split is what they arrive as, and a shard that
+// outgrows its share still grows.
 func newProofSizeEstimator(expectedReadCells int) *proofSizeEstimator {
 	e := &proofSizeEstimator{}
-	e.seen.presize(expectedReadCells * 7 / 5)
+	perShard := expectedReadCells * 7 / 5 / proofEstimatorShards
+	for i := range e.shards {
+		e.shards[i].seen.presize(perShard)
+	}
 	return e
 }
 
@@ -58,26 +169,46 @@ func (e *proofSizeEstimator) addLoadedCell(root *cell.Cell) {
 	}
 	loadedBytes := uint64(5+(root.BitsSize()+7)/8) + uint64(len(refs))*3
 
-	// Explicit unlock: this runs tens of thousands of times per block.
-	e.mu.Lock()
-	seen, wasLoaded := e.seen.observe(hash, true)
-	if seen && wasLoaded {
-		e.mu.Unlock()
-		return
-	}
-	if seen {
-		// The cell stood in as a pruned branch until now; it is charged at its
-		// loaded size instead.
-		e.bytes -= estimatedPrunedBranchBytes
-	}
-	e.bytes += loadedBytes
-	for _, ref := range refs {
-		if seen, _ = e.seen.observe(ref, false); seen {
-			continue
+	// The hashes above are read before any lock is taken: they are what names
+	// the shards to take, and a reference read that had to page a cell in would
+	// re-enter this callback. Explicit unlock rather than defer, because this
+	// runs tens of thousands of times per block.
+	mask := proofEstimatorChargeMask(hash, refs)
+	e.lockShards(mask)
+	if !e.sealed {
+		shard := &e.shards[proofEstimatorShardOf(hash)]
+		prior := shard.seen.observe(hash, proofSeenLoaded|proofSeenSelected, proofSeenBoundary)
+		if prior&proofSeenLoaded == 0 {
+			if prior&proofSeenBoundary != 0 {
+				// The cell stood in as a pruned branch until now; it is charged
+				// at its loaded size instead. The stand-in was charged to this
+				// same shard — only an observation of this hash could have put
+				// it there — so the subtraction cannot take a shard below zero.
+				//
+				// Keyed on the boundary flag, not on the entry merely existing:
+				// an entry an execution read created was never charged the
+				// boundary, and subtracting one it never paid is how a split
+				// estimate goes backwards.
+				shard.bytes -= estimatedPrunedBranchBytes
+			}
+			shard.bytes += loadedBytes
+
+			// The children are charged under the same held locks as the cell
+			// itself, as the rest of one indivisible step. A size() landing
+			// between the two halves would report the cell without the pruned
+			// boundaries that come with it — fewer bytes than the estimator ever
+			// holds, at a point where the number decides what the block admits.
+			for _, ref := range refs {
+				child := &e.shards[proofEstimatorShardOf(ref)]
+				if child.seen.observe(ref, proofSeenBoundary, 0) == 0 {
+					// Nothing has seen this child yet, so it is charged as the
+					// pruned branch it will be serialized as.
+					child.bytes += estimatedPrunedBranchBytes
+				}
+			}
 		}
-		e.bytes += estimatedPrunedBranchBytes
 	}
-	e.mu.Unlock()
+	e.unlockShards(mask)
 }
 
 // addExecutionRead marks a cell the transaction executor loaded as belonging in
@@ -101,9 +232,12 @@ func (e *proofSizeEstimator) addExecutionRead(loaded *cell.Cell) {
 	}
 	hash := loaded.HashKey()
 
-	e.mu.Lock()
-	e.seen.observe(hash, true)
-	e.mu.Unlock()
+	shard := &e.shards[proofEstimatorShardOf(hash)]
+	shard.mu.Lock()
+	if !e.sealed {
+		shard.seen.observe(hash, proofSeenSelected, 0)
+	}
+	shard.mu.Unlock()
 }
 
 // proofSeenHashSet is the estimator's dedup memo as an open-addressed table
@@ -128,12 +262,40 @@ func (e *proofSizeEstimator) addExecutionRead(loaded *cell.Cell) {
 // it stores — at 28k entries that churn alone outweighed everything the table
 // saves over the map.
 type proofSeenHashSet struct {
-	// slots hold proofCellFingerprint(hash)<<32 | (index+1)<<1 | loaded bit;
-	// zero is empty.
+	// slots hold proofCellFingerprint(hash)<<32 | (index+1)<<3 | flags; zero is
+	// empty. See the proofSeen* flags for what the three bits mean.
 	slots  []uint64
 	hashes [][]cell.Hash
 	count  int
 }
+
+// The three things the set can know about a hash, independently. They are
+// separate bits rather than one "loaded" flag because each answers a different
+// question and the answers do not move together:
+//
+//	proofSeenLoaded    its loaded size is on the byte total
+//	proofSeenBoundary  estimatedPrunedBranchBytes are on the byte total for it
+//	proofSeenSelected  it belongs in the emitted proof, charged or not
+//
+// The last one exists for the cells the transaction executor reports. Those are
+// selected — an account's code missing from the collated proof is what a peer
+// reports back as a pruned branch — but they cannot be charged when they arrive,
+// because execution also loads the inbound message and cells it built itself,
+// which are not in the predecessor tree and are never emitted. Folding selection
+// into the loaded bit, as this set used to, made every such cell look already
+// charged: the traversal that later reached it through the predecessor tree
+// found it "loaded" and skipped its size and its children's boundaries, so cells
+// that really were emitted never reached the estimate at all. The estimate is
+// meant to be a floor with a hard check behind it; that made it a floor well
+// under what the block actually wrote.
+const (
+	proofSeenLoaded uint64 = 1 << iota
+	proofSeenBoundary
+	proofSeenSelected
+)
+
+const proofSeenFlagBits = 3
+const proofSeenFlagMask = uint64(1)<<proofSeenFlagBits - 1
 
 const proofSeenChunkBits = 10
 
@@ -173,10 +335,11 @@ func (s *proofSeenHashSet) presize(expected int) {
 	s.slots = make([]uint64, slots)
 }
 
-// observe records hash and reports whether it was already present and, if so,
-// whether it was present as loaded. A loaded observation promotes an entry that
-// was standing in as a pruned branch; a referenced one never demotes.
-func (s *proofSeenHashSet) observe(hash cell.Hash, loaded bool) (bool, bool) {
+// observe records hash with the flags in set and returns the flags the entry
+// carried before, or zero for one this call created. Flags only ever accumulate;
+// clear names the one flag a promotion retires, the boundary a cell stops being
+// once it is charged at its loaded size.
+func (s *proofSeenHashSet) observe(hash cell.Hash, set, clear uint64) uint64 {
 	if s.slots == nil {
 		s.slots = make([]uint64, 64)
 	}
@@ -188,11 +351,13 @@ func (s *proofSeenHashSet) observe(hash cell.Hash, loaded bool) (bool, bool) {
 		if slot == 0 {
 			break
 		}
-		if uint32(slot>>32) == fingerprint && s.hashAt((uint32(slot)>>1)-1) == hash {
-			if loaded && slot&1 == 0 {
-				s.slots[pos] = slot | 1
+		if uint32(slot>>32) == fingerprint && s.hashAt((uint32(slot)>>proofSeenFlagBits)-1) == hash {
+			prior := slot & proofSeenFlagMask
+			if next := prior&^clear | set; next != prior {
+				s.slots[pos] = slot&^proofSeenFlagMask | next
 			}
-			return true, slot&1 != 0
+
+			return prior
 		}
 		pos = (pos + 1) & mask
 	}
@@ -208,22 +373,15 @@ func (s *proofSeenHashSet) observe(hash cell.Hash, loaded bool) (bool, bool) {
 		}
 	}
 	s.appendHash(hash)
-	entry := uint64(s.count) << 1
-	if loaded {
-		entry |= 1
-	}
-	s.slots[pos] = uint64(fingerprint)<<32 | entry
-	return false, false
+	s.slots[pos] = uint64(fingerprint)<<32 | uint64(s.count)<<proofSeenFlagBits | set
+
+	return 0
 }
 
-func (s proofSeenHashSet) loaded(hash cell.Hash) bool {
-	_, loaded := s.status(hash)
-	return loaded
-}
-
-func (s proofSeenHashSet) status(hash cell.Hash) (bool, bool) {
+// flags reports what the set knows about hash, or zero for one it has not seen.
+func (s proofSeenHashSet) flags(hash cell.Hash) uint64 {
 	if len(s.slots) == 0 {
-		return false, false
+		return 0
 	}
 	fingerprint := proofCellFingerprint(hash)
 	mask := len(s.slots) - 1
@@ -231,14 +389,24 @@ func (s proofSeenHashSet) status(hash cell.Hash) (bool, bool) {
 	for range s.slots {
 		slot := s.slots[pos]
 		if slot == 0 {
-			return false, false
+			return 0
 		}
-		if uint32(slot>>32) == fingerprint && s.hashAt((uint32(slot)>>1)-1) == hash {
-			return true, slot&1 != 0
+		if uint32(slot>>32) == fingerprint && s.hashAt((uint32(slot)>>proofSeenFlagBits)-1) == hash {
+			return slot & proofSeenFlagMask
 		}
 		pos = (pos + 1) & mask
 	}
-	return false, false
+
+	return 0
+}
+
+// emitted reports whether hash belongs in the proof: charged at its loaded size,
+// or selected by an execution read that could not be charged. This is the
+// predicate the collated-proof selector walks with, and it holds exactly the set
+// the single loaded bit used to hold — splitting the bits moved what is charged,
+// never what is emitted.
+func (s proofSeenHashSet) emitted(hash cell.Hash) bool {
+	return s.flags(hash)&(proofSeenLoaded|proofSeenSelected) != 0
 }
 
 // merkleUpdateSourceShape returns the non-leaf source cells whose structure
@@ -270,7 +438,7 @@ func merkleUpdateSourceShape(update *cell.Cell) (proofSeenHashSet, error) {
 		if current.GetType() == cell.PrunedCellType || current.RefsNum() == 0 {
 			continue
 		}
-		if seen, _ := shape.observe(current.HashKeyAt(0), true); seen {
+		if shape.observe(current.HashKeyAt(0), proofSeenLoaded, 0) != 0 {
 			continue
 		}
 		for i := 0; i < int(current.RefsNum()); i++ {
@@ -284,16 +452,46 @@ func merkleUpdateSourceShape(update *cell.Cell) (proofSeenHashSet, error) {
 	return shape, nil
 }
 
-// loadedHashes returns an immutable view after collation has stopped loading
-// predecessor cells. The proof serializer runs only in that phase, so sharing
-// the table avoids copying tens of thousands of hashes for every block.
-func (e *proofSizeEstimator) loadedHashes() proofSeenHashSet {
+// proofLoadedHashes is the estimator's seen set as one lookup across its shards.
+type proofLoadedHashes struct {
+	shards [proofEstimatorShards]proofSeenHashSet
+}
+
+func (l *proofLoadedHashes) loaded(hash cell.Hash) bool {
+	return l.shards[proofEstimatorShardOf(hash)].emitted(hash)
+}
+
+// loadedHashes seals the estimator and returns its seen set as one view. It is
+// the end of the estimator's life: the view IS the predicate that selects the
+// cells of the previous-state proof, so what it answers must not move while the
+// selection walk asks it, and a walk whose answers moved would emit a proof that
+// depends on when a goroutine ran.
+//
+// Two things make it not move. The shards are taken all at once, so the view is
+// the estimator at a single instant rather than a mixture of sixteen; and the
+// seal means no later record can reach the tables the view shares, which is what
+// lets it share them — copying tens of thousands of hashes for every block buys
+// nothing a seal does not.
+//
+// A record arriving after the seal is dropped, deliberately and in silence. It
+// can only come from a phase running past the point the collation stops loading
+// predecessor cells, and both answers are finished by then: the byte total has
+// already admitted the last message, and this view has already been handed to
+// the selector. Dropping is what keeps those two answers the same on every run;
+// letting the record through would put a cell in the proof on the runs where it
+// arrived first.
+func (e *proofSizeEstimator) loadedHashes() *proofLoadedHashes {
+	view := &proofLoadedHashes{}
 	if e == nil {
-		return proofSeenHashSet{}
+		return view
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.seen
+	e.lockShards(proofEstimatorAllShards)
+	e.sealed = true
+	for i := range e.shards {
+		view.shards[i] = e.shards[i].seen
+	}
+	e.unlockShards(proofEstimatorAllShards)
+	return view
 }
 
 func (s *proofSeenHashSet) grow() {
@@ -321,25 +519,85 @@ func proofCellFingerprint(hash cell.Hash) uint32 {
 
 // size is nil-safe: the masterchain path carries no estimator, and reading zero
 // from it is the same answer a never-fed estimator gave.
+//
+// The total is taken under every shard lock, not summed from sixteen loads.
+// Admission asks for this after every message and compares it against the
+// collated-data limit, so a total that caught a charge between a cell and that
+// cell's children would drop or admit a message on nothing but timing.
+//
+// The locks are uncontended as the pipeline stands, because the phases that
+// record in parallel join before the loop that asks resumes. What they cost is
+// then 94ns a call against 30ns for the lock-free sum, over the ~700 calls a
+// mainnet block makes: a twentieth of a millisecond, against a collated-data
+// limit nobody can afford to have decided by a race.
 func (e *proofSizeEstimator) size() uint64 {
 	if e == nil {
 		return 0
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.bytes
+	e.lockShards(proofEstimatorAllShards)
+	var total uint64
+	for i := range e.shards {
+		total += e.shards[i].bytes
+	}
+	e.unlockShards(proofEstimatorAllShards)
+	return total
 }
 
-// sizeLimitRetries is how many times a collation is rebuilt after the finished
-// block turned out not to fit the consensus size limit. The check that raises
-// ErrSizeLimit runs on the serialized block, so the only way a retry can end
-// differently is by admitting less: each attempt narrows the byte budget the
-// limiter enforces, and after the last one the collation fails as before.
+// maxCollationAttempts bounds how many times one slot's collation is rebuilt
+// after the finished block turned out not to fit the consensus size limit. It
+// is collator.cpp:57's MAX_ATTEMPTS, and collationAttempt below escalates the
+// way that file does, attempt for attempt.
 //
-// Bounded on purpose. The production loop retries a retryable error until its
-// context is cancelled, so a size failure that never changes its mind would
-// mean no block at all for the slot rather than a smaller one.
-const sizeLimitRetries = 2
+// Bounded on purpose, and gated on the build deadline besides. The production
+// loop retries a retryable error until its context is cancelled, so a size
+// failure that never changes its mind would mean no block at all for the slot
+// rather than a smaller one.
+const maxCollationAttempts = 5
+
+// collationAttempt is everything one pass through the collator knows about the
+// passes that failed before it. Narrowing the byte budget is the first lever
+// and the only one that acts on the axis that actually overflowed; the rest are
+// categories of work dropped wholesale, because a block that will not fit is
+// worth less than a smaller block delivered inside the slot.
+//
+// The escalation is collator.cpp's, ported attempt for attempt so that a shard
+// under the same load makes the same concessions in the same order here and
+// there. Nothing about it is a heuristic of ours.
+type collationAttempt struct {
+	// index is the zero-based attempt number, collator.cpp's attempt_idx.
+	index int
+	// cap is the ceiling derived by aimBelow from the attempt that overflowed.
+	// Zero on the first attempt and whenever no attempt has produced a usable
+	// ratio yet, which leaves the configured limits standing.
+	cap sizeBudgetCap
+}
+
+// skipDispatchTail drops the two policy-bounded dispatch-queue passes, keeping
+// only the mandatory one that takes a single message per account.
+// collator.cpp:4382-4385.
+func (a collationAttempt) skipDispatchTail() bool { return a.index >= 1 }
+
+// skipExternals drops inbound external messages entirely. They are the only
+// class of work a block can decline without consequence: an external that is
+// not included stays in the pool and is offered again next block, while an
+// internal that is not imported holds up its queue.
+// collator.cpp:4193-4196 and 4229-4232.
+func (a collationAttempt) skipExternals() bool { return a.index >= 2 }
+
+// limitDivisor scales the block limits themselves once dropping categories has
+// not been enough. collator.cpp:863-873 halves bytes, gas and collated data on
+// attempt 3 and quarters them on attempt 4; logical time is left alone in both,
+// because lt delta has no bearing on how large the serialized block is.
+func (a collationAttempt) limitDivisor() uint64 {
+	switch {
+	case a.index >= 4:
+		return 4
+	case a.index == 3:
+		return 2
+	default:
+		return 1
+	}
+}
 
 // sizeBudgetCap is an absolute ceiling on the limiter's byte estimate for one
 // attempt. Zero means the configured limits stand as they are.
@@ -368,25 +626,102 @@ func aimBelow(estimate, produced, limit uint64) sizeBudgetCap {
 }
 
 // retryUnderSizeLimit runs attempt until it produces a block or fails for a
-// reason a narrower budget cannot fix.
-func retryUnderSizeLimit(attempt func(sizeBudgetCap) (*Candidate, error)) (*Candidate, error) {
-	var cap sizeBudgetCap
-	for n := 0; ; n++ {
-		candidate, err := attempt(cap)
-		if err == nil || n >= sizeLimitRetries {
-			return candidate, err
+// reason the next attempt's concessions cannot fix.
+//
+// Every index from 1 to maxCollationAttempts-1 withdraws something the previous
+// one offered, so unlike the pure byte-ceiling narrowing this replaced, there is
+// no attempt that can only rebuild the identical block: a ceiling that stops
+// biting is no longer a dead end. The two ways out are the bound and the build
+// deadline — collator.cpp:359 declines to repeat once the timeout has passed,
+// for the same reason we do, that a narrower block delivered after the slot is
+// worth no more than no block at all and costs the next slot its CPU.
+//
+// The attempt count is stamped on the candidate it returns. Retries are
+// invisible from the outside otherwise: the block that finally fits looks
+// exactly like a block that fit the first time, which is why a retry that
+// succeeded left nothing at all in six hours of production logs.
+func retryUnderSizeLimit(
+	ctx context.Context,
+	attempt func(collationAttempt) (*Candidate, error),
+) (*Candidate, error) {
+	current := collationAttempt{}
+	for {
+		candidate, err := attempt(current)
+		if err == nil {
+			if candidate != nil {
+				candidate.Stats.CollationAttempts = uint32(current.index) + 1
+			}
+			return candidate, nil
 		}
+
 		var overflow sizeLimitError
 		if !errors.As(err, &overflow) {
 			return candidate, err
 		}
-		next := aimBelow(overflow.estimate, overflow.produced, overflow.limit)
-		if cap != 0 && next >= cap {
-			// The ceiling stopped biting; nothing further to try.
-			return candidate, err
+		next := collationAttempt{index: current.index + 1, cap: current.cap}
+		if next.index >= maxCollationAttempts {
+			return candidate, collationAttemptsError{attempts: next.index, err: err}
 		}
-		cap = next
+		if err := ctx.Err(); err != nil {
+			// Both errors, and the deadline one first: callers upstream test the
+			// returned error for context.Canceled and context.DeadlineExceeded to
+			// tell a lost slot from a producer fault, and a chain that unwraps only
+			// to ErrSizeLimit reports a clean shutdown as a collation failure.
+			return candidate, collationAttemptsError{
+				attempts: current.index + 1,
+				err: fmt.Errorf(
+					"the collation deadline passed before another attempt could run: %w: %w",
+					err, overflow,
+				),
+			}
+		}
+		if ceiling := aimBelow(overflow.estimate, overflow.produced, overflow.limit); ceiling != 0 &&
+			(next.cap == 0 || ceiling < next.cap) {
+			next.cap = ceiling
+		}
+		// aimBelow stalls. It scales the ceiling by produced/limit measured on the
+		// admission estimate, and once an attempt overshoots by a little the ratio
+		// it derives is a little under one, so the eighth it holds back is the
+		// whole of the movement: traced on the heavy fixture the ceiling walked
+		// 327426 -> 204076 -> 198087 while the block it produced stayed within
+		// 1.1% of the limit it had to clear. An attempt that rebuilds the identical
+		// block is an attempt spent, so the ceiling is made to move whether or not
+		// the ratio says it should.
+		if current.cap != 0 {
+			if forced := current.cap - current.cap/8; next.cap == 0 || next.cap > forced {
+				next.cap = forced
+			}
+		}
+		current = next
 	}
+}
+
+// collationAttemptsError records how many passes through the collator a failure
+// actually cost. Without it the only evidence is that the error unwraps to
+// ErrSizeLimit, which is true after one attempt and after five alike — so a
+// collation abandoned on the deadline after its first overflow was reported as
+// one that had exhausted every concession, naming cuts it never made.
+type collationAttemptsError struct {
+	attempts int
+	err      error
+}
+
+func (e collationAttemptsError) Error() string {
+	return fmt.Sprintf("%s after %d collation attempts", e.err, e.attempts)
+}
+
+func (e collationAttemptsError) Unwrap() error { return e.err }
+
+// collationAttemptsSpent reports how many attempts a failed collation ran, and
+// whether that number is known at all: a failure raised outside the retry ladder
+// carries no count and must not be described as if it had one.
+func collationAttemptsSpent(err error) (int, bool) {
+	var spent collationAttemptsError
+	if !errors.As(err, &spent) {
+		return 0, false
+	}
+
+	return spent.attempts, true
 }
 
 // sizeLimitError carries what overflowed and how far the limiter had counted, so
@@ -497,13 +832,63 @@ func parseBlockLimits(raw *tlb.BlockLimits) (blockLimits, error) {
 // a rebuild after ErrSizeLimit stops earlier than the one that overflowed. Only
 // the byte budget moves: gas, logical time and collated data had nothing to do
 // with the failure, and lowering them would drop transactions for no reason.
+//
+// The HARD threshold is left where the network config put it, and that exclusion
+// is load-bearing rather than tidy. The ceiling is an admission device — it
+// decides when to stop taking messages — while the hard threshold is a statement
+// about what a block may contain, and hardOverflow reads it to decide whether the
+// mandatory own-queue drain still fits. Narrowing all four collapses the two:
+// admission stops at the ceiling, which is now also the hard bound, so the drain
+// that runs afterwards finds the block already at its hard limit and refuses with
+// ErrMandatoryDequeueOverflow. That error is not a sizeLimitError, so it ends the
+// retry ladder instead of narrowing it further, and the slot is lost with the
+// blame pointing at the predecessor's queue. The reference has no hard-class
+// check at all — grep cl_hard in collator.cpp and nothing comes back — so leaving
+// this one bound alone is also the closer reading of it.
+//
+// classify reads the same threshold, and it is the load class the network would
+// have given this block rather than the one our own rebuild ceiling implies,
+// which is what the overload history and the split signal behind it want.
 func (s *blockLimitStatus) narrowBytes(ceiling sizeBudgetCap) {
 	if ceiling == 0 {
 		return
 	}
-	for i := range s.limits.bytes {
+	for i := range s.limits.bytes[:LoadHard-1] {
 		s.limits.bytes[i] = min(s.limits.bytes[i], uint64(ceiling))
 	}
+}
+
+// applyAttempt is narrowBytes plus the wholesale scaling the late attempts do.
+// The divisor lands on bytes, gas and collated data and not on logical time,
+// which is collator.cpp:863-873's set: lt delta does not describe how large the
+// serialized block is, and shrinking it would only refuse transactions that
+// would have fit.
+//
+// ORDER MATTERS, and it is the opposite of the obvious one. The divisor scales
+// the configured budget and the ceiling narrows it, so the budget is
+// min(config/divisor, cap) and not min(config, cap)/divisor. Dividing the
+// already-narrowed ceiling compounds the two: on a workload where the ceiling is
+// the binding term — which is every workload that got this far, since the block
+// overflowed the consensus maximum while the configured budget still had room —
+// attempt 3 would admit half of what fits and attempt 4 a quarter. Measured on
+// the heavy mainnet fixture, the compounded order shipped blocks at 50-54% of
+// the limit where this order ships them at 88-94%.
+//
+// Division keeps the thresholds ordered, so a scaled limitThresholds is still a
+// valid one and classify still walks it from underload to hard.
+func (s *blockLimitStatus) applyAttempt(attempt collationAttempt) {
+	if divisor := attempt.limitDivisor(); divisor > 1 {
+		for _, thresholds := range []*limitThresholds{
+			&s.limits.bytes,
+			&s.limits.gas,
+			&s.limits.collatedData,
+		} {
+			for i := range thresholds {
+				thresholds[i] /= divisor
+			}
+		}
+	}
+	s.narrowBytes(attempt.cap)
 }
 
 type blockLimitStatus struct {
@@ -587,11 +972,11 @@ type accountPathSizeEstimator struct {
 
 func (e *accountPathSizeEstimator) addLoadedCell(loaded *cell.Cell) {
 	hash := loaded.HashKey()
-	seen, wasLoaded := e.seen.observe(hash, true)
-	if seen && wasLoaded {
+	prior := e.seen.observe(hash, proofSeenLoaded, proofSeenBoundary)
+	if prior&proofSeenLoaded != 0 {
 		return
 	}
-	if seen {
+	if prior&proofSeenBoundary != 0 {
 		e.bytes -= 40
 	}
 
@@ -600,11 +985,11 @@ func (e *accountPathSizeEstimator) addLoadedCell(loaded *cell.Cell) {
 	e.bytes += 12 + uint64(loaded.BitsSize())/8 + 3
 	for i := 0; i < int(loaded.RefsNum()); i++ {
 		ref := loaded.MustRefHashAt(i)
-		seen, wasLoaded = e.seen.observe(ref, false)
+		prior = e.seen.observe(ref, proofSeenBoundary, 0)
 		switch {
-		case !seen:
+		case prior == 0:
 			e.bytes += 40
-		case wasLoaded:
+		case prior&proofSeenLoaded != 0:
 			// A new edge to content already reached by another path.
 			e.bytes += 3
 		default:
@@ -617,11 +1002,11 @@ func (e *accountPathSizeEstimator) addLoadedCell(loaded *cell.Cell) {
 }
 
 func (e *accountPathSizeEstimator) satisfyReference(hash cell.Hash) {
-	seen, loaded := e.seen.status(hash)
-	if !seen || loaded {
+	prior := e.seen.flags(hash)
+	if prior == 0 || prior&proofSeenLoaded != 0 {
 		return
 	}
-	e.seen.observe(hash, true)
+	e.seen.observe(hash, proofSeenLoaded, proofSeenBoundary)
 	e.bytes -= 40
 }
 

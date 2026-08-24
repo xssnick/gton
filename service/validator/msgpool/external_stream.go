@@ -41,6 +41,27 @@ type externalSnapshotCandidate struct {
 // messages already ready for its shard. capacity is backpressure capacity,
 // not a limit on the total number of messages the collation may consume.
 func (p *Pool) OpenExternalStream(shard ShardIdent, capacity int) (*ExternalStream, error) {
+	return p.OpenExternalStreamExcluding(shard, capacity, nil)
+}
+
+// OpenExternalStreamExcluding opens a stream that will never offer the named
+// messages, neither in its first fill nor in anything admitted afterwards.
+//
+// It exists for a collation that starts before its predecessor has reported what
+// it consumed. The pool learns that at the predecessor's commit; a successor
+// opened ahead of it would be offered those messages again, execute them a
+// second time, and have its feedback dropped as stale — which leaves them
+// without a retry stamp, so the same messages come back on every remaining slot
+// of the window.
+//
+// The exclusion is seeded into the same map that gates both selection and follow
+// admission, and it is seeded before the first fill: seeding after it would let
+// the very first batch through, which is the batch a successor takes.
+func (p *Pool) OpenExternalStreamExcluding(
+	shard ShardIdent,
+	capacity int,
+	exclude [][32]byte,
+) (*ExternalStream, error) {
 	if capacity <= 0 {
 		return nil, fmt.Errorf("msgpool: external stream capacity must be positive")
 	}
@@ -60,8 +81,11 @@ func (p *Pool) OpenExternalStream(shard ShardIdent, capacity int) (*ExternalStre
 		seed:     p.rnd.Uint64(),
 		follow:   true,
 		buffer:   make([]ExternalSnapshot, capacity),
-		seen:     make(map[[32]byte]struct{}, capacity),
+		seen:     make(map[[32]byte]struct{}, capacity+len(exclude)),
 		wake:     make(chan struct{}, 1),
+	}
+	for _, hash := range exclude {
+		stream.seen[hash] = struct{}{}
 	}
 	p.streams[stream.id] = stream
 	p.refillExternalStreamLocked(stream)
@@ -174,7 +198,20 @@ func (s *ExternalStream) takeReadyLocked(limit int) []ExternalSnapshot {
 		}
 		batch = append(batch, snapshot)
 	}
-	if s.dirty {
+	// Topping the buffer back up after a batch is prefetch, not correctness: the
+	// loop above refills the moment it runs dry, so a take never has to stall
+	// for want of one. Unconditionally it was a full scan of every slab, under
+	// the pool mutex, after every batch — with a buffer of thousands and a batch
+	// of a few hundred the buffer never emptied, so the scan ran every time and
+	// re-ranked a pool the take had barely moved.
+	//
+	// Half full is where it becomes worth doing again: below that the next few
+	// batches could drain it, and the scan is cheaper here than inside a take.
+	// The only thing this delays is a message whose retry backoff expired, which
+	// reactivateDueLocked notices during the scan; new arrivals do not wait for
+	// it, because offerExternalLocked pushes them into every interested stream
+	// as they are admitted.
+	if s.dirty && s.size*2 <= s.capacity {
 		s.pool.refillExternalStreamLocked(s)
 	}
 
@@ -267,7 +304,11 @@ func (p *Pool) refillExternalStreamLocked(stream *ExternalStream) {
 		return
 	}
 
-	candidates := make([]selectionCandidate, 0, min(p.totalCount, free*2))
+	// Sized for what the loop below appends, which is every eligible entry in
+	// the pool rather than what the stream has room for: free*2 described the
+	// take, not the scan, so a full pool grew this slice from a few hundred to
+	// thousands one doubling at a time.
+	candidates := make([]selectionCandidate, 0, p.totalCount)
 	levels := make([]selectionLevel, 0, len(p.prioDesc))
 	now := p.clock.Now()
 	p.expireLocked(now)

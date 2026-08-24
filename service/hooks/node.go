@@ -41,9 +41,9 @@ type MasterchainHead interface {
 	SeenMasterchainBlock() (ton.BlockIDExt, error)
 }
 
-// AccountPrewarmer schedules raw cell-record warming for account state trees.
-// Implementations are non-blocking: a saturated bounded queue may discard a
-// hint because warming never participates in block correctness.
+// AccountPrewarmer schedules raw cell-record warming for account state and
+// exact cell trees. Implementations are non-blocking: a saturated bounded
+// queue may discard a hint because warming never participates in correctness.
 type AccountPrewarmer interface {
 	EnqueueRoot(cell.Hash) bool
 	EnqueueAccount(workchain int32, account [32]byte) bool

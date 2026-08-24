@@ -77,6 +77,9 @@ type ExternalMessageEvent struct {
 	// IsLocal is true when the message came from this node's local API path,
 	// not from an overlay broadcast.
 	IsLocal bool
+	// SerializedSize is the exact length of the received message BOC. The raw
+	// buffer is borrowed by the ingress path and is not retained by extensions.
+	SerializedSize int
 	// MessageRoot is the parsed root cell of the external message.
 	MessageRoot *cell.Cell
 	// MessageParsed is the decoded external message when it was already

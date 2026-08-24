@@ -54,7 +54,7 @@ labels. When metrics are disabled, the new stage clocks are skipped entirely.
 | `gton_validator_validation_stage_duration_seconds` | histogram | `chain`, `stage` | Non-overlapping validation runtime stages. |
 | `gton_validator_validation_semantic_stage_duration_seconds` | histogram | `chain`, `stage` | Nested deterministic stages inside `semantic_validation`. |
 | `gton_validator_validation_task_duration_seconds` | histogram | `chain`, `result` | The single semantic-validation task for a candidate. |
-| `gton_validator_candidate_size_bytes` | histogram | `chain`, `part` | Candidate block and collated-data payload sizes entering validation. |
+| `gton_validator_candidate_size_bytes` | gauge | `chain`, `part` | Exact size of the most recent block and collated-data payload entering validation. A gauge avoids interpolation across broad histogram buckets; use `quantile_over_time` or `max_over_time`. If multiple candidates arrive between scrapes, only the latest one is visible. |
 | `gton_validator_candidate_cache_entries` | gauge | `chain`, `state` | Consensus candidate cache entries by whether their payload is still in memory. |
 | `gton_validator_candidate_cache_bytes` | gauge | `chain` | Candidate wire, block, and collated-data bytes retained by live consensus sessions. |
 | `gton_validator_candidate_retention_capped_total` | counter | `chain` | Finalizations whose candidate retention pruned past the lineage the local producer still needs. |
@@ -64,6 +64,10 @@ labels. When metrics are disabled, the new stage clocks are skipped entirely.
 | `gton_validator_storage_stat_recomputes_total` | counter | `chain` | Replayed transactions whose bound account storage-stat proof was pruned short of this validator's update walk, so the stat was recomputed from state. The candidate still validates; a steady rate names a producer whose proof shape (update order) disagrees with our replay. |
 | `gton_validator_chain_tip_wait_backstops_total` | counter | `chain` | Predecessor reads that waited past the backstop for a block to become readable. |
 | `gton_validator_session_spec_rejections_total` | counter | `chain`, `role`, `reason` | Transitions of a local validator or observer session specification into rejection. |
+| `gton_validator_candidate_outbound_queue_items` | gauge | `chain` | Candidates currently waiting for a source-side private two-step sender worker. A nonzero steady value means old slots are queueing behind transport work. |
+| `gton_validator_candidate_outbound_queue_age_seconds` | histogram | `chain` | Age of a candidate when it leaves the source-side private two-step sender queue for a send attempt. Session-shutdown drains are excluded. |
+| `gton_validator_candidate_outbound_dropped_total` | counter | `chain`, `reason` | Candidates which could not enter the private sender queue. `reason` is `queue_full` or `unavailable`. Public candidate publication is independent and may still have succeeded. |
+| `gton_validator_candidate_transport_send_duration_seconds` | histogram | `chain`, `result` | Time occupied by one private two-step source fan-out. `result` is `success`, `deadline`, `canceled`, or `error`; deadline samples identify peers or routes which exhausted the fast-path send budget. |
 | `gton_validator_consensus_slot` | gauge | `chain` | Present consensus slot of the newest live session on this chain. |
 | `gton_validator_consensus_finalized_slot` | gauge | `chain` | Highest finalized consensus slot. |
 | `gton_validator_consensus_last_finalization_timestamp_seconds` | gauge | `chain` | Unix time of the last observed finalization; its age is the liveness signal. |
@@ -247,6 +251,10 @@ histogram_quantile(0.95, sum(rate(gton_validator_validation_ready_duration_secon
 histogram_quantile(0.95, sum(rate(gton_validator_validation_stage_duration_seconds_bucket[5m])) by (le, chain, stage))
 histogram_quantile(0.95, sum(rate(gton_validator_validation_semantic_stage_duration_seconds_bucket[5m])) by (le, chain, stage))
 sum(rate(gton_validator_session_spec_rejections_total[5m])) by (chain, role, reason)
+max(gton_validator_candidate_outbound_queue_items) by (chain)
+histogram_quantile(0.95, sum(rate(gton_validator_candidate_outbound_queue_age_seconds_bucket[5m])) by (le, chain))
+sum(rate(gton_validator_candidate_outbound_dropped_total[5m])) by (chain, reason)
+histogram_quantile(0.95, sum(rate(gton_validator_candidate_transport_send_duration_seconds_bucket[5m])) by (le, chain, result))
 sum(gton_validator_candidate_cache_bytes) by (chain)
 sum(rate(gton_validator_candidate_retention_capped_total[5m])) by (chain)
 sum(rate(gton_validator_candidate_persist_failures_total[5m])) by (chain)
@@ -294,13 +302,15 @@ collation-only, because they measure work only a producer performs.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `gton_collator_builds_total` | counter | `mode`, `chain`, `result` | Candidate build attempts. |
-| `gton_collator_builds_inflight` | gauge | `mode`, `chain` | Builds currently acquiring inputs or collating. |
-| `gton_collator_build_duration_seconds` | histogram | `mode`, `chain`, `result` | Whole build future: input acquisition, active candidate assembly, external-message waiting, and serialization. |
-| `gton_collator_stage_duration_seconds` | histogram | `mode`, `chain`, `stage` | Non-overlapping acquisition and producer stages. |
+| `gton_collator_builds_total` | counter | `mode`, `chain`, `result` | Candidate build attempts. Speculative first-slot builds are excluded — they are bets rather than slots this node owes anyone, and they are counted on `gton_collator_pipeline_handoffs_total{outcome="speculative_*"}` instead. |
+| `gton_collator_builds_inflight` | gauge | `mode`, `chain` | Builds currently acquiring inputs or collating. On shardchains this is nonzero for most of the previous slot's block: the successor starts the moment that block's state update is finished, so it runs beside the validation closure, both serializations, the signature, the commit, the marker write and the emission. Speculative first-slot builds are excluded for the same reason they are excluded from `gton_collator_builds_total`: one running through a rotation gap would show a collation in flight while this node is not in the leader order at all. |
+| `gton_collator_build_duration_seconds` | histogram | `mode`, `chain`, `result` | Whole build future: input acquisition, active candidate assembly, external-message waiting, and serialization. For a pipelined shardchain slot the future opens when the predecessor's state update is finished rather than at this slot's scheduled start, so any head start is inside this duration — subtract `schedule_lateness{event="build_lead"}` before calling a rise a regression. When the producer is running behind, that correction is zero and this duration is unaffected: the build opened late either way. |
+| `gton_collator_stage_duration_seconds` | histogram | `mode`, `chain`, `stage` | Non-overlapping acquisition and producer stages: the timeline of the goroutine that drives the build, so the stages still sum to it. Work that moved onto a branch of its own is reported as a substage, not as a stage, for exactly that reason. The mean-per-build query below must not name a subset of stages — an omitted stage is invisible rather than obviously missing, and the five that used to be omitted were 47 ms of a 327 ms build. |
 | `gton_collator_candidates_total` | counter | `mode`, `chain`, `kind` | Newly signed block or empty candidates. |
-| `gton_collator_candidate_production_duration_seconds` | histogram | `mode`, `chain`, `kind`, `result` | Candidate production through persistence, state commit, schedule wait, and emission; recovered candidates are a separate kind. |
-| `gton_collator_candidate_size_bytes` | histogram | `mode`, `chain`, `origin`, `part` | Block and collated-data sizes. `origin="collation"` is a block this node built; `origin="validation"` is one it accepted from another validator. |
+| `gton_collator_candidate_production_duration_seconds` | histogram | `mode`, `chain`, `kind`, `result` | Candidate production through persistence, state commit, schedule wait, and emission; recovered candidates are a separate kind. Carries the same pipelined head start as `build_duration_seconds`, for the same reason. |
+| `gton_collator_substage_duration_seconds` | histogram | `mode`, `chain`, `stage`, `substage` | Spans nested inside one production stage. Substages of a stage may overlap and do not sum to it; the stage histogram stays a partition of the build. Present for `acquire_inputs` (`lock_session`, `resolve_chain`, `install_pending_delta`, `load_neighbors`, `cut_views`, `seed_source_from_state`, `shard_end_lt`, `messages`, `prewarm_current`), `validation_closure` (`accounts`, `out_queue`, `immediate_queue`, `processed_queue`, `dispatch_queue`) and `serialize_candidate` (`block_boc`). `block_boc` is the one substage that is not nested in its stage's wall time at all: the block BOC runs on its own goroutine and starts before the stage does, which is exactly why it needs its own series — after the reorder it is the only part of the build with no wall-clock exposure of its own, and a regression there would move no stage. `install_pending_delta` appears only on a pipelined build and is the queue node its predecessor has not committed yet. Added because both stages spend most of their wall time in store reads, which neither the CPU nor the blocking profile can attribute. |
+| `gton_collator_candidate_size_bytes` | gauge | `mode`, `chain`, `origin`, `part` | Size of the most recent block and collated-data payload. `origin="collation"` is a block this node built; `origin="validation"` is one it accepted from another validator. A gauge because payloads live between 0.5 and 2 MiB, which a power-of-two histogram covered with one bucket from 1 to 2 MiB: `histogram_quantile` had to interpolate across it and read a p95 of 1.89 MiB over a window whose true p95 was 1.40 MiB and whose largest block was 1.47 MiB, which made a block look pressed against the 2 MiB limit when it was not. Use `quantile_over_time` or `max_over_time` on this series. |
+| `gton_collator_candidate_size_bytes_total` | counter | `mode`, `chain`, `origin`, `part` | Cumulative payload bytes, replacing what the histogram `_sum` carried. Divided by `gton_collator_candidate_messages_total` it gives the bytes one producer spends per message, which is how this node's block is compared against another producer's on the same chain. |
 | `gton_collator_candidate_transactions` | histogram | `mode`, `chain`, `origin` | Transactions in a non-empty candidate, by `origin`. |
 | `gton_collator_candidate_latest_transactions` | gauge | `mode`, `chain` | Exact transaction count in the latest candidate produced by this process. An empty candidate resets it to zero. |
 | `gton_collator_candidate_gas_used` | histogram | `mode`, `chain` | Gas used by a produced block. Collation only: gas is a producer's own metering and is not recoverable from a block. |
@@ -310,13 +320,16 @@ collation-only, because they measure work only a producer performs.
 | `gton_collator_candidate_queue_cleaned_messages` | histogram | `mode`, `chain` | Outbound queue entries removed by the cleanup phase. |
 | `gton_collator_queue_cleanup_stop_total` | counter | `mode`, `chain`, `reason` | Why the NEIGHBOUR half of out-queue cleanup stopped: `exhausted`, `block_full` or `budget`. A rising `budget` share means the wall-clock cleanup budget is binding. It says nothing about the predecessor's own half, which is drained to exhaustion under every reason — leaving one of our own processed entries queued produces a block every validator rejects. When that drain cannot fit the block limits the collation fails instead of truncating, and that is reported by `gton_collator_alarms_total{alarm="mandatory_dequeue_overflow"}`, not here. |
 | `gton_collator_external_batches` | histogram | `mode`, `chain` | Ready external batches consumed. |
-| `gton_collator_external_stop_total` | counter | `mode`, `chain`, `reason` | External-message phase stop reason. |
+| `gton_collator_external_stop_total` | counter | `mode`, `chain`, `reason` | External-message phase stop reason. `queue_brake` replaces `ready_drained`/`deadline` when the phase ended while the outbound-queue brake (`skipExternalsQueueSize`) was closed — the block carried no externals because the intake was refusing them, not because none arrived; a sustained `queue_brake` rate is the shard saying its outbound queue outgrows what it can drain. |
 | `gton_collator_load_class_total` | counter | `mode`, `chain`, `class` | Produced candidates by load class. |
 | `gton_collator_overload_total` | counter | `mode`, `chain`, `reason` | Produced candidates by overload cause. |
 | `gton_collator_deadline_events_total` | counter | `mode`, `chain`, `deadline`, `action` | Soft/hard producer deadline decisions. |
 | `gton_collator_retries_total` | counter | `mode`, `chain`, `reason` | Retried producer windows. |
-| `gton_collator_alarms_total` | counter | `mode`, `chain`, `alarm` | Producer faults that need an operator, not a trend line: `short_collated_proof` and `mandatory_dequeue_overflow`. Any nonzero rate is a defect on this node. |
-| `gton_collator_schedule_lateness_seconds` | histogram | `mode`, `chain`, `event` | Positive lateness at build-start or broadcast slot boundaries. The first shardchain slot of a window is excluded from `build_start` because its early schedule is established only after resolving the window base; masterchain starts and `broadcast` still include every slot. |
+| `gton_collator_alarms_total` | counter | `mode`, `chain`, `alarm` | Producer faults that need an operator, not a trend line: `short_collated_proof`, `mandatory_dequeue_overflow` and `size_limit_retry`. Any nonzero rate is a defect on this node. |
+| `gton_collator_pipeline_handoffs_total` | counter | `mode`, `chain`, `outcome` | Predecessors handed to the producer before they were committed, by what became of each. `started` is a successor that ran; the `declined_*` outcomes name the gate that refused one; the `abandoned_*` outcomes name why one that had started was thrown away. Every handoff reports exactly one, so the rate of `started` is the pipeline's duty cycle and everything else is the reason it is not higher. The `speculative_*` outcomes are the other boundary — a window's FIRST slot begun before consensus observed the window, on a candidate this node validated and the network had not yet notarized. `speculative_started` is a bet placed, `speculative_adopted` a window that opened on the very base it was placed on (the only outcome that saved time), `speculative_missed` one that opened on another base or that nobody came for, `speculative_failed` one whose window did open on its base but whose build could not serve it, and `speculative_declined` a bet never placed. Every bet reports exactly one of these, so `started` equals the sum of the rest; `speculative_failed` is the only place a bet that dies inside its own build is visible, because a speculative build is deliberately kept out of `gton_collator_builds_total` and out of the `block collation failed` log — a lost bet costs the collation nothing and its errors would read as the collator failing. `adopted / (adopted + missed)` is the hit rate the mechanism lives or dies by; it should track how often the previous leader's last slot survives, and a non-zero `failed` rate means the bet is burning a collation per window for nothing. |
+| `gton_collator_pipeline_overlap_seconds` | histogram | `mode`, `chain` | How long a successor actually ran beside the rest of its predecessor's block, from the handoff to the end of that build or the withdrawal of the offer, whichever came first. This is the saving, measured rather than assumed, and it is the number to read before and after any change to the boundary. |
+| `gton_collator_pipeline_handoff_pickup_seconds` | histogram | `mode`, `chain` | How long a started successor sat parked before the producer reached its slot and adopted it. Large values mean the handoff is running further ahead of the schedule than the slot needs. |
+| `gton_collator_schedule_lateness_seconds` | histogram | `mode`, `chain`, `event` | Positive lateness at build-start or broadcast slot boundaries, and — under `build_lead` — the head start a shard build won instead, whether from a pipelined predecessor or, for an adopted speculative first slot, the time it had already been running when its window opened. The first shardchain slot of a window is excluded from `build_start` because its early schedule is established only after resolving the window base; masterchain starts and `broadcast` still include every slot. |
 | `gton_collator_windows_inflight` | gauge | `mode`, `chain` | Producer windows currently running. |
 | `gton_collator_windows_total` | counter | `mode`, `chain`, `result` | Finished producer windows. |
 | `gton_collator_window_duration_seconds` | histogram | `mode`, `chain`, `result` | Whole producer-window duration, including retries. |
@@ -366,24 +379,69 @@ Common values:
   `gton_collator_storage_db_*` gauges is where that pressure is visible on its
   own. The whole cost including the overlapped part remains inside
   `gton_collator_candidate_production_duration_seconds`.
+  On shardchains everything after `build_state_update` runs beside the next
+  slot's collation. The successor is handed the finished state at the end of that
+  stage, so `validation_closure`, `serialize_block`, `serialize_candidate`,
+  `finalize_candidate`, the signature, the commit, the marker write and the
+  emission all have a live build alongside them and
+  `gton_collator_builds_inflight` is nonzero throughout. The stack itself is
+  still a partition of the wall clock, because it is the timeline of one
+  goroutine: the block BOC moved onto a branch of its own and is reported as the
+  `block_boc` substage of `serialize_candidate` rather than as a stage, so it
+  never double-counts. What the two do not tell you is how much of that ran in
+  parallel — that is `pipeline_overlap_seconds`, which is nonzero exactly when a
+  successor was live and says for how long.
+  `resolve_candidate_state` moves with the build it precedes: for a pipelined
+  slot it is sampled during its predecessor's tail, and a slot whose pipelined
+  resolve failed is resolved a second time by the loop when it reaches the slot
+  on schedule, which is where that failure is reported.
 - deadline/action: `soft` or `hard`; `wait`, `emit_empty`, `abort`, or
   `wait_no_empty`. `wait_no_empty` is a soft deadline the producer had to keep
   waiting through because the session has not finalized for
   `NoEmptyBlocksOnErrTimeout` and an empty block is therefore forbidden — the
   producer is not slow, it is not allowed to end the wait, and that is a
   different fault from an ordinary `wait`.
-- schedule `event`: `build_start`, `broadcast`.
+- pipeline handoff `outcome`: `started`, `declined_busy`,
+  `declined_masterchain`, `declined_window_end`, `declined_lead`,
+  `declined_empty`, `declined_base_unseeded`, `abandoned_retry`,
+  `abandoned_failed`, `abandoned_superseded`.
+  `declined_busy` is the only exact detector of a third live build, and
+  `declined_base_unseeded` is a successor refused because installing its queue
+  base would have meant rebuilding the source from the predecessor's state root
+  while holding the session lock the predecessor's own commit is about to need.
+  `abandoned_retry` means the predecessor overflowed the consensus size limit
+  and is being rebuilt, so the root the successor was started on is one no block
+  will carry; a sustained rate there is the same defect
+  `alarms_total{alarm="size_limit_retry"}` reports, seen from the other side.
+- schedule `event`: `build_start`, `broadcast`, `build_lead`.
+  `build_lead` is the shardchain pipeline: a slot's build begins the instant its
+  predecessor's state update is finished, without waiting for that block to be
+  serialized, signed, committed or broadcast, so it starts before its own
+  scheduled build instant. The sample is
+  how far before. Lateness is clamped to zero everywhere in this histogram, so a
+  pipelined slot that genuinely started early reports zero under `build_start`
+  and its head start under `build_lead`. A pipelined slot that was already late
+  when its predecessor committed — which is every slot on a producer running
+  behind, and that is the measured state on the stand today — reports its real
+  lateness under `build_start` and a clamped zero under `build_lead`, and is
+  indistinguishable there from a slot the loop started on its own schedule. Read
+  a nonzero `build_lead` as "this slot won time"; do not read a zero one as
+  "this slot was not pipelined". Masterchain never
+  reports it: masterchain slots are not pipelined, because a masterchain build
+  takes an external snapshot when it opens and measures its phase budgets from
+  its own start, so an early one would admit a different set of messages rather
+  than the same set sooner.
 - retry `reason`: `not_ready`, `other`.
 - external stop `reason`: `unknown`, `ready_drained`, `soft_limit`, `deadline`,
-  `attempt_limit`.
+  `attempt_limit`, `queue_brake`.
 - load `class`: `underload`, `normal`, `soft`, `medium`, `hard`, `unknown`.
 - overload `reason`: `none`, `block_limit`, `force_split_queue`,
   `long_collation`, `unknown`.
 
 `alarms_total` is the one collator counter that is never a workload
-characteristic. Both members are conditions this node can detect about its own
-output and nothing downstream can, and neither shows up anywhere else in this
-table.
+characteristic. Every member is a condition this node can detect about its own
+output and nothing downstream can, and none of them shows up anywhere else in
+this table.
 
 `alarm="short_collated_proof"` means a block SHIPPED with a collated proof this
 node knows does not cover the predecessor-queue scan a proof-backed validator
@@ -408,6 +466,26 @@ block. It points at a preceding run of blocks whose own drain stopped early, at
 a restored or imported predecessor, or at block limits configured below what the
 shard's own queue needs — and the shard will report it every slot until the
 population fits.
+
+`alarm="size_limit_retry"` is a finished block thrown away. The serialized block
+or its collated data came out over the consensus maximum, so the collator
+rebuilt the slot from the start under concessions that escalate the way
+`collator.cpp` escalates them: attempt 1 drops the two policy-bounded
+dispatch-queue passes, attempt 2 drops inbound external messages entirely, and
+attempts 3 and 4 halve and then quarter the byte, gas and collated-data limits
+themselves. It fires whether the rebuild eventually fit or the slot was lost,
+because both mean the same thing — the size estimate admission runs against was
+wrong by enough to pay for a whole extra build.
+
+It needs its own counter because a successful rebuild is otherwise invisible.
+The block that finally fits is indistinguishable from a block that fit at once:
+one candidate, one success in `builds_total`, and the failed attempt's error
+consumed by the loop that replaced it. The only other trace is the attempt count
+on the candidate, which reaches the log line beside this counter along with what
+that attempt conceded. A sustained rate means the estimator, not the workload:
+the block limits admission stops on are derived from the network config, while
+this check compares the serialized result against the consensus maximum, and a
+persistent gap between them costs part of every slot.
 
 The standalone extension additionally collects its bounded controller and
 storage status at scrape time. The read is outside collation and has a one
@@ -434,8 +512,10 @@ Useful examples:
 ```promql
 histogram_quantile(0.95, sum(rate(gton_collator_build_duration_seconds_bucket{mode="validator",result="success"}[5m])) by (le, chain))
 histogram_quantile(0.95, sum(rate(gton_collator_stage_duration_seconds_bucket{mode="standalone"}[5m])) by (le, chain, stage))
-sum by (stage) (rate(gton_collator_stage_duration_seconds_sum{stage=~"acquire_inputs|prepare_state|cleanup_out_queue|execute_internal_messages|execute_external_messages|finalize_accounts|build_state_update|serialize_candidate|finalize_candidate|wait_external_messages"}[5m]))
-  / scalar(sum(rate(gton_collator_build_duration_seconds_count[5m])))
+sum by (stage) (rate(gton_collator_stage_duration_seconds_sum[5m]))
+  / scalar(sum(rate(gton_collator_build_duration_seconds_count{result="success"}[5m])))
+histogram_quantile(0.5, sum(rate(gton_collator_pipeline_overlap_seconds_bucket[5m])) by (le, mode, chain))
+sum(rate(gton_collator_pipeline_handoffs_total[5m])) by (mode, chain, outcome)
 histogram_quantile(0.95, sum(rate(gton_collator_schedule_lateness_seconds_bucket[5m])) by (le, mode, chain, event))
 sum(rate(gton_collator_deadline_events_total[5m])) by (mode, chain, deadline, action)
 sum(rate(gton_collator_retries_total[5m])) by (mode, chain, reason)

@@ -50,6 +50,10 @@ func TestValidationClosureRunsAfterTheStateUpdate(t *testing.T) {
 // pinned here rather than left to the call site.
 func TestValidationClosureReplaysEveryPart(t *testing.T) {
 	want := []string{
+		// The gate is in the list because cleanupClaimedLocalDequeues asks the
+		// same question, to decide whether to keep the prefix cells this pass
+		// records. Inlining the condition here again is how the two drift.
+		"closureRecordsPredecessorReads",
 		"traceAccountValidationClosure",
 		"traceOutQueueValidationClosure",
 		"traceImmediateQueueValidationClosure",

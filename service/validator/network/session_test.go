@@ -1,6 +1,7 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"errors"
@@ -33,6 +34,64 @@ type testPrivateOverlay struct {
 	broadcast       func(context.Context) error
 	broadcasts      int
 	send            func(context.Context, p2p.PeerID, []byte) error
+}
+
+type testCandidateTransportObserver struct {
+	mu         sync.Mutex
+	queueItems int
+	queueAges  []time.Duration
+	drops      [candidateOutboundDropReasonCount]int
+	sends      []CandidateTransportSendObservation
+}
+
+func (o *testCandidateTransportObserver) AddCandidateOutboundQueue(
+	_ collator.MetricChain,
+	delta int,
+) {
+	o.mu.Lock()
+	o.queueItems += delta
+	o.mu.Unlock()
+}
+
+func (o *testCandidateTransportObserver) ObserveCandidateOutboundQueueAge(
+	_ collator.MetricChain,
+	age time.Duration,
+) {
+	o.mu.Lock()
+	o.queueAges = append(o.queueAges, age)
+	o.mu.Unlock()
+}
+
+func (o *testCandidateTransportObserver) AddCandidateOutboundDrop(
+	_ collator.MetricChain,
+	reason CandidateOutboundDropReason,
+) {
+	o.mu.Lock()
+	o.drops[reason]++
+	o.mu.Unlock()
+}
+
+func (o *testCandidateTransportObserver) ObserveCandidateTransportSend(
+	observation CandidateTransportSendObservation,
+) {
+	o.mu.Lock()
+	o.sends = append(o.sends, observation)
+	o.mu.Unlock()
+}
+
+func (o *testCandidateTransportObserver) snapshot() (
+	int,
+	[]time.Duration,
+	[candidateOutboundDropReasonCount]int,
+	[]CandidateTransportSendObservation,
+) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return o.queueItems,
+		append([]time.Duration(nil), o.queueAges...),
+		o.drops,
+		append([]CandidateTransportSendObservation(nil), o.sends...)
 }
 
 func (o *testPrivateOverlay) Close() error {
@@ -190,6 +249,8 @@ type testSessionReceiver struct {
 	precheckErr error
 	receiveErr  error
 	serve       func(validator.CandidateRequest) (validator.CandidateResponse, error)
+	payload     []byte
+	delegation  *simplex.Delegation
 }
 
 func (r *testSessionReceiver) ReceiveConsensusMessage(simplex.PeerID, int, []byte) {
@@ -207,12 +268,15 @@ func (r *testSessionReceiver) PrecheckCandidateBroadcast(uint32, [32]byte, bool)
 }
 
 func (r *testSessionReceiver) ReceiveCandidate(
-	context.Context,
-	uint32,
-	[]byte,
+	_ context.Context,
+	_ uint32,
+	payload []byte,
+	delegation *simplex.Delegation,
 ) (validator.CandidateArtifact, error) {
 	r.mu.Lock()
 	r.candidates++
+	r.payload = payload
+	r.delegation = delegation
 	err := r.receiveErr
 	r.mu.Unlock()
 	if err != nil {
@@ -246,6 +310,7 @@ func (r *testRelayingReceiver) ReceiveCandidate(
 	_ context.Context,
 	expectedSlot uint32,
 	_ []byte,
+	_ *simplex.Delegation,
 ) (validator.CandidateArtifact, error) {
 	r.mu.Lock()
 	r.candidates++
@@ -429,6 +494,72 @@ func TestDelegatedCandidateSourceChecksLeaderAuthorizationBeforeCommit(t *testin
 	}
 	if _, err = hub.validateCandidateSource(source, source[:], validExtra, true); err != nil {
 		t.Fatalf("valid checked delegation was rejected: %v", err)
+	}
+}
+
+func TestDelegatedCandidateDeliveryPassesBarePayloadWithoutCopy(t *testing.T) {
+	manager, opener, spec, _ := testSessionManager(t)
+	collatorKey := ed25519.NewKeyFromSeed(bytesOf(0xd2, ed25519.SeedSize))
+	collatorPublic := collatorKey.Public().(ed25519.PublicKey)
+	collatorID, err := publicKeyID(collatorPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := p2p.PeerID(collatorID)
+	spec.candidateADNL[source] = source
+	endpoint, err := manager.prepare(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver := &testSessionReceiver{}
+	startTestEndpoint(t, endpoint, receiver)
+
+	delegationSignature, err := simplex.SignDelegation(spec.signer, spec.id, 0, collatorID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra, err := (&simplex.BroadcastExtra{
+		Slot: 0,
+		Delegation: &simplex.Delegation{
+			CollatorKey: collatorPublic,
+			Signature:   delegationSignature,
+		},
+	}).Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{0x7a}, 700<<10)
+	disposition := opener.latest().callbacks.Broadcast(context.Background(), p2p.PrivateOverlayBroadcast{
+		Source:     source,
+		SourceADNL: source[:],
+		Payload:    payload,
+		Extra:      extra,
+		Delivery:   p2p.DeliveryTwoStep,
+	})
+	if disposition != p2p.PrivateOverlayBroadcastAcceptAndRelay {
+		t.Fatalf("candidate disposition = %d", disposition)
+	}
+
+	receiver.mu.Lock()
+	receivedPayload := receiver.payload
+	receivedDelegation := receiver.delegation
+	receiver.mu.Unlock()
+	if len(receivedPayload) != len(payload) || &receivedPayload[0] != &payload[0] {
+		t.Fatal("candidate transport copied the bare candidate payload")
+	}
+	if receivedDelegation == nil ||
+		!bytes.Equal(receivedDelegation.CollatorKey, collatorPublic) ||
+		!bytes.Equal(receivedDelegation.Signature, delegationSignature) {
+		t.Fatalf("candidate transport delegation = %+v", receivedDelegation)
+	}
+
+	// ParseBroadcastExtra owns its byte fields. The runtime may retain them
+	// until lazy canonical materialization, so they must not alias the overlay
+	// extra buffer even though the large payload deliberately does.
+	clear(extra)
+	if !bytes.Equal(receivedDelegation.CollatorKey, collatorPublic) ||
+		!bytes.Equal(receivedDelegation.Signature, delegationSignature) {
+		t.Fatal("candidate delegation aliases the overlay extra buffer")
 	}
 }
 
@@ -763,6 +894,71 @@ func TestCandidateRelayDoesNotWaitForPrivateWorkerAndRetireCancels(t *testing.T)
 	}
 	if got := len(endpoint.candidateOutbound); got != 0 {
 		t.Fatalf("retired private candidate queue retained %d messages", got)
+	}
+}
+
+func TestCandidatePrivateSendDeadlineReleasesWorkerAndObservesQueueAge(t *testing.T) {
+	manager, opener, validatorSpec, _ := testSessionManager(t)
+	observer := &testCandidateTransportObserver{}
+	manager.candidateMetrics = observer
+	endpoint, err := manager.prepare(context.Background(), validatorSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if retireErr := manager.RetireValidatorSession(context.Background(), validatorSpec.id); retireErr != nil {
+			t.Error(retireErr)
+		}
+	}()
+	startTestEndpoint(t, endpoint, &testSessionReceiver{})
+
+	started := make(chan struct{}, 1)
+	handle := opener.latest()
+	handle.mu.Lock()
+	handle.broadcast = func(ctx context.Context) error {
+		started <- struct{}{}
+		<-ctx.Done()
+
+		return ctx.Err()
+	}
+	handle.mu.Unlock()
+
+	extra, err := (&simplex.BroadcastExtra{Slot: 1}).Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = endpoint.BroadcastCandidate(
+		context.Background(),
+		simplex.CandidateBroadcast{Data: []byte{1}, Extra: extra},
+		validator.CandidateArtifact{BlockBOC: []byte{2}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("private candidate send did not start")
+	}
+
+	waitForCondition(t, func() bool {
+		_, _, _, sends := observer.snapshot()
+		return len(sends) == 1
+	})
+	queueItems, queueAges, drops, sends := observer.snapshot()
+	if queueItems != 0 {
+		t.Fatalf("candidate queue items = %d, want 0", queueItems)
+	}
+	if len(queueAges) != 1 {
+		t.Fatalf("candidate queue age samples = %d, want 1", len(queueAges))
+	}
+	if drops[CandidateOutboundDropQueueFull] != 0 || drops[CandidateOutboundDropUnavailable] != 0 {
+		t.Fatalf("candidate queue drops = %v, want none", drops)
+	}
+	if sends[0].Result != CandidateTransportSendDeadline {
+		t.Fatalf("candidate send result = %d, want deadline", sends[0].Result)
+	}
+	if sends[0].Duration < candidateTransportSendTimeout/2 || sends[0].Duration > 2*candidateTransportSendTimeout {
+		t.Fatalf("candidate send duration = %s, want bounded near %s", sends[0].Duration, candidateTransportSendTimeout)
 	}
 }
 

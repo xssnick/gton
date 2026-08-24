@@ -130,6 +130,27 @@ func (i *Internals) SeedsFromStateRoot(
 	return routedSeedsFromStateRoot(root, source, top, i.snapshot.Load())
 }
 
+// SeedsFromStateRootSequential is SeedsFromStateRoot with the split walk
+// withheld. It exists for the test that holds the split to the sequential
+// walk's output; production always goes through SeedsFromStateRoot.
+func SeedsFromStateRootSequential(i *Internals, source ShardIdent, top SourceRef, root *cell.Cell) ([]RoutedSeed, uint64, error) {
+	return routedSeedsFromStateRootWith(root, source, top, i.snapshot.Load(), false)
+}
+
+// SeedsForDestination is SeedsFromStateRoot narrowed to one destination. The
+// caller that acquires masterchain inputs takes exactly one run out of the full
+// topology, and narrowing lets the walk skip the envelope parse for every entry
+// bound elsewhere. It returns no queue total for the reason given on
+// routedSeedsForDestination.
+func (i *Internals) SeedsForDestination(
+	source ShardIdent,
+	top SourceRef,
+	root *cell.Cell,
+	destination ShardIdent,
+) ([]*InternalMessage, error) {
+	return routedSeedsForDestination(root, source, top, i.snapshot.Load(), destination)
+}
+
 // SourceTop reports the applied source position inside one destination.
 func (i *Internals) SourceTop(destination, source ShardIdent) (SourceRef, error) {
 	state, err := i.destination(destination)
@@ -340,6 +361,79 @@ func (r *destinationRouter) insert(destination ShardIdent, index int) {
 		node = node.children[bit]
 	}
 	node.destinations = append(node.destinations, index)
+}
+
+// routes reports whether one destination covers the prefix. It is walk with an
+// early exit and no callback, for the caller that holds a single destination
+// and needs the answer before deciding whether to decode a queue entry.
+// routesUnder reports whether any key under a partial account prefix could
+// route to one destination. bits is how much of the 64-bit account prefix the
+// caller actually knows; the rest is unconstrained.
+//
+// It is the pruning question the exact routes() cannot answer. A seed walk that
+// only wants one destination still has to visit every entry of the source queue
+// to ask routes() about it — the key has to be parsed before the question can be
+// put — and on a queue thousands deep that is the walk, not the decode. Asked
+// once per subtree instead of once per entry, the same question skips whole
+// subtrees: everything destined for another workchain, and after a split
+// everything destined for the sibling shard.
+//
+// Two ways a subtree can match. The destination may own a node on the way down,
+// in which case everything below it routes there; or it may sit somewhere in the
+// subtree below the known bits, in which case part of it does.
+func (r destinationRouter) routesUnder(prefix AccountPrefix, bits int, index int) bool {
+	node := r.workchains[prefix.Workchain]
+	if node == nil {
+		return false
+	}
+	for depth := 0; depth < bits && node != nil; depth++ {
+		for _, destination := range node.destinations {
+			if destination == index {
+				return true
+			}
+		}
+		bit := prefix.Prefix >> (63 - depth) & 1
+		node = node.children[bit]
+	}
+
+	return routeSubtreeHolds(node, index)
+}
+
+// routeSubtreeHolds is the second half of routesUnder: the destination
+// registered anywhere below the bits the caller knew. The trie has one node per
+// shard, so this walk is over the shard topology and not over the queue.
+func routeSubtreeHolds(node *routeNode, index int) bool {
+	if node == nil {
+		return false
+	}
+	for _, destination := range node.destinations {
+		if destination == index {
+			return true
+		}
+	}
+
+	return routeSubtreeHolds(node.children[0], index) || routeSubtreeHolds(node.children[1], index)
+}
+
+func (r destinationRouter) routes(prefix AccountPrefix, index int) bool {
+	node := r.workchains[prefix.Workchain]
+	if node == nil {
+		return false
+	}
+	for depth := 0; node != nil; depth++ {
+		for _, destination := range node.destinations {
+			if destination == index {
+				return true
+			}
+		}
+		if depth == 64 {
+			return false
+		}
+		bit := prefix.Prefix >> (63 - depth) & 1
+		node = node.children[bit]
+	}
+
+	return false
 }
 
 // walk visits every destination covering the prefix. Overlapping prepared

@@ -97,8 +97,13 @@ func TestAccountPathEstimateCoversFinalDictionaryProof(t *testing.T) {
 			traced := &tlb.ShardAccountsAugDict{
 				AugmentedDictionary: accounts.Copy().SetTrace(usage.Trace()),
 			}
+			// usage is both the trace on the predecessor dictionary and the
+			// collation's record, as it is in a real build: the lane tracer
+			// forwards to c.usage, so the two must be the same recorder for the
+			// descent to land where the proof is measured.
 			c := &collation{
 				shard: msgpool.ShardIdent{Workchain: 0, Shard: 1 << 63},
+				usage: usage,
 				accountSources: [2]predecessorAccountSource{{
 					shard:    tlb.ShardIdent{WorkchainID: 0},
 					accounts: traced,
@@ -109,7 +114,9 @@ func TestAccountPathEstimateCoversFinalDictionaryProof(t *testing.T) {
 			var key [32]byte
 			copy(key[:], test.addr.address.Data())
 			keyCell := cell.BeginCell().MustStoreSlice(key[:], 256).EndCell()
-			value, path, err := c.loadPredecessorAccount(key, keyCell)
+			lane := &accountLane{key: key}
+			lane.tracer = newLaneTracer(c, lane)
+			value, path, err := c.loadPredecessorAccount(lane.tracer, key, keyCell)
 			existed := err == nil
 			if err != nil && !errors.Is(err, cell.ErrNoSuchKeyInDict) {
 				t.Fatalf("load account path: %v", err)
@@ -181,6 +188,7 @@ func TestAccountPathRecorderStopsAtDictionaryValue(t *testing.T) {
 	}
 	c := &collation{
 		shard: msgpool.ShardIdent{Workchain: 0, Shard: 1 << 63},
+		usage: usage,
 		accountSources: [2]predecessorAccountSource{{
 			shard:    tlb.ShardIdent{WorkchainID: 0},
 			accounts: traced,
@@ -191,7 +199,9 @@ func TestAccountPathRecorderStopsAtDictionaryValue(t *testing.T) {
 	var key [32]byte
 	copy(key[:], addr.Data())
 	keyCell := cell.BeginCell().MustStoreSlice(key[:], 256).EndCell()
-	value, path, err := c.loadPredecessorAccount(key, keyCell)
+	lane := &accountLane{key: key}
+	lane.tracer = newLaneTracer(c, lane)
+	value, path, err := c.loadPredecessorAccount(lane.tracer, key, keyCell)
 	if err != nil {
 		t.Fatalf("load predecessor account: %v", err)
 	}
@@ -201,19 +211,28 @@ func TestAccountPathRecorderStopsAtDictionaryValue(t *testing.T) {
 	if value.Trace() == nil {
 		t.Fatal("account value lost the predecessor read trace")
 	}
-
-	recorded := len(c.accountPathRecorder.path)
+	// The spine recorder is per lookup and is stripped off the value, so the
+	// payload must not extend the path: the slice handed back is final.
+	recorded := len(path)
 	var account tlb.ShardAccount
 	if err = loadExactSlice(&account, value); err != nil {
 		t.Fatalf("decode account value: %v", err)
 	}
-	if len(c.accountPathRecorder.path) != recorded {
-		t.Fatalf("account payload extended Patricia path from %d to %d cells",
-			recorded, len(c.accountPathRecorder.path))
+	if len(path) != recorded {
+		t.Fatalf("account payload extended Patricia path from %d to %d cells", recorded, len(path))
 	}
 	for _, loaded := range path {
 		if loaded.HashKey() == account.Account.HashKey() {
 			t.Fatal("account payload cell was recorded as a Patricia path cell")
 		}
+	}
+	// The value's remaining trace is the lane's, and the lane is in
+	// pass-through, so the shared record saw the descent as it happened —
+	// exactly the cells of the spine, delivered through the tracer.
+	if got, want := value.Trace(), lane.tracer.trace; got != want {
+		t.Fatalf("account value carries trace %p, want the lane tracer %p", got, want)
+	}
+	if usage.Size() != len(path) {
+		t.Fatalf("shared record holds %d cells, want the %d cells of the spine", usage.Size(), len(path))
 	}
 }

@@ -553,38 +553,82 @@ func (o *ConsensusObserver) UpdateSession(
 	defer session.lifecycleMu.Unlock()
 
 	session.mu.Lock()
-	defer session.mu.Unlock()
 	switch session.phase {
 	case observerSessionFailed:
-		return session.terminal
+		terminal := session.terminal
+		session.mu.Unlock()
+
+		return terminal
 	case observerSessionRetiring, observerSessionRetired:
+		session.mu.Unlock()
+
 		return collator.ErrSessionRetired
 	case observerSessionPreparing:
+		session.mu.Unlock()
+
 		return collator.ErrSessionUnavailable
 	case observerSessionRecovered:
+		session.mu.Unlock()
+
 		return collator.ErrSessionUnavailable
 	}
 	if !session.descriptor.Overlay.Session.Equal(descriptor.Overlay.Session) ||
 		session.config.Protocol != input.config.Protocol || session.limits != input.limits {
+		session.mu.Unlock()
+
 		return collator.ErrSessionConflict
 	}
 	if session.descriptor.Equal(descriptor) {
+		session.mu.Unlock()
+
 		return nil
 	}
-	if !session.descriptor.Overlay.Equal(descriptor.Overlay) {
+	updateNetwork := !session.descriptor.Overlay.Equal(descriptor.Overlay)
+	runtime := session.runtime
+	updateRuntime := runtime != nil &&
+		(!sessionStateEqual(session.state, input.state) || session.descriptor.Params != descriptor.Params)
+	if !updateNetwork && !updateRuntime {
+		session.descriptor = descriptor
+		session.state = cloneSessionState(input.state)
+		session.config = input.config
+		session.mu.Unlock()
+
+		return nil
+	}
+
+	// lifecycleMu excludes competing session lifecycle mutations while the
+	// external calls run. session.mu must remain free: Runtime.Update serializes
+	// its commit with progress observation, whose callback re-enters this session.
+	// Holding it here would invert session.mu and runtime.lifecycleMu; holding it
+	// over network I/O would stall the same progress for no additional invariant.
+	session.mu.Unlock()
+	if updateNetwork {
 		if err = o.network.UpdateSession(ctx, descriptor.Overlay); err != nil {
 			return fmt.Errorf("validator consensus observer: update network session: %w", err)
 		}
 	}
-	if session.runtime != nil &&
-		(!sessionStateEqual(session.state, input.state) || session.descriptor.Params != descriptor.Params) {
-		if err = session.runtime.Update(ctx, input.state); err != nil {
+	if updateRuntime {
+		if err = runtime.Update(ctx, input.state); err != nil {
 			return fmt.Errorf("validator consensus observer: update runtime: %w", err)
 		}
+	}
+
+	session.mu.Lock()
+	if session.phase == observerSessionFailed {
+		terminal := session.terminal
+		session.mu.Unlock()
+
+		return terminal
+	}
+	if session.runtime != runtime {
+		session.mu.Unlock()
+
+		return collator.ErrSessionUnavailable
 	}
 	session.descriptor = descriptor
 	session.state = cloneSessionState(input.state)
 	session.config = input.config
+	session.mu.Unlock()
 
 	return nil
 }
@@ -627,12 +671,16 @@ func (o *ConsensusObserver) BroadcastCandidate(
 	// the capsule here made the standalone collator compress every payload twice
 	// per slot and throw the first one away, then reach the second by parsing both
 	// BOCs back into cells and re-serializing them to prove they were canonical.
+	generationTimeMS, generationTimeKnown := artifact.GenerationTimeMS()
+
 	return session.runtime.publishCandidate(ctx, &CandidateArtifact{
-		Candidate:    artifact.Candidate,
-		BlockBOC:     artifact.BlockBOC,
-		CollatedData: artifact.CollatedData,
-		prepared:     artifact.Prepared(),
-		digested:     artifact.Digested(),
+		Candidate:           artifact.Candidate,
+		BlockBOC:            artifact.BlockBOC,
+		CollatedData:        artifact.CollatedData,
+		prepared:            artifact.Prepared(),
+		digested:            artifact.Digested(),
+		generationTimeMS:    generationTimeMS,
+		generationTimeKnown: generationTimeKnown,
 	})
 }
 
@@ -936,7 +984,7 @@ func (o *ConsensusObserver) prepareRuntime(
 	}
 
 	config.Journal = o.storage.Journal(config.StorageID, len(config.Validators))
-	backend, err := NewLocalSessionBackend(ctx, LocalSessionBackendOptions{
+	backendPreparation, err := PrepareLocalSessionBackend(ctx, LocalSessionBackendOptions{
 		Config:  config,
 		Initial: session.state,
 		Node:    o.node,
@@ -953,7 +1001,8 @@ func (o *ConsensusObserver) prepareRuntime(
 	if err != nil {
 		return nil, fmt.Errorf("validator consensus observer: prepare local backend: %w", err)
 	}
-	runtime, err := prepareSessionRuntime(ctx, config, session.state, RuntimeOptions{
+	backend := backendPreparation.Backend
+	runtime, err := prepareSessionRuntime(ctx, config, backendPreparation.RuntimeState, RuntimeOptions{
 		Storage:    o.storage,
 		Network:    session.network,
 		Backend:    backend,
@@ -1108,8 +1157,7 @@ func (o *ConsensusObserver) handleProgress(
 	// inside the same critical section.
 	session.mu.Lock()
 	sessionID := session.config.SessionID
-	windowSize := session.config.Protocol.SlotsPerLeaderWindow
-	converted, err := collatorConsensusProgress(sessionID, windowSize, progress)
+	converted, err := collatorConsensusProgress(sessionID, progress)
 	if err != nil {
 		session.mu.Unlock()
 

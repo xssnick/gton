@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -185,6 +186,8 @@ func (a *LocalAcquisition) acquireShardMessages(
 	previous []PreviousBlock,
 	candidateBase []PreviousBlock,
 	candidateTip *[32]byte,
+	seedAllowed bool,
+	hints *prewarmHints,
 ) (localAcquiredMessages, error) {
 	expected, err := expectedShardNeighbors(master.context, target)
 	if err != nil {
@@ -192,6 +195,8 @@ func (a *LocalAcquisition) acquireShardMessages(
 	}
 
 	views := make(map[msgpool.ShardIdent]*localNeighborView, len(expected))
+	const stage = CollationStageAcquireInputs
+	stepStarted := time.Now()
 	neighbors, err := a.loadExpectedNeighbors(
 		ctx,
 		master,
@@ -202,6 +207,7 @@ func (a *LocalAcquisition) acquireShardMessages(
 		masterNeedsCollatedProofs(master),
 		acquisitionReadImmediate,
 	)
+	a.observeSubstage(MetricChainShardchain, stage, "load_neighbors", stepStarted)
 	if err != nil {
 		return localAcquiredMessages{}, err
 	}
@@ -210,10 +216,13 @@ func (a *LocalAcquisition) acquireShardMessages(
 		return localAcquiredMessages{}, err
 	}
 	messageViews := effectiveShardMessageViews(destination, previous, views)
-	cut, err := a.cutCommittedViews(branch, destination, messageViews, candidateBase, candidateTip)
+	stepStarted = time.Now()
+	cut, err := a.cutCommittedViews(branch, destination, messageViews, candidateBase, candidateTip, seedAllowed, hints)
+	a.observeSubstage(MetricChainShardchain, stage, "cut_views", stepStarted)
 	if err != nil {
 		return localAcquiredMessages{}, err
 	}
+	stepStarted = time.Now()
 	endLT, err := a.historicalShardEndLT(
 		ctx,
 		master,
@@ -223,6 +232,7 @@ func (a *LocalAcquisition) acquireShardMessages(
 		nil,
 		acquisitionReadImmediate,
 	)
+	a.observeSubstage(MetricChainShardchain, stage, "shard_end_lt", stepStarted)
 	if err != nil {
 		return localAcquiredMessages{}, err
 	}
@@ -327,6 +337,7 @@ func (a *LocalAcquisition) acquireMasterMessages(
 	candidateTip *[32]byte,
 	tops []ShardTop,
 	provider *localShardTopProvider,
+	hints *prewarmHints,
 ) (localAcquiredMessages, error) {
 	registry := &ShardRegistry{
 		leaves:   cloneShardRegistryLeaves(master.registry.leaves),
@@ -390,7 +401,10 @@ func (a *LocalAcquisition) acquireMasterMessages(
 			localRuns = append(localRuns, messages)
 		}
 	}
-	committed, err := a.cutViews(branch, destination, views, candidateBase, candidateTip, localSources)
+	// Masterchain: always allowed. Neither kind of build that must refuse runs
+	// here — the handoff declines masterchain outright and speculation is
+	// shard-only — so there is never a block of ours waiting on this mutex.
+	committed, err := a.cutViews(branch, destination, views, candidateBase, candidateTip, localSources, true, hints)
 	if err != nil {
 		return localAcquiredMessages{}, err
 	}
@@ -809,10 +823,27 @@ func (a *LocalAcquisition) cutCommittedViews(
 	views map[msgpool.ShardIdent]*localNeighborView,
 	candidateBase []PreviousBlock,
 	candidateTip *[32]byte,
+	seedAllowed bool,
+	hints *prewarmHints,
 ) (*msgpool.Cut, error) {
-	return a.cutViews(branch, destination, views, candidateBase, candidateTip, nil)
+	return a.cutViews(branch, destination, views, candidateBase, candidateTip, nil, seedAllowed, hints)
 }
 
+// seedAllowed says whether this acquisition may fall back to walking a whole
+// source queue out of its state when a source is not pinned.
+//
+// It is false for the two builds that run beside a block the producer is still
+// finishing: the pipelined successor and the speculative first slot. The walk is
+// thousands of entries deep and it happens with the acquisition session's mutex
+// held — the same mutex AdvanceConsensusBase takes to open a window and
+// CommitCandidate takes between signing a block and putting it on the wire. A
+// build speculating on a block must not stand in front of that block, so it
+// gives the slot back instead and the producer collates it the ordinary way.
+//
+// installCandidateDeltaLocked has refused seeding for exactly this reason since
+// the pipeline went in; this is the same refusal ten lines further down, where
+// the walk actually happens for the sources the candidate lineage does not
+// cover.
 func (a *LocalAcquisition) cutViews(
 	branch *msgpool.Branch,
 	destination msgpool.ShardIdent,
@@ -820,6 +851,8 @@ func (a *LocalAcquisition) cutViews(
 	candidateBase []PreviousBlock,
 	candidateTip *[32]byte,
 	omit map[msgpool.ShardIdent]struct{},
+	seedAllowed bool,
+	hints *prewarmHints,
 ) (*msgpool.Cut, error) {
 	candidateSources := make([]msgpool.ShardIdent, 0, len(candidateBase)+1)
 	if candidateTip != nil {
@@ -860,9 +893,23 @@ func (a *LocalAcquisition) cutViews(
 				!errors.Is(err, msgpool.ErrNotFound) {
 				return nil, fmt.Errorf("pin internal-message source: %w", err)
 			}
-			if _, err = branch.SeedSourceFromStateRoot(source, ref, view.previous.State); err != nil {
+			if !seedAllowed {
+				return nil, fmt.Errorf(
+					"%w: internal-message source %v is not pinned and may not be seeded here",
+					ErrAcquisitionNotReady, source,
+				)
+			}
+			// The fallback walks the whole source queue out of the state and is
+			// suspected of being most of acquire_inputs under load, when the
+			// queue is thousands deep. Its own span, so the suspicion can be
+			// settled by a histogram instead of argued.
+			seedStarted := time.Now()
+			seeded, _, err := branch.SeedSourceFromStateRoot(source, ref, view.previous.State)
+			a.observeSubstage(MetricChainShardchain, CollationStageAcquireInputs, "seed_source_from_state", seedStarted)
+			if err != nil {
 				return nil, fmt.Errorf("seed session internal-message source: %w", err)
 			}
+			a.collectPooledInternals(hints, seeded)
 			if err = branch.PinSource(source, ref); err != nil {
 				return nil, fmt.Errorf("pin seeded internal-message source: %w", err)
 			}
@@ -925,17 +972,20 @@ func (a *LocalAcquisition) localSeedCut(
 	if err != nil {
 		return nil, err
 	}
-	routed, _, err := a.messages.Internals().SeedsFromStateRoot(source, ref, view.previous.State)
+	// Narrowed to the one destination this acquisition is for. The full form
+	// decodes every entry of the source queue into a message and routes it to
+	// whichever destinations cover it, and this caller then keeps one run and
+	// drops the rest — which on a masterchain build meant materializing a whole
+	// shard's outbound queue to collect the few entries bound for us.
+	messages, err := a.messages.Internals().SeedsForDestination(source, ref, view.previous.State, destination)
 	if err != nil {
+		if errors.Is(err, msgpool.ErrNotFound) {
+			return nil, fmt.Errorf("%w: masterchain destination is absent from internal-message topology", ErrAcquisitionNotReady)
+		}
 		return nil, fmt.Errorf("derive request-local shard-top queue: %w", err)
 	}
-	for i := range routed {
-		if routed[i].Destination == destination {
-			return routed[i].Messages, nil
-		}
-	}
 
-	return nil, fmt.Errorf("%w: masterchain destination is absent from internal-message topology", ErrAcquisitionNotReady)
+	return messages, nil
 }
 
 // mergeLocalCuts interleaves the committed cut with the request-local

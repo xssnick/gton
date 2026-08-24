@@ -119,6 +119,35 @@ func TestPrepareMasterAccountsNeighborProofsBeforeAdmission(t *testing.T) {
 		t.Fatalf("fixed collated estimate = %d, want above compact boundary %d",
 			collation.collatedFixedEstimate, boundary)
 	}
+	if collation.master.topBlockDescrSet == nil {
+		t.Fatal("master TopBlockDescr set was not cached during prepare")
+	}
+	fixedRoots, err := collation.masterCollatedPrefix(consensusExtraRoot(fixture.request.Header.GenUtimeMS))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixedRoots[0] != collation.master.topBlockDescrSet {
+		t.Fatal("master collated prefix did not reuse the prepared TopBlockDescr set")
+	}
+	fixedRoots = append(fixedRoots, collation.fullCollatedProofs...)
+	finalRoots, err := collation.buildCollatedRoots(
+		consensusExtraRoot(fixture.request.Header.GenUtimeMS),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalRoots[0] != collation.master.topBlockDescrSet {
+		t.Fatal("final master collated roots rebuilt the prepared TopBlockDescr set")
+	}
+	fixedBOC, err := cell.ToBOCWithOptionsErr(fixedRoots, cell.BOCSerializeOptions{WithCRC32C: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collation.collatedFixedEstimate != uint64(len(fixedBOC)) {
+		t.Fatalf("fixed collated estimate = %d, serialized size = %d",
+			collation.collatedFixedEstimate, len(fixedBOC))
+	}
 	if collation.limits.fits(LoadNormal) {
 		t.Fatal("neighbor proofs were not reflected in pre-admission collated-data limits")
 	}

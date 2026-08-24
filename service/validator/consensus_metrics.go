@@ -47,11 +47,10 @@ const (
 	lineageStepSourceCount
 )
 
-// LineageWalkObservation is one completed walk from a leader window's base back
-// to the applied anchor. Candidates is the depth, Steps says what each step
-// cost, and Duration is the whole thing including the anchor state load — the
-// three questions asked of every abstain in the field investigation, none of
-// which the node could answer about itself.
+// LineageWalkObservation is one ancestry check from a leader window's base back
+// to the locally applied block. Candidates is the depth, Steps says where each
+// candidate came from, and Duration is the complete parent-link walk. Historical
+// states are not materialized by this check.
 type LineageWalkObservation struct {
 	Chain      collator.MetricChain
 	Result     LineageWalkResult

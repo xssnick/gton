@@ -38,19 +38,21 @@ var (
 // ManagerOptions binds the validator protocol endpoint to the node's one ADNL
 // identity and its dynamic private-overlay registry.
 type ManagerOptions struct {
-	PrivateOverlays *p2p.PrivateOverlayRegistry
-	BlockBroadcasts *p2p.BlockBroadcasts
-	Logger          zerolog.Logger
+	PrivateOverlays  *p2p.PrivateOverlayRegistry
+	BlockBroadcasts  *p2p.BlockBroadcasts
+	CandidateMetrics CandidateTransportObserver
+	Logger           zerolog.Logger
 }
 
 // Manager owns validator and standalone-collator private overlays. A session
 // handle is fixed-membership; UpdateSession closes and reopens it atomically
 // from the Manager's point of view.
 type Manager struct {
-	openOverlay privateOverlayOpener
-	broadcasts  blockBroadcastPublisher
-	localADNLID [32]byte
-	log         zerolog.Logger
+	openOverlay      privateOverlayOpener
+	broadcasts       blockBroadcastPublisher
+	localADNLID      [32]byte
+	log              zerolog.Logger
+	candidateMetrics CandidateTransportObserver
 
 	operationMu     sync.Mutex
 	mu              sync.RWMutex
@@ -85,10 +87,11 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 		) (privateOverlay, error) {
 			return options.PrivateOverlays.Open(config, callbacks)
 		},
-		broadcasts:  options.BlockBroadcasts,
-		localADNLID: localADNLID,
-		log:         options.Logger,
-		sessions:    make(map[[32]byte]*session),
+		broadcasts:       options.BlockBroadcasts,
+		localADNLID:      localADNLID,
+		log:              options.Logger,
+		candidateMetrics: options.CandidateMetrics,
+		sessions:         make(map[[32]byte]*session),
 	}, nil
 }
 

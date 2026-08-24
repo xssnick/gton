@@ -1,6 +1,7 @@
 package collator
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -38,14 +39,17 @@ func (o *collationAlarmObserver) ObserveCollationAlarm(chain MetricChain, alarm 
 	o.chains[alarm] = chain
 }
 
-func (o *collationAlarmObserver) AddCollationBuildInflight(MetricChain, int)                {}
-func (o *collationAlarmObserver) ObserveCollationBuild(CollationBuildObservation)           {}
-func (o *collationAlarmObserver) ObserveCollationStage(CollationStageObservation)           {}
-func (o *collationAlarmObserver) ObserveCollationCandidate(CandidateObservation)            {}
-func (o *collationAlarmObserver) ObserveCandidateProduction(CandidateProductionObservation) {}
-func (o *collationAlarmObserver) ObserveCollationRetry(MetricChain, ProductionRetryReason)  {}
-func (o *collationAlarmObserver) AddCollationWindowInflight(MetricChain, int)               {}
-func (o *collationAlarmObserver) ObserveCollationWindow(WindowObservation)                  {}
+func (o *collationAlarmObserver) ObservePipelineHandoff(MetricChain, PipelineHandoffOutcome) {}
+func (o *collationAlarmObserver) ObservePipelineHandoffPickup(MetricChain, time.Duration)    {}
+func (o *collationAlarmObserver) ObservePipelineOverlap(MetricChain, time.Duration)          {}
+func (o *collationAlarmObserver) AddCollationBuildInflight(MetricChain, int)                 {}
+func (o *collationAlarmObserver) ObserveCollationBuild(CollationBuildObservation)            {}
+func (o *collationAlarmObserver) ObserveCollationStage(CollationStageObservation)            {}
+func (o *collationAlarmObserver) ObserveCollationCandidate(CandidateObservation)             {}
+func (o *collationAlarmObserver) ObserveCandidateProduction(CandidateProductionObservation)  {}
+func (o *collationAlarmObserver) ObserveCollationRetry(MetricChain, ProductionRetryReason)   {}
+func (o *collationAlarmObserver) AddCollationWindowInflight(MetricChain, int)                {}
+func (o *collationAlarmObserver) ObserveCollationWindow(WindowObservation)                   {}
 func (o *collationAlarmObserver) ObserveScheduleLateness(MetricChain, ScheduleEvent, time.Duration) {
 }
 func (o *collationAlarmObserver) ObserveCollationDeadline(MetricChain, CollationDeadline, DeadlineAction) {
@@ -92,6 +96,34 @@ func TestCollationAlarmsFireOnTheirOwnFaults(t *testing.T) {
 			buildErr: errors.New("context canceled"),
 			want:     map[CollationAlarm]int{},
 		},
+		{
+			name:      "a block that fit only after a rebuild",
+			candidate: &Candidate{Stats: Stats{CollationAttempts: 3}},
+			want:      map[CollationAlarm]int{CollationAlarmSizeLimitRetry: 1},
+		},
+		{
+			name:      "a block that fit at once",
+			candidate: &Candidate{Stats: Stats{CollationAttempts: 1}},
+			want:      map[CollationAlarm]int{},
+		},
+		{
+			name: "a slot lost because no rebuild fit",
+			buildErr: collationAttemptsError{
+				attempts: maxCollationAttempts,
+				err:      fmt.Errorf("%w: block BOC is 9 bytes, limit is 8", ErrSizeLimit),
+			},
+			want: map[CollationAlarm]int{CollationAlarmSizeLimitRetry: 1},
+		},
+		{
+			// The failure this used to describe as "after every rebuild": one
+			// overflow and then a deadline, with none of the concessions made.
+			name: "a slot lost to the deadline after its first overflow",
+			buildErr: collationAttemptsError{
+				attempts: 1,
+				err:      fmt.Errorf("%w: %w", context.Canceled, ErrSizeLimit),
+			},
+			want: map[CollationAlarm]int{CollationAlarmSizeLimitRetry: 1},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			observer := newCollationAlarmObserver()
@@ -100,10 +132,7 @@ func TestCollationAlarmsFireOnTheirOwnFaults(t *testing.T) {
 			acquisition.reportCollationAlarms(
 				MetricChainShardchain, request, tc.candidate, tc.buildErr)
 
-			for _, alarm := range []CollationAlarm{
-				CollationAlarmShortCollatedProof,
-				CollationAlarmMandatoryDequeueOverflow,
-			} {
+			for alarm := CollationAlarm(0); alarm < collationAlarmCount; alarm++ {
 				if got := observer.alarms[alarm]; got != tc.want[alarm] {
 					t.Fatalf("%s alarms = %d, want %d", alarm, got, tc.want[alarm])
 				}

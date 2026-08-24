@@ -853,7 +853,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "95% of candidates are smaller than the displayed value. Block and collated data are separated.",
+      "description": "P95 over exact sizes sampled from the latest candidate entering validation. Block and collated data are separated; if multiple candidates arrive between Prometheus scrapes, only the latest one is visible.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -927,7 +927,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le, chain, part) (rate(${metric_namespace}_validator_candidate_size_bytes_bucket{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\"}[$__rate_interval])))",
+          "expr": "quantile_over_time(0.95, ${metric_namespace}_validator_candidate_size_bytes{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\"}[$__rate_interval])",
           "instant": false,
           "legendFormat": "{{part}}",
           "range": true,
@@ -1209,95 +1209,6 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Mean signatures in each stored certificate by kind. A decline reveals participation loss before consensus stops.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "axisSoftMin": 0,
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 12,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 4,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "decimals": 3,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 29
-      },
-      "id": 16,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": true,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "expr": "sum by (chain, kind) (rate(${metric_namespace}_validator_consensus_certificate_signatures_total{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\"}[$__rate_interval])) / clamp_min(sum by (chain, kind) (rate(${metric_namespace}_validator_consensus_certificates_total{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\"}[$__rate_interval])), 1e-9)",
-          "instant": false,
-          "legendFormat": "{{kind}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Signatures per certificate",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
       "description": "Retained entries keep their payload; released entries keep metadata only. The additional line shows payloads actually retained.",
       "fieldConfig": {
         "defaults": {
@@ -1352,8 +1263,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 24,
+        "x": 0,
         "y": 29
       },
       "id": 17,
@@ -1448,7 +1359,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
         "y": 37
       },
@@ -1483,95 +1394,6 @@
         }
       ],
       "title": "Cache memory and budget",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
-      "description": "Where candidates were found during lineage walks. Storage or peer reads instead of memory indicate retention pressure.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "axisSoftMin": 0,
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 55,
-            "gradientMode": "opacity",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 4,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "normal"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "decimals": 3,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 37
-      },
-      "id": 19,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": true,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "expr": "sum by (chain, source) (rate(${metric_namespace}_validator_lineage_walk_steps_total{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\"}[$__rate_interval]))",
-          "instant": false,
-          "legendFormat": "{{source}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Lineage walk source",
       "type": "timeseries"
     },
     {
@@ -1770,6 +1592,41 @@
           "legendFormat": "deliver candidate",
           "instant": false,
           "range": true
+        },
+        {
+          "refId": "R",
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",stage=\"processed_info\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",stage=\"processed_info\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "processed info",
+          "instant": false,
+          "range": true
+        },
+        {
+          "refId": "S",
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",stage=\"claimed_local_cleanup\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",stage=\"claimed_local_cleanup\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "claimed local cleanup",
+          "instant": false,
+          "range": true
+        },
+        {
+          "refId": "T",
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",stage=\"flush_batches\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",stage=\"flush_batches\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "flush batches",
+          "instant": false,
+          "range": true
+        },
+        {
+          "refId": "U",
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",stage=\"validation_closure\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",stage=\"validation_closure\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "validation closure",
+          "instant": false,
+          "range": true
+        },
+        {
+          "refId": "V",
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",stage=\"serialize_block\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",stage=\"serialize_block\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "serialize block",
+          "instant": false,
+          "range": true
         }
       ],
       "title": "Collation stages",
@@ -1780,7 +1637,137 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Successful candidate build rate.",
+      "description": "Mean additive partition of one shard candidate build. Orange is exclusive stage time before the early-successor handoff fence, while the next build is still blocked. Green is serialize_candidate plus finalize_candidate after the fence and may overlap the successor. The stack height is the mean BuildCandidate duration. block_boc is a nested concurrent substage and is intentionally not added; percentiles are not additive and are intentionally not stacked.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "before handoff — next build blocked"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#FF9830",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "after handoff — overlaps successor"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#73BF69",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 149
+      },
+      "id": 63,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum((sum by (stage) (rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=~\"acquire_inputs|wait_external_messages|prepare_state|cleanup_out_queue|execute_internal_messages|execute_external_messages|finalize_accounts|processed_info|claimed_local_cleanup|flush_batches|build_state_update|serialize_block|validation_closure\"}[$__rate_interval]))) / clamp_min(sum by (stage) (rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=~\"acquire_inputs|wait_external_messages|prepare_state|cleanup_out_queue|execute_internal_messages|execute_external_messages|finalize_accounts|processed_info|claimed_local_cleanup|flush_batches|build_state_update|serialize_block|validation_closure\"}[$__rate_interval])), 1e-9))",
+          "instant": false,
+          "legendFormat": "before handoff — next build blocked",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "sum((sum by (stage) (rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=~\"serialize_candidate|finalize_candidate\"}[$__rate_interval]))) / clamp_min(sum by (stage) (rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=~\"serialize_candidate|finalize_candidate\"}[$__rate_interval])), 1e-9))",
+          "instant": false,
+          "legendFormat": "after handoff — overlaps successor",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Collation pipeline split (mean)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Produced blocks/s uses recently completed local leader windows: successfully delivered candidates divided by their combined actual window time, so idle time is excluded. It is emitted only when Prometheus observes a window completion and is zero otherwise; its timestamp is bounded by the 15 s scrape interval. Validated blocks/s remains the normal rolling validation throughput.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1801,7 +1788,7 @@
               "tooltip": false,
               "viz": false
             },
-            "lineInterpolation": "smooth",
+            "lineInterpolation": "stepAfter",
             "lineWidth": 2,
             "pointSize": 4,
             "scaleDistribution": {
@@ -1817,7 +1804,7 @@
               "mode": "off"
             }
           },
-          "decimals": 3,
+          "decimals": 2,
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -1854,14 +1841,21 @@
       },
       "targets": [
         {
-          "expr": "sum by (chain) (rate(${metric_namespace}_collator_builds_total{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",result=\"success\"}[$__rate_interval]))",
+          "expr": "((sum(increase(${metric_namespace}_collator_candidate_production_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",result=\"success\"}[1m])) / clamp_min(sum(increase(${metric_namespace}_collator_window_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",result=\"success\"}[1m])), 1e-9)) * (sum(irate(${metric_namespace}_collator_windows_total{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",result=\"success\"}[1m])) > bool 0)) or vector(0)",
           "instant": false,
-          "legendFormat": "",
+          "legendFormat": "produced blocks/s (our window)",
           "range": true,
           "refId": "A"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_validator_validations_total{job=~\"$job\",instance=~\"$instance\",chain=\"masterchain\",result=\"success\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "validated blocks/s",
+          "range": true,
+          "refId": "B"
         }
       ],
-      "title": "Successful builds",
+      "title": "Block throughput",
       "type": "timeseries"
     },
     {
@@ -2047,7 +2041,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "95th-percentile item count in one masterchain block. Each value is a per-block quantity, not a sum across blocks.",
+      "description": "95th-percentile outbound queue size after producing a masterchain candidate.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2122,27 +2116,13 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(${metric_namespace}_collator_candidate_transactions_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",origin=\"collation\"}[$__rate_interval])))",
-          "instant": false,
-          "range": true,
-          "legendFormat": "transactions"
-        },
-        {
-          "refId": "B",
-          "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(${metric_namespace}_collator_candidate_messages_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",origin=\"collation\"}[$__rate_interval])))",
-          "instant": false,
-          "range": true,
-          "legendFormat": "{{kind}} messages"
-        },
-        {
-          "refId": "C",
           "expr": "histogram_quantile(0.95, sum by (le) (rate(${metric_namespace}_collator_candidate_out_queue_messages_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\"}[$__rate_interval])))",
           "instant": false,
           "range": true,
           "legendFormat": "out queue"
         }
       ],
-      "title": "Candidate contents p95",
+      "title": "Outbound queue size p95",
       "type": "timeseries"
     },
     {
@@ -2150,7 +2130,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Block and collated data sizes for origin=collation only.",
+      "description": "95th percentile of exact block and collated-data gauge samples for locally produced masterchain candidates.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2224,7 +2204,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le, chain, part) (rate(${metric_namespace}_collator_candidate_size_bytes_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",origin=\"collation\"}[$__rate_interval])))",
+          "expr": "quantile_over_time(0.95, ${metric_namespace}_collator_candidate_size_bytes{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",origin=\"collation\"}[$__rate_interval])",
           "instant": false,
           "legendFormat": "{{part}}",
           "range": true,
@@ -2239,7 +2219,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Exact contents of the latest candidate produced by this node, stacked by item type. Each scraped value is exact; when multiple candidates are produced between Prometheus scrapes, only the latest one is visible.",
+      "description": "Exact contents of the latest masterchain candidate produced by this node. External messages are stacked with internal and tick-tock transactions; the separate total-transactions series is intentionally omitted. Each scraped value is exact; when multiple candidates are produced between Prometheus scrapes, only the latest one is visible.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2314,17 +2294,17 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "${metric_namespace}_collator_candidate_latest_transactions{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\"}",
+          "expr": "${metric_namespace}_collator_candidate_latest_messages{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",kind=\"external\"}",
           "instant": false,
           "range": true,
-          "legendFormat": "transactions"
+          "legendFormat": "external"
         },
         {
           "refId": "B",
-          "expr": "${metric_namespace}_collator_candidate_latest_messages{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",kind=~\"external|internal\"}",
+          "expr": "clamp_min(${metric_namespace}_collator_candidate_latest_transactions{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\"} - on(job, instance, mode, chain) ${metric_namespace}_collator_candidate_latest_messages{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"masterchain\",kind=\"external\"}, 0)",
           "instant": false,
           "range": true,
-          "legendFormat": "{{kind}} messages"
+          "legendFormat": "internal + tick-tock"
         }
       ],
       "title": "Latest produced block contents (exact)",
@@ -3559,7 +3539,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "95% of candidates are smaller than the displayed value. Block and collated data are separated.",
+      "description": "P95 over exact sizes sampled from the latest candidate entering validation. Block and collated data are separated; if multiple candidates arrive between Prometheus scrapes, only the latest one is visible.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3633,7 +3613,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le, chain, part) (rate(${metric_namespace}_validator_candidate_size_bytes_bucket{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\"}[$__rate_interval])))",
+          "expr": "quantile_over_time(0.95, ${metric_namespace}_validator_candidate_size_bytes{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\"}[$__rate_interval])",
           "instant": false,
           "legendFormat": "{{part}}",
           "range": true,
@@ -3915,95 +3895,6 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Mean signatures in each stored certificate by kind. A decline reveals participation loss before consensus stops.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "axisSoftMin": 0,
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 12,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 4,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "decimals": 3,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 123
-      },
-      "id": 45,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": true,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "expr": "sum by (chain, kind) (rate(${metric_namespace}_validator_consensus_certificate_signatures_total{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\"}[$__rate_interval])) / clamp_min(sum by (chain, kind) (rate(${metric_namespace}_validator_consensus_certificates_total{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\"}[$__rate_interval])), 1e-9)",
-          "instant": false,
-          "legendFormat": "{{kind}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Signatures per certificate",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
       "description": "Retained entries keep their payload; released entries keep metadata only. The additional line shows payloads actually retained.",
       "fieldConfig": {
         "defaults": {
@@ -4058,8 +3949,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 24,
+        "x": 0,
         "y": 123
       },
       "id": 46,
@@ -4154,7 +4045,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
         "y": 131
       },
@@ -4189,95 +4080,6 @@
         }
       ],
       "title": "Cache memory and budget",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
-      "description": "Where candidates were found during lineage walks. Storage or peer reads instead of memory indicate retention pressure.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "axisSoftMin": 0,
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 55,
-            "gradientMode": "opacity",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 4,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "normal"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "decimals": 3,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 131
-      },
-      "id": 48,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": true,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "expr": "sum by (chain, source) (rate(${metric_namespace}_validator_lineage_walk_steps_total{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\"}[$__rate_interval]))",
-          "instant": false,
-          "legendFormat": "{{source}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Lineage walk source",
       "type": "timeseries"
     },
     {
@@ -4476,6 +4278,41 @@
           "legendFormat": "deliver candidate",
           "instant": false,
           "range": true
+        },
+        {
+          "refId": "R",
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=\"processed_info\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=\"processed_info\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "processed info",
+          "instant": false,
+          "range": true
+        },
+        {
+          "refId": "S",
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=\"claimed_local_cleanup\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=\"claimed_local_cleanup\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "claimed local cleanup",
+          "instant": false,
+          "range": true
+        },
+        {
+          "refId": "T",
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=\"flush_batches\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=\"flush_batches\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "flush batches",
+          "instant": false,
+          "range": true
+        },
+        {
+          "refId": "U",
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=\"validation_closure\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=\"validation_closure\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "validation closure",
+          "instant": false,
+          "range": true
+        },
+        {
+          "refId": "V",
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=\"serialize_block\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",stage=\"serialize_block\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "serialize block",
+          "instant": false,
+          "range": true
         }
       ],
       "title": "Collation stages",
@@ -4486,7 +4323,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Successful candidate build rate.",
+      "description": "Produced blocks/s uses recently completed local leader windows: successfully delivered candidates divided by their combined actual window time, so idle time is excluded. It is emitted only when Prometheus observes a window completion and is zero otherwise; its timestamp is bounded by the 15 s scrape interval. Validated blocks/s remains the normal rolling validation throughput.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4507,7 +4344,7 @@
               "tooltip": false,
               "viz": false
             },
-            "lineInterpolation": "smooth",
+            "lineInterpolation": "stepAfter",
             "lineWidth": 2,
             "pointSize": 4,
             "scaleDistribution": {
@@ -4523,7 +4360,7 @@
               "mode": "off"
             }
           },
-          "decimals": 3,
+          "decimals": 2,
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -4542,7 +4379,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 149
+        "y": 157
       },
       "id": 50,
       "options": {
@@ -4560,14 +4397,21 @@
       },
       "targets": [
         {
-          "expr": "sum by (chain) (rate(${metric_namespace}_collator_builds_total{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",result=\"success\"}[$__rate_interval]))",
+          "expr": "((sum(increase(${metric_namespace}_collator_candidate_production_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",result=\"success\"}[1m])) / clamp_min(sum(increase(${metric_namespace}_collator_window_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",result=\"success\"}[1m])), 1e-9)) * (sum(irate(${metric_namespace}_collator_windows_total{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",result=\"success\"}[1m])) > bool 0)) or vector(0)",
           "instant": false,
-          "legendFormat": "",
+          "legendFormat": "produced blocks/s (our window)",
           "range": true,
           "refId": "A"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_validator_validations_total{job=~\"$job\",instance=~\"$instance\",chain=\"shardchain\",result=\"success\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "validated blocks/s",
+          "range": true,
+          "refId": "B"
         }
       ],
-      "title": "Successful builds",
+      "title": "Block throughput",
       "type": "timeseries"
     },
     {
@@ -4631,7 +4475,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 149
+        "y": 157
       },
       "id": 51,
       "options": {
@@ -4720,7 +4564,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 149
+        "y": 157
       },
       "id": 52,
       "options": {
@@ -4753,7 +4597,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "95th-percentile item count in one masterchain block. Each value is a per-block quantity, not a sum across blocks.",
+      "description": "95th-percentile outbound queue size after producing a shardchain candidate.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4809,7 +4653,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 156
+        "y": 164
       },
       "id": 53,
       "options": {
@@ -4828,27 +4672,13 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(${metric_namespace}_collator_candidate_transactions_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",origin=\"collation\"}[$__rate_interval])))",
-          "instant": false,
-          "range": true,
-          "legendFormat": "transactions"
-        },
-        {
-          "refId": "B",
-          "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(${metric_namespace}_collator_candidate_messages_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",origin=\"collation\"}[$__rate_interval])))",
-          "instant": false,
-          "range": true,
-          "legendFormat": "{{kind}} messages"
-        },
-        {
-          "refId": "C",
           "expr": "histogram_quantile(0.95, sum by (le) (rate(${metric_namespace}_collator_candidate_out_queue_messages_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\"}[$__rate_interval])))",
           "instant": false,
           "range": true,
           "legendFormat": "out queue"
         }
       ],
-      "title": "Candidate contents p95",
+      "title": "Outbound queue size p95",
       "type": "timeseries"
     },
     {
@@ -4856,7 +4686,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Block and collated data sizes for origin=collation only.",
+      "description": "95th percentile of exact block and collated-data gauge samples for locally produced shardchain candidates.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4912,7 +4742,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 156
+        "y": 164
       },
       "id": 54,
       "options": {
@@ -4930,7 +4760,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le, chain, part) (rate(${metric_namespace}_collator_candidate_size_bytes_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",origin=\"collation\"}[$__rate_interval])))",
+          "expr": "quantile_over_time(0.95, ${metric_namespace}_collator_candidate_size_bytes{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",origin=\"collation\"}[$__rate_interval])",
           "instant": false,
           "legendFormat": "{{part}}",
           "range": true,
@@ -4945,7 +4775,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Exact contents of the latest candidate produced by this node, stacked by item type. Each scraped value is exact; when multiple candidates are produced between Prometheus scrapes, only the latest one is visible.",
+      "description": "Exact external and internal message counts in the latest shardchain candidate produced by this node. The separate total-transactions series is intentionally omitted. Each scraped value is exact; when multiple candidates are produced between Prometheus scrapes, only the latest one is visible.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5001,7 +4831,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 164
+        "y": 172
       },
       "id": 62,
       "options": {
@@ -5020,13 +4850,6 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "${metric_namespace}_collator_candidate_latest_transactions{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\"}",
-          "instant": false,
-          "range": true,
-          "legendFormat": "transactions"
-        },
-        {
-          "refId": "B",
           "expr": "${metric_namespace}_collator_candidate_latest_messages{job=~\"$job\",instance=~\"$instance\",mode=\"validator\",chain=\"shardchain\",kind=~\"external|internal\"}",
           "instant": false,
           "range": true,
@@ -5097,7 +4920,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 172
+        "y": 180
       },
       "id": 55,
       "options": {
@@ -5186,7 +5009,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 172
+        "y": 180
       },
       "id": 56,
       "options": {
@@ -5289,7 +5112,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 172
+        "y": 180
       },
       "id": 57,
       "options": {
@@ -5378,7 +5201,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 180
+        "y": 188
       },
       "id": 58,
       "options": {
@@ -5440,7 +5263,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 188
+        "y": 196
       },
       "id": 59,
       "panels": [],
@@ -5508,7 +5331,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 189
+        "y": 197
       },
       "id": 60,
       "options": {
@@ -5697,5 +5520,5 @@
   "weekStart": "",
   "id": null,
   "uid": "gton-validator-metrics",
-  "version": 10
+  "version": 16
 }

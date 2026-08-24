@@ -1,6 +1,7 @@
 package peerroute
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +33,7 @@ type Route struct {
 	retryState       atomic.Int64
 	retryMu          sync.Mutex
 	dialFailures     uint32
+	dialDone         chan struct{}
 	backgroundDial   atomic.Bool
 	lastUsedUnixNano atomic.Int64
 	retryPolicy      RetryPolicy
@@ -95,15 +97,43 @@ func (r *Route) QUICDialPermitted(now time.Time) bool {
 }
 
 func (r *Route) BeginQUICDial(now time.Time) bool {
+	r.retryMu.Lock()
+	defer r.retryMu.Unlock()
+
 	nowUnixNano := now.UnixNano()
-	for {
-		retryState := r.retryState.Load()
-		if retryState < 0 || retryState > nowUnixNano {
-			return false
-		}
-		if r.retryState.CompareAndSwap(retryState, -1) {
-			return true
-		}
+	retryState := r.retryState.Load()
+	if retryState < 0 || retryState > nowUnixNano {
+		return false
+	}
+	if !r.retryState.CompareAndSwap(retryState, -1) {
+		return false
+	}
+	r.dialDone = make(chan struct{})
+
+	return true
+}
+
+func (r *Route) QUICDialInFlight() bool {
+	return r.retryState.Load() < 0
+}
+
+// WaitQUICDial waits for the current route owner, if any. Completion is
+// signalled independently of the transport library's non-context dial mutex,
+// so a latency-bounded caller can stop waiting on its own deadline.
+func (r *Route) WaitQUICDial(ctx context.Context) error {
+	r.retryMu.Lock()
+	if r.retryState.Load() >= 0 {
+		r.retryMu.Unlock()
+		return nil
+	}
+	done := r.dialDone
+	r.retryMu.Unlock()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -111,6 +141,7 @@ func (r *Route) FinishQUICDial() {
 	r.retryMu.Lock()
 	if r.retryState.CompareAndSwap(-1, 0) {
 		r.dialFailures = 0
+		r.finishQUICDialLocked()
 	}
 	r.retryMu.Unlock()
 }
@@ -123,6 +154,7 @@ func (r *Route) SucceedQUICDial(claimed bool) {
 		if !r.retryState.CompareAndSwap(-1, 0) {
 			return
 		}
+		r.finishQUICDialLocked()
 	} else {
 		for {
 			retryState := r.retryState.Load()
@@ -148,10 +180,18 @@ func (r *Route) FailQUICDial(now time.Time) {
 	for current := r.retryState.Load(); current < retryAt; {
 		if r.retryState.CompareAndSwap(current, retryAt) {
 			r.dialFailures = failures
+			if current < 0 {
+				r.finishQUICDialLocked()
+			}
 			return
 		}
 		current = r.retryState.Load()
 	}
+}
+
+func (r *Route) finishQUICDialLocked() {
+	close(r.dialDone)
+	r.dialDone = nil
 }
 
 func (r *Route) DeferQUICDial(now time.Time) {

@@ -237,6 +237,7 @@ type localBackendTestCollator struct {
 	commit        func(context.Context, collator.WindowRequest) error
 	selfErr       error
 	updateErr     error
+	activateErr   error
 	progressErr   error
 	retireErr     error
 	prepareCalls  []collator.SessionRecord
@@ -246,6 +247,9 @@ type localBackendTestCollator struct {
 	commitCalls   []collator.WindowRequest
 	selfCalls     []collator.SelfWindowRequest
 	selfDeadlines []time.Time
+	speculateErr  error
+	speculateWake chan struct{}
+	speculateCall []collator.SpeculativeWindowRequest
 	retireCalls   [][32]byte
 	progressCalls []collator.ConsensusProgress
 	updateEntered chan struct{}
@@ -356,7 +360,7 @@ func (c *localBackendTestCollator) ActivateSession(
 	activation collator.SessionActivation,
 ) error {
 	c.activateCalls = append(c.activateCalls, activation)
-	return nil
+	return c.activateErr
 }
 
 func (c *localBackendTestCollator) RetireSession(_ context.Context, id [32]byte) error {
@@ -388,6 +392,32 @@ func (c *localBackendTestCollator) CommitDelegation(
 	}
 
 	return err
+}
+
+func (c *localBackendTestCollator) SpeculateSelfWindow(
+	_ context.Context,
+	window collator.SpeculativeWindowRequest,
+) error {
+	c.mu.Lock()
+	c.speculateCall = append(c.speculateCall, window)
+	wake := c.speculateWake
+	err := c.speculateErr
+	c.mu.Unlock()
+	if wake != nil {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+
+	return err
+}
+
+func (c *localBackendTestCollator) speculations() []collator.SpeculativeWindowRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return append([]collator.SpeculativeWindowRequest(nil), c.speculateCall...)
 }
 
 func (c *localBackendTestCollator) ActivateSelfWindow(
@@ -514,6 +544,7 @@ type localBackendProductionTestFixture struct {
 	backend    *LocalSessionBackend
 	producer   *localBackendTestCollator
 	config     SessionConfig
+	start      SessionStart
 	privateKey ed25519.PrivateKey
 	signer     *localBackendRecordingSigner
 }
@@ -525,7 +556,7 @@ func newLocalBackendProductionTestFixture(
 ) *localBackendProductionTestFixture {
 	t.Helper()
 
-	config, _, state := localBackendTestRuntimeInputs(t)
+	config, start, state := localBackendTestRuntimeInputs(t)
 	baseSigner, ok := config.Identity.Validator.Signer.(localBackendTestSigner)
 	if !ok {
 		t.Fatal("runtime fixture validator signer has unexpected type")
@@ -534,14 +565,16 @@ func newLocalBackendProductionTestFixture(
 	config.Identity.Validator.Signer = signer
 	producer := &localBackendTestCollator{id: [32]byte{0x96}}
 	backend := &LocalSessionBackend{
-		config:         config,
-		delegations:    delegations,
-		collator:       producer,
-		productionMode: mode,
-		validator:      config.Identity.Validator,
-		state:          state,
-		update:         localCollatorUpdate(config.SessionID, state),
-		closeAfter:     time.Second,
+		config:            config,
+		session:           localCollatorSession(config),
+		delegations:       delegations,
+		collator:          producer,
+		productionMode:    mode,
+		validator:         config.Identity.Validator,
+		validationChanged: make(chan struct{}),
+		state:             state,
+		update:            localCollatorUpdate(config.SessionID, state),
+		closeAfter:        time.Second,
 	}
 	if mode == collator.ProductionModeSelf {
 		backend.self = producer
@@ -551,6 +584,7 @@ func newLocalBackendProductionTestFixture(
 		backend:    backend,
 		producer:   producer,
 		config:     config,
+		start:      start,
 		privateKey: baseSigner.key,
 		signer:     signer,
 	}
@@ -571,6 +605,37 @@ func (f *localBackendProductionTestFixture) window(start, observed uint32) Leade
 		},
 		StartAt: time.Unix(240, 0),
 		Submit:  func(context.Context, *CandidateArtifact) error { return nil },
+	}
+}
+
+func (f *localBackendProductionTestFixture) deferCollatorAhead() SessionState {
+	recovered := cloneSessionState(f.backend.state)
+	recovered.MasterchainBlock.SeqNo += 2
+	recovered.MasterchainBlock.RootHash = bytes.Repeat([]byte{0xc1}, 32)
+	recovered.MasterchainBlock.FileHash = bytes.Repeat([]byte{0xc2}, 32)
+	f.backend.update = localCollatorUpdate(f.config.SessionID, recovered)
+	f.backend.collatorReady = make(chan struct{})
+	f.backend.collatorReadyOnce = sync.Once{}
+	f.backend.collatorDeferred.Store(true)
+
+	return recovered
+}
+
+func assertLocalBackendLeaderWindowWaiting(
+	t *testing.T,
+	result <-chan error,
+	producer *localBackendTestCollator,
+) {
+	t.Helper()
+
+	select {
+	case err := <-result:
+		t.Fatalf("deferred leader window returned before readiness: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if len(producer.updateCalls) != 0 || len(producer.selfCalls) != 0 {
+		t.Fatalf("deferred leader window reached producer: update/self = %d/%d",
+			len(producer.updateCalls), len(producer.selfCalls))
 	}
 }
 
@@ -637,7 +702,7 @@ func TestLocalSessionBackendLoadsExactOrdinaryAndZeroStateTips(t *testing.T) {
 	}
 }
 
-func TestNewLocalSessionBackendSeparatesCloseFromRetirement(t *testing.T) {
+func TestPrepareLocalSessionBackendSeparatesCloseFromRetirement(t *testing.T) {
 	config, start, initial := localBackendTestRuntimeInputs(t)
 	producer := &localBackendTestCollator{id: [32]byte{0x81}, sessionErr: collator.ErrNotFound}
 	router := NewLocalCandidateRouter()
@@ -646,7 +711,7 @@ func TestNewLocalSessionBackendSeparatesCloseFromRetirement(t *testing.T) {
 		stateCells: make(map[string]*cell.Cell),
 		blocks:     make(map[string][]byte),
 	}
-	backend, err := NewLocalSessionBackend(context.Background(), LocalSessionBackendOptions{
+	preparation, err := PrepareLocalSessionBackend(context.Background(), LocalSessionBackendOptions{
 		Config:          config,
 		Initial:         initial,
 		Node:            node,
@@ -661,6 +726,7 @@ func TestNewLocalSessionBackendSeparatesCloseFromRetirement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	backend := preparation.Backend
 	if err = backend.ActivateSession(context.Background(), start); err != nil {
 		t.Fatal(err)
 	}
@@ -701,7 +767,7 @@ func TestNewLocalSessionBackendSeparatesCloseFromRetirement(t *testing.T) {
 	}
 }
 
-func TestNewLocalSessionBackendAllowsRemoteVotingWithoutCandidateRouter(t *testing.T) {
+func TestPrepareLocalSessionBackendAllowsRemoteVotingWithoutCandidateRouter(t *testing.T) {
 	backend, producer := newLocalBackendTestRemoteVotingBackend(t)
 	if len(producer.prepareCalls) != 1 {
 		t.Fatalf("prepared remote collator sessions = %d, want 1", len(producer.prepareCalls))
@@ -712,12 +778,12 @@ func TestNewLocalSessionBackendAllowsRemoteVotingWithoutCandidateRouter(t *testi
 	}
 }
 
-func TestNewLocalSessionBackendRejectsInvalidProductionModeRouterCombinations(t *testing.T) {
+func TestPrepareLocalSessionBackendRejectsInvalidProductionModeRouterCombinations(t *testing.T) {
 	t.Run("self without router", func(t *testing.T) {
 		options := localBackendTestConstructorOptions(t)
 		options.ProductionMode = collator.ProductionModeSelf
 
-		if _, err := NewLocalSessionBackend(context.Background(), options); err == nil {
+		if _, err := PrepareLocalSessionBackend(context.Background(), options); err == nil {
 			t.Fatal("self production without candidate router was accepted")
 		}
 	})
@@ -728,7 +794,7 @@ func TestNewLocalSessionBackendRejectsInvalidProductionModeRouterCombinations(t 
 		options.Delegations = newRuntimeTestStorage()
 		options.CandidateRouter = NewLocalCandidateRouter()
 
-		if _, err := NewLocalSessionBackend(context.Background(), options); err == nil {
+		if _, err := PrepareLocalSessionBackend(context.Background(), options); err == nil {
 			t.Fatal("delegated production with candidate router was accepted")
 		}
 	})
@@ -736,7 +802,7 @@ func TestNewLocalSessionBackendRejectsInvalidProductionModeRouterCombinations(t 
 	t.Run("unspecified mode", func(t *testing.T) {
 		options := localBackendTestConstructorOptions(t)
 
-		if _, err := NewLocalSessionBackend(context.Background(), options); err == nil {
+		if _, err := PrepareLocalSessionBackend(context.Background(), options); err == nil {
 			t.Fatal("validator production without an explicit mode was accepted")
 		}
 	})
@@ -923,7 +989,7 @@ func TestLocalSessionBackendAcceptsFromLatestAppliedShardRegistry(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend, err := NewLocalSessionBackend(t.Context(), LocalSessionBackendOptions{
+	preparation, err := PrepareLocalSessionBackend(t.Context(), LocalSessionBackendOptions{
 		Config:  base.config,
 		Initial: SessionState{MasterchainBlock: stale.MasterchainBlock, Registered: stale.Registered},
 		Node:    &acceptanceTestNode{},
@@ -940,6 +1006,7 @@ func TestLocalSessionBackendAcceptsFromLatestAppliedShardRegistry(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	backend := preparation.Backend
 	defer func() {
 		if closeErr := backend.Close(); closeErr != nil {
 			t.Fatal(closeErr)
@@ -1032,6 +1099,145 @@ func TestPrepareLocalCollatorSessionPreservesRecoveredProgress(t *testing.T) {
 	}
 }
 
+func TestPrepareLocalCollatorSessionKeepsRecoveredFinalizedAnchorAcrossNewerMasterchainView(t *testing.T) {
+	producer := &localBackendTestCollator{}
+	session, latest := localBackendTestCollatorRecord()
+	latest.MasterchainBlock.SeqNo = 13
+	latest.MasterchainBlock.RootHash = bytes.Repeat([]byte{0x31}, 32)
+	latest.MasterchainBlock.FileHash = bytes.Repeat([]byte{0x32}, 32)
+	latest.HasFinalizedBlock = true
+	latest.FinalizedBlock = localBackendTestBlockID(
+		session.Shard.Workchain,
+		session.Shard.Shard,
+		5,
+		bytes.Repeat([]byte{0x33}, 32),
+		nil,
+	)
+	recovered := latest
+	recovered.MasterchainBlock.SeqNo = 12
+	recovered.MasterchainBlock.RootHash = bytes.Repeat([]byte{0x41}, 32)
+	recovered.MasterchainBlock.FileHash = bytes.Repeat([]byte{0x42}, 32)
+	recovered.FinalizedBlock = localBackendTestBlockID(
+		session.Shard.Workchain,
+		session.Shard.Shard,
+		7,
+		bytes.Repeat([]byte{0x43}, 32),
+		nil,
+	)
+	producer.record = &collator.SessionRecord{Session: session, Update: recovered}
+
+	got, err := prepareLocalCollatorSession(t.Context(), producer, session, latest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ready || !got.update.MasterchainBlock.Equals(&latest.MasterchainBlock) ||
+		!got.update.HasFinalizedBlock || !got.update.FinalizedBlock.Equals(&recovered.FinalizedBlock) {
+		t.Fatalf("reconciled newer masterchain update = %+v, want latest chain with recovered anchor", got)
+	}
+	if len(producer.updateCalls) != 1 || !producer.updateCalls[0].Equal(got.update) {
+		t.Fatalf("producer update calls = %+v, want merged update", producer.updateCalls)
+	}
+}
+
+func TestPrepareLocalCollatorSessionKeepsRawFinalizedAnchorAcrossAheadRecovery(t *testing.T) {
+	producer := &localBackendTestCollator{}
+	session, latest := localBackendTestCollatorRecord()
+	latest.HasFinalizedBlock = true
+	latest.FinalizedBlock = localBackendTestBlockID(
+		session.Shard.Workchain,
+		session.Shard.Shard,
+		9,
+		bytes.Repeat([]byte{0x51}, 32),
+		nil,
+	)
+	recovered := latest
+	recovered.MasterchainBlock.SeqNo += 2
+	recovered.MasterchainBlock.RootHash = bytes.Repeat([]byte{0x52}, 32)
+	recovered.MasterchainBlock.FileHash = bytes.Repeat([]byte{0x53}, 32)
+	recovered.FinalizedBlock = localBackendTestBlockID(
+		session.Shard.Workchain,
+		session.Shard.Shard,
+		8,
+		bytes.Repeat([]byte{0x54}, 32),
+		nil,
+	)
+	producer.record = &collator.SessionRecord{Session: session, Update: recovered}
+
+	got, err := prepareLocalCollatorSession(t.Context(), producer, session, latest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ready || !got.update.MasterchainBlock.Equals(&recovered.MasterchainBlock) ||
+		!got.update.HasFinalizedBlock || !got.update.FinalizedBlock.Equals(&latest.FinalizedBlock) {
+		t.Fatalf("ahead recovered update = %+v, want recovered chain with raw stronger anchor", got)
+	}
+	if len(producer.updateCalls) != 0 || len(producer.prepareCalls) != 0 {
+		t.Fatal("ahead recovered session was mutated")
+	}
+}
+
+func TestPrepareLocalCollatorSessionRejectsFinalizedAnchorConflict(t *testing.T) {
+	type finalizedConflictTest struct {
+		name   string
+		mutate func(*collator.SessionUpdate, collator.Session)
+	}
+	tests := []finalizedConflictTest{
+		{
+			name: "same height different block",
+			mutate: func(recovered *collator.SessionUpdate, session collator.Session) {
+				recovered.FinalizedBlock = localBackendTestBlockID(
+					session.Shard.Workchain,
+					session.Shard.Shard,
+					7,
+					bytes.Repeat([]byte{0x63}, 32),
+					nil,
+				)
+			},
+		},
+		{
+			name: "different shard",
+			mutate: func(recovered *collator.SessionUpdate, session collator.Session) {
+				recovered.FinalizedBlock = localBackendTestBlockID(
+					session.Shard.Workchain+1,
+					session.Shard.Shard,
+					8,
+					bytes.Repeat([]byte{0x64}, 32),
+					nil,
+				)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			producer := &localBackendTestCollator{}
+			session, latest := localBackendTestCollatorRecord()
+			latest.HasFinalizedBlock = true
+			latest.FinalizedBlock = localBackendTestBlockID(
+				session.Shard.Workchain,
+				session.Shard.Shard,
+				7,
+				bytes.Repeat([]byte{0x62}, 32),
+				nil,
+			)
+			recovered := latest
+			recovered.MasterchainBlock.SeqNo += 2
+			recovered.MasterchainBlock.RootHash = bytes.Repeat([]byte{0x65}, 32)
+			recovered.MasterchainBlock.FileHash = bytes.Repeat([]byte{0x66}, 32)
+			test.mutate(&recovered, session)
+			producer.record = &collator.SessionRecord{Session: session, Update: recovered}
+
+			_, err := prepareLocalCollatorSession(t.Context(), producer, session, latest)
+			if !errors.Is(err, collator.ErrSessionConflict) {
+				t.Fatalf("finalized anchor conflict error = %v, want session conflict", err)
+			}
+			if len(producer.updateCalls) != 0 || len(producer.prepareCalls) != 0 {
+				t.Fatal("conflicting recovered session was mutated")
+			}
+		})
+	}
+}
+
 func TestPrepareLocalCollatorSessionRetriesExactRecoveredUpdate(t *testing.T) {
 	retryErr := errors.New("retry durable collator update")
 	producer := &localBackendTestCollator{updateErr: retryErr}
@@ -1067,6 +1273,195 @@ func TestPrepareLocalCollatorSessionDefersRecoveredMasterchainView(t *testing.T)
 	}
 }
 
+func TestPrepareLocalSessionBackendStrengthensRuntimeFinalizedAnchorWithoutAdvancingNodeView(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	config, privateKey := runtimeTestConfig(0xa6, &runtimeTestJournal{})
+	keyID := config.Validators[0].PublicKeyHash
+	config.Identity = SessionIdentity{
+		ADNLID: keyID,
+		Validator: &ValidatorIdentity{
+			Index:  0,
+			KeyID:  keyID,
+			Signer: runtimeTestSigner{key: privateKey},
+		},
+	}
+	config.OverlayMembers = [][32]byte{keyID}
+	config.StorageID.IsValidator = true
+	config.StorageID.ValidatorKeyID = keyID
+	config.StorageID.LocalADNLID = keyID
+	config.StorageID.ValidatorIndex = 0
+	validatorSetHash, err := groups.ValidatorSetHash(groups.ValidatorSetHashInput{
+		CatchainSeqno: config.CatchainSeqno,
+		Validators:    config.Validators,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.ValidatorSetHash = validatorSetHash
+
+	initial := runtimeTestState()
+	initial.MasterchainBlock = localBackendTestBlockID(
+		-1,
+		math.MinInt64,
+		20,
+		bytes.Repeat([]byte{0x41}, 32),
+		nil,
+	)
+	initial.Params.TargetRate = 31 * time.Millisecond
+	initial.Params.CandidateResolveTimeoutCap = 47 * time.Millisecond
+	initial.Registered = []groups.ShardDescription{{
+		Shard: config.Shard,
+		Block: localBackendTestBlockID(
+			config.Shard.Workchain,
+			config.Shard.Shard,
+			9,
+			bytes.Repeat([]byte{0x42}, 32),
+			nil,
+		),
+	}}
+
+	recoveredState := cloneSessionState(initial)
+	recoveredState.MasterchainBlock = localBackendTestBlockID(
+		-1,
+		math.MinInt64,
+		22,
+		bytes.Repeat([]byte{0x51}, 32),
+		nil,
+	)
+	recoveredState.Params.TargetRate = 59 * time.Millisecond
+	recoveredState.Params.CandidateResolveTimeoutCap = 83 * time.Millisecond
+	recoveredState.Registered[0].Block = localBackendTestBlockID(
+		config.Shard.Workchain,
+		config.Shard.Shard,
+		12,
+		bytes.Repeat([]byte{0x52}, 32),
+		nil,
+	)
+	recoveredFinalized := localBackendTestBlockID(
+		config.Shard.Workchain,
+		config.Shard.Shard,
+		11,
+		bytes.Repeat([]byte{0x53}, 32),
+		nil,
+	)
+	recoveredState.FinalizedBlock = &recoveredFinalized
+	recovered := localCollatorUpdate(config.SessionID, recoveredState)
+	producer := &localBackendTestCollator{
+		record: &collator.SessionRecord{
+			Session: localCollatorSession(config),
+			Update:  recovered,
+		},
+	}
+
+	preparation, err := PrepareLocalSessionBackend(t.Context(), LocalSessionBackendOptions{
+		Config:         config,
+		Initial:        initial,
+		Node:           &localBackendTestNode{},
+		Groups:         localBackendTestGroups{snapshot: &groups.Snapshot{}},
+		Storage:        storage,
+		Delegations:    storage,
+		Acquisition:    &collator.LocalAcquisition{},
+		Collator:       producer,
+		ProductionMode: collator.ProductionModeDelegated,
+		CloseTimeout:   time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := preparation.Backend
+	var session SessionRuntime
+	t.Cleanup(func() {
+		if session != nil {
+			if closeErr := session.Close(); closeErr != nil {
+				t.Error(closeErr)
+			}
+
+			return
+		}
+		if closeErr := backend.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
+	})
+
+	if !preparation.RuntimeState.MasterchainBlock.Equals(&initial.MasterchainBlock) ||
+		preparation.RuntimeState.Params != initial.Params ||
+		len(preparation.RuntimeState.Registered) != 1 ||
+		!preparation.RuntimeState.Registered[0].Block.Equals(&initial.Registered[0].Block) {
+		t.Fatalf("runtime preparation advanced the raw node view: %+v", preparation.RuntimeState)
+	}
+	if preparation.RuntimeState.FinalizedBlock == nil ||
+		!preparation.RuntimeState.FinalizedBlock.Equals(&recoveredFinalized) {
+		t.Fatalf("runtime finalized anchor = %v, want recovered %v",
+			preparation.RuntimeState.FinalizedBlock, recoveredFinalized)
+	}
+	if !backend.collatorDeferred.Load() || !backend.update.Equal(recovered) {
+		t.Fatalf("prepared backend deferred/update = %v/%+v, want true/recovered",
+			backend.collatorDeferred.Load(), backend.update)
+	}
+
+	session, err = PrepareSessionRuntime(
+		t.Context(),
+		config,
+		preparation.RuntimeState,
+		RuntimeOptions{
+			Storage: storage,
+			Network: newRuntimeTestNetwork(),
+			Backend: backend,
+			Limits: CandidateLimits{
+				MaxBlockBytes:        1 << 20,
+				MaxCollatedDataBytes: 1 << 20,
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := session.(*sessionRuntime)
+	if finalized := runtime.currentFinalizedBlock(); finalized == nil || !finalized.Equals(&recoveredFinalized) {
+		t.Fatalf("runtime finalized anchor = %v, want recovered %v", finalized, recoveredFinalized)
+	}
+	if !runtime.state.MasterchainBlock.Equals(&initial.MasterchainBlock) || runtime.state.Params != initial.Params {
+		t.Fatalf("runtime node view = %+v, want raw initial %+v", runtime.state, initial)
+	}
+	if !backend.collatorDeferred.Load() || len(producer.updateCalls) != 0 ||
+		len(producer.activateCalls) != 0 || backend.validation.Load() != nil {
+		t.Fatalf("runtime construction released ahead producer: deferred/update/activate/view = %v/%d/%d/%v",
+			backend.collatorDeferred.Load(), len(producer.updateCalls), len(producer.activateCalls),
+			backend.validation.Load())
+	}
+
+	intermediate := cloneSessionState(initial)
+	intermediate.MasterchainBlock = localBackendTestBlockID(
+		-1,
+		math.MinInt64,
+		21,
+		bytes.Repeat([]byte{0x61}, 32),
+		nil,
+	)
+	lowerFinalized := localBackendTestBlockID(
+		config.Shard.Workchain,
+		config.Shard.Shard,
+		10,
+		bytes.Repeat([]byte{0x62}, 32),
+		nil,
+	)
+	intermediate.FinalizedBlock = &lowerFinalized
+	if err = runtime.Update(t.Context(), intermediate); err != nil {
+		t.Fatalf("apply intermediate node view: %v", err)
+	}
+	if finalized := runtime.currentFinalizedBlock(); finalized == nil || !finalized.Equals(&recoveredFinalized) {
+		t.Fatalf("intermediate runtime anchor = %v, want retained %v", finalized, recoveredFinalized)
+	}
+	if backend.state.FinalizedBlock == nil || !backend.state.FinalizedBlock.Equals(&recoveredFinalized) ||
+		!backend.state.MasterchainBlock.Equals(&intermediate.MasterchainBlock) {
+		t.Fatalf("intermediate backend state = %+v, want F1.5 with recovered anchor", backend.state)
+	}
+	if !backend.collatorDeferred.Load() || len(producer.updateCalls) != 0 || len(producer.activateCalls) != 0 {
+		t.Fatalf("intermediate view released ahead producer: deferred/update/activate = %v/%d/%d",
+			backend.collatorDeferred.Load(), len(producer.updateCalls), len(producer.activateCalls))
+	}
+}
+
 func TestLocalSessionBackendActivatesDeferredCollatorAfterChainCatchesUp(t *testing.T) {
 	config, start, initial := localBackendTestRuntimeInputs(t)
 	recoveredState := cloneSessionState(initial)
@@ -1081,7 +1476,7 @@ func TestLocalSessionBackendActivatesDeferredCollatorAfterChainCatchesUp(t *test
 			Update:  recovered,
 		},
 	}
-	backend, err := NewLocalSessionBackend(context.Background(), LocalSessionBackendOptions{
+	preparation, err := PrepareLocalSessionBackend(context.Background(), LocalSessionBackendOptions{
 		Config:         config,
 		Initial:        initial,
 		Node:           &localBackendTestNode{},
@@ -1095,6 +1490,7 @@ func TestLocalSessionBackendActivatesDeferredCollatorAfterChainCatchesUp(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	backend := preparation.Backend
 	defer func() {
 		if closeErr := backend.Close(); closeErr != nil {
 			t.Fatal(closeErr)
@@ -1159,6 +1555,407 @@ func TestLocalSessionBackendActivatesDeferredCollatorAfterChainCatchesUp(t *test
 	view := backend.validation.Load()
 	if view == nil || !view.update.Equal(recovered) {
 		t.Fatalf("published recovered validation view = %+v", view)
+	}
+}
+
+func TestLocalSessionBackendDeferredProgressRequestsRecheckAfterCatchUp(t *testing.T) {
+	config, start, initial := localBackendTestRuntimeInputs(t)
+	recoveredState := cloneSessionState(initial)
+	recoveredState.MasterchainBlock.SeqNo += 2
+	recoveredState.MasterchainBlock.RootHash = bytes.Repeat([]byte{0xa1}, 32)
+	recoveredState.MasterchainBlock.FileHash = bytes.Repeat([]byte{0xa2}, 32)
+	recovered := localCollatorUpdate(config.SessionID, recoveredState)
+	activation := localCollatorActivation(config.SessionID, start)
+	producer := &localBackendTestCollator{}
+	backend := &LocalSessionBackend{
+		config:            config,
+		session:           localCollatorSession(config),
+		collator:          producer,
+		progress:          producer,
+		validator:         config.Identity.Validator,
+		validationChanged: make(chan struct{}),
+		state:             initial,
+		update:            recovered,
+		activation:        &activation,
+		closeAfter:        time.Second,
+	}
+	backend.collatorDeferred.Store(true)
+	t.Cleanup(func() {
+		if err := backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	base := newSelectedBaseProgressFixture(t)
+	progress := sessionConsensusProgress{
+		Window: simplex.Window{
+			Base:         simplex.Parent(base.candidate),
+			ObservedSlot: 4,
+			StartSlot:    4,
+			EndSlot:      6,
+			Leader:       0,
+			LocalLeader:  true,
+			ObservedAt:   time.Now(),
+		},
+		StartAt:   time.Unix(123, 0),
+		BaseState: base.chain,
+	}
+	if err := backend.ObserveConsensusProgress(context.Background(), progress); err != nil {
+		t.Fatal(err)
+	}
+	if len(producer.progressCalls) != 0 || backend.pendingWindow == nil {
+		t.Fatalf("deferred progress calls/pending = %d/%v, want 0/non-nil",
+			len(producer.progressCalls), backend.pendingWindow)
+	}
+	if !backend.update.Equal(recovered) {
+		t.Fatalf("pending window leaked into staged update = %+v", backend.update)
+	}
+
+	retryErr := errors.New("retry recovered collator update")
+	producer.updateErr = retryErr
+	err := backend.UpdateSession(context.Background(), recoveredState)
+	if !errors.Is(err, retryErr) {
+		t.Fatalf("first catch-up error = %v, want %v", err, retryErr)
+	}
+	if !backend.collatorDeferred.Load() || backend.pendingWindow == nil ||
+		backend.recheckWindow != nil || backend.validation.Load() != nil {
+		t.Fatal("failed catch-up consumed the pending window or opened the deferred collator")
+	}
+	if len(producer.updateCalls) != 1 || producer.updateCalls[0].HasCurrentWindow {
+		t.Fatalf("staged updates after retryable catch-up failure = %+v, want one without pending window",
+			producer.updateCalls)
+	}
+
+	producer.updateErr = nil
+	if err = backend.UpdateSession(context.Background(), recoveredState); err != nil {
+		t.Fatalf("retry recovered collator update: %v", err)
+	}
+	if backend.collatorDeferred.Load() || backend.pendingWindow != nil || backend.recheckWindow == nil {
+		t.Fatal("successful catch-up did not turn the pending window into an exact recheck")
+	}
+	if len(producer.progressCalls) != 0 {
+		t.Fatalf("catch-up reused %d stale progress capabilities, want zero", len(producer.progressCalls))
+	}
+	leaderWindow := LeaderWindow{
+		Window:  progress.Window,
+		StartAt: progress.StartAt,
+		Submit:  func(context.Context, *CandidateArtifact) error { return nil },
+	}
+	if err = backend.HandleLeaderWindow(context.Background(), leaderWindow); !errors.Is(
+		err,
+		errLeaderWindowNeedsRecheck,
+	) {
+		t.Fatalf("waiting window result = %v, want proof recheck", err)
+	}
+	if backend.recheckWindow == nil {
+		t.Fatal("first waiting handle consumed the proof-recheck debt")
+	}
+	if err = backend.HandleLeaderWindow(context.Background(), leaderWindow); !errors.Is(
+		err,
+		errLeaderWindowNeedsRecheck,
+	) {
+		t.Fatalf("second waiting window result = %v, want proof recheck", err)
+	}
+	if backend.recheckWindow == nil {
+		t.Fatal("second waiting handle consumed the proof-recheck debt")
+	}
+	if err = backend.ObserveConsensusProgress(context.Background(), progress); err != nil {
+		t.Fatalf("recheck consensus progress: %v", err)
+	}
+	if backend.recheckWindow != nil {
+		t.Fatal("fresh consensus progress did not discharge proof-recheck debt")
+	}
+	if len(producer.progressCalls) != 1 || producer.progressCalls[0].Window != progress.Window ||
+		producer.progressCalls[0].Base == nil {
+		t.Fatalf("fresh progress after recheck = %+v", producer.progressCalls)
+	}
+	view := backend.validation.Load()
+	if view == nil || view.update.CurrentBase != progress.Window.Base {
+		t.Fatalf("published view after fresh progress = %+v", view)
+	}
+}
+
+func TestLocalSessionBackendFinalizedAdvanceBeforeHandleRequiresRecheck(t *testing.T) {
+	fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+	fixture.backend.progress = fixture.producer
+	t.Cleanup(func() {
+		if err := fixture.backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	window := fixture.window(0, 0)
+	progress := sessionConsensusProgress{Window: window.Window, StartAt: window.StartAt}
+	if err := fixture.backend.ObserveConsensusProgress(t.Context(), progress); err != nil {
+		t.Fatalf("observe opening window: %v", err)
+	}
+	if fixture.backend.appliedWindow == nil || fixture.backend.handledWindow != nil {
+		t.Fatal("opening proof was not left pending for HandleLeaderWindow")
+	}
+
+	next := cloneSessionState(fixture.backend.state)
+	finalized := *fixture.start.Genesis[0].Copy()
+	next.FinalizedBlock = &finalized
+	if err := fixture.backend.UpdateSession(t.Context(), next); err != nil {
+		t.Fatalf("advance finalized block before handle: %v", err)
+	}
+	if fixture.backend.recheckWindow == nil {
+		t.Fatal("finalized advance did not mark the unhandled proof for recheck")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := fixture.backend.HandleLeaderWindow(ctx, window); !errors.Is(err, errLeaderWindowNeedsRecheck) {
+		t.Fatalf("handle after finalized advance = %v, want proof recheck", err)
+	}
+	if len(fixture.producer.selfCalls) != 0 {
+		t.Fatalf("stale opening started %d self windows", len(fixture.producer.selfCalls))
+	}
+	if err := fixture.backend.ObserveConsensusProgress(ctx, progress); err != nil {
+		t.Fatalf("reobserve opening window: %v", err)
+	}
+	if fixture.backend.recheckWindow != nil {
+		t.Fatal("fresh proof did not discharge finalized-anchor debt")
+	}
+	if err := fixture.backend.HandleLeaderWindow(ctx, window); err != nil {
+		t.Fatalf("handle freshly checked opening: %v", err)
+	}
+	if len(fixture.producer.selfCalls) != 1 ||
+		fixture.backend.handledWindow != fixture.backend.appliedWindow {
+		t.Fatalf("fresh opening self calls/handled = %d/%v, want 1/current proof",
+			len(fixture.producer.selfCalls), fixture.backend.handledWindow)
+	}
+}
+
+func TestLocalSessionBackendFinalizedAdvanceAfterHandlePreservesRunningWindow(t *testing.T) {
+	fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+	fixture.backend.progress = fixture.producer
+	t.Cleanup(func() {
+		if err := fixture.backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	window := fixture.window(0, 0)
+	progress := sessionConsensusProgress{Window: window.Window, StartAt: window.StartAt}
+	if err := fixture.backend.ObserveConsensusProgress(t.Context(), progress); err != nil {
+		t.Fatalf("observe opening window: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := fixture.backend.HandleLeaderWindow(ctx, window); err != nil {
+		t.Fatalf("start opening window: %v", err)
+	}
+	if fixture.backend.handledWindow == nil ||
+		fixture.backend.handledWindow != fixture.backend.appliedWindow {
+		t.Fatal("successful handle did not bind the applied proof generation")
+	}
+	fixture.backend.routeMu.RLock()
+	route := fixture.backend.window
+	fixture.backend.routeMu.RUnlock()
+	if route == nil {
+		t.Fatal("self window did not install its candidate route")
+	}
+	if err := fixture.backend.ObserveConsensusProgress(t.Context(), progress); err != nil {
+		t.Fatalf("repeat exact handled progress: %v", err)
+	}
+	if fixture.backend.handledWindow != fixture.backend.appliedWindow {
+		t.Fatal("duplicate exact progress reopened an already handled proof gap")
+	}
+
+	next := cloneSessionState(fixture.backend.state)
+	finalized := *fixture.start.Genesis[0].Copy()
+	next.FinalizedBlock = &finalized
+	if err := fixture.backend.UpdateSession(t.Context(), next); err != nil {
+		t.Fatalf("advance finalized block after handle: %v", err)
+	}
+	if fixture.backend.recheckWindow != nil {
+		t.Fatal("finalized advance invalidated an already running window snapshot")
+	}
+	fixture.backend.routeMu.RLock()
+	currentRoute := fixture.backend.window
+	fixture.backend.routeMu.RUnlock()
+	if currentRoute != route {
+		t.Fatal("finalized advance replaced or cleared the running window route")
+	}
+	if len(fixture.producer.selfCalls) != 1 {
+		t.Fatalf("finalized advance restarted self production %d times, want one", len(fixture.producer.selfCalls))
+	}
+}
+
+func TestLocalSessionBackendNewerObservedSlotClearsFinalizedRecheckDebt(t *testing.T) {
+	fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+	fixture.backend.progress = fixture.producer
+	t.Cleanup(func() {
+		if err := fixture.backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	window := fixture.window(0, 0)
+	progress := sessionConsensusProgress{Window: window.Window, StartAt: window.StartAt}
+	if err := fixture.backend.ObserveConsensusProgress(t.Context(), progress); err != nil {
+		t.Fatalf("observe opening window: %v", err)
+	}
+	next := cloneSessionState(fixture.backend.state)
+	finalized := *fixture.start.Genesis[0].Copy()
+	next.FinalizedBlock = &finalized
+	if err := fixture.backend.UpdateSession(t.Context(), next); err != nil {
+		t.Fatalf("advance finalized block: %v", err)
+	}
+	if fixture.backend.recheckWindow == nil {
+		t.Fatal("test setup did not create proof-recheck debt")
+	}
+
+	progress.Window.ObservedSlot++
+	progress.StartAt = time.Time{}
+	if err := fixture.backend.ObserveConsensusProgress(t.Context(), progress); err != nil {
+		t.Fatalf("apply newer in-window progress: %v", err)
+	}
+	if fixture.backend.recheckWindow != nil {
+		t.Fatal("newer observed slot did not discharge older proof debt")
+	}
+}
+
+func TestLocalSessionBackendTerminalProgressClearsFinalizedRecheckDebt(t *testing.T) {
+	fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+	fixture.backend.progress = fixture.producer
+	t.Cleanup(func() {
+		if err := fixture.backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	window := fixture.window(0, 0)
+	progress := sessionConsensusProgress{Window: window.Window, StartAt: window.StartAt}
+	if err := fixture.backend.ObserveConsensusProgress(t.Context(), progress); err != nil {
+		t.Fatalf("observe opening window: %v", err)
+	}
+	next := cloneSessionState(fixture.backend.state)
+	finalized := *fixture.start.Genesis[0].Copy()
+	next.FinalizedBlock = &finalized
+	if err := fixture.backend.UpdateSession(t.Context(), next); err != nil {
+		t.Fatalf("advance finalized block: %v", err)
+	}
+	if fixture.backend.recheckWindow == nil {
+		t.Fatal("test setup did not create proof-recheck debt")
+	}
+
+	fixture.producer.progressErr = fmt.Errorf(
+		"producer stopped during recheck: %w",
+		collator.ErrSessionUnavailable,
+	)
+	progress.StartAt = window.StartAt.Add(time.Minute)
+	if err := fixture.backend.ObserveConsensusProgress(t.Context(), progress); err != nil {
+		t.Fatalf("terminal progress was not isolated: %v", err)
+	}
+	if !fixture.backend.collatorUnavailable || fixture.backend.recheckWindow != nil ||
+		fixture.backend.pendingWindow != nil || fixture.backend.appliedWindow != nil ||
+		fixture.backend.handledWindow != nil {
+		t.Fatalf("terminal recheck quarantine state = unavailable %v, recheck %v, pending %v, applied %v, handled %v",
+			fixture.backend.collatorUnavailable, fixture.backend.recheckWindow,
+			fixture.backend.pendingWindow, fixture.backend.appliedWindow,
+			fixture.backend.handledWindow)
+	}
+	if !fixture.backend.update.CurrentWindowStartAt.Equal(window.StartAt) {
+		t.Fatalf("quarantine lost deferred start time: got %v, want %v",
+			fixture.backend.update.CurrentWindowStartAt, window.StartAt)
+	}
+}
+
+func TestLocalSessionBackendDeferredTerminalProducerFailurePublishesValidationView(t *testing.T) {
+	type terminalStageTest struct {
+		name              string
+		updateErr         error
+		activateErr       error
+		wantActivateCalls int
+	}
+	terminal := func(stage string) error {
+		return fmt.Errorf("%s stopped: %w", stage, collator.ErrSessionUnavailable)
+	}
+	tests := []terminalStageTest{
+		{name: "update", updateErr: terminal("session update")},
+		{name: "activate", activateErr: terminal("session activation"), wantActivateCalls: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config, start, initial := localBackendTestRuntimeInputs(t)
+			recoveredState := cloneSessionState(initial)
+			recoveredState.MasterchainBlock.SeqNo += 2
+			recoveredState.MasterchainBlock.RootHash = bytes.Repeat([]byte{0xb1}, 32)
+			recoveredState.MasterchainBlock.FileHash = bytes.Repeat([]byte{0xb2}, 32)
+			recovered := localCollatorUpdate(config.SessionID, recoveredState)
+			activation := localCollatorActivation(config.SessionID, start)
+			producer := &localBackendTestCollator{
+				updateErr:   test.updateErr,
+				activateErr: test.activateErr,
+			}
+			backend := &LocalSessionBackend{
+				config:            config,
+				session:           localCollatorSession(config),
+				collator:          producer,
+				progress:          producer,
+				validator:         config.Identity.Validator,
+				validationChanged: make(chan struct{}),
+				state:             initial,
+				update:            recovered,
+				activation:        &activation,
+				closeAfter:        time.Second,
+			}
+			backend.collatorDeferred.Store(true)
+			t.Cleanup(func() {
+				if err := backend.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+
+			base := newSelectedBaseProgressFixture(t)
+			progress := sessionConsensusProgress{
+				Window: simplex.Window{
+					Base:         simplex.Parent(base.candidate),
+					ObservedSlot: 4,
+					StartSlot:    4,
+					EndSlot:      6,
+					Leader:       0,
+					ObservedAt:   time.Now(),
+				},
+				StartAt:   time.Unix(123, 0),
+				BaseState: base.chain,
+			}
+			if err := backend.ObserveConsensusProgress(context.Background(), progress); err != nil {
+				t.Fatal(err)
+			}
+			if !backend.update.Equal(recovered) {
+				t.Fatalf("pending terminal progress leaked into staged update = %+v", backend.update)
+			}
+			if err := backend.UpdateSession(context.Background(), recoveredState); err != nil {
+				t.Fatalf("authoritative update after deferred producer failure: %v", err)
+			}
+			if !backend.collatorUnavailable || backend.collatorDeferred.Load() || backend.pendingWindow != nil {
+				t.Fatalf("terminal producer state unavailable/deferred/pending = %v/%v/%v, want true/false/nil",
+					backend.collatorUnavailable, backend.collatorDeferred.Load(), backend.pendingWindow)
+			}
+			if !backend.state.MasterchainBlock.Equals(&recoveredState.MasterchainBlock) {
+				t.Fatalf("committed masterchain block = %v, want %v",
+					backend.state.MasterchainBlock, recoveredState.MasterchainBlock)
+			}
+			view := backend.validation.Load()
+			if view == nil || view.update.CurrentBase != progress.Window.Base {
+				t.Fatalf("published view after terminal producer failure = %+v", view)
+			}
+			if len(producer.updateCalls) != 1 || producer.updateCalls[0].HasCurrentWindow {
+				t.Fatalf("terminal staged updates = %+v, want one without pending window", producer.updateCalls)
+			}
+			if len(producer.activateCalls) != test.wantActivateCalls {
+				t.Fatalf("terminal activation calls = %d, want %d",
+					len(producer.activateCalls), test.wantActivateCalls)
+			}
+			if len(producer.progressCalls) != 0 {
+				t.Fatalf("terminal catch-up reused %d stale progress capabilities, want zero",
+					len(producer.progressCalls))
+			}
+		})
 	}
 }
 
@@ -1411,6 +2208,18 @@ func TestSelfCandidateSignatureIsStillCheckedBeforeTheNetwork(t *testing.T) {
 	if got := broadcasts.Load(); got != 1 {
 		t.Fatalf("honest candidate broadcasts = %d, want 1", got)
 	}
+	runtime.candidates.mu.Lock()
+	retained := runtime.candidates.entries[routed.Candidate.ID].candidate
+	runtime.candidates.mu.Unlock()
+	if retained == nil || !retained.generationTimeKnown {
+		t.Fatal("custom local candidate was retained without derived generation time")
+	}
+	withoutBOC := *retained
+	withoutBOC.CollatedData = []byte("not a BOC")
+	gotTime, err := withoutBOC.generationTime()
+	if err != nil || gotTime.UnixMilli() != int64(honest.generationTimeMS) {
+		t.Fatalf("custom local generation time = %v, %v; want %d", gotTime, err, honest.generationTimeMS)
+	}
 
 	if err = runtime.Close(); err != nil {
 		t.Fatal(err)
@@ -1423,6 +2232,7 @@ func TestSelfCandidateSignatureIsStillCheckedBeforeTheNetwork(t *testing.T) {
 func TestLocalSessionBackendPublishesConsensusProgressToInProcessCollator(t *testing.T) {
 	producer := &localBackendTestCollator{id: [32]byte{0x71}}
 	config, _, initial := localBackendTestRuntimeInputs(t)
+	base := newSelectedBaseProgressFixture(t)
 	backend := &LocalSessionBackend{
 		config:     config,
 		collator:   producer,
@@ -1433,20 +2243,15 @@ func TestLocalSessionBackendPublishesConsensusProgressToInProcessCollator(t *tes
 		closeAfter: time.Second,
 	}
 	progress := sessionConsensusProgress{
-		FinalizedAnchor: initial.FinalizedBlock,
 		Window: simplex.Window{
-			Base:         simplex.Genesis(),
+			Base:         simplex.Parent(base.candidate),
 			ObservedSlot: 4,
 			StartSlot:    4,
-			EndSlot:      8,
-			Leader:       1,
+			EndSlot:      6,
+			Leader:       0,
 		},
-		StartAt: time.Unix(123, 0),
-		Candidates: []*CandidateArtifact{{
-			Candidate:    simplex.Candidate{ID: simplex.CandidateID{Slot: 3}},
-			BlockBOC:     []byte{1, 2},
-			CollatedData: []byte{3, 4},
-		}},
+		StartAt:   time.Unix(123, 0),
+		BaseState: base.chain,
 	}
 	if err := backend.ObserveConsensusProgress(context.Background(), progress); err != nil {
 		t.Fatal(err)
@@ -1456,14 +2261,8 @@ func TestLocalSessionBackendPublishesConsensusProgressToInProcessCollator(t *tes
 	}
 	got := producer.progressCalls[0]
 	if got.SessionID != config.SessionID || got.Window != progress.Window || !got.StartAt.Equal(progress.StartAt) ||
-		len(got.Candidates) != 1 || (progress.FinalizedAnchor != nil &&
-		(got.FinalizedAnchor == nil || !sameBlockID(*got.FinalizedAnchor, *progress.FinalizedAnchor))) {
+		got.Base == nil {
 		t.Fatalf("forwarded progress = %+v", got)
-	}
-	if got.Candidates[0].WindowID.StartSlot != 2 ||
-		&got.Candidates[0].BlockBOC[0] != &progress.Candidates[0].BlockBOC[0] ||
-		&got.Candidates[0].CollatedData[0] != &progress.Candidates[0].CollatedData[0] {
-		t.Fatal("consensus progress did not preserve the immutable candidate projection")
 	}
 	if !backend.update.HasCurrentWindow || backend.update.CurrentWindowStart != 4 ||
 		backend.update.CurrentWindowObservedSlot != 4 || backend.update.CurrentBase != progress.Window.Base ||
@@ -1659,15 +2458,19 @@ func TestLocalSessionBackendQuarantinesTerminalProducerOnly(t *testing.T) {
 		id:          [32]byte{0x73},
 		progressErr: fmt.Errorf("collator generation stopped: %w", collator.ErrSessionUnavailable),
 	}
-	config, _, initial := localBackendTestRuntimeInputs(t)
+	config, start, initial := localBackendTestRuntimeInputs(t)
+	activation := localCollatorActivation(config.SessionID, start)
 	backend := &LocalSessionBackend{
-		config:     config,
-		collator:   producer,
-		progress:   producer,
-		validator:  config.Identity.Validator,
-		state:      initial,
-		update:     localCollatorUpdate(config.SessionID, initial),
-		closeAfter: time.Second,
+		config:            config,
+		session:           localCollatorSession(config),
+		activation:        &activation,
+		collator:          producer,
+		progress:          producer,
+		validator:         config.Identity.Validator,
+		validationChanged: make(chan struct{}),
+		state:             initial,
+		update:            localCollatorUpdate(config.SessionID, initial),
+		closeAfter:        time.Second,
 	}
 	progress := sessionConsensusProgress{
 		Window: simplex.Window{
@@ -1679,14 +2482,28 @@ func TestLocalSessionBackendQuarantinesTerminalProducerOnly(t *testing.T) {
 		},
 		StartAt: time.Now(),
 	}
-	if err := backend.ObserveConsensusProgress(context.Background(), progress); !errors.Is(
-		err,
-		collator.ErrSessionUnavailable,
-	) {
-		t.Fatalf("terminal producer progress error = %v", err)
+	if err := backend.ObserveConsensusProgress(context.Background(), progress); err != nil {
+		t.Fatalf("terminal producer progress isolated from validation: %v", err)
 	}
 	if !backend.collatorUnavailable {
 		t.Fatal("terminal producer was not quarantined")
+	}
+	view := backend.validation.Load()
+	if view == nil || !view.update.HasCurrentWindow || view.update.CurrentWindowObservedSlot != 0 {
+		t.Fatalf("terminal progress validation view = %+v", view)
+	}
+
+	progress.Window.ObservedSlot++
+	progress.StartAt = time.Time{}
+	if err := backend.ObserveConsensusProgress(context.Background(), progress); err != nil {
+		t.Fatalf("subsequent progress after producer quarantine: %v", err)
+	}
+	view = backend.validation.Load()
+	if view == nil || view.update.CurrentWindowObservedSlot != progress.Window.ObservedSlot {
+		t.Fatalf("subsequent quarantined validation view = %+v", view)
+	}
+	if len(producer.progressCalls) != 1 {
+		t.Fatalf("quarantined producer progress calls = %d, want 1", len(producer.progressCalls))
 	}
 
 	next := cloneSessionState(initial)
@@ -1713,6 +2530,320 @@ func TestLocalSessionBackendQuarantinesTerminalProducerOnly(t *testing.T) {
 	}
 	if len(producer.updateCalls) != 0 || len(producer.commitCalls) != 0 {
 		t.Fatal("quarantined producer received further production work")
+	}
+}
+
+func TestLocalSessionBackendQuarantinesTerminalActivation(t *testing.T) {
+	fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+	fixture.producer.activateErr = fmt.Errorf("producer activation stopped: %w", collator.ErrSessionUnavailable)
+	t.Cleanup(func() {
+		if err := fixture.backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	if err := fixture.backend.ActivateSession(context.Background(), fixture.start); err != nil {
+		t.Fatalf("terminal producer activation isolated from validation: %v", err)
+	}
+	want := localCollatorActivation(fixture.config.SessionID, fixture.start)
+	if !fixture.backend.collatorUnavailable || fixture.backend.activation == nil ||
+		!fixture.backend.activation.Equal(want) {
+		t.Fatalf("terminal activation unavailable/activation = %v/%+v",
+			fixture.backend.collatorUnavailable, fixture.backend.activation)
+	}
+	if len(fixture.producer.activateCalls) != 1 {
+		t.Fatalf("terminal producer activation calls = %d, want 1", len(fixture.producer.activateCalls))
+	}
+	view := fixture.backend.validation.Load()
+	if view == nil || !view.update.Equal(fixture.backend.update) {
+		t.Fatalf("validation view after terminal activation = %+v", view)
+	}
+}
+
+func TestLocalSessionBackendQuarantinesTerminalUpdate(t *testing.T) {
+	fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+	activation := localCollatorActivation(fixture.config.SessionID, fixture.start)
+	fixture.backend.activation = &activation
+	fixture.producer.updateErr = fmt.Errorf("producer update stopped: %w", collator.ErrSessionUnavailable)
+	t.Cleanup(func() {
+		if err := fixture.backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	next := cloneSessionState(fixture.backend.state)
+	next.MasterchainBlock.SeqNo++
+	next.MasterchainBlock.RootHash = bytes.Repeat([]byte{0xd1}, 32)
+	next.MasterchainBlock.FileHash = bytes.Repeat([]byte{0xd2}, 32)
+	if err := fixture.backend.UpdateSession(context.Background(), next); err != nil {
+		t.Fatalf("terminal producer update isolated from validation: %v", err)
+	}
+	if !fixture.backend.collatorUnavailable ||
+		!fixture.backend.state.MasterchainBlock.Equals(&next.MasterchainBlock) {
+		t.Fatalf("terminal update unavailable/state = %v/%+v",
+			fixture.backend.collatorUnavailable, fixture.backend.state)
+	}
+	if len(fixture.producer.updateCalls) != 1 {
+		t.Fatalf("terminal producer update calls = %d, want 1", len(fixture.producer.updateCalls))
+	}
+	view := fixture.backend.validation.Load()
+	if view == nil || !view.update.MasterchainBlock.Equals(&next.MasterchainBlock) {
+		t.Fatalf("validation view after terminal update = %+v", view)
+	}
+}
+
+func TestLocalSessionBackendBindsActivationAfterDeferredProducerQuarantine(t *testing.T) {
+	fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+	recovered := fixture.deferCollatorAhead()
+	fixture.producer.updateErr = fmt.Errorf("recovered producer stopped: %w", collator.ErrSessionUnavailable)
+	t.Cleanup(func() {
+		if err := fixture.backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	if err := fixture.backend.UpdateSession(context.Background(), recovered); err != nil {
+		t.Fatalf("terminal recovered update: %v", err)
+	}
+	if fixture.backend.validation.Load() != nil {
+		t.Fatal("validation opened before the session activation was known")
+	}
+	fixture.producer.activateErr = errors.New("quarantined producer must not be activated")
+	if err := fixture.backend.ActivateSession(context.Background(), fixture.start); err != nil {
+		t.Fatalf("bind validation activation after producer quarantine: %v", err)
+	}
+	if len(fixture.producer.activateCalls) != 0 {
+		t.Fatalf("quarantined producer activation calls = %d, want 0", len(fixture.producer.activateCalls))
+	}
+	view := fixture.backend.validation.Load()
+	if view == nil || !view.update.MasterchainBlock.Equals(&recovered.MasterchainBlock) {
+		t.Fatalf("validation view after quarantined activation = %+v", view)
+	}
+}
+
+func TestLocalSessionBackendDeferredLeaderWindowResumesAfterCatchUp(t *testing.T) {
+	fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+	fixture.backend.progress = fixture.producer
+	recovered := fixture.deferCollatorAhead()
+	t.Cleanup(func() {
+		if err := fixture.backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	window := fixture.window(0, 0)
+	progress := sessionConsensusProgress{Window: window.Window, StartAt: window.StartAt}
+	if err := fixture.backend.ObserveConsensusProgress(ctx, progress); err != nil {
+		t.Fatalf("observe deferred window: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- fixture.backend.HandleLeaderWindow(ctx, window)
+	}()
+	assertLocalBackendLeaderWindowWaiting(t, result, fixture.producer)
+
+	if err := fixture.backend.UpdateSession(ctx, recovered); err != nil {
+		t.Fatalf("complete recovered catch-up: %v", err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, errLeaderWindowNeedsRecheck) {
+			t.Fatalf("resumed leader window = %v, want anchor recheck", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("leader window did not resume after catch-up: %v", ctx.Err())
+	}
+	select {
+	case <-fixture.backend.collatorReady:
+	default:
+		t.Fatal("successful catch-up did not close producer readiness")
+	}
+	if len(fixture.producer.updateCalls) != 1 || len(fixture.producer.selfCalls) != 0 ||
+		len(fixture.producer.progressCalls) != 0 {
+		t.Fatalf("pre-recheck producer update/self/progress calls = %d/%d/%d, want 1/0/0",
+			len(fixture.producer.updateCalls), len(fixture.producer.selfCalls),
+			len(fixture.producer.progressCalls))
+	}
+	if err := fixture.backend.ObserveConsensusProgress(ctx, progress); err != nil {
+		t.Fatalf("observe rechecked window: %v", err)
+	}
+	if err := fixture.backend.HandleLeaderWindow(ctx, window); err != nil {
+		t.Fatalf("handle rechecked window: %v", err)
+	}
+	if len(fixture.producer.updateCalls) != 2 {
+		t.Fatalf("catch-up/rechecked opening update calls = %d, want 2", len(fixture.producer.updateCalls))
+	}
+	opening := fixture.producer.updateCalls[1]
+	if !opening.HasCurrentWindow || opening.CurrentWindowStart != window.Window.StartSlot {
+		t.Fatalf("resumed opening update = %+v", opening)
+	}
+	if len(fixture.producer.selfCalls) != 1 ||
+		fixture.producer.selfCalls[0].StartSlot != window.Window.StartSlot {
+		t.Fatalf("rechecked self window calls = %+v", fixture.producer.selfCalls)
+	}
+	if len(fixture.producer.progressCalls) != 1 {
+		t.Fatalf("rechecked progress calls = %d, want 1", len(fixture.producer.progressCalls))
+	}
+}
+
+func TestLocalSessionBackendDeferredLeaderWindowStopsAfterTerminalCatchUp(t *testing.T) {
+	fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+	recovered := fixture.deferCollatorAhead()
+	fixture.producer.updateErr = fmt.Errorf("recovered producer stopped: %w", collator.ErrSessionUnavailable)
+	t.Cleanup(func() {
+		if err := fixture.backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- fixture.backend.HandleLeaderWindow(ctx, fixture.window(0, 0))
+	}()
+	assertLocalBackendLeaderWindowWaiting(t, result, fixture.producer)
+
+	if err := fixture.backend.UpdateSession(ctx, recovered); err != nil {
+		t.Fatalf("terminal recovered catch-up: %v", err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("leader window after terminal catch-up: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("terminal catch-up did not wake leader window: %v", ctx.Err())
+	}
+	select {
+	case <-fixture.backend.collatorReady:
+	default:
+		t.Fatal("terminal catch-up did not close producer readiness")
+	}
+	if !fixture.backend.collatorUnavailable || fixture.backend.collatorDeferred.Load() {
+		t.Fatalf("terminal catch-up unavailable/deferred = %v/%v, want true/false",
+			fixture.backend.collatorUnavailable, fixture.backend.collatorDeferred.Load())
+	}
+	if len(fixture.producer.updateCalls) != 1 || len(fixture.producer.selfCalls) != 0 {
+		t.Fatalf("terminal catch-up producer update/self calls = %d/%d, want 1/0",
+			len(fixture.producer.updateCalls), len(fixture.producer.selfCalls))
+	}
+}
+
+func TestLocalSessionBackendDeferredLeaderWindowStopsOnClose(t *testing.T) {
+	fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+	fixture.deferCollatorAhead()
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- fixture.backend.HandleLeaderWindow(ctx, fixture.window(0, 0))
+	}()
+	assertLocalBackendLeaderWindowWaiting(t, result, fixture.producer)
+
+	if err := fixture.backend.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrLocalSessionBackendClosed) {
+			t.Fatalf("leader window close error = %v, want backend closed", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("close did not wake leader window: %v", ctx.Err())
+	}
+	if len(fixture.producer.updateCalls) != 0 || len(fixture.producer.selfCalls) != 0 {
+		t.Fatal("closed deferred window reached producer")
+	}
+}
+
+func TestLocalSessionBackendDeferredLeaderWindowStopsOnContextCancel(t *testing.T) {
+	fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+	fixture.deferCollatorAhead()
+	t.Cleanup(func() {
+		if err := fixture.backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	result := make(chan error, 1)
+	go func() {
+		result <- fixture.backend.HandleLeaderWindow(ctx, fixture.window(0, 0))
+	}()
+	assertLocalBackendLeaderWindowWaiting(t, result, fixture.producer)
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("leader window cancellation error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context cancellation did not wake leader window")
+	}
+	if !fixture.backend.collatorDeferred.Load() {
+		t.Fatal("window cancellation changed producer recovery state")
+	}
+	if len(fixture.producer.updateCalls) != 0 || len(fixture.producer.selfCalls) != 0 {
+		t.Fatal("cancelled deferred window reached producer")
+	}
+	select {
+	case <-fixture.backend.collatorReady:
+		t.Fatal("window cancellation resolved producer recovery readiness")
+	default:
+	}
+}
+
+func TestLocalSessionBackendLeaderWindowQuarantinesTerminalProducer(t *testing.T) {
+	type terminalLeaderStageTest struct {
+		name          string
+		updateErr     error
+		selfErr       error
+		wantSelfCalls int
+	}
+	terminal := func(stage string) error {
+		return fmt.Errorf("%s stopped: %w", stage, collator.ErrSessionUnavailable)
+	}
+	tests := []terminalLeaderStageTest{
+		{name: "window update", updateErr: terminal("window update")},
+		{name: "self activation", selfErr: terminal("self activation"), wantSelfCalls: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+			fixture.producer.updateErr = test.updateErr
+			fixture.producer.selfErr = test.selfErr
+			t.Cleanup(func() {
+				if err := fixture.backend.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			if err := fixture.backend.HandleLeaderWindow(ctx, fixture.window(0, 0)); err != nil {
+				t.Fatalf("terminal leader producer stage: %v", err)
+			}
+			if !fixture.backend.collatorUnavailable {
+				t.Fatal("terminal leader producer was not quarantined")
+			}
+			if len(fixture.producer.updateCalls) != 1 ||
+				len(fixture.producer.selfCalls) != test.wantSelfCalls {
+				t.Fatalf("terminal leader update/self calls = %d/%d, want 1/%d",
+					len(fixture.producer.updateCalls), len(fixture.producer.selfCalls), test.wantSelfCalls)
+			}
+			fixture.backend.routeMu.RLock()
+			route := fixture.backend.window
+			fixture.backend.routeMu.RUnlock()
+			if route != nil {
+				t.Fatal("terminal leader producer retained the candidate route")
+			}
+		})
 	}
 }
 
@@ -1923,7 +3054,7 @@ func TestLocalSessionBackendDelegatedCurrentWindowHasNoFallback(t *testing.T) {
 	}
 }
 
-func TestNewLocalSessionBackendDelegatedConstructorDoesNotPerformDelegationIO(t *testing.T) {
+func TestPrepareLocalSessionBackendDelegatedConstructorDoesNotPerformDelegationIO(t *testing.T) {
 	options := localBackendTestConstructorOptions(t)
 	baseSigner, ok := options.Config.Identity.Validator.Signer.(localBackendTestSigner)
 	if !ok {
@@ -1967,10 +3098,11 @@ func TestNewLocalSessionBackendDelegatedConstructorDoesNotPerformDelegationIO(t 
 	options.ProductionMode = collator.ProductionModeDelegated
 	options.Delegations = delegations
 
-	backend, err := NewLocalSessionBackend(context.Background(), options)
+	preparation, err := PrepareLocalSessionBackend(context.Background(), options)
 	if err != nil {
 		t.Fatal(err)
 	}
+	backend := preparation.Backend
 	defer func() {
 		if closeErr := backend.Close(); closeErr != nil {
 			t.Fatal(closeErr)
@@ -2183,7 +3315,7 @@ func newLocalBackendTestRemoteVotingBackend(
 
 	config, start, initial := localBackendTestRuntimeInputs(t)
 	producer := &localBackendTestCollator{id: [32]byte{0x91}, sessionErr: collator.ErrNotFound}
-	backend, err := NewLocalSessionBackend(context.Background(), LocalSessionBackendOptions{
+	preparation, err := PrepareLocalSessionBackend(context.Background(), LocalSessionBackendOptions{
 		Config:  config,
 		Initial: initial,
 		Node: &localBackendTestNode{
@@ -2202,6 +3334,7 @@ func newLocalBackendTestRemoteVotingBackend(
 	if err != nil {
 		t.Fatalf("construct remote voting backend without candidate router: %v", err)
 	}
+	backend := preparation.Backend
 	if err = backend.ActivateSession(context.Background(), start); err != nil {
 		t.Fatalf("activate remote voting backend: %v", err)
 	}

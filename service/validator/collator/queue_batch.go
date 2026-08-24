@@ -49,7 +49,11 @@ func (c *collation) flushQueueDeletes() error {
 // roots, exactly as the generated C++ validators do — see traceQueueEntryClosure
 // for how, and for why it descends the entry instead of decoding it.
 func (c *collation) traceOutQueueValidationClosure() error {
-	return c.oldOutQueue.ScanDiff(c.outQueue.AugmentedDictionary, true, func(
+	// Scanned by subtree on workers: with the queue thousands of entries deep
+	// this was the longest of the closure's five tasks once the account
+	// replay was split, 37 ms on the testnet validator, and it has the same
+	// shape — sibling loads and augmentation checks along changed paths.
+	return c.oldOutQueue.ScanDiffParallel(c.outQueue.AugmentedDictionary, true, func(
 		keyCell *cell.Cell,
 		oldValueExtra, newValueExtra *cell.Slice,
 	) error {
@@ -76,7 +80,7 @@ func (c *collation) traceOutQueueValidationClosure() error {
 		}
 
 		return nil
-	})
+	}, collationParallelism)
 }
 
 // queueDiffKeyLabel renders a diff key for an error message. Formatting is the

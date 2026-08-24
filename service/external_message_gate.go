@@ -58,7 +58,12 @@ func (a *ExternalMessageAdmission) AcceptExternalMessage(ctx context.Context, ev
 }
 
 func (a *ExternalMessageAdmission) AcceptCheckedExternalMessage(ctx context.Context, event p2p.ExternalMessageEvent) error {
-	return runExternalMessageGate(ctx, a.gate, event.IsLocal, event.Root, event.Message)
+	return runExternalMessageGate(ctx, a.gate, ExternalMessageEvent{
+		IsLocal:        event.IsLocal,
+		SerializedSize: len(event.Body),
+		MessageRoot:    event.Root,
+		MessageParsed:  event.Message,
+	})
 }
 
 func acceptExternalMessage(ctx context.Context, event p2p.ExternalMessageEvent, checker ExternalMessageChecker, gate *externalMessageGateRunner) error {
@@ -71,7 +76,12 @@ func acceptExternalMessage(ctx context.Context, event p2p.ExternalMessageEvent, 
 		return err
 	}
 
-	return runExternalMessageGate(ctx, gate, event.IsLocal, result.Root, result.Message)
+	return runExternalMessageGate(ctx, gate, ExternalMessageEvent{
+		IsLocal:        event.IsLocal,
+		SerializedSize: len(event.Body),
+		MessageRoot:    result.Root,
+		MessageParsed:  result.Message,
+	})
 }
 
 func checkExternalMessage(ctx context.Context, event p2p.ExternalMessageEvent, checker ExternalMessageChecker) (externalmsg.CheckResult, error) {
@@ -82,16 +92,12 @@ func checkExternalMessage(ctx context.Context, event p2p.ExternalMessageEvent, c
 	return checker.CheckBOC(ctx, event.Body)
 }
 
-func runExternalMessageGate(ctx context.Context, gate *externalMessageGateRunner, isLocal bool, root *cell.Cell, msg *tlb.ExternalMessage) error {
+func runExternalMessageGate(ctx context.Context, gate *externalMessageGateRunner, event ExternalMessageEvent) error {
 	if gate == nil {
 		return nil
 	}
 
-	return gate.run(ctx, ExternalMessageEvent{
-		IsLocal:       isLocal,
-		MessageRoot:   root,
-		MessageParsed: msg,
-	})
+	return gate.run(ctx, event)
 }
 
 func (r *externalMessageGateRunner) run(ctx context.Context, event ExternalMessageEvent) error {

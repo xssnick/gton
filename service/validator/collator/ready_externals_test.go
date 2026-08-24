@@ -28,6 +28,7 @@ func TestBuildShardWithReadyExternalsDrainsAlreadyAdmittedMessages(t *testing.T)
 		time.Time{},
 		1,
 		time.Time{},
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -58,6 +59,7 @@ func TestBuildShardWithReadyExternalsConsumesAdmissionsUntilSlotBoundary(t *test
 			waitUntil,
 			waitUntil,
 			1,
+			time.Time{},
 			time.Time{},
 		)
 		result <- buildResult{candidate: candidate, err: err}
@@ -99,6 +101,7 @@ func TestBuildShardWithReadyExternalsSharesAttemptBudgetAcrossBatches(t *testing
 		time.Time{},
 		time.Time{},
 		1,
+		time.Time{},
 		time.Time{},
 	)
 	if err != nil {
@@ -205,6 +208,7 @@ func TestReadyExternalCandidateSignsAfterFinalStats(t *testing.T) {
 			time.Time{},
 			1,
 			time.Time{},
+			time.Time{},
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -246,11 +250,11 @@ func requireCandidateAssemblyStages(t *testing.T, durations *candidateAssemblyDu
 	t.Helper()
 
 	for _, stage := range candidateAssemblyStages {
-		if durations[stage] <= 0 {
+		if !durations.entered[stage] {
 			t.Fatalf("candidate assembly stage %d was not measured", stage)
 		}
 	}
-	if durations[CollationStageWaitExternalMessages] != 0 {
+	if durations.stages[CollationStageWaitExternalMessages] != 0 {
 		t.Fatal("external wait leaked into candidate assembly durations")
 	}
 }
@@ -309,6 +313,7 @@ func TestBuildShardReadyExternalSizeRetryReplaysFrozenTranscript(t *testing.T) {
 		time.Time{},
 		500,
 		time.Time{},
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -325,6 +330,7 @@ func TestBuildShardReadyExternalSizeRetryReplaysFrozenTranscript(t *testing.T) {
 		time.Time{},
 		time.Time{},
 		500,
+		time.Time{},
 		time.Time{},
 	)
 	if err != nil {
@@ -380,7 +386,7 @@ func addReadyExternal(t *testing.T, pool *msgpool.Pool, dst *address.Address, ta
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = pool.AddExternal(nil, message, nil, msgpool.ExternalPriorityLocal); err != nil {
+	if _, err = pool.AddExternal(len(message.ToBOC()), message, nil, msgpool.ExternalPriorityLocal); err != nil {
 		t.Fatal(err)
 	}
 }

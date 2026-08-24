@@ -133,15 +133,32 @@ type candidateEntry struct {
 	wire            []byte
 	// wireHash is the canonical wire identity, kept after the payload itself is
 	// released. It is the same sha256 the store indexes the candidate by, and it
-	// is what keeps a conflicting duplicate detectable once the bytes are gone.
-	// It says what this candidate is, never where its bytes can be found.
-	wireHash     [32]byte
-	hasWireHash  bool
+	// keeps another wire from replacing bytes whose exact representation this
+	// session already admitted. It says which bytes were admitted, never where
+	// they can be found. A candidate id does not replace this check: signatures
+	// and delegation are part of the wire but not of the id.
+	wireHash    [32]byte
+	hasWireHash bool
+	// lazyWire is a received candidate's canonical wire before anything has
+	// asked for it. While it is set, wire is nil and hasWireHash is false: an
+	// entry that already knows an exact wire hash materializes and compares a
+	// received representation before attaching it. The bytes and the digest
+	// both come out of materialize, on the goroutine of
+	// whichever consumer reaches them first — a store, a peer's request, or a
+	// durable-index comparison.
+	// It is cleared by the materialization that fills wire and wireHash, and by
+	// release, which drops the payload it would have produced.
+	lazyWire     *lazyCandidateWire
 	notarization simplex.VerifiedCertificate
 	load         *resolverFlight
 	resolve      *resolverFlight
 	store        *resolverFlight
-	serve        *resolverFlight
+	// storeBuilds counts StoreCandidate calls which have claimed this payload
+	// but are still materializing its lazy wire. They have not created the
+	// storage flight yet, but the finalization sweep must already treat them as
+	// store owners and leave the payload in place.
+	storeBuilds int
+	serve       *resolverFlight
 }
 
 // releasable reports whether the payload of an already finalized candidate can
@@ -151,24 +168,25 @@ type candidateEntry struct {
 // released because it can be read back; a payload without one is released
 // because consensus never accepted it — nothing stores a candidate that was
 // only ever fetched from a peer, so requiring durability here would pin those
-// bytes for the whole session and hide them from this sweep entirely. What the
-// entry keeps in both cases is its identity and its certificate; what differs
-// is only where the bytes come from if they are ever needed again, and that
-// question is answered by durable rather than by this predicate.
+// bytes for the whole session and hide them from this sweep entirely. The map
+// key and certificate remain; an exact wireHash remains too only if some
+// consumer materialized the lazy wire before release. Where bytes come from if
+// they are ever needed again is answered by durable rather than by this
+// predicate.
 //
 // An empty candidate carries no BOCs, so releasing one frees nothing measurable
 // and only costs a lineage walk one storage read per step.
 //
-// A load or a store flight is left to itself: each is bounded by one storage
-// operation and each is installing or writing out the very bytes this would
-// drop. A resolve flight is not a claim on the payload either. It has its own
-// waiter/owner lifetime, and resolveInner holds no pointer to the bytes while
-// waiting for a certificate; it re-reads the durable copy when it finally has
-// both parts.
+// A load, store flight or store-side lazy build is left to itself: each is
+// bounded by one storage operation or one serialization and is installing or
+// writing out the very bytes this would drop. A resolve flight is not a claim
+// on the payload either. It has its own waiter/owner lifetime, and resolveInner
+// holds no pointer to the bytes while waiting for a certificate; it re-reads
+// the durable copy when it finally has both parts.
 func (e *candidateEntry) releasable(slot uint32, watermark uint32) bool {
 	return e.candidate != nil && slot < watermark &&
 		!e.candidate.Candidate.Empty &&
-		e.load == nil && e.store == nil
+		e.load == nil && e.store == nil && e.storeBuilds == 0
 }
 
 type resolverFlight struct {
@@ -350,6 +368,71 @@ func (r *candidateResolver) stage(artifact *CandidateArtifact, wire []byte) erro
 	return nil
 }
 
+// stageDeferred is stage for a received candidate whose canonical wire has not
+// been built. A new entry can retain it lazily, but an entry whose payload was
+// released may still carry the exact hash of the wire admitted earlier. In that
+// case the new representation is built outside the resolver lock and compared
+// before it can replace the old one: candidate ids commit to the payload, not
+// to the candidate signature or delegation bytes around it.
+func (r *candidateResolver) stageDeferred(artifact *CandidateArtifact, lazy *lazyCandidateWire) error {
+	id := artifact.Candidate.ID
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+
+		return ErrResolverClosed
+	}
+
+	entry := r.entry(id)
+	if entry.candidate != nil {
+		r.completeResolveLocked(id, entry)
+		r.mu.Unlock()
+
+		return nil
+	}
+	if entry.durable {
+		r.mu.Unlock()
+
+		return nil
+	}
+	if !entry.hasWireHash {
+		r.attachDeferredPayloadLocked(id, entry, artifact, lazy)
+		r.completeResolveLocked(id, entry)
+		r.mu.Unlock()
+
+		return nil
+	}
+	r.mu.Unlock()
+
+	wire, hash, err := lazy.materialize()
+	if err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return ErrResolverClosed
+	}
+	entry = r.entry(id)
+	if entry.candidate != nil {
+		r.completeResolveLocked(id, entry)
+
+		return nil
+	}
+	if entry.durable {
+		return nil
+	}
+	if entry.hasWireHash && hash != entry.wireHash {
+		return ErrCandidateConflict
+	}
+	r.attachPayloadLocked(id, entry, artifact, wire, hash)
+	r.completeResolveLocked(id, entry)
+
+	return nil
+}
+
 // attachPayloadLocked installs the bytes of one candidate. Every payload the
 // resolver retains passes through here and through releasePayloadLocked, which
 // is what keeps the projection exact without a walk and what keeps the release
@@ -381,6 +464,89 @@ func (r *candidateResolver) attachPayloadLocked(
 	r.cache.Candidates++
 	r.cache.Bytes += candidatePayloadBytes(artifact, wire)
 	r.queueReleaseLocked(id, entry)
+}
+
+// attachDeferredPayloadLocked is attachPayloadLocked for a candidate whose wire
+// is still lazy. The caller has established that entry has no wire hash to
+// preserve. The cache accounting counts the two BOCs only: the wire does not
+// exist yet, and when it does the materializing consumer adds it.
+func (r *candidateResolver) attachDeferredPayloadLocked(
+	id simplex.CandidateID,
+	entry *candidateEntry,
+	artifact *CandidateArtifact,
+	lazy *lazyCandidateWire,
+) {
+	// Empty candidates and codec fallbacks can arrive with the cheap wire
+	// already built. Retain it eagerly so cache.Bytes and wireHash describe the
+	// bytes that are actually resident; inspecting it here does not invoke the
+	// serializer under the resolver lock.
+	if lazy.wire != nil {
+		r.attachPayloadLocked(id, entry, artifact, lazy.wire, lazy.hash)
+
+		return
+	}
+
+	entry.candidate = artifact
+	if artifact.preparedBlock != nil || artifact.validationRoots != nil {
+		retained := *artifact
+		retained.preparedBlock = nil
+		retained.validationRoots = nil
+		entry.candidate = &retained
+	}
+	if r.validateCandidates {
+		entry.validationRoots = artifact.validationRoots
+	}
+	entry.lazyWire = lazy
+	r.cache.Candidates++
+	r.cache.Bytes += candidatePayloadBytes(artifact, nil)
+	r.queueReleaseLocked(id, entry)
+}
+
+// materializeWire builds a lazy entry's canonical wire before taking the
+// resolver lock and then installs it. Between the caller's snapshot and that
+// install another consumer may have materialized the same entry, in which case
+// its bytes win and these are dropped, and the entry may have been released,
+// in which case nothing is installed and the bytes are returned to the caller
+// alone.
+//
+// The returned wire is the entry's own buffer when one is installed: callers
+// that hand it outside the resolver copy it, exactly as they do for a wire that
+// arrived eager.
+func (r *candidateResolver) materializeWire(id simplex.CandidateID, entry *candidateEntry, lazy *lazyCandidateWire) ([]byte, [32]byte, error) {
+	wire, hash, err := lazy.materialize()
+	if err != nil {
+		return nil, [32]byte{}, err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, [32]byte{}, ErrResolverClosed
+	}
+	if entry.lazyWire != lazy {
+		// Materialized by someone else, or released. Whatever the entry holds
+		// now is the answer; these bytes were a duplicate.
+		if entry.wire != nil {
+			return entry.wire, entry.wireHash, nil
+		}
+		if entry.hasWireHash && hash != entry.wireHash {
+			return nil, [32]byte{}, ErrCandidateConflict
+		}
+
+		return wire, hash, nil
+	}
+	if entry.hasWireHash && hash != entry.wireHash {
+		return nil, [32]byte{}, ErrCandidateConflict
+	}
+	entry.lazyWire = nil
+	entry.wire = wire
+	entry.wireHash = hash
+	entry.hasWireHash = true
+	if entry.candidate != nil {
+		r.cache.Bytes += int64(len(wire))
+	}
+
+	return wire, hash, nil
 }
 
 // markDurableLocked records that the store holds this candidate. Every place
@@ -419,6 +585,7 @@ func (r *candidateResolver) releasePayloadLocked(id simplex.CandidateID, entry *
 		entry.candidate = nil
 		entry.validationRoots = nil
 		entry.wire = nil
+		entry.lazyWire = nil
 	}
 	delete(r.retained, id)
 }
@@ -593,10 +760,10 @@ func (r *candidateResolver) allowRequestLocked(source simplex.PeerID, now time.T
 }
 
 // candidateCacheStats is a projection of the session-scoped candidate cache.
-// Bytes is the payload actually retained in memory: for a staged candidate that
-// is the canonical wire plus the decoded block and collated data, all three of
-// which survive the durable write to storage. An entry whose payload has been
-// released counts in Entries but not in Candidates or Bytes, which is the
+// Bytes is the payload actually retained in memory: the decoded block and
+// collated data, plus the canonical wire once a lazy receive materializes it.
+// All three survive the durable write to storage. An entry whose payload has
+// been released counts in Entries but not in Candidates or Bytes, which is the
 // intended reading.
 //
 // Stored counts the entries the candidate store holds a copy of, which is not
@@ -919,8 +1086,18 @@ func (r *candidateResolver) response(
 		// response buffer, but a whole overlay asking at once must not queue
 		// multi-megabyte copies behind the lock the consensus goroutine takes.
 		wire := entry.wire
-		released := wire == nil && entry.durable
+		lazy := entry.lazyWire
+		released := wire == nil && lazy == nil && entry.durable
 		r.mu.Unlock()
+		if lazy != nil {
+			// First consumer of a deferred wire. Built here, on the request
+			// goroutine, and installed for everyone after.
+			built, _, err := r.materializeWire(request.ID, entry, lazy)
+			if err != nil {
+				return CandidateResponse{}, err
+			}
+			wire = built
+		}
 		if released {
 			loaded, err := r.storedWire(ctx, request.ID)
 			if err != nil {
@@ -1061,11 +1238,16 @@ func (r *candidateResolver) loadStoredWire(
 	}
 
 	r.mu.Lock()
-	if entry = r.entries[id]; entry != nil && !entry.hasWireHash {
+	entry = r.entries[id]
+	conflict = entry != nil && entry.hasWireHash && record.ContentHash != entry.wireHash
+	if entry != nil && !entry.hasWireHash {
 		entry.wireHash = record.ContentHash
 		entry.hasWireHash = true
 	}
 	r.mu.Unlock()
+	if conflict {
+		return nil, ErrCandidateConflict
+	}
 
 	return record.Wire, nil
 }
@@ -1427,6 +1609,18 @@ func (r *candidateResolver) loadDurableCandidate(id simplex.CandidateID) (*Candi
 	}
 	if entry.candidate == nil {
 		r.attachPayloadLocked(id, entry, artifact, record.Wire, record.ContentHash)
+	} else if entry.lazyWire != nil {
+		// A received candidate whose wire was never built, met by its own
+		// durable copy. The store's bytes are canonical and its digest is in
+		// hand, so they are installed as the entry's wire and the deferred build
+		// is dropped unbuilt. With no previously admitted hash the durable record
+		// wins the representation race; when a hash was known, the conflict check
+		// above already compared it.
+		entry.lazyWire = nil
+		entry.wire = record.Wire
+		entry.wireHash = record.ContentHash
+		entry.hasWireHash = true
+		r.cache.Bytes += int64(len(record.Wire))
 	}
 	r.markDurableLocked(entry)
 	r.completeResolveLocked(id, entry)
@@ -1469,18 +1663,16 @@ func (r *candidateResolver) mergeResponse(request CandidateRequest, response Can
 	}
 
 	var artifact *CandidateArtifact
-	var canonicalWire []byte
-	var wireHash [32]byte
+	var lazy *lazyCandidateWire
 	var err error
 	if len(response.CandidateWire) != 0 {
-		// The canonical wire comes from the roots the decode parsed: the
-		// signature is verified once, and neither BOC is parsed or
-		// re-serialized a second time to prove it canonical.
-		artifact, canonicalWire, err = r.codec.decodeCanonical(response.CandidateWire, &request.ID)
+		// Verification is mandatory even when a local candidate wins the request
+		// race. Building its canonical wire is not: that representation is retained
+		// lazily only if the response supplies the missing payload.
+		artifact, lazy, err = r.codec.decodeDeferred(response.CandidateWire, &request.ID)
 		if err != nil {
 			return err
 		}
-		wireHash = sha256.Sum256(canonicalWire)
 	}
 	var notarization simplex.VerifiedCertificate
 	if response.Notarization != nil {
@@ -1492,27 +1684,59 @@ func (r *candidateResolver) mergeResponse(request CandidateRequest, response Can
 		}
 	}
 
+	return r.mergeVerifiedResponse(request.ID, artifact, lazy, notarization)
+}
+
+// mergeVerifiedResponse installs the already verified parts of one peer
+// response. A candidate is discarded when memory or storage won while the
+// request was in flight. A genuinely missing candidate stays lazy unless this
+// entry remembers an exact earlier wire hash, in which case comparison requires
+// materializing outside the resolver lock and then rechecking the race.
+func (r *candidateResolver) mergeVerifiedResponse(
+	id simplex.CandidateID,
+	artifact *CandidateArtifact,
+	lazy *lazyCandidateWire,
+	notarization simplex.VerifiedCertificate,
+) error {
 	r.mu.Lock()
-	entry := r.entry(request.ID)
-	if artifact != nil {
-		if entry.hasWireHash && wireHash != entry.wireHash {
+	if r.closed {
+		r.mu.Unlock()
+
+		return ErrResolverClosed
+	}
+	entry := r.entry(id)
+	if artifact != nil && entry.candidate == nil && !entry.durable {
+		if !entry.hasWireHash {
+			r.attachDeferredPayloadLocked(id, entry, artifact, lazy)
+		} else {
 			r.mu.Unlock()
 
-			return ErrCandidateConflict
-		}
-		// A peer answering for a candidate the store already holds must not put
-		// the payload back into memory: the sweep released it because it can be
-		// read, and every consumer reaches storage before the network. Without a
-		// readable copy the peer's bytes are the only bytes there are, and the
-		// identity check above is what keeps them from being different ones.
-		if entry.candidate == nil && !entry.durable {
-			r.attachPayloadLocked(request.ID, entry, artifact, canonicalWire, wireHash)
+			wire, hash, err := lazy.materialize()
+			if err != nil {
+				return err
+			}
+
+			r.mu.Lock()
+			if r.closed {
+				r.mu.Unlock()
+
+				return ErrResolverClosed
+			}
+			entry = r.entry(id)
+			if entry.candidate == nil && !entry.durable {
+				if entry.hasWireHash && hash != entry.wireHash {
+					r.mu.Unlock()
+
+					return ErrCandidateConflict
+				}
+				r.attachPayloadLocked(id, entry, artifact, wire, hash)
+			}
 		}
 	}
 	if !notarization.IsZero() && entry.notarization.IsZero() {
 		entry.notarization = notarization
 	}
-	r.completeResolveLocked(request.ID, entry)
+	r.completeResolveLocked(id, entry)
 	r.mu.Unlock()
 
 	return nil
@@ -1553,10 +1777,47 @@ func (r *candidateResolver) storeAsync(id simplex.CandidateID, notify func(error
 
 		return nil, nil
 	}
-	if entry.candidate == nil || len(entry.wire) == 0 {
+	if entry.candidate == nil || (len(entry.wire) == 0 && entry.lazyWire == nil) {
 		r.mu.Unlock()
 
 		return nil, ErrCandidateUnavailable
+	}
+	if lazy := entry.lazyWire; lazy != nil {
+		// The store is content-addressed by the canonical digest, so the bytes
+		// have to exist before the record does. Built outside the lock, then
+		// re-entered: by the time the lock is back another consumer may have
+		// built them, and the flight below reads whichever were installed.
+		entry.storeBuilds++
+		r.mu.Unlock()
+		_, _, materializeErr := r.materializeWire(id, entry, lazy)
+		r.mu.Lock()
+		entry.storeBuilds--
+		if materializeErr != nil {
+			r.mu.Unlock()
+			if notify != nil {
+				notify(materializeErr)
+			}
+
+			return nil, materializeErr
+		}
+		if r.closed {
+			r.mu.Unlock()
+
+			return nil, ErrResolverClosed
+		}
+		if entry.durable {
+			r.mu.Unlock()
+			if notify != nil {
+				notify(nil)
+			}
+
+			return nil, nil
+		}
+		if entry.candidate == nil || len(entry.wire) == 0 {
+			r.mu.Unlock()
+
+			return nil, ErrCandidateUnavailable
+		}
 	}
 	flight := entry.store
 	var wire []byte

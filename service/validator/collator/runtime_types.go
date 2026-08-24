@@ -114,10 +114,57 @@ type CandidateArtifact struct {
 	// an artifact assembled outside this package cannot assert it.
 	digested bool
 
-	// blockRoot and collatedRoots are a borrowed, validation-call-scoped handoff
-	// from the network decoder. They never leave prepareValidationCandidate.
+	// blockRoot and collatedRoots are a borrowed handoff from whoever already
+	// held this candidate's parsed payload: the network decoder for a received
+	// candidate, this node's own builder for one it produced. On the way in they
+	// never leave prepareValidationCandidate; on the way out they are lent to the
+	// one validation the emission feeds and to nothing that outlives it, because
+	// they pin the block DAG and the whole collated proof set. Every holder that
+	// keeps an artifact past that call must therefore keep what retained()
+	// returns instead of the artifact it was handed.
 	blockRoot     *cell.Cell
 	collatedRoots []*cell.Cell
+
+	// generationTimeMS is the exact timestamp serialized into the consensus
+	// extra root. The known bit is provenance: only the sealed builder path can
+	// set it, so an external Pipeline cannot attach an unrelated scalar to
+	// mutable CollatedData.
+	generationTimeMS    uint64
+	generationTimeKnown bool
+}
+
+// retained is the form of this artifact a holder keeps past the call it was
+// handed to: the producer's own lineage pointer into the next slot, the window's
+// memory of what it emitted, or anything else that outlives one validation.
+//
+// It drops the borrowed roots, which are the whole block cell DAG and the entire
+// collated proof set — the two largest objects a slot produces, held for as long
+// as the holder lives. Every reader downstream of such a holder parses the two
+// BOCs beside them anyway, so nothing but the memory is lost.
+func (a CandidateArtifact) retained() CandidateArtifact {
+	a.blockRoot = nil
+	a.collatedRoots = nil
+
+	return a
+}
+
+// ValidationRoots is the parsed payload of a candidate this process already
+// decoded or built, or nil for one that must be parsed from its bytes.
+//
+// The two BOC fields beside them are the serialization of these very roots and
+// are pinned to them by the candidate's two file hashes, which is what lets a
+// validation handed both skip decoding either. Fields, and therefore this
+// accessor, are unexported-backed for the same reason prepared is: nothing
+// outside this package can claim a root belongs to bytes it does not.
+func (a CandidateArtifact) ValidationRoots() (*cell.Cell, []*cell.Cell) {
+	return a.blockRoot, a.collatedRoots
+}
+
+// GenerationTimeMS returns the exact millisecond timestamp carried by this
+// process's sealed build. False means the artifact crossed a public Pipeline
+// boundary and its CollatedData must be decoded before the value can be used.
+func (a CandidateArtifact) GenerationTimeMS() (uint64, bool) {
+	return a.generationTimeMS, a.generationTimeKnown
 }
 
 // Prepared is the broadcast payload this candidate was built with, or nil for
@@ -141,33 +188,50 @@ func (a CandidateArtifact) Digested() bool {
 	return a.digested
 }
 
-// FinalizedAnchorState is the immutable exact state a validator resolver has
-// already loaded for a finalized candidate. It is optional because remote
-// collators do not receive node-resident cells. BlockBOC is absent only for a
-// zerostate. The local acquisition pipeline validates the BOC, state root,
-// and their Merkle-update edge before using this handoff.
-type FinalizedAnchorState struct {
-	Block    ton.BlockIDExt
-	BlockBOC []byte
-	State    *cell.Cell
+// ConsensusProgress is one authenticated observer transition delivered to a
+// standalone collator. Base is the resolver-owned exact state selected by
+// Window.Base. It is absent only for consensus genesis. StartAt includes the
+// selected parent's gen_utime_exact clamp; Window.ObservedAt is only the
+// observation time.
+type ConsensusProgress struct {
+	SessionID [32]byte
+	Window    simplex.Window
+	StartAt   time.Time
+	Base      *SelectedBaseState
 }
 
-// ConsensusProgress is one authenticated observer transition delivered to a
-// standalone collator. Candidates are the exact oldest-to-newest lineage
-// needed to materialize Window.Base locally. FinalizedAnchor is the newest
-// candidate in that lineage whose exact state is already available from node
-// storage; FinalizedAnchorState carries that already-loaded state for the
-// in-process path. It can be newer than the masterchain-confirmed block in
-// the collator's asynchronous SessionUpdate. StartAt is resolved from the
-// lineage and includes the parent gen_utime_exact clamp;
-// Window.ObservedAt is only the observation time.
-type ConsensusProgress struct {
-	SessionID            [32]byte
-	Window               simplex.Window
-	StartAt              time.Time
-	FinalizedAnchor      *ton.BlockIDExt
-	FinalizedAnchorState *FinalizedAnchorState
-	Candidates           []CandidateArtifact
+// ConsensusBaseUpdate atomically installs the exact state selected by
+// Update.CurrentBase and advances the pipeline's live session view. Base is
+// nil exactly while CurrentBase is consensus genesis.
+type ConsensusBaseUpdate struct {
+	Session ActivatedSession
+	Update  SessionUpdate
+	Base    *SelectedBaseState
+}
+
+// SpeculativeWindowRequest opens the first slot of the leader window that is
+// about to start, before consensus has observed it.
+//
+// The bet it places is that the window will open on Base: a candidate this node
+// has already validated, and whose notarization certificate is the very event
+// that will open the window. Nothing about the session is advanced by placing
+// it — the acquisition keeps the window it is in, and the candidate this build
+// produces is held until the real window arrives and names the same base. A bet
+// that loses costs the CPU of one collation and nothing else.
+//
+// StartAt is the instant the runtime expects the window to start, computed by
+// the same rule the observed window uses. It only stamps the block's time; the
+// producer's schedule still comes from the observed window.
+type SpeculativeWindowRequest struct {
+	SessionID [32]byte
+	StartSlot uint32
+	Leader    uint32
+	Base      *SelectedBaseState
+	StartAt   time.Time
+	// Deadline bounds the speculative build the way a window deadline bounds a
+	// real one: a bet nobody comes to collect is dropped rather than left
+	// holding an acquisition slot.
+	Deadline time.Time
 }
 
 // SoftTimeoutAction is the explicit producer decision at
@@ -193,19 +257,16 @@ type SoftTimeoutDecision struct {
 // BuildRequest is the sequential input passed to the authenticated
 // acquisition/build pipeline. Previous is nil for the first slot and points
 // to the already durable preceding artifact otherwise. FinalizedAnchor is set
-// only while restoring the first candidate of a finalized consensus lineage.
-// FinalizedAnchorState, when present, is the already verified resolver state
-// for that anchor and avoids a second node-storage read. Both pointers are
-// borrowed immutable views valid only for the pipeline call.
+// only while recovering the first locally stored candidate whose finalized
+// predecessor can be loaded from node storage.
 type BuildRequest struct {
-	Session              ActivatedSession
-	Update               SessionUpdate
-	Slot                 uint32
-	Leader               uint32
-	Parent               simplex.ParentID
-	Previous             *CandidateArtifact
-	FinalizedAnchor      *ton.BlockIDExt
-	FinalizedAnchorState *FinalizedAnchorState
+	Session         ActivatedSession
+	Update          SessionUpdate
+	Slot            uint32
+	Leader          uint32
+	Parent          simplex.ParentID
+	Previous        *CandidateArtifact
+	FinalizedAnchor *ton.BlockIDExt
 	// ExternalWaitUntil is the shardchain slot boundary. A local shard collator
 	// may consume ingress-admitted external messages until this instant;
 	// masterchain and restore requests leave it zero.
@@ -220,6 +281,58 @@ type BuildRequest struct {
 	// derives them from params_.soft_timeout. Restore requests leave it zero,
 	// which leaves those budgets inert.
 	BuildSoftDeadline time.Time
+	// speculative marks a build started before its leader window was observed
+	// and carries the predecessor it bet on. It is unexported because the only
+	// legitimate producer of one is this package's speculation entry point:
+	// every other request resolves its predecessor out of the session, and a
+	// caller that could set this could make a build read a state consensus never
+	// selected.
+	speculative *speculativeBase
+	// PaceStartedAt is the instant this build was scheduled to begin. The
+	// CPU-bound split heuristic measures its spans from here rather than from
+	// the wall clock, so a build the producer starts ahead of its schedule
+	// reports the total, body and external wait a build started on time would
+	// have reported.
+	//
+	// It matters because that heuristic writes into the block: a long collation
+	// raises the overload class, the class enters OverloadHistory, and the
+	// history decides header.WantSplit — silently, because validators mask that
+	// bit.
+	//
+	// Which way an unclamped measurement errs depends on where the head start
+	// went. The overload predicate compares the external wait against the total,
+	// and the head start lands in both; whether that makes overload harder or
+	// easier to declare turns on how much of the head start was spent waiting for
+	// external messages. The point of the clamp is not that it errs safely — it
+	// is that a build's verdict should not depend on when the producer happened
+	// to be free to start it.
+	//
+	// Zero leaves the clamp inert, which is the convention every deterministic
+	// entry point already relies on.
+	PaceStartedAt time.Time
+	// PreviousPending is a predecessor that has been built but not committed,
+	// handed over by the collation that produced it. It exists because the state
+	// this build needs is complete a long way before the candidate it belongs to
+	// is installed, and waiting for the installation is the whole of what the
+	// pipeline removes.
+	//
+	// Set only by the producer's handoff path. When it is set the request's
+	// Parent and Previous are provisional and unread: the lineage is bound by the
+	// producer when it adopts the offer, against the predecessor it actually
+	// committed.
+	PreviousPending *SuccessorOffer
+	// excludeExternals are the external messages the pending predecessor
+	// consumed. Its consumption is reported to the pool at its commit, which has
+	// not happened yet, so without this the successor's stream offers them again.
+	excludeExternals [][32]byte
+	// onSuccessor is where a build hands its result the moment it stops
+	// recording, before it has serialized anything. The producer installs it on
+	// every request it starts; the acquisition layer turns it into the
+	// collation's port once it knows the chain the offer has to carry.
+	onSuccessor func(SuccessorOffer)
+	// revokeSuccessor withdraws an offer this build already made, naming the
+	// predecessor root it named. Installed alongside onSuccessor.
+	revokeSuccessor func([32]byte, PipelineHandoffOutcome)
 }
 
 // CandidateCommit publishes one already durable candidate transition to the
@@ -266,12 +379,15 @@ type EmitCandidate func(context.Context, CandidateArtifact) error
 // concurrency-safe and must not mutate build-owned state. PrepareSession
 // creates a query-ready tentative session. ActivateSession binds its chain
 // anchors exactly once; no build is issued before it succeeds. PrepareSession,
-// ActivateSession, UpdateSession, and RetireSession must be atomic from the
-// caller's view: an error must leave the previous pipeline state usable and
-// unchanged. RestoreCandidate is idempotent per candidate. An error may retain
-// an exact successfully restored prefix, but retrying the same ordered lineage
-// must resume deterministically. These properties are required because the
-// service cannot roll back opaque acquisition state.
+// ActivateSession, UpdateSession, AdvanceConsensusBase, and RetireSession must
+// be atomic from the caller's view: an error must leave the previous pipeline
+// state usable and unchanged. AdvanceConsensusBase installs its selected state
+// and Update together; production must never observe one without the other.
+// Service advances CurrentBase only through AdvanceConsensusBase; ordinary
+// UpdateSession calls carry masterchain/finalization/window metadata for the
+// already installed base.
+// RestoreCandidate is idempotent per locally durable candidate recovered after
+// a restart.
 // RetireSession is additionally idempotent so bounded Close can retry cleanup.
 // A successful BuildCandidate transfers ownership of the returned Candidate
 // and all of its byte slices to Service; the pipeline must not retain or
@@ -282,6 +398,7 @@ type Pipeline interface {
 	PrepareSession(context.Context, Session, SessionUpdate) error
 	ActivateSession(context.Context, SessionActivation, SessionUpdate) error
 	UpdateSession(context.Context, Session, SessionUpdate) error
+	AdvanceConsensusBase(context.Context, ConsensusBaseUpdate) error
 	ResolveCandidateState(context.Context, BuildRequest) (CandidateState, error)
 	BuildCandidate(context.Context, BuildRequest) (*Candidate, error)
 	RestoreCandidate(context.Context, BuildRequest, CandidateArtifact) error

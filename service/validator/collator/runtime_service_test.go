@@ -78,21 +78,33 @@ func (c *runtimeLockObservedContext) Done() <-chan struct{} {
 }
 
 type runtimeTestPipeline struct {
-	mu        sync.Mutex
-	prepare   func(context.Context, Session, SessionUpdate) error
-	activate  func(context.Context, SessionActivation, SessionUpdate) error
-	update    func(context.Context, Session, SessionUpdate) error
-	retire    func(context.Context, [32]byte) error
-	state     func(context.Context, BuildRequest) (CandidateState, error)
-	build     func(context.Context, BuildRequest) (*Candidate, error)
-	soft      func(context.Context, SoftTimeoutRequest) (SoftTimeoutDecision, error)
-	restore   func(context.Context, BuildRequest, CandidateArtifact) error
-	commit    func(context.Context, CandidateCommit) error
-	prepared  int
-	activated int
-	updated   int
-	retired   int
-	built     int
+	mu       sync.Mutex
+	prepare  func(context.Context, Session, SessionUpdate) error
+	activate func(context.Context, SessionActivation, SessionUpdate) error
+	update   func(context.Context, Session, SessionUpdate) error
+	advance  func(context.Context, ConsensusBaseUpdate) error
+	retire   func(context.Context, [32]byte) error
+	state    func(context.Context, BuildRequest) (CandidateState, error)
+	build    func(context.Context, BuildRequest) (*Candidate, error)
+	soft     func(context.Context, SoftTimeoutRequest) (SoftTimeoutDecision, error)
+	restore  func(context.Context, BuildRequest, CandidateArtifact) error
+	// successorPolicy is the empty-block decision a produced block carries into
+	// the offer it hands to the next slot. It is separate from state because the
+	// two are asked at different moments about different slots: state answers for
+	// a slot the producer is about to schedule, this one for a slot a block has
+	// just made possible.
+	successorPolicy func(BuildRequest, *Candidate) CandidateState
+	// successorRoot overrides the predecessor root an offer names. A real
+	// collation always names the block it just built; a size-limit retry then
+	// rebuilds that block and the root the offer named becomes one no block will
+	// ever carry, which is the case this exists to reproduce.
+	successorRoot func(BuildRequest, *Candidate) []byte
+	commit        func(context.Context, CandidateCommit) error
+	prepared      int
+	activated     int
+	updated       int
+	retired       int
+	built         int
 }
 
 func (p *runtimeTestPipeline) counts() (prepared, activated, updated, retired, built int) {
@@ -140,6 +152,25 @@ func (p *runtimeTestPipeline) UpdateSession(ctx context.Context, session Session
 	return nil
 }
 
+func (p *runtimeTestPipeline) AdvanceConsensusBase(
+	ctx context.Context,
+	request ConsensusBaseUpdate,
+) error {
+	p.mu.Lock()
+	p.updated++
+	advance := p.advance
+	update := p.update
+	p.mu.Unlock()
+	if advance != nil {
+		return advance(ctx, request)
+	}
+	if update != nil {
+		return update(ctx, request.Session.Session, request.Update)
+	}
+
+	return nil
+}
+
 func (p *runtimeTestPipeline) ResolveCandidateState(
 	ctx context.Context,
 	request BuildRequest,
@@ -174,10 +205,75 @@ func (p *runtimeTestPipeline) BuildCandidate(ctx context.Context, request BuildR
 	p.built++
 	build := p.build
 	p.mu.Unlock()
+	var (
+		candidate *Candidate
+		err       error
+	)
 	if build != nil {
-		return build(ctx, request)
+		candidate, err = build(ctx, request)
+	} else {
+		candidate = runtimeBuiltCandidate(request)
 	}
-	return runtimeBuiltCandidate(request), nil
+	if err == nil && candidate != nil {
+		p.mu.Lock()
+		policy, rootOverride := p.successorPolicy, p.successorRoot
+		p.mu.Unlock()
+		runtimeHandOffSuccessor(request, candidate, policy, rootOverride)
+	}
+
+	return candidate, err
+}
+
+// runtimeHandOffSuccessor is the synchronous stand-in for what a real collation
+// does on its block-BOC branch: the moment the block exists and the record has
+// gone inert, it offers the block to whoever asked for the next slot early.
+//
+// It runs at the end of the build rather than partway through it, which is the
+// one thing this stand-in cannot reproduce — the overlap itself. Everything the
+// producer does with the offer, which is what these tests are about, is the
+// same either way.
+func runtimeHandOffSuccessor(
+	request BuildRequest,
+	candidate *Candidate,
+	successorPolicy func(BuildRequest, *Candidate) CandidateState,
+	successorRoot func(BuildRequest, *Candidate) []byte,
+) {
+	if request.onSuccessor == nil {
+		return
+	}
+	id := cloneBlockID(candidate.ID)
+	if successorRoot != nil {
+		id.RootHash = successorRoot(request, candidate)
+	}
+	policy := CandidateState{
+		Block:     cloneBlockID(candidate.ID),
+		NextSeqno: candidate.ID.SeqNo + 1,
+	}
+	if successorPolicy != nil {
+		policy = successorPolicy(request, candidate)
+	}
+	// The three cells a real offer carries. A fixture that left them nil would
+	// let a successor that reads them past every test in this package.
+	root := candidate.State
+	if root == nil {
+		root = cell.BeginCell().MustStoreUInt(uint64(candidate.ID.SeqNo), 32).EndCell()
+	}
+	update := candidate.StateUpdate
+	if update == nil {
+		update = root
+	}
+	request.onSuccessor(SuccessorOffer{
+		successorPayload: successorPayload{
+			ID:          id,
+			Root:        root,
+			State:       root,
+			StateUpdate: update,
+			StartLT:     uint64(request.Slot) * 1000,
+		},
+		Policy:          policy,
+		predecessorSlot: request.Slot,
+		handoffAt:       time.Now(),
+	})
 }
 
 func (p *runtimeTestPipeline) SoftTimeout(ctx context.Context, request SoftTimeoutRequest) (SoftTimeoutDecision, error) {
@@ -589,10 +685,13 @@ func (*runtimeScheduleObserver) ObserveCollationCandidate(CandidateObservation) 
 func (*runtimeScheduleObserver) ObserveCandidateProduction(CandidateProductionObservation) {}
 func (*runtimeScheduleObserver) ObserveCollationDeadline(MetricChain, CollationDeadline, DeadlineAction) {
 }
-func (*runtimeScheduleObserver) ObserveCollationRetry(MetricChain, ProductionRetryReason) {}
-func (*runtimeScheduleObserver) ObserveCollationAlarm(MetricChain, CollationAlarm)        {}
-func (*runtimeScheduleObserver) AddCollationWindowInflight(MetricChain, int)              {}
-func (*runtimeScheduleObserver) ObserveCollationWindow(WindowObservation)                 {}
+func (*runtimeScheduleObserver) ObserveCollationRetry(MetricChain, ProductionRetryReason)   {}
+func (*runtimeScheduleObserver) ObserveCollationAlarm(MetricChain, CollationAlarm)          {}
+func (*runtimeScheduleObserver) ObservePipelineHandoff(MetricChain, PipelineHandoffOutcome) {}
+func (*runtimeScheduleObserver) ObservePipelineHandoffPickup(MetricChain, time.Duration)    {}
+func (*runtimeScheduleObserver) ObservePipelineOverlap(MetricChain, time.Duration)          {}
+func (*runtimeScheduleObserver) AddCollationWindowInflight(MetricChain, int)                {}
+func (*runtimeScheduleObserver) ObserveCollationWindow(WindowObservation)                   {}
 
 func newRuntimeFixture(
 	t *testing.T,
@@ -765,6 +864,32 @@ func runtimeConsensusProgress(session Session, update SessionUpdate) ConsensusPr
 	}
 }
 
+func runtimeSelectedBase(
+	t testing.TB,
+	session Session,
+	candidate simplex.CandidateID,
+) *SelectedBaseState {
+	t.Helper()
+
+	built, err := testBuilder().BuildShard(context.Background(), emptyCandidateRequest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := NewSelectedBaseState(
+		session.ID,
+		candidate,
+		built.ID,
+		built.BlockBOC,
+		candidateBlock(t, built),
+		built.State,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return base
+}
+
 func TestRuntimeBackendReportsCollatorID(t *testing.T) {
 	fixture := newRuntimeFixture(t, 1, 1, nil, nil, nil)
 	defer fixture.close(t)
@@ -806,17 +931,25 @@ func TestRuntimeBuildStartLatenessExcludesFirstShardWindowSlot(t *testing.T) {
 	}
 
 	first := runtimeAwaitArtifact(t, emitted)
-	if got := observer.count(ScheduleEventBuildStart); got != 0 {
-		close(releaseFirst)
-		t.Fatalf("first-slot build-start observations = %d, want 0", got)
-	}
 	close(releaseFirst)
 	second := runtimeAwaitArtifact(t, emitted)
 	if first.Candidate.ID.Slot != 0 || second.Candidate.ID.Slot != 1 {
 		t.Fatalf("emitted slots = %d, %d, want 0, 1", first.Candidate.ID.Slot, second.Candidate.ID.Slot)
 	}
+	// One sample for two slots, and it belongs to the second one. There used to
+	// be a check here that the count was still zero while the first slot's
+	// emission was held open; pipelining starts the second slot's build before
+	// that emission returns, so the count is already one at that point and the
+	// check said nothing about which slot it came from. The pair below says it
+	// exactly: a pipelined build reports both series, so a build_lead sample
+	// proves the second slot reported build_start, and a total of one then
+	// proves the first slot did not.
 	if got := observer.count(ScheduleEventBuildStart); got != 1 {
-		t.Fatalf("continuation build-start observations = %d, want 1", got)
+		t.Fatalf("build-start observations = %d over two slots, want 1", got)
+	}
+	if got := observer.count(ScheduleEventBuildLead); got != 1 {
+		t.Fatalf("build-lead observations = %d, want 1 — the second slot was not pipelined, so the "+
+			"assertion above no longer proves the first slot was excluded", got)
 	}
 	if got := observer.count(ScheduleEventBroadcast); got != 2 {
 		t.Fatalf("broadcast observations = %d, want 2", got)
@@ -851,7 +984,7 @@ func TestRuntimeProductionModesRejectOppositeAuthority(t *testing.T) {
 	}
 }
 
-func TestRuntimeSelfActivationWaitsForDurableConsensusProgress(t *testing.T) {
+func TestRuntimeSelfActivationStartsBeforeConsensusProgressWALCallback(t *testing.T) {
 	baseStorage := newRuntimeMemoryStorage()
 	storage := &runtimeLateSessionCommitStorage{
 		runtimeMemoryStorage: baseStorage,
@@ -915,26 +1048,21 @@ func TestRuntimeSelfActivationWaitsForDurableConsensusProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if launched := runtimeProductionCount(managed); launched != 0 {
-		t.Fatalf("self production jobs before progress WAL callback = %d, want 0", launched)
-	}
-	if builds := pipeline.buildCount(); builds != 0 {
-		t.Fatalf("self builds before progress WAL callback = %d, want 0", builds)
-	}
-	select {
-	case request := <-built:
-		t.Fatalf("self build started before progress WAL callback: %+v", request)
-	case artifact := <-emitted:
-		t.Fatalf("self candidate emitted before progress WAL callback: %+v", artifact)
-	default:
-	}
-
-	release()
 	request := runtimeAwaitBuild(t, built)
 	if request.Slot != 0 {
 		t.Fatalf("self build slot = %d, want 0", request.Slot)
 	}
 	runtimeAwaitArtifact(t, emitted)
+	managed.mu.Lock()
+	pending := managed.sessionWritePending
+	armed := managed.progressReady
+	managed.mu.Unlock()
+	if !pending || !armed {
+		t.Fatalf("production before WAL callback = pending %t, armed %t, want true, true", pending, armed)
+	}
+
+	release()
+	runtimeAwaitSessionWrite(t, fixture.service, session.ID)
 }
 
 func TestRuntimeSelfActivationDoesNotSaveDelegation(t *testing.T) {
@@ -2701,11 +2829,11 @@ func TestRuntimeRestartForgetsCurrentDelegationAndAcceptsFreshNextWindow(t *test
 	}
 }
 
-func TestRuntimeProgressRestoresEmptyFinalizedAnchor(t *testing.T) {
-	restored := make(chan BuildRequest, 1)
+func TestRuntimeProgressAdvancesGenesisWithoutSelectedBase(t *testing.T) {
+	advanced := make(chan ConsensusBaseUpdate, 1)
 	pipeline := &runtimeTestPipeline{}
-	pipeline.restore = func(_ context.Context, request BuildRequest, _ CandidateArtifact) error {
-		restored <- request
+	pipeline.advance = func(_ context.Context, request ConsensusBaseUpdate) error {
+		advanced <- request
 
 		return nil
 	}
@@ -2714,112 +2842,81 @@ func TestRuntimeProgressRestoresEmptyFinalizedAnchor(t *testing.T) {
 
 	session, update := fixture.session(55, 4, 0, time.Time{})
 	update.HasCurrentWindow = false
-	update.HasFinalizedBlock = true
-	update.FinalizedBlock = runtimeTestBlockID(session.Shard.Workchain, session.Shard.Shard, 12)
 	fixture.prepare(t, session, update)
-
-	parent := simplex.Parent(simplex.CandidateID{Slot: 3, Hash: [32]byte{0x31}})
-	candidate := simplex.Candidate{
-		Parent: parent,
-		Leader: 0,
-		Empty:  true,
-		Block:  update.FinalizedBlock,
-	}
-	candidate.ID = candidate.ComputeID(4)
 	progress := ConsensusProgress{
-		SessionID:       session.ID,
-		FinalizedAnchor: &update.FinalizedBlock,
+		SessionID: session.ID,
 		Window: simplex.Window{
-			Base:         simplex.Parent(candidate.ID),
-			ObservedSlot: 5,
-			StartSlot:    4,
-			EndSlot:      8,
-			Leader:       0,
-			ObservedAt:   time.Now(),
-		},
-		Candidates: []CandidateArtifact{{
-			SessionID: session.ID,
-			Candidate: candidate,
-		}},
-	}
-	if err := fixture.service.ApplyConsensusProgress(context.Background(), progress); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case request := <-restored:
-		if request.Previous != nil || request.Parent != parent ||
-			request.FinalizedAnchor == nil ||
-			!sameBlockID(*request.FinalizedAnchor, update.FinalizedBlock) {
-			t.Fatalf("empty finalized restore request = %+v", request)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("empty finalized anchor was not restored")
-	}
-}
-
-func TestRuntimeProgressAcceptsFinalizedAnchorAheadOfSessionUpdate(t *testing.T) {
-	restored := make(chan BuildRequest, 1)
-	pipeline := &runtimeTestPipeline{}
-	pipeline.restore = func(_ context.Context, request BuildRequest, _ CandidateArtifact) error {
-		restored <- request
-
-		return nil
-	}
-	fixture := newRuntimeFixture(t, 1, 1, pipeline, nil, nil)
-	defer fixture.close(t)
-
-	session, update := fixture.session(58, 4, 4, time.Now().Add(-time.Second))
-	update.HasFinalizedBlock = true
-	update.FinalizedBlock = runtimeTestBlockID(session.Shard.Workchain, session.Shard.Shard, 12)
-	update.CurrentBase = simplex.Parent(simplex.CandidateID{Slot: 3, Hash: [32]byte{0x31}})
-	fixture.prepare(t, session, update)
-
-	anchor := runtimeTestBlockID(session.Shard.Workchain, session.Shard.Shard, 13)
-	anchorState := cell.BeginCell().MustStoreUInt(0x73, 8).EndCell()
-	parent := simplex.Parent(simplex.CandidateID{Slot: 6, Hash: [32]byte{0x61}})
-	candidate := simplex.Candidate{
-		Parent: parent,
-		Leader: 0,
-		Empty:  true,
-		Block:  anchor,
-	}
-	candidate.ID = candidate.ComputeID(7)
-	progress := ConsensusProgress{
-		SessionID:       session.ID,
-		FinalizedAnchor: &anchor,
-		FinalizedAnchorState: &FinalizedAnchorState{
-			Block:    anchor,
-			BlockBOC: []byte{0x01},
-			State:    anchorState,
-		},
-		Window: simplex.Window{
-			Base:         simplex.Parent(candidate.ID),
-			ObservedSlot: 8,
-			StartSlot:    8,
-			EndSlot:      12,
+			Base:         simplex.Genesis(),
+			ObservedSlot: 0,
+			StartSlot:    0,
+			EndSlot:      4,
 			Leader:       0,
 			ObservedAt:   time.Now(),
 		},
 		StartAt: time.Now(),
-		Candidates: []CandidateArtifact{{
-			SessionID: session.ID,
-			Candidate: candidate,
-		}},
 	}
 	if err := fixture.service.ApplyConsensusProgress(context.Background(), progress); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case request := <-restored:
-		if request.Parent != parent || !request.Update.HasFinalizedBlock ||
-			!sameBlockID(request.Update.FinalizedBlock, update.FinalizedBlock) ||
-			request.FinalizedAnchor == nil || !sameBlockID(*request.FinalizedAnchor, anchor) ||
-			request.FinalizedAnchorState == nil || request.FinalizedAnchorState.State != anchorState ||
-			!sameBlockID(request.FinalizedAnchorState.Block, anchor) {
-			t.Fatalf("finalized-anchor restore request = %+v", request)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("newer finalized anchor was not restored")
+	request := <-advanced
+	if request.Base != nil || request.Update.CurrentBase.Exists || request.Session.ID != session.ID {
+		t.Fatalf("genesis base update = %+v", request)
+	}
+}
+
+func TestRuntimeProgressRejectsMisboundSelectedBase(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		changeBinding func(*Session, *simplex.CandidateID)
+	}{
+		{
+			name: "different session",
+			changeBinding: func(session *Session, _ *simplex.CandidateID) {
+				session.ID[0] ^= 0xff
+			},
+		},
+		{
+			name: "different candidate",
+			changeBinding: func(_ *Session, candidate *simplex.CandidateID) {
+				candidate.Hash[0] ^= 0xff
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pipeline := &runtimeTestPipeline{}
+			fixture := newRuntimeFixture(t, 1, 1, pipeline, nil, nil)
+			defer fixture.close(t)
+
+			session, update := fixture.session(58, 4, 0, time.Time{})
+			update.HasCurrentWindow = false
+			fixture.prepare(t, session, update)
+			selected := simplex.CandidateID{Slot: 0, Hash: [32]byte{0x61}}
+			boundSession := session
+			boundCandidate := selected
+			test.changeBinding(&boundSession, &boundCandidate)
+			progress := ConsensusProgress{
+				SessionID: session.ID,
+				Window: simplex.Window{
+					Base:         simplex.Parent(selected),
+					ObservedSlot: 1,
+					StartSlot:    0,
+					EndSlot:      4,
+					Leader:       0,
+					ObservedAt:   time.Now(),
+				},
+				Base: runtimeSelectedBase(t, boundSession, boundCandidate),
+			}
+			if err := fixture.service.ApplyConsensusProgress(
+				context.Background(),
+				progress,
+			); !errors.Is(err, ErrCandidateConflict) {
+				t.Fatalf("misbound progress error = %v, want ErrCandidateConflict", err)
+			}
+			_, _, advanced, _, _ := pipeline.counts()
+			if advanced != 0 {
+				t.Fatalf("misbound base reached pipeline %d times", advanced)
+			}
+		})
 	}
 }
 
@@ -2873,12 +2970,18 @@ func TestRuntimeFirstMidWindowProgressDoesNotProduce(t *testing.T) {
 }
 
 func TestRuntimeProgressAdvancesBaseAndPreservesWindowStart(t *testing.T) {
-	restored := make(chan BuildRequest, 1)
+	advancedRequests := make(chan ConsensusBaseUpdate, 2)
+	var restores atomic.Int32
 	pipeline := &runtimeTestPipeline{}
-	pipeline.restore = func(_ context.Context, request BuildRequest, _ CandidateArtifact) error {
-		restored <- request
+	pipeline.advance = func(_ context.Context, request ConsensusBaseUpdate) error {
+		advancedRequests <- request
 
 		return nil
+	}
+	pipeline.restore = func(context.Context, BuildRequest, CandidateArtifact) error {
+		restores.Add(1)
+
+		return errors.New("unexpected lineage restore")
 	}
 	fixture := newRuntimeFixture(t, 1, 1, pipeline, nil, nil)
 	defer fixture.close(t)
@@ -2902,17 +3005,17 @@ func TestRuntimeProgressAdvancesBaseAndPreservesWindowStart(t *testing.T) {
 	if err := fixture.service.ApplyConsensusProgress(context.Background(), initial); err != nil {
 		t.Fatal(err)
 	}
-
-	candidate := simplex.Candidate{
-		Parent: simplex.Genesis(),
-		Leader: 0,
-		Block:  runtimeTestBlockID(session.Shard.Workchain, session.Shard.Shard, 13),
+	initialRequest := <-advancedRequests
+	if initialRequest.Base != nil {
+		t.Fatal("genesis progress carried a selected base")
 	}
-	candidate.ID = candidate.ComputeID(0)
+
+	candidateID := simplex.CandidateID{Slot: 0, Hash: [32]byte{0x71}}
+	selected := runtimeSelectedBase(t, session, candidateID)
 	advanced := ConsensusProgress{
 		SessionID: session.ID,
 		Window: simplex.Window{
-			Base:         simplex.Parent(candidate.ID),
+			Base:         simplex.Parent(candidateID),
 			ObservedSlot: 1,
 			StartSlot:    0,
 			EndSlot:      4,
@@ -2920,13 +3023,14 @@ func TestRuntimeProgressAdvancesBaseAndPreservesWindowStart(t *testing.T) {
 			ObservedAt:   time.Now(),
 		},
 		StartAt: time.Now(),
-		Candidates: []CandidateArtifact{{
-			SessionID: session.ID,
-			Candidate: candidate,
-		}},
+		Base:    selected,
 	}
 	if err := fixture.service.ApplyConsensusProgress(context.Background(), advanced); err != nil {
 		t.Fatal(err)
+	}
+	advancedRequest := <-advancedRequests
+	if advancedRequest.Base != selected || advancedRequest.Update.CurrentBase != advanced.Window.Base {
+		t.Fatalf("selected base update = %+v", advancedRequest)
 	}
 	runtimeAwaitSessionWrite(t, fixture.service, session.ID)
 	record, err := fixture.storage.Session(context.Background(), session.ID)
@@ -2934,117 +3038,76 @@ func TestRuntimeProgressAdvancesBaseAndPreservesWindowStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !record.Update.CurrentWindowStartAt.Equal(startedAt) ||
-		record.Update.CurrentBase != simplex.Parent(candidate.ID) {
+		record.Update.CurrentBase != simplex.Parent(candidateID) {
 		t.Fatalf("advanced progress = %+v", record.Update)
 	}
-	select {
-	case request := <-restored:
-		if request.Parent.Exists || request.Slot != 0 {
-			t.Fatalf("restored candidate request = %+v", request)
+	if restores.Load() != 0 {
+		t.Fatalf("direct selected-base progress restored %d lineage candidates", restores.Load())
+	}
+}
+
+func TestRuntimeProgressBaseAdvanceFailureCanRetry(t *testing.T) {
+	advanceErr := fmt.Errorf("install selected base: %w", ErrAcquisitionNotReady)
+	var calls atomic.Int32
+	pipeline := &runtimeTestPipeline{}
+	pipeline.advance = func(context.Context, ConsensusBaseUpdate) error {
+		if calls.Add(1) == 1 {
+			return advanceErr
 		}
-	case <-time.After(time.Second):
-		t.Fatal("advanced candidate was not restored")
-	}
-}
 
-func TestRuntimeProgressRestoreFailureRetainsRetryablePrefix(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-	}{
-		{
-			name: "older internal message cut",
-			err: fmt.Errorf(
-				"seed candidate predecessor queue: %w",
-				ErrAcquisitionNotReady,
-			),
+		return nil
+	}
+	fixture := newRuntimeFixture(t, 1, 1, pipeline, nil, nil)
+	defer fixture.close(t)
+	session, update := fixture.session(60, 4, 0, time.Now())
+	fixture.prepare(t, session, update)
+
+	candidateID := simplex.CandidateID{Slot: 0, Hash: [32]byte{0x81}}
+	progress := ConsensusProgress{
+		SessionID: session.ID,
+		Window: simplex.Window{
+			Base:         simplex.Parent(candidateID),
+			ObservedSlot: 1,
+			StartSlot:    0,
+			EndSlot:      session.SlotsPerLeaderWindow,
+			Leader:       0,
+			ObservedAt:   time.Now(),
 		},
-		{name: "missing lazy state cell", err: errors.New("load lazy cell: not found")},
+		StartAt: update.CurrentWindowStartAt,
+		Base:    runtimeSelectedBase(t, session, candidateID),
 	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			var calls []uint32
-			failures := make(chan error, 1)
-			failures <- test.err
-			pipeline := &runtimeTestPipeline{}
-			pipeline.restore = func(
-				_ context.Context,
-				request BuildRequest,
-				_ CandidateArtifact,
-			) error {
-				calls = append(calls, request.Slot)
-				if request.Slot == 1 {
-					select {
-					case err := <-failures:
-						return err
-					default:
-					}
-				}
-
-				return nil
-			}
-			fixture := newRuntimeFixture(t, 1, 1, pipeline, nil, nil)
-			defer fixture.close(t)
-			session, update := fixture.session(60, 4, 0, time.Now())
-			fixture.prepare(t, session, update)
-
-			first := simplex.Candidate{
-				Parent: simplex.Genesis(),
-				Leader: 0,
-				Block:  runtimeTestBlockID(session.Shard.Workchain, session.Shard.Shard, 13),
-			}
-			first.ID = first.ComputeID(0)
-			second := simplex.Candidate{
-				Parent: simplex.Parent(first.ID),
-				Leader: 0,
-				Empty:  true,
-				Block:  first.Block,
-			}
-			second.ID = second.ComputeID(1)
-			progress := ConsensusProgress{
-				SessionID: session.ID,
-				Window: simplex.Window{
-					Base:         simplex.Parent(second.ID),
-					ObservedSlot: 2,
-					StartSlot:    0,
-					EndSlot:      session.SlotsPerLeaderWindow,
-					Leader:       0,
-					ObservedAt:   time.Now(),
-				},
-				StartAt: update.CurrentWindowStartAt,
-				Candidates: []CandidateArtifact{
-					{SessionID: session.ID, Candidate: first},
-					{SessionID: session.ID, Candidate: second},
-				},
-			}
-			if err := fixture.service.ApplyConsensusProgress(context.Background(), progress); !errors.Is(err, test.err) {
-				t.Fatalf("first progress error = %v, want %v", err, test.err)
-			}
-			if _, err := fixture.service.Session(context.Background(), session.ID); err != nil {
-				t.Fatalf("session poisoned by retryable restore failure: %v", err)
-			}
-			if err := fixture.service.ApplyConsensusProgress(context.Background(), progress); err != nil {
-				t.Fatalf("retry progress: %v", err)
-			}
-			if !slices.Equal(calls, []uint32{0, 1, 0, 1}) {
-				t.Fatalf("restore call slots = %v, want [0 1 0 1]", calls)
-			}
-			record, err := fixture.service.Session(context.Background(), session.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if record.Update.CurrentBase != progress.Window.Base ||
-				record.Update.CurrentWindowObservedSlot != progress.Window.ObservedSlot {
-				t.Fatalf("retried progress was not committed: %+v", record.Update)
-			}
-		})
+	if err := fixture.service.ApplyConsensusProgress(
+		context.Background(),
+		progress,
+	); !errors.Is(err, advanceErr) {
+		t.Fatalf("first progress error = %v, want %v", err, advanceErr)
+	}
+	record, err := fixture.service.Session(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !record.Update.Equal(update) {
+		t.Fatalf("failed base advance changed session update: %+v", record.Update)
+	}
+	if err = fixture.service.ApplyConsensusProgress(context.Background(), progress); err != nil {
+		t.Fatalf("retry progress: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("base advance calls = %d, want 2", calls.Load())
+	}
+	record, err = fixture.service.Session(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Update.CurrentBase != progress.Window.Base ||
+		record.Update.CurrentWindowObservedSlot != progress.Window.ObservedSlot {
+		t.Fatalf("retried progress was not committed: %+v", record.Update)
 	}
 }
 
-func TestRuntimeProgressRestoreFailureDoesNotResumeOldProduction(t *testing.T) {
-	restoreErr := fmt.Errorf("commit candidate message delta: %w", ErrAcquisitionNotReady)
-	var restoreCalls atomic.Int32
+func TestRuntimeProgressBaseAdvanceFailureDoesNotResumeOldProduction(t *testing.T) {
+	advanceErr := fmt.Errorf("install selected base: %w", ErrAcquisitionNotReady)
+	var advanceCalls atomic.Int32
 	started := make(chan struct{}, 2)
 	buildCancelled := make(chan struct{})
 	releaseBuild := make(chan struct{})
@@ -3057,9 +3120,9 @@ func TestRuntimeProgressRestoreFailureDoesNotResumeOldProduction(t *testing.T) {
 
 		return nil, ctx.Err()
 	}
-	pipeline.restore = func(context.Context, BuildRequest, CandidateArtifact) error {
-		if restoreCalls.Add(1) == 1 {
-			return restoreErr
+	pipeline.advance = func(context.Context, ConsensusBaseUpdate) error {
+		if advanceCalls.Add(1) == 1 {
+			return advanceErr
 		}
 
 		return nil
@@ -3080,23 +3143,18 @@ func TestRuntimeProgressRestoreFailureDoesNotResumeOldProduction(t *testing.T) {
 		t.Fatal("old production did not start")
 	}
 
-	candidate := simplex.Candidate{
-		Parent: simplex.Genesis(),
-		Leader: 0,
-		Block:  runtimeTestBlockID(session.Shard.Workchain, session.Shard.Shard, 14),
-	}
-	candidate.ID = candidate.ComputeID(2)
+	candidateID := simplex.CandidateID{Slot: 2, Hash: [32]byte{0x91}}
 	progress := ConsensusProgress{
 		SessionID: session.ID,
 		Window: simplex.Window{
-			Base:         simplex.Parent(candidate.ID),
+			Base:         simplex.Parent(candidateID),
 			ObservedSlot: 3,
 			StartSlot:    2,
 			EndSlot:      4,
 			Leader:       0,
 			ObservedAt:   time.Now(),
 		},
-		Candidates: []CandidateArtifact{{SessionID: session.ID, Candidate: candidate}},
+		Base: runtimeSelectedBase(t, session, candidateID),
 	}
 	if err := fixture.service.ApplyConsensusProgress(context.Background(), progress); !errors.Is(err, ErrAcquisitionNotReady) {
 		t.Fatalf("busy progress error = %v, want acquisition not ready", err)
@@ -3111,8 +3169,8 @@ func TestRuntimeProgressRestoreFailureDoesNotResumeOldProduction(t *testing.T) {
 		status, _ := fixture.service.Status(context.Background())
 		return status.ActiveWindows == 0
 	})
-	if err := fixture.service.ApplyConsensusProgress(context.Background(), progress); !errors.Is(err, restoreErr) {
-		t.Fatalf("restore progress error = %v, want %v", err, restoreErr)
+	if err := fixture.service.ApplyConsensusProgress(context.Background(), progress); !errors.Is(err, advanceErr) {
+		t.Fatalf("base advance error = %v, want %v", err, advanceErr)
 	}
 	select {
 	case <-started:
@@ -3123,7 +3181,7 @@ func TestRuntimeProgressRestoreFailureDoesNotResumeOldProduction(t *testing.T) {
 		t.Fatalf("retry progress: %v", err)
 	}
 	if _, err := fixture.service.Session(context.Background(), session.ID); err != nil {
-		t.Fatalf("session poisoned by restore failure: %v", err)
+		t.Fatalf("session poisoned by base advance failure: %v", err)
 	}
 }
 
@@ -3225,23 +3283,12 @@ func TestRuntimeProgressStorageFailureCanRetry(t *testing.T) {
 	if _, err := fixture.service.Session(context.Background(), session.ID); err != nil {
 		t.Fatalf("session poisoned by progress storage failure: %v", err)
 	}
-	managed, err := fixture.service.runningSession(session.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if launched := runtimeProductionCount(managed); launched != 0 {
-		t.Fatalf("productions between failed storage write and retry = %d, want 0", launched)
-	}
-	if builds := pipeline.buildCount(); builds != 0 {
-		t.Fatalf("builds between failed storage write and retry = %d, want 0", builds)
-	}
-	deadline := time.Now().Add(time.Second)
-	for pipeline.buildCount() == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if builds := pipeline.buildCount(); builds == 0 {
-		t.Fatal("service-owned progress write retry did not resume production")
-	}
+	runtimeAwait(t, func() bool {
+		status, statusErr := fixture.service.Status(context.Background())
+
+		return statusErr == nil && strings.Contains(status.LastError, saveErr.Error())
+	})
+	runtimeAwait(t, func() bool { return pipeline.buildCount() != 0 })
 	runtimeAwaitSessionWrite(t, fixture.service, session.ID)
 	record, err := storage.Session(context.Background(), session.ID)
 	if err != nil {
@@ -4031,8 +4078,8 @@ func TestRuntimeAcceptedProgressKeepsCallerAndWALViewsMonotonic(t *testing.T) {
 	pending := managed.sessionWritePending
 	armed := managed.progressReady
 	managed.mu.Unlock()
-	if !pending || armed {
-		t.Fatalf("pending accepted progress state = pending %t, armed %t", pending, armed)
+	if !pending || !armed {
+		t.Fatalf("pending accepted progress state = pending %t, armed %t, want true, true", pending, armed)
 	}
 
 	newer := next
@@ -4055,10 +4102,10 @@ func TestRuntimeAcceptedProgressKeepsCallerAndWALViewsMonotonic(t *testing.T) {
 
 func TestRuntimeFailedProgressCannotRearmOlderPendingRevision(t *testing.T) {
 	baseStorage := newRuntimeMemoryStorage()
-	restoreErr := errors.New("restore speculative candidate")
+	advanceErr := errors.New("install selected consensus base")
 	pipeline := &runtimeTestPipeline{}
-	pipeline.restore = func(context.Context, BuildRequest, CandidateArtifact) error {
-		return restoreErr
+	pipeline.advance = func(context.Context, ConsensusBaseUpdate) error {
+		return advanceErr
 	}
 	fixture := newRuntimeFixture(t, 1, 1, pipeline, baseStorage, nil)
 	defer fixture.close(t)
@@ -4091,27 +4138,22 @@ func TestRuntimeFailedProgressCannotRearmOlderPendingRevision(t *testing.T) {
 		t.Fatal("accepted update did not reach storage")
 	}
 
-	candidate := simplex.Candidate{
-		Parent: next.CurrentBase,
-		Leader: 0,
-		Block:  runtimeTestBlockID(session.Shard.Workchain, session.Shard.Shard, 186),
-	}
-	candidate.ID = candidate.ComputeID(1)
+	candidateID := simplex.CandidateID{Slot: 1, Hash: [32]byte{0xa1}}
 	progress := ConsensusProgress{
 		SessionID: session.ID,
 		Window: simplex.Window{
-			Base:         simplex.Parent(candidate.ID),
+			Base:         simplex.Parent(candidateID),
 			ObservedSlot: 2,
 			StartSlot:    2,
 			EndSlot:      3,
 			Leader:       0,
 			ObservedAt:   time.Now(),
 		},
-		StartAt:    next.CurrentWindowStartAt.Add(time.Second),
-		Candidates: []CandidateArtifact{{SessionID: session.ID, Candidate: candidate}},
+		StartAt: next.CurrentWindowStartAt.Add(time.Second),
+		Base:    runtimeSelectedBase(t, session, candidateID),
 	}
-	if err := fixture.service.ApplyConsensusProgress(context.Background(), progress); !errors.Is(err, restoreErr) {
-		t.Fatalf("failed progress error = %v, want %v", err, restoreErr)
+	if err := fixture.service.ApplyConsensusProgress(context.Background(), progress); !errors.Is(err, advanceErr) {
+		t.Fatalf("failed progress error = %v, want %v", err, advanceErr)
 	}
 	managed, err := fixture.service.runningSession(session.ID)
 	if err != nil {
@@ -4161,6 +4203,54 @@ func TestRuntimeUpdateAcceptsEquivalentWindowTime(t *testing.T) {
 	pipeline.mu.Unlock()
 	if updated != 0 {
 		t.Fatalf("equivalent duplicate reached pipeline %d times", updated)
+	}
+}
+
+func TestRuntimeOrdinaryUpdateCannotAdvanceSelectedConsensusBase(t *testing.T) {
+	pipeline := &runtimeTestPipeline{}
+	fixture := newRuntimeFixture(t, 1, 1, pipeline, nil, nil)
+	defer fixture.close(t)
+
+	session, update := fixture.session(43, 1, 4, time.Now())
+	update.CurrentBase = simplex.Parent(simplex.CandidateID{
+		Slot: 3,
+		Hash: sha256.Sum256([]byte("selected-base")),
+	})
+	fixture.prepare(t, session, update)
+
+	managed, err := fixture.service.runningSession(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed.mu.Lock()
+	managed.progressReady = true
+	managed.mu.Unlock()
+
+	next := cloneSessionUpdate(update)
+	next.CurrentWindowStart++
+	next.CurrentWindowObservedSlot++
+	next.CurrentWindowStartAt = update.CurrentWindowStartAt.Add(update.TargetRate)
+	next.CurrentBase = simplex.Parent(simplex.CandidateID{
+		Slot: 4,
+		Hash: sha256.Sum256([]byte("unbound-base")),
+	})
+	if err = fixture.service.UpdateSession(context.Background(), next); !errors.Is(err, ErrCandidateConflict) {
+		t.Fatalf("ordinary selected-base advance error = %v, want ErrCandidateConflict", err)
+	}
+
+	pipeline.mu.Lock()
+	updated := pipeline.updated
+	pipeline.mu.Unlock()
+	if updated != 0 {
+		t.Fatalf("unbound selected base reached pipeline %d times", updated)
+	}
+	managed.mu.Lock()
+	base := managed.record.Update.CurrentBase
+	ready := managed.progressReady
+	pending := managed.sessionWritePending
+	managed.mu.Unlock()
+	if base != update.CurrentBase || !ready || pending {
+		t.Fatalf("rejected base mutated runtime base/ready/pending = %v/%v/%v", base, ready, pending)
 	}
 }
 
@@ -4677,12 +4767,33 @@ func TestRuntimeCancelledProductionAbandonsStuckStorageWrite(t *testing.T) {
 // is the only thing keeping a retryable mid-window failure from ending the
 // window at its first already signed slot.
 func TestRuntimeRetriedWindowReemitsSignedSlotFromMemory(t *testing.T) {
-	var resolves atomic.Int32
+	var failures atomic.Int32
 	pipeline := &runtimeTestPipeline{}
-	pipeline.state = func(_ context.Context, request BuildRequest) (CandidateState, error) {
-		if resolves.Add(1) == 1 {
-			return CandidateState{}, errors.New("candidate state unavailable")
+	// The failure is injected into the build rather than into the state
+	// resolution, because a pipelined slot never resolves: its predecessor hands
+	// it the verdict along with the block. What this test is about — a window
+	// that fails after it has already signed a slot, and re-emits that slot from
+	// memory when it retries — is the same either way.
+	//
+	// Slot 1 fails its first TWO builds, and it takes two to reach the retry.
+	// The first is the pipelined successor slot 0 handed over, and the producer
+	// declines a successor that has already failed rather than adopting its
+	// error as the slot's own — that is the whole point of the viability check
+	// at adoption. The second is the build the producer then starts itself on
+	// schedule, and that one is the failure this test needs.
+	var buildsMu sync.Mutex
+	buildsPerSlot := map[uint32]int{}
+	pipeline.build = func(_ context.Context, request BuildRequest) (*Candidate, error) {
+		buildsMu.Lock()
+		buildsPerSlot[request.Slot]++
+		buildsMu.Unlock()
+		if request.Slot == 1 && failures.Add(1) <= 2 {
+			return nil, errors.New("candidate build unavailable")
 		}
+
+		return runtimeBuiltCandidate(request), nil
+	}
+	pipeline.state = func(_ context.Context, request BuildRequest) (CandidateState, error) {
 		block := cloneBlockID(request.Previous.Candidate.Block)
 
 		return CandidateState{Block: block, NextSeqno: block.SeqNo + 1}, nil
@@ -4718,8 +4829,14 @@ func TestRuntimeRetriedWindowReemitsSignedSlotFromMemory(t *testing.T) {
 		!slices.Equal(resumed.CollatedData, signed.CollatedData) {
 		t.Fatal("retry re-emitted different bytes for a slot already signed")
 	}
-	if built := pipeline.buildCount(); built != 2 {
-		t.Fatalf("window built %d candidates for 2 slots; the signed slot was rebuilt", built)
+	// Per slot, not in total: the retried slot is legitimately built twice — the
+	// attempt that failed and the one that succeeded — and what this asserts is
+	// that the slot which was already signed is not among them.
+	buildsMu.Lock()
+	defer buildsMu.Unlock()
+	if buildsPerSlot[0] != 1 {
+		t.Fatalf("slot 0 was built %d times; the signed slot was rebuilt instead of re-emitted "+
+			"from memory", buildsPerSlot[0])
 	}
 
 	stored, err := fixture.storage.Candidate(context.Background(), signed.WindowID, 0)

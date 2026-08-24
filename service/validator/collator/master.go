@@ -33,6 +33,10 @@ type masterCollation struct {
 	shardHashes *cell.Dictionary
 	shardFees   *tlb.ShardFeesAugDict
 	shardTops   []ShardTop
+	// topBlockDescrSet is the immutable prefix root shared by the admission
+	// estimate and the final collated data. Building it twice repeated every
+	// dictionary insertion and cell hash calculation on the master hot path.
+	topBlockDescrSet *cell.Cell
 
 	feesImported    tlb.CurrencyCollection
 	importedCreated tlb.CurrencyCollection
@@ -65,8 +69,8 @@ func (b *Builder) BuildMaster(ctx context.Context, req MasterRequest) (*Candidat
 	if err := validateCollationRequest(&common); err != nil {
 		return nil, err
 	}
-	candidate, err := retryUnderSizeLimit(func(narrowing sizeBudgetCap) (*Candidate, error) {
-		return b.buildMasterAttempt(ctx, req, narrowing)
+	candidate, err := retryUnderSizeLimit(ctx, func(attempt collationAttempt) (*Candidate, error) {
+		return b.buildMasterAttempt(ctx, req, attempt)
 	})
 	if err != nil {
 		return candidate, err
@@ -78,17 +82,23 @@ func (b *Builder) BuildMaster(ctx context.Context, req MasterRequest) (*Candidat
 	return candidate, nil
 }
 
-func (b *Builder) buildMasterAttempt(ctx context.Context, req MasterRequest, narrowing sizeBudgetCap) (*Candidate, error) {
-	c, err := b.prepareMasterPhases(ctx, req, narrowing)
+func (b *Builder) buildMasterAttempt(ctx context.Context, req MasterRequest, attempt collationAttempt) (*Candidate, error) {
+	c, err := b.prepareMasterPhases(ctx, req, attempt)
 	if err != nil {
 		return nil, err
 	}
+	// The external phase below enters the wave machinery exactly as the shard
+	// path does, and the pool it starts belongs to this collation. Without this
+	// release the workers outlive the build, parked on a queue nobody closes.
+	defer c.stopWaves()
 	timer := c.req.assembly.start(CollationStageExecuteExternalMessages)
 	defer func() {
 		timer.stop()
 	}()
-	if err = c.processExternals(); err != nil {
-		return nil, err
+	if !attempt.skipExternals() {
+		if err = c.processExternals(); err != nil {
+			return nil, err
+		}
 	}
 	timer.stop()
 
@@ -98,17 +108,19 @@ func (b *Builder) buildMasterAttempt(ctx context.Context, req MasterRequest, nar
 func (b *Builder) prepareMasterPhases(
 	ctx context.Context,
 	req MasterRequest,
-	narrowing sizeBudgetCap,
+	attempt collationAttempt,
 ) (*collation, error) {
 	timer := req.assembly.start(CollationStagePrepareState)
 	defer func() {
 		timer.stop()
 	}()
+	// Assigned every attempt, for the reason spelled out in prepareShardPhases.
+	req.Dispatch.AttemptIndex = uint32(attempt.index)
 	c, err := b.prepareMaster(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	c.limits.narrowBytes(narrowing)
+	c.limits.applyAttempt(attempt)
 	if err = c.limits.addProof(c.outQueue.RootCell()); err != nil {
 		return nil, fmt.Errorf("initial outbound queue proof: %w", err)
 	}
@@ -426,6 +438,9 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 	}
 	c.prepareAccountPathRecorder()
 	if err = c.prepareFullCollatedProofs(); err != nil {
+		return nil, err
+	}
+	if err = c.prepareMasterCollatedPrefix(); err != nil {
 		return nil, err
 	}
 	if err = c.prepareMasterCollatedEstimate(); err != nil {
@@ -881,12 +896,25 @@ func (c *collation) prepareMasterCollatedEstimate() error {
 		return err
 	}
 	roots = append(roots, c.fullCollatedProofs...)
-	boc, err := cell.ToBOCWithOptionsErr(roots, cell.BOCSerializeOptions{WithCRC32C: true})
+	size, err := collatedBOCSize(roots)
 	if err != nil {
 		return fmt.Errorf("estimate fixed masterchain collated data: %w", err)
 	}
-	c.collatedFixedEstimate = uint64(len(boc))
+	c.collatedFixedEstimate = size
 	c.updateCollatedEstimate()
+	return nil
+}
+
+func (c *collation) prepareMasterCollatedPrefix() error {
+	if len(c.master.shardTops) == 0 {
+		return nil
+	}
+
+	set, err := buildMasterTopBlockDescrSet(c.master.shardTops)
+	if err != nil {
+		return err
+	}
+	c.master.topBlockDescrSet = set
 	return nil
 }
 
@@ -894,11 +922,10 @@ func (c *collation) masterCollatedPrefix(consensus *cell.Cell) ([]*cell.Cell, er
 	if len(c.master.shardTops) == 0 {
 		return []*cell.Cell{consensus}, nil
 	}
-	set, err := buildMasterTopBlockDescrSet(c.master.shardTops)
-	if err != nil {
-		return nil, err
+	if c.master.topBlockDescrSet == nil {
+		return nil, fmt.Errorf("masterchain collated TopBlockDescr set was not prepared")
 	}
-	return []*cell.Cell{set, consensus}, nil
+	return []*cell.Cell{c.master.topBlockDescrSet, consensus}, nil
 }
 
 func (c *collation) processMasterTickTock(tock bool) error {

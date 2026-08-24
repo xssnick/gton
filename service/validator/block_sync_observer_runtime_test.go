@@ -260,7 +260,7 @@ func TestBlockSyncObserverRuntimeAuthenticatesCandidateWithoutPublishing(t *test
 	})
 
 	artifact := runtimeOrdinaryArtifact(t, config, privateKey, 0, simplex.Genesis())
-	wire, err := simplex.SerializeCandidate(
+	broadcast, err := simplex.SerializeCandidateForBroadcast(
 		artifact.Candidate,
 		artifact.BlockBOC,
 		artifact.CollatedData,
@@ -268,12 +268,27 @@ func TestBlockSyncObserverRuntimeAuthenticatesCandidateWithoutPublishing(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	received, err := runtime.ReceiveCandidate(context.Background(), artifact.Candidate.ID.Slot, wire)
+	extra, err := simplex.ParseBroadcastExtra(broadcast.Extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	received, err := runtime.ReceiveCandidate(
+		context.Background(),
+		artifact.Candidate.ID.Slot,
+		broadcast.Data,
+		extra.Delegation,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertCandidateArtifactEqual(t, &received, artifact)
-	if _, err = runtime.ReceiveCandidate(context.Background(), artifact.Candidate.ID.Slot+1, wire); err == nil {
+	assertPreparedBlockRoute(t, 1, &received)
+	if _, err = runtime.ReceiveCandidate(
+		context.Background(),
+		artifact.Candidate.ID.Slot+1,
+		broadcast.Data,
+		extra.Delegation,
+	); err == nil {
 		t.Fatal("candidate with a mismatched broadcast slot was accepted")
 	}
 
@@ -281,7 +296,7 @@ func TestBlockSyncObserverRuntimeAuthenticatesCandidateWithoutPublishing(t *test
 	forged.Candidate = artifact.Candidate
 	forged.Candidate.Signature = bytes.Clone(artifact.Candidate.Signature)
 	forged.Candidate.Signature[0] ^= 0xff
-	forgedWire, err := simplex.SerializeCandidate(
+	forgedBroadcast, err := simplex.SerializeCandidateForBroadcast(
 		forged.Candidate,
 		forged.BlockBOC,
 		forged.CollatedData,
@@ -289,7 +304,12 @@ func TestBlockSyncObserverRuntimeAuthenticatesCandidateWithoutPublishing(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = runtime.ReceiveCandidate(context.Background(), artifact.Candidate.ID.Slot, forgedWire); err == nil {
+	if _, err = runtime.ReceiveCandidate(
+		context.Background(),
+		artifact.Candidate.ID.Slot,
+		forgedBroadcast.Data,
+		extra.Delegation,
+	); err == nil {
 		t.Fatal("forged candidate was accepted")
 	}
 	firstBroadcast := [32]byte{0x11}

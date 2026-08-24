@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -36,13 +37,30 @@ type PreparedCandidate struct {
 	// PrepareCandidate returns, and from the goroutine PrepareCandidateAsync
 	// starts.
 	ready   chan struct{}
-	payload []byte
+	payload *candidatePayload
 	err     error
 
-	rootHash         [32]byte
+	// digests is the pair bind checks a candidate against, published separately
+	// from the rest of the capsule because the producer that starts the build
+	// earliest has not serialized either BOC yet and so cannot have hashed one:
+	// a collator launches this the moment its roots are final, several
+	// milliseconds before the two component serializations it will declare the
+	// hashes of have finished. The atomic store is what orders that publication
+	// against the delivery goroutine that later reads it in bind; the build
+	// itself never looks at these two values, which is why it can run without
+	// them.
+	digests atomic.Pointer[preparedDigests]
+
+	rootHash [32]byte
+	seqNo    uint32
+}
+
+// preparedDigests is one candidate's file-hash pair: sha256 of its block BOC and
+// sha256 of its collated data, as the producer computed them over the very bytes
+// it serialized from this capsule's roots.
+type preparedDigests struct {
 	fileHash         [32]byte
 	collatedFileHash [32]byte
-	seqNo            uint32
 }
 
 // PrepareCandidate builds the payload on the calling goroutine. cellsHint is
@@ -56,7 +74,8 @@ func PrepareCandidate(
 	collatedFileHash [32]byte,
 	cellsHint int,
 ) (*PreparedCandidate, error) {
-	prepared, build := newPreparedCandidate(seqNo, blockRoot, collatedRoots, fileHash, collatedFileHash, cellsHint)
+	prepared, build := newPreparedCandidate(seqNo, blockRoot, collatedRoots, cellsHint)
+	prepared.DeclareDigests(fileHash, collatedFileHash)
 	build()
 	if prepared.err != nil {
 		return nil, prepared.err
@@ -67,8 +86,15 @@ func PrepareCandidate(
 
 // PrepareCandidateAsync starts the build on its own goroutine and returns
 // immediately. The caller overlaps the compression tail of its candidate with
-// whatever it does between building that candidate and serializing it —
-// signing, persistence and the scheduled broadcast wait for a collator.
+// whatever it does between building that candidate and serializing it — for a
+// collator: the rest of its own serialization, signing, persistence and the
+// scheduled broadcast wait.
+//
+// It takes no file hashes because its callers do not have them yet — the point
+// of starting here is to start before the BOCs those hashes are taken over
+// exist. The producer must call DeclareDigests once it has both, and always
+// before it hands the candidate on; a payload asked for without them is refused
+// rather than served unchecked.
 //
 // The roots must be final: they are read without synchronisation until the
 // build completes. Cell trees are immutable once finalized, and BOC
@@ -78,29 +104,31 @@ func PrepareCandidateAsync(
 	seqNo uint32,
 	blockRoot *cell.Cell,
 	collatedRoots []*cell.Cell,
-	fileHash [32]byte,
-	collatedFileHash [32]byte,
 	cellsHint int,
 ) *PreparedCandidate {
-	prepared, build := newPreparedCandidate(seqNo, blockRoot, collatedRoots, fileHash, collatedFileHash, cellsHint)
+	prepared, build := newPreparedCandidate(seqNo, blockRoot, collatedRoots, cellsHint)
 	go build()
 
 	return prepared
+}
+
+// DeclareDigests publishes the two file hashes bind compares a candidate
+// against. It must be called before the capsule is reachable by whatever asks
+// for the payload — the producer is the only party that can compute these, and
+// the ordering between its store and that reader's load is the store itself.
+func (p *PreparedCandidate) DeclareDigests(fileHash, collatedFileHash [32]byte) {
+	p.digests.Store(&preparedDigests{fileHash: fileHash, collatedFileHash: collatedFileHash})
 }
 
 func newPreparedCandidate(
 	seqNo uint32,
 	blockRoot *cell.Cell,
 	collatedRoots []*cell.Cell,
-	fileHash [32]byte,
-	collatedFileHash [32]byte,
 	cellsHint int,
 ) (*PreparedCandidate, func()) {
 	prepared := &PreparedCandidate{
-		ready:            make(chan struct{}),
-		fileHash:         fileHash,
-		collatedFileHash: collatedFileHash,
-		seqNo:            seqNo,
+		ready: make(chan struct{}),
+		seqNo: seqNo,
 	}
 	if blockRoot == nil {
 		prepared.err = errors.New("simplex: prepared candidate has no block root")
@@ -125,7 +153,7 @@ func newPreparedCandidate(
 // payloadFor returns the payload once it is built, after checking that it
 // belongs to candidate. The binding is checked before the wait so a mismatch is
 // reported without blocking on work that will be discarded.
-func (p *PreparedCandidate) payloadFor(candidate Candidate) ([]byte, error) {
+func (p *PreparedCandidate) payloadFor(candidate Candidate) (*candidatePayload, error) {
 	if err := p.bind(candidate); err != nil {
 		return nil, err
 	}
@@ -147,10 +175,19 @@ func (p *PreparedCandidate) bind(candidate Candidate) error {
 	if !bytes.Equal(candidate.Block.RootHash, p.rootHash[:]) {
 		return fmt.Errorf("%w: block root hash", ErrPreparedCandidateMismatch)
 	}
-	if !bytes.Equal(candidate.Block.FileHash, p.fileHash[:]) {
+	// A capsule started before its producer had hashed anything carries no
+	// digests until DeclareDigests runs, which is always before the candidate
+	// leaves that producer. Reaching this point without them is a producer that
+	// never declared them, so the payload is refused: serving it would be
+	// serving bytes nothing has checked belong to this candidate.
+	digests := p.digests.Load()
+	if digests == nil {
+		return fmt.Errorf("%w: file hashes were never declared", ErrPreparedCandidateMismatch)
+	}
+	if !bytes.Equal(candidate.Block.FileHash, digests.fileHash[:]) {
 		return fmt.Errorf("%w: block file hash", ErrPreparedCandidateMismatch)
 	}
-	if candidate.CollatedFileHash != p.collatedFileHash {
+	if candidate.CollatedFileHash != digests.collatedFileHash {
 		return fmt.Errorf("%w: collated file hash", ErrPreparedCandidateMismatch)
 	}
 

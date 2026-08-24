@@ -45,6 +45,7 @@ type Node struct {
 	quicServeDone            chan struct{}
 	quicServeErr             error
 	quicQuerySlots           chan struct{}
+	quicOutboundDialSlots    chan struct{}
 	fastSyncBroadcastFECPace time.Duration
 	quicPeersMx              sync.RWMutex
 	quicPeers                map[PeerID]*authenticatedQUICPeer
@@ -333,6 +334,7 @@ func New(opts Options) (*Node, error) {
 		gateway:                       gateway,
 		quicGateway:                   quicGateway,
 		quicQuerySlots:                make(chan struct{}, inboundQUICQueryParallelism),
+		quicOutboundDialSlots:         make(chan struct{}, outboundQUICDialParallelism),
 		fastSyncBroadcastFECPace:      fastSyncBroadcastFECPace,
 		quicPeers:                     make(map[PeerID]*authenticatedQUICPeer),
 		dhtListenAddr:                 opts.DHTListenAddr,

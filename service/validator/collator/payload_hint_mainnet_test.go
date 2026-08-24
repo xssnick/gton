@@ -102,6 +102,21 @@ type payloadHintArm struct {
 	collatedSum string
 }
 
+// PROVENANCE, both store-shaped arms. The source proof over a lazy parent was
+// being built with a forked branch worker, which gave that branch its own build
+// memo: a subtree reached from both sides was built twice, once from the
+// resolved instance and once from the placeholder, and those are not the same
+// cell. The block therefore depended on where the fork happened to fall, which
+// the carried memo hint selects — so the values recorded here were one of two
+// the collator could produce, not the collator's answer. The fork is now
+// withheld over a lazy source (tonutils readset_update.go) and these are the
+// sequential build's values, the ones the resident arms and the pre-parallel
+// implementation have always produced.
+//
+// Both arms kept their byte length to the byte — 446619 and 689084 — and both
+// collated sums are unchanged, which is the shape of the change: only the OLD
+// side of the state update moved, and only in which instance it was rebuilt
+// from. The resident arms are untouched, as is the full-collated golden.
 func payloadHintArms() []payloadHintArm {
 	return []payloadHintArm{
 		{
@@ -111,7 +126,7 @@ func payloadHintArms() []payloadHintArm {
 		},
 		{
 			"store-shaped repeat=1", 1, true,
-			446619, "3a3d3502b593811a8b0cdbf3e932fb96b769ed6a01ca789f88d69fb2204ed51c",
+			446619, "cc094895cee364e387a9c484527ce8383d58cc8e5349622856e871ba36a17d5c",
 			332325, "200345126757bce36e99953590b6840c8877b78f2d33cff5903b5ceb3d2f290d",
 		},
 		{
@@ -121,7 +136,7 @@ func payloadHintArms() []payloadHintArm {
 		},
 		{
 			"store-shaped repeat=3", 3, true,
-			689084, "dfa9382adcc1ecf68fbbb8277c3b5c3fd3e584b1e305ad343ae6fea98cea839b",
+			689084, "b2e9b99a22281d8823d7259289072fcc5390577fcfdbaa7b5c817da0f1b9751a",
 			419846, "3270aade3dc8066dcfdcc7f039686d0ce12edfdfd95a766211a508d0b5d2a5bb",
 		},
 	}

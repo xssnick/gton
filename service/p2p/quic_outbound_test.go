@@ -899,9 +899,9 @@ func TestQUICOutboundOperationsReuseGatewayPathAndFrameOverlay(t *testing.T) {
 	if len(peerSet) != 1 {
 		t.Fatalf("resolved QUIC two-step peers = %d, want 1", len(peerSet))
 	}
-	broadcastPeer, ok := peerSet[0].(quicRouteBroadcastPeer)
+	broadcastPeer, ok := peerSet[0].(quicTwoStepSendPeer)
 	if !ok {
-		t.Fatalf("resolved two-step peer = %T, want concrete QUIC peer", peerSet[0])
+		t.Fatalf("resolved two-step peer = %T, want dial-on-send QUIC peer", peerSet[0])
 	}
 	if !bytes.Equal(broadcastPeer.ID(), serverID[:]) {
 		t.Fatalf("broadcast peer id = %x, want %x", broadcastPeer.ID(), serverID)
@@ -1386,11 +1386,18 @@ func TestCustomTwoStepQUICDoesNotFallbackWithoutRoute(t *testing.T) {
 	t.Cleanup(sub.broadcastReceiver.Close)
 
 	peerSet, failed := sub.resolveTwoStepPeerSet(context.Background(), PeerID{})
-	if len(peerSet) != 0 {
-		t.Fatalf("resolved peers without QUIC route = %d, want 0", len(peerSet))
+	if len(peerSet) != 1 {
+		t.Fatalf("deferred peers without QUIC route = %d, want 1", len(peerSet))
 	}
-	if len(failed) != 1 || !errors.Is(failed[0].Err, errQUICRouteMissing) {
-		t.Fatalf("QUIC route failures = %+v, want one missing-route error", failed)
+	if len(failed) != 0 {
+		t.Fatalf("unexpected eager QUIC route failures = %+v", failed)
+	}
+	sendPeer, ok := peerSet[0].(quicTwoStepSendPeer)
+	if !ok {
+		t.Fatalf("deferred two-step peer = %T, want dial-on-send QUIC peer", peerSet[0])
+	}
+	if err = sendPeer.SendCustomMessage(context.Background(), overlay.Ping{}); !errors.Is(err, errQUICRouteMissing) {
+		t.Fatalf("deferred QUIC send error = %v, want missing route", err)
 	}
 	if len(rldpTransport.sent) != 0 || len(base.sent) != 0 {
 		t.Fatal("missing QUIC route fell back to RLDP or ADNL")

@@ -298,6 +298,7 @@ type runtimeTestBackend struct {
 
 	stateRoot  *cell.Cell
 	updates    []SessionState
+	update     func(context.Context, SessionState) error
 	updateErr  error
 	closeErrs  []error
 	closeCalls int
@@ -323,15 +324,25 @@ func newRuntimeTestBackend() *runtimeTestBackend {
 	}
 }
 
-func (b *runtimeTestBackend) UpdateSession(_ context.Context, state SessionState) error {
+func (b *runtimeTestBackend) UpdateSession(ctx context.Context, state SessionState) error {
 	b.mu.Lock()
 	err := b.updateErr
-	if err == nil {
-		b.updates = append(b.updates, cloneSessionState(state))
+	update := b.update
+	b.mu.Unlock()
+	if err != nil {
+		return err
 	}
+	if update != nil {
+		if err = update(ctx, state); err != nil {
+			return err
+		}
+	}
+
+	b.mu.Lock()
+	b.updates = append(b.updates, cloneSessionState(state))
 	b.mu.Unlock()
 
-	return err
+	return nil
 }
 
 func (b *runtimeTestBackend) LoadChainState(
@@ -870,6 +881,234 @@ func TestSessionRuntimeUpdateBeforeRunAndLifecycle(t *testing.T) {
 	}
 	if backend.updateCount() != 2 {
 		t.Fatalf("backend update count = %d, want 2", backend.updateCount())
+	}
+}
+
+func TestSessionRuntimeReceivesBareDelegatedCandidate(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	network := newRuntimeTestNetwork()
+	backend := newRuntimeTestBackend()
+	runtime, leaderKey := prepareRuntimeTest(t, 0x34, storage, network, backend)
+	runResult := make(chan error, 1)
+	go func() { runResult <- runtime.Run(context.Background(), runtimeTestStart()) }()
+	select {
+	case <-network.started:
+	case <-time.After(time.Second):
+		t.Fatal("network did not start")
+	}
+	t.Cleanup(func() {
+		if err := runtime.Close(); err != nil {
+			t.Error(err)
+		}
+		if err := <-runResult; err != nil {
+			t.Errorf("run after close: %v", err)
+		}
+	})
+
+	ordinary := runtimeOrdinaryArtifact(t, runtime.config, leaderKey, 0, simplex.Genesis())
+	delegated := runtimeDelegatedArtifact(t, runtime.config, leaderKey, ordinary)
+	broadcast, err := simplex.SerializeCandidateForBroadcast(
+		delegated.Candidate,
+		delegated.BlockBOC,
+		delegated.CollatedData,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra, err := simplex.ParseBroadcastExtra(broadcast.Extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = runtime.ReceiveCandidate(
+		context.Background(),
+		delegated.Candidate.ID.Slot+1,
+		broadcast.Data,
+		extra.Delegation,
+	); err == nil {
+		t.Fatal("runtime accepted a candidate whose inner and broadcast slots differ")
+	}
+	if _, err = runtime.ReceiveCandidate(
+		context.Background(),
+		delegated.Candidate.ID.Slot,
+		broadcast.Data,
+		corruptDelegationSignature(extra.Delegation),
+	); err == nil {
+		t.Fatal("runtime trusted the transport's invalid delegation")
+	}
+
+	received, err := runtime.ReceiveCandidate(
+		context.Background(),
+		delegated.Candidate.ID.Slot,
+		broadcast.Data,
+		extra.Delegation,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCandidateArtifactEqual(t, &received, delegated)
+	if !sameDelegation(received.Candidate.Delegation, delegated.Candidate.Delegation) {
+		t.Fatal("runtime changed the delegated candidate authority")
+	}
+}
+
+func TestSessionRuntimeUpdatePreservesFinalizedBlockWhenUnobserved(t *testing.T) {
+	backend := newRuntimeTestBackend()
+	runtime, _ := prepareRuntimeTest(
+		t,
+		0x76,
+		newRuntimeTestStorage(),
+		newRuntimeTestNetwork(),
+		backend,
+	)
+	defer runtime.Close()
+
+	finalized := ton.BlockIDExt{
+		Workchain: runtime.config.Shard.Workchain,
+		Shard:     runtime.config.Shard.Shard,
+		SeqNo:     17,
+		RootHash:  testTipRootHash(0xe1),
+		FileHash:  testTipFileHash(0xe1),
+	}
+	observed := runtimeTestState()
+	observed.FinalizedBlock = &finalized
+	if err := runtime.Update(context.Background(), observed); err != nil {
+		t.Fatal(err)
+	}
+
+	unobserved := runtimeTestState()
+	unobserved.Params.TargetRate += time.Millisecond
+	if err := runtime.Update(context.Background(), unobserved); err != nil {
+		t.Fatal(err)
+	}
+
+	effective := runtime.currentFinalizedBlock()
+	if effective == nil || !sameBlockID(*effective, finalized) {
+		t.Fatalf("runtime finalized block = %v, want preserved %v", effective, finalized)
+	}
+	committed := backend.latestState()
+	if committed.FinalizedBlock == nil || !sameBlockID(*committed.FinalizedBlock, finalized) {
+		t.Fatalf("backend finalized block = %v, want preserved %v", committed.FinalizedBlock, finalized)
+	}
+}
+
+func TestSessionRuntimeUpdateKeepsFinalizedBlockMonotonic(t *testing.T) {
+	type finalizedUpdateTest struct {
+		name        string
+		update      func(ton.BlockIDExt) *ton.BlockIDExt
+		wantError   bool
+		wantAdvance bool
+		wantBackend bool
+	}
+	tests := []finalizedUpdateTest{
+		{
+			name: "older observation",
+			update: func(current ton.BlockIDExt) *ton.BlockIDExt {
+				older := current
+				older.SeqNo--
+				older.RootHash = testTipRootHash(0xd1)
+				older.FileHash = testTipFileHash(0xd1)
+
+				return &older
+			},
+			wantBackend: true,
+		},
+		{
+			name: "same exact observation",
+			update: func(current ton.BlockIDExt) *ton.BlockIDExt {
+				exact := *current.Copy()
+
+				return &exact
+			},
+			wantBackend: true,
+		},
+		{
+			name: "same height conflict",
+			update: func(current ton.BlockIDExt) *ton.BlockIDExt {
+				conflict := current
+				conflict.RootHash = testTipRootHash(0xd2)
+				conflict.FileHash = testTipFileHash(0xd2)
+
+				return &conflict
+			},
+			wantError: true,
+		},
+		{
+			name: "newer observation",
+			update: func(current ton.BlockIDExt) *ton.BlockIDExt {
+				newer := current
+				newer.SeqNo++
+				newer.RootHash = testTipRootHash(0xd3)
+				newer.FileHash = testTipFileHash(0xd3)
+
+				return &newer
+			},
+			wantAdvance: true,
+			wantBackend: true,
+		},
+		{
+			name: "wrong shard",
+			update: func(current ton.BlockIDExt) *ton.BlockIDExt {
+				wrong := current
+				wrong.Workchain++
+
+				return &wrong
+			},
+			wantError: true,
+		},
+	}
+
+	for i, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newRuntimeTestBackend()
+			runtime, _ := prepareRuntimeTest(
+				t,
+				byte(0xb0+i),
+				newRuntimeTestStorage(),
+				newRuntimeTestNetwork(),
+				backend,
+			)
+			defer runtime.Close()
+
+			current := ton.BlockIDExt{
+				Workchain: runtime.config.Shard.Workchain,
+				Shard:     runtime.config.Shard.Shard,
+				SeqNo:     17,
+				RootHash:  testTipRootHash(0xd0),
+				FileHash:  testTipFileHash(0xd0),
+			}
+			state := runtimeTestState()
+			state.FinalizedBlock = &current
+			if err := runtime.Update(t.Context(), state); err != nil {
+				t.Fatal(err)
+			}
+			beforeBackend := backend.updateCount()
+
+			incoming := test.update(current)
+			next := runtimeTestState()
+			next.FinalizedBlock = incoming
+			err := runtime.Update(t.Context(), next)
+			if (err != nil) != test.wantError {
+				t.Fatalf("update error = %v, want error %v", err, test.wantError)
+			}
+			want := current
+			if test.wantAdvance {
+				want = *incoming
+			}
+			if got := runtime.currentFinalizedBlock(); got == nil || !sameBlockID(*got, want) {
+				t.Fatalf("runtime finalized block = %v, want %v", got, want)
+			}
+			backendDelta := backend.updateCount() - beforeBackend
+			if test.wantBackend && backendDelta != 1 {
+				t.Fatalf("backend update delta = %d, want 1", backendDelta)
+			}
+			if !test.wantBackend && backendDelta != 0 {
+				t.Fatalf("backend update delta = %d, want 0", backendDelta)
+			}
+			committed := backend.latestState()
+			if committed.FinalizedBlock == nil || !sameBlockID(*committed.FinalizedBlock, want) {
+				t.Fatalf("backend finalized block = %v, want %v", committed.FinalizedBlock, want)
+			}
+		})
 	}
 }
 
@@ -1415,6 +1654,117 @@ func TestSessionRuntimeDoesNotRetryProgressPastWindowDeadline(t *testing.T) {
 	}
 }
 
+func TestSessionRuntimeRechecksSameLeaderWindowAfterDeferredBackendCatchUp(t *testing.T) {
+	type anchorRecheckTest struct {
+		name            string
+		finalized       func(SessionStart) ton.BlockIDExt
+		wantProgresses  int
+		wantWindowCalls int
+	}
+	tests := []anchorRecheckTest{
+		{
+			name: "new anchor remains an ancestor",
+			finalized: func(start SessionStart) ton.BlockIDExt {
+				return *start.Genesis[0].Copy()
+			},
+			wantProgresses:  2,
+			wantWindowCalls: 2,
+		},
+		{
+			name: "new anchor is ahead of the window",
+			finalized: func(start SessionStart) ton.BlockIDExt {
+				block := *start.Genesis[0].Copy()
+				block.SeqNo++
+				block.RootHash = testTipRootHash(0xe7)
+				block.FileHash = testTipFileHash(0xe7)
+
+				return block
+			},
+			wantProgresses:  1,
+			wantWindowCalls: 1,
+		},
+	}
+
+	for i, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newRuntimeTestBackend()
+			runtime, _ := prepareRuntimeTest(
+				t,
+				byte(0xc0+i),
+				newRuntimeTestStorage(),
+				newRuntimeTestNetwork(),
+				backend,
+			)
+			defer runtime.Close()
+
+			start := runtimeTestStart()
+			if err := runtime.states.start(t.Context(), start); err != nil {
+				t.Fatal(err)
+			}
+			progresses := 0
+			backend.progress = func(context.Context, sessionConsensusProgress) error {
+				progresses++
+
+				return nil
+			}
+			var firstSubmitter *windowSubmitter
+			windowCalls := 0
+			backend.window = func(ctx context.Context, _ LeaderWindow) error {
+				windowCalls++
+				runtime.windowMu.Lock()
+				current := runtime.window
+				runtime.windowMu.Unlock()
+				if current == nil {
+					t.Fatal("leader-window callback has no active submitter")
+				}
+				current.mu.Lock()
+				isLive := current.runtime == runtime && current.err == nil
+				current.mu.Unlock()
+				if !isLive {
+					t.Fatal("leader-window callback received a closed submitter")
+				}
+				if windowCalls == 1 {
+					firstSubmitter = current
+					state := runtimeTestState()
+					finalized := test.finalized(start)
+					state.FinalizedBlock = &finalized
+					if err := runtime.Update(ctx, state); err != nil {
+						return err
+					}
+
+					return errLeaderWindowNeedsRecheck
+				}
+				if current == firstSubmitter {
+					t.Fatal("same-window recheck reused the detached submitter")
+				}
+
+				return nil
+			}
+
+			runtime.handleWindow(t.Context(), simplex.Window{
+				Base:         simplex.Genesis(),
+				ObservedSlot: 0,
+				StartSlot:    0,
+				EndSlot:      runtime.config.Protocol.SlotsPerLeaderWindow,
+				Leader:       0,
+				LocalLeader:  true,
+			})
+			if progresses != test.wantProgresses || windowCalls != test.wantWindowCalls {
+				t.Fatalf("progress/window calls = %d/%d, want %d/%d",
+					progresses, windowCalls, test.wantProgresses, test.wantWindowCalls)
+			}
+			if test.wantWindowCalls == 1 {
+				runtime.windowMu.Lock()
+				active := runtime.window
+				runtime.windowMu.Unlock()
+				if active != nil {
+					t.Fatal("window rejected by the new anchor retained a submitter")
+				}
+			}
+		})
+	}
+}
+
 func TestSessionRuntimeLeaderWindowFailureSkipsOnlyCurrentWindow(t *testing.T) {
 	storage := newRuntimeTestStorage()
 	network := newRuntimeTestNetwork()
@@ -1498,57 +1848,428 @@ func TestSessionRuntimeLeaderWindowFailureSkipsOnlyCurrentWindow(t *testing.T) {
 	}
 }
 
-func TestSessionRuntimeWaitsForExactFinalizedStateWithoutStopping(t *testing.T) {
-	resolver, candidates, artifacts := lineageResolverForTest(t, false)
-	defer resolver.close()
-	defer candidates.close()
+type ancestryRetryStorage struct {
+	ValidatorStorage
 
-	resolver.mu.Lock()
-	resolver.finalized[artifacts[0].Candidate.ID] = &finalizedState{isDone: true, reconciled: true}
-	resolver.mu.Unlock()
+	mu    sync.Mutex
+	calls int
+	first chan struct{}
+}
 
-	var calls int
+func (s *ancestryRetryStorage) Candidate(
+	context.Context,
+	SessionStorageID,
+	simplex.CandidateID,
+) (CandidateRecord, error) {
+	s.mu.Lock()
+	s.calls++
+	first := s.calls == 1
+	s.mu.Unlock()
+	if first {
+		close(s.first)
+
+		return CandidateRecord{}, ErrBlockNotReady
+	}
+
+	return CandidateRecord{}, errors.New("unexpected second candidate storage read")
+}
+
+func (s *ancestryRetryStorage) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.calls
+}
+
+type runtimeAncestryObserver struct {
+	selfRejectionObserver
+
+	observations chan LineageWalkObservation
+}
+
+func (o *runtimeAncestryObserver) ObserveLineageWalk(observation LineageWalkObservation) {
+	o.observations <- observation
+}
+
+func installRuntimeResolvers(
+	t *testing.T,
+	runtime *sessionRuntime,
+	states *stateResolver,
+	candidates *candidateResolver,
+) {
+	t.Helper()
+
+	runtime.states.close()
+	runtime.candidates.close()
+	runtime.states = states
+	runtime.candidates = candidates
+	t.Cleanup(func() {
+		if err := runtime.Close(); err != nil {
+			t.Errorf("close runtime: %v", err)
+		}
+	})
+}
+
+func installWindowBaseFlight(
+	t *testing.T,
+	states *stateResolver,
+	base simplex.ParentID,
+) *stateFlight {
+	t.Helper()
+
+	states.mu.Lock()
+	defer states.mu.Unlock()
+
+	if states.genesis == nil {
+		t.Fatal("state resolver is not started")
+	}
+	flight := &stateFlight{
+		done:   make(chan struct{}),
+		cancel: func() {},
+	}
+	states.states[base] = flight
+
+	return flight
+}
+
+func finishWindowBaseFlight(
+	states *stateResolver,
+	base simplex.ParentID,
+	flight *stateFlight,
+) {
+	states.mu.Lock()
+	states.finishStateFlightLocked(
+		base,
+		flight,
+		ResolvedState{State: states.genesis},
+		nil,
+		true,
+	)
+	states.mu.Unlock()
+}
+
+func waitForWindowBaseResolution(
+	t *testing.T,
+	states *stateResolver,
+	flight *stateFlight,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		states.mu.Lock()
+		waiters := flight.waiters
+		states.mu.Unlock()
+		if waiters != 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("leader window did not wait for its base state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestSessionRuntimeRechecksFinalizedBlockAfterBaseResolution(t *testing.T) {
+	states, candidates, artifacts := lineageResolverForTest(t, false)
+	storage := newRuntimeTestStorage()
 	backend := newRuntimeTestBackend()
-	backend.load = func(
-		_ context.Context,
-		request ChainStateRequest,
-	) (ChainStateData, error) {
-		calls++
-		if calls == 1 {
-			return ChainStateData{}, ErrBlockNotReady
-		}
+	progresses := make(chan sessionConsensusProgress, 1)
+	backend.progress = func(_ context.Context, progress sessionConsensusProgress) error {
+		progresses <- progress
 
-		tips := make([]ChainTip, len(request.Blocks))
-		for i := range request.Blocks {
-			tips[i] = ChainTip{
-				ID:       request.Blocks[i],
-				State:    backend.stateRoot,
-				BlockBOC: testTipBOCFor(request.Blocks[i]),
-				Block:    testTipBlockFor(request.Blocks[i]),
-			}
-		}
-
-		return ChainStateData{Tips: tips}, nil
+		return nil
 	}
-	resolver.backend = backend
-	runtime := &sessionRuntime{states: resolver}
+	runtime, _ := prepareRuntimeTest(t, 0x74, storage, newRuntimeTestNetwork(), backend)
+	installRuntimeResolvers(t, runtime, states, candidates)
+	observations := &runtimeAncestryObserver{observations: make(chan LineageWalkObservation, 2)}
+	runtime.metrics = observations
+
+	tip := artifacts[len(artifacts)-1]
+	base := simplex.Parent(tip.Candidate.ID)
+	flight := installWindowBaseFlight(t, states, base)
 	window := simplex.Window{
-		Base:      simplex.Parent(artifacts[2].Candidate.ID),
-		StartSlot: artifacts[2].Candidate.ID.Slot + 1,
+		Base:         base,
+		StartSlot:    tip.Candidate.ID.Slot + 1,
+		EndSlot:      tip.Candidate.ID.Slot + 2,
+		ObservedSlot: tip.Candidate.ID.Slot + 1,
 	}
-	anchor := artifacts[0].Candidate.Block
+	handled := make(chan struct{})
+	go func() {
+		runtime.handleWindow(context.Background(), window)
+		close(handled)
+	}()
+	waitForWindowBaseResolution(t, states, flight)
 
-	lineage, err := runtime.resolveWindowLineage(context.Background(), window, &anchor)
-	if err != nil {
+	updated := runtimeTestState()
+	finalized := ton.BlockIDExt{
+		Workchain: runtime.config.Shard.Workchain,
+		Shard:     runtime.config.Shard.Shard,
+		SeqNo:     tip.Candidate.Block.SeqNo + 10,
+		RootHash:  testTipRootHash(0xf1),
+		FileHash:  testTipFileHash(0xf1),
+	}
+	updated.FinalizedBlock = &finalized
+	if err := runtime.Update(context.Background(), updated); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 2 {
-		t.Fatalf("exact state load calls = %d, want 2", calls)
+	finishWindowBaseFlight(states, base, flight)
+
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("leader window did not finish after its base resolved")
 	}
-	assertArtifactIdentity(t, lineage.Candidates, artifacts)
-	if lineage.AppliedAnchor == nil || !sameBlockID(*lineage.AppliedAnchor, anchor) {
-		t.Fatalf("applied anchor = %v, want %v", lineage.AppliedAnchor, anchor)
+	select {
+	case observation := <-observations.observations:
+		if observation.Result != LineageWalkFailure {
+			t.Fatalf("ancestry result = %v, want failure against the updated finalized block", observation.Result)
+		}
+	default:
+		t.Fatal("updated finalized block was not verified")
 	}
+	select {
+	case progress := <-progresses:
+		t.Fatalf("stale consensus base reached the observer: %+v", progress.Window)
+	default:
+	}
+	select {
+	case window := <-backend.windows:
+		t.Fatalf("stale leader window reached the backend: %+v", window.Window)
+	default:
+	}
+}
+
+func TestSessionRuntimeRewalksWhenFinalizedBlockChangesAfterVerifiedAncestry(t *testing.T) {
+	states, candidates, artifacts := lineageResolverForTest(t, false)
+	storage := newRuntimeTestStorage()
+	backend := newRuntimeTestBackend()
+	progresses := make(chan sessionConsensusProgress, 1)
+	backend.progress = func(_ context.Context, progress sessionConsensusProgress) error {
+		progresses <- progress
+
+		return nil
+	}
+	runtime, _ := prepareRuntimeTest(t, 0x75, storage, newRuntimeTestNetwork(), backend)
+	installRuntimeResolvers(t, runtime, states, candidates)
+	observations := &runtimeAncestryObserver{observations: make(chan LineageWalkObservation, 4)}
+	runtime.metrics = observations
+
+	first := artifacts[0].Candidate.Block
+	initial := runtimeTestState()
+	initial.FinalizedBlock = &first
+	if err := runtime.Update(context.Background(), initial); err != nil {
+		t.Fatal(err)
+	}
+
+	tip := artifacts[len(artifacts)-1]
+	base := simplex.Parent(tip.Candidate.ID)
+	flight := installWindowBaseFlight(t, states, base)
+	finishWindowBaseFlight(states, base, flight)
+	window := simplex.Window{
+		Base:         base,
+		StartSlot:    tip.Candidate.ID.Slot + 1,
+		EndSlot:      tip.Candidate.ID.Slot + 2,
+		ObservedSlot: tip.Candidate.ID.Slot + 1,
+	}
+
+	updateEntered := make(chan struct{})
+	releaseUpdate := make(chan struct{})
+	backend.mu.Lock()
+	backend.update = func(ctx context.Context, _ SessionState) error {
+		close(updateEntered)
+		select {
+		case <-releaseUpdate:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	backend.mu.Unlock()
+	second := ton.BlockIDExt{
+		Workchain: runtime.config.Shard.Workchain,
+		Shard:     runtime.config.Shard.Shard,
+		SeqNo:     tip.Candidate.Block.SeqNo + 1,
+		RootHash:  testTipRootHash(0xf2),
+		FileHash:  testTipFileHash(0xf2),
+	}
+	updated := runtimeTestState()
+	updated.FinalizedBlock = &second
+	updateResult := make(chan error, 1)
+	go func() {
+		updateResult <- runtime.Update(context.Background(), updated)
+	}()
+	select {
+	case <-updateEntered:
+	case <-time.After(time.Second):
+		t.Fatal("finalized-block update did not enter the backend")
+	}
+
+	handled := make(chan struct{})
+	go func() {
+		runtime.handleWindow(context.Background(), window)
+		close(handled)
+	}()
+	select {
+	case observation := <-observations.observations:
+		if observation.Result != LineageWalkSuccess {
+			t.Fatalf("first ancestry result = %v, want success", observation.Result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first ancestry verification did not finish")
+	}
+	select {
+	case progress := <-progresses:
+		t.Fatalf("consensus progress overtook its finalized-block update: %+v", progress.Window)
+	default:
+	}
+
+	close(releaseUpdate)
+	if err := <-updateResult; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("leader window did not finish after the finalized-block update")
+	}
+	select {
+	case observation := <-observations.observations:
+		if observation.Result != LineageWalkFailure {
+			t.Fatalf("rewalk ancestry result = %v, want failure", observation.Result)
+		}
+	default:
+		t.Fatal("finalized-block change did not force a second ancestry verification")
+	}
+	select {
+	case progress := <-progresses:
+		t.Fatalf("stale consensus base reached the observer: %+v", progress.Window)
+	default:
+	}
+	select {
+	case window := <-backend.windows:
+		t.Fatalf("stale leader window reached the backend: %+v", window.Window)
+	default:
+	}
+}
+
+func TestSessionRuntimeRetriesUnavailableAncestryAndCancels(t *testing.T) {
+	prepare := func(t *testing.T) (
+		*stateResolver,
+		*candidateResolver,
+		[]*CandidateArtifact,
+		*ancestryRetryStorage,
+	) {
+		t.Helper()
+
+		resolver, candidates, artifacts := lineageResolverForTest(t, false)
+		t.Cleanup(resolver.close)
+		t.Cleanup(candidates.close)
+
+		tip := artifacts[len(artifacts)-1]
+		if err := candidates.store(context.Background(), tip.Candidate.ID); err != nil {
+			t.Fatal(err)
+		}
+		storage := &ancestryRetryStorage{
+			ValidatorStorage: candidates.storage,
+			first:            make(chan struct{}),
+		}
+		candidates.storage = storage
+
+		candidates.mu.Lock()
+		candidates.releasePayloadLocked(tip.Candidate.ID, candidates.entries[tip.Candidate.ID])
+		candidates.mu.Unlock()
+
+		return resolver, candidates, artifacts, storage
+	}
+	waitForFirstAttempt := func(t *testing.T, candidates *candidateResolver, id simplex.CandidateID) {
+		t.Helper()
+
+		deadline := time.Now().Add(time.Second)
+		for {
+			candidates.mu.Lock()
+			entry := candidates.entries[id]
+			finished := entry != nil && !entry.durable && entry.resolve == nil
+			candidates.mu.Unlock()
+			if finished {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("first unavailable ancestry attempt did not finish")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	t.Run("retry", func(t *testing.T) {
+		resolver, candidates, artifacts, storage := prepare(t)
+		tip := artifacts[len(artifacts)-1]
+		anchor := artifacts[0].Candidate.Block
+		window := simplex.Window{
+			Base:      simplex.Parent(tip.Candidate.ID),
+			StartSlot: tip.Candidate.ID.Slot + 1,
+		}
+		runtime := &sessionRuntime{states: resolver}
+		result := make(chan error, 1)
+		go func() {
+			result <- runtime.verifyWindowAncestry(context.Background(), window, &anchor)
+		}()
+
+		select {
+		case <-storage.first:
+		case <-time.After(time.Second):
+			t.Fatal("ancestry did not read the released candidate")
+		}
+		waitForFirstAttempt(t, candidates, tip.Candidate.ID)
+		if err := candidates.stage(tip, []byte{byte(len(artifacts))}); err != nil {
+			t.Fatal(err)
+		}
+
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("ancestry did not retry after the candidate arrived")
+		}
+		if calls := storage.callCount(); calls != 1 {
+			t.Fatalf("candidate storage reads = %d, want the one unavailable attempt", calls)
+		}
+	})
+
+	t.Run("cancel", func(t *testing.T) {
+		resolver, candidates, artifacts, storage := prepare(t)
+		tip := artifacts[len(artifacts)-1]
+		anchor := artifacts[0].Candidate.Block
+		window := simplex.Window{
+			Base:      simplex.Parent(tip.Candidate.ID),
+			StartSlot: tip.Candidate.ID.Slot + 1,
+		}
+		runtime := &sessionRuntime{states: resolver}
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		go func() {
+			result <- runtime.verifyWindowAncestry(ctx, window, &anchor)
+		}()
+
+		select {
+		case <-storage.first:
+		case <-time.After(time.Second):
+			t.Fatal("ancestry did not read the released candidate")
+		}
+		waitForFirstAttempt(t, candidates, tip.Candidate.ID)
+		cancel()
+
+		select {
+		case err := <-result:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancelled ancestry error = %v, want context.Canceled", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("ancestry retry did not stop on cancellation")
+		}
+	})
 }
 
 func TestSessionRuntimeSkipsWindowBehindLocallyFinalizedState(t *testing.T) {
@@ -1606,6 +2327,9 @@ func TestSessionRuntimeSkipsWindowBehindLocallyFinalizedState(t *testing.T) {
 	if err := runtime.Update(context.Background(), state); err != nil {
 		t.Fatal(err)
 	}
+	if finalized := runtime.currentFinalizedBlock(); finalized == nil || !sameBlockID(*finalized, ahead) {
+		t.Fatalf("older masterchain anchor regressed finalized block to %v, want %v", finalized, ahead)
+	}
 	runtime.HandleWindow(simplex.Window{
 		StartSlot:    101,
 		EndSlot:      102,
@@ -1614,11 +2338,12 @@ func TestSessionRuntimeSkipsWindowBehindLocallyFinalizedState(t *testing.T) {
 	})
 	select {
 	case progress := <-backend.progresses:
-		if progress.Window.StartSlot != 101 {
-			t.Fatalf("consensus progress start = %d, want 101", progress.Window.StartSlot)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("runtime did not resume consensus progress")
+		t.Fatalf("consensus progress regressed behind finalized state: %+v", progress.Window)
+	case window := <-backend.windows:
+		t.Fatalf("leader window regressed behind finalized state: %+v", window.Window)
+	case err := <-runResult:
+		t.Fatalf("runtime stopped after retaining finalized progress: %v", err)
+	case <-time.After(50 * time.Millisecond):
 	}
 
 	if err := runtime.Close(); err != nil {
@@ -2838,10 +3563,11 @@ func runtimeBlockArtifact(
 	if err != nil {
 		t.Fatal(err)
 	}
+	generationTimeMS := uint64(time.Now().Unix())*1000 + 321
 	extra := cell.BeginCell().
 		MustStoreUInt(consensusExtraDataTag, 32).
 		MustStoreUInt(0, 32).
-		MustStoreUInt(uint64(time.Now().UnixMilli()), 64).
+		MustStoreUInt(generationTimeMS, 64).
 		EndCell()
 	collatedData, err := cell.ToBOCWithOptionsErr(
 		[]*cell.Cell{extra},
@@ -2886,7 +3612,9 @@ func runtimeBlockArtifact(
 		// buffers it just serialized. A fixture that stood for a produced
 		// candidate but withheld the claim would exercise the fallback rather
 		// than the path production takes.
-		digested: true,
+		digested:            true,
+		generationTimeMS:    generationTimeMS,
+		generationTimeKnown: true,
 	}
 }
 

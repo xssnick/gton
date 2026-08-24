@@ -3,6 +3,7 @@ package collator
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -19,25 +20,41 @@ func (c *collation) traceValidationClosure() error {
 	// these reads to reach: collatedProofEstimate is only built under the
 	// capability, so off it they record into nothing at all. The masterchain is
 	// excluded for the same reason it emits no state proof.
-	if !c.fullCollated || c.master != nil {
+	if !c.closureRecordsPredecessorReads() {
 		return nil
 	}
 
-	tasks := [...]func() error{
-		func() error { return c.traceAccountValidationClosure() },
-		func() error { return c.traceOutQueueValidationClosure() },
-		func() error { return c.traceImmediateQueueValidationClosure() },
-		func() error { return c.traceProcessedQueueValidationClosure() },
-		func() error { return c.traceDispatchQueueValidationClosure() },
+	// Spelled as calls rather than method values on purpose: the composition
+	// is pinned by an AST guard that reads the call sites, and it should stay
+	// readable as five calls.
+	tasks := [...]struct {
+		name string
+		run  func() error
+	}{
+		{"accounts", func() error { return c.traceAccountValidationClosure() }},
+		{"out_queue", func() error { return c.traceOutQueueValidationClosure() }},
+		{"immediate_queue", func() error { return c.traceImmediateQueueValidationClosure() }},
+		{"processed_queue", func() error { return c.traceProcessedQueueValidationClosure() }},
+		{"dispatch_queue", func() error { return c.traceDispatchQueueValidationClosure() }},
 	}
 	var errs [len(tasks)]error
+	// The stage is the slowest of the five, so the stage timer alone cannot
+	// say which one to shorten. Each task's own span is recorded here — on the
+	// worker, into its own slot — and merged into the build's durations once
+	// they have all joined.
+	var spans [len(tasks)]time.Duration
 	var wait sync.WaitGroup
 	for i, task := range tasks {
 		wait.Go(func() {
-			errs[i] = task()
+			started := time.Now()
+			errs[i] = task.run()
+			spans[i] = time.Since(started)
 		})
 	}
 	wait.Wait()
+	for i, task := range tasks {
+		c.req.assembly.substage(CollationStageValidationClosure, task.name, spans[i])
+	}
 
 	// Keep the old deterministic error priority even though the work is now
 	// concurrent. A later failure must not hide the account or queue error the
@@ -48,6 +65,15 @@ func (c *collation) traceValidationClosure() error {
 		}
 	}
 	return nil
+}
+
+// closureRecordsPredecessorReads is the gate above, asked separately because an
+// earlier phase has to know the same answer: cleanupClaimedLocalDequeues keeps
+// its parsed cells for the closure only when there is a closure to keep them
+// for. The two must never disagree, or the collection is either dead weight or
+// silently absent.
+func (c *collation) closureRecordsPredecessorReads() bool {
+	return c.fullCollated && c.master == nil
 }
 
 // traceProcessedQueueValidationClosure retains the predecessor outbound-queue
@@ -116,6 +142,21 @@ func (c *collation) traceProcessedQueueValidationClosure() error {
 	if !c.processedClaimed {
 		return nil
 	}
+	// cleanupClaimedLocalDequeues already made this exact walk, over the same
+	// dictionary, to the same bound, with recording suspended because it ran
+	// before the state update. Its cells are the cells this pass would parse,
+	// so record those rather than resolving the whole prefix a second time.
+	// Record is the path OnLoad takes, so what lands in the read set and in the
+	// collated-size estimator is the same set either way; the stamp is what says
+	// the collection is that walk's and not some other one's.
+	if c.claimedPrefix.serves(c.oldOutQueue, c.shard, c.processedClaim) {
+		for _, parsed := range c.claimedPrefix.cells {
+			c.usage.Record(parsed)
+		}
+		c.claimedPrefix.release()
+
+		return c.ctx.Err()
+	}
 	err := walkSemanticQueuePrefix(c.oldOutQueue, c.shard, c.processedClaim,
 		func(semanticQueueEntry) error { return c.ctx.Err() })
 	if err == nil {
@@ -173,13 +214,19 @@ func (c *collation) traceImmediateQueueValidationClosure() error {
 // retaining an intermediate trie.
 func (c *collation) traceAccountValidationClosure() error {
 	if c.accountMutationDiff != nil {
-		return c.accountMutationDiff.Replay()
+		// The replay is the slowest of the five closure tasks by a factor of
+		// four on the testnet validator — 44 ms against 10 for the next — and
+		// it is a sparse trie walk, so it splits by subtree. Half of its time
+		// there is loading siblings the collation never touched, which the
+		// split overlaps as well as the parsing.
+		return c.accountMutationDiff.ReplayParallel(collationParallelism)
 	}
 
-	return c.oldState.Accounts.ShardAccounts.ScanDiff(
+	return c.oldState.Accounts.ShardAccounts.ScanDiffParallel(
 		c.accounts.AugmentedDictionary,
 		true,
 		func(_ *cell.Cell, _, _ *cell.Slice) error { return nil },
+		collationParallelism,
 	)
 }
 
@@ -256,7 +303,7 @@ func (c *collation) traceDispatchQueueValidationClosure() error {
 	}
 
 	for _, accountID := range sortedAccountKeys(c.lanes) {
-		if c.lanes[accountID].transactions == nil {
+		if !c.lanes[accountID].touched {
 			continue
 		}
 		if _, err = c.loadPredecessorDispatchValue(accountID); err != nil && !isMissingKey(err) {

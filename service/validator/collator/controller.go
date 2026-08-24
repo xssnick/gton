@@ -689,20 +689,6 @@ func (c *Controller) handleConsensusFinalization(
 func validateConsensusProgress(session Session, progress ConsensusProgress) error {
 	window := progress.Window
 	windowSize := session.SlotsPerLeaderWindow
-	if progress.FinalizedAnchor != nil &&
-		(validateBlockID(*progress.FinalizedAnchor) != nil ||
-			progress.FinalizedAnchor.Workchain != session.Shard.Workchain ||
-			progress.FinalizedAnchor.Shard != session.Shard.Shard) {
-		return ErrCandidateConflict
-	}
-	if progress.FinalizedAnchorState != nil {
-		state := progress.FinalizedAnchorState
-		if progress.FinalizedAnchor == nil || !sameBlockID(state.Block, *progress.FinalizedAnchor) || state.State == nil ||
-			(state.Block.SeqNo == 0 && len(state.BlockBOC) != 0) ||
-			(state.Block.SeqNo != 0 && len(state.BlockBOC) == 0) {
-			return ErrCandidateConflict
-		}
-	}
 	if windowSize == 0 || window.StartSlot%windowSize != 0 ||
 		window.StartSlot > ^uint32(0)-windowSize || window.EndSlot != window.StartSlot+windowSize {
 		return ErrWindowConflict
@@ -717,33 +703,16 @@ func validateConsensusProgress(session Session, progress ConsensusProgress) erro
 		return ErrWindowConflict
 	}
 	if !window.Base.Exists {
-		if len(progress.Candidates) != 0 {
+		if progress.Base != nil {
 			return ErrCandidateConflict
 		}
 
 		return nil
 	}
-	if len(progress.Candidates) == 0 ||
-		progress.Candidates[len(progress.Candidates)-1].Candidate.ID != window.Base.ID {
-		return ErrCandidateConflict
-	}
-	for i := range progress.Candidates {
-		artifact := &progress.Candidates[i]
-		candidate := &artifact.Candidate
-		if artifact.SessionID != session.ID || candidate.ID.Slot >= window.ObservedSlot ||
-			uint64(candidate.Leader) >= uint64(len(session.Validators)) ||
-			candidate.Leader != candidate.ID.Slot/windowSize%uint32(len(session.Validators)) {
-			return ErrCandidateConflict
-		}
-		if err := candidate.ValidateShape(); err != nil || candidate.ComputeID(candidate.ID.Slot) != candidate.ID {
-			return ErrCandidateConflict
-		}
-		if i > 0 && candidate.Parent != simplex.Parent(progress.Candidates[i-1].Candidate.ID) {
-			return ErrCandidateConflict
-		}
-	}
-	if progress.FinalizedAnchor != nil &&
-		!sameBlockID(progress.Candidates[0].Candidate.Block, *progress.FinalizedAnchor) {
+	if progress.Base == nil || !progress.Base.matches(session.ID, window.Base.ID) ||
+		window.Base.ID.Slot >= window.ObservedSlot ||
+		progress.Base.block.ID.Workchain != session.Shard.Workchain ||
+		progress.Base.block.ID.Shard != session.Shard.Shard {
 		return ErrCandidateConflict
 	}
 

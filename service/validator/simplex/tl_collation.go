@@ -230,6 +230,22 @@ func ParseCandidateWrapped(data []byte) (*ConsensusCandidateWrapped, error) {
 	return out, nil
 }
 
+// ParseCandidateData decodes one bare consensus.block or consensus.empty.
+// Private-overlay broadcasts carry this form and keep an optional delegation
+// in BroadcastExtra; storage and resolver wires may instead use the wrapper
+// accepted by ParseCandidateWrapped.
+func ParseCandidateData(data []byte) (tl.Serializable, error) {
+	inner, rest, err := parseCandidateData(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("simplex/tl: trailing bytes in candidate data")
+	}
+
+	return inner, nil
+}
+
 func parseCandidateData(data []byte) (tl.Serializable, []byte, error) {
 	var inner tl.Serializable
 	rest, err := tl.Parse(&inner, data, true)

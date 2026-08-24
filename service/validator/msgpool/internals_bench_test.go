@@ -257,7 +257,7 @@ func BenchmarkInternalFromEnvelope(b *testing.B) {
 	envelope := deltaEnvelope(b, deltaInternalMsgRich(b, deltaAddr(0, 0x11), deltaAddr(0, 0x22), 4_242), regularNext(96))
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := internalFromEnvelope(envelope); err != nil {
+		if _, err := InternalMessageFromEnvelope(envelope); err != nil {
 			b.Fatal(err)
 		}
 	}
