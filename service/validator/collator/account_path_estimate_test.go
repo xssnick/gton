@@ -113,10 +113,9 @@ func TestAccountPathEstimateCoversFinalDictionaryProof(t *testing.T) {
 
 			var key [32]byte
 			copy(key[:], test.addr.address.Data())
-			keyCell := cell.BeginCell().MustStoreSlice(key[:], 256).EndCell()
 			lane := &accountLane{key: key}
 			lane.tracer = newLaneTracer(c, lane)
-			value, path, err := c.loadPredecessorAccount(lane.tracer, key, keyCell)
+			value, path, err := c.loadPredecessorAccount(lane.tracer, key)
 			existed := err == nil
 			if err != nil && !errors.Is(err, cell.ErrNoSuchKeyInDict) {
 				t.Fatalf("load account path: %v", err)
@@ -127,7 +126,7 @@ func TestAccountPathEstimateCoversFinalDictionaryProof(t *testing.T) {
 			var newAccount *cell.Cell
 			if existed {
 				var old tlb.ShardAccount
-				if err = loadExactSlice(&old, value); err != nil {
+				if err = loadExactSlice(&old, &value); err != nil {
 					t.Fatalf("decode old account: %v", err)
 				}
 				oldAccount = old.Account
@@ -147,6 +146,7 @@ func TestAccountPathEstimateCoversFinalDictionaryProof(t *testing.T) {
 			estimated := status.estimatedBytes() - 2000
 
 			updated := accounts.Copy()
+			keyCell := cell.BeginCell().MustStoreSlice(key[:], 256).EndCell()
 			if test.deleted {
 				err = updated.Delete(keyCell)
 			} else {
@@ -198,10 +198,9 @@ func TestAccountPathRecorderStopsAtDictionaryValue(t *testing.T) {
 
 	var key [32]byte
 	copy(key[:], addr.Data())
-	keyCell := cell.BeginCell().MustStoreSlice(key[:], 256).EndCell()
 	lane := &accountLane{key: key}
 	lane.tracer = newLaneTracer(c, lane)
-	value, path, err := c.loadPredecessorAccount(lane.tracer, key, keyCell)
+	value, path, err := c.loadPredecessorAccount(lane.tracer, key)
 	if err != nil {
 		t.Fatalf("load predecessor account: %v", err)
 	}
@@ -215,7 +214,7 @@ func TestAccountPathRecorderStopsAtDictionaryValue(t *testing.T) {
 	// payload must not extend the path: the slice handed back is final.
 	recorded := len(path)
 	var account tlb.ShardAccount
-	if err = loadExactSlice(&account, value); err != nil {
+	if err = loadExactSlice(&account, &value); err != nil {
 		t.Fatalf("decode account value: %v", err)
 	}
 	if len(path) != recorded {

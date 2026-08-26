@@ -1,7 +1,6 @@
 package collator
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -227,7 +226,7 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 	if oldState.ShardIdent != masterIdent || oldState.Seqno != req.Previous.ID.SeqNo || oldState.McStateExtra == nil {
 		return nil, fmt.Errorf("%w: predecessor id and masterchain state header disagree", ErrInvalidInput)
 	}
-	if req.Previous.ID.SeqNo == 0 && !bytes.Equal(req.Previous.ID.RootHash, req.Previous.State.Hash()) {
+	if req.Previous.ID.SeqNo == 0 && !equalCellHashBytes(req.Previous.State, req.Previous.ID.RootHash) {
 		return nil, fmt.Errorf("%w: masterchain zerostate hash differs from its id", ErrInvalidInput)
 	}
 	if req.Previous.Block != nil {
@@ -345,21 +344,6 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 		return nil, fmt.Errorf("prepare masterchain transaction context: %w", err)
 	}
 
-	accounts := &tlb.ShardAccountsAugDict{AugmentedDictionary: oldState.Accounts.ShardAccounts.Copy()}
-	outQueue := &tlb.OutMsgQueueAugDict{AugmentedDictionary: queueInfo.OutQueue.Copy()}
-	inMessages, err := tlb.NewInMsgDescrAugDict(req.Config.globalVersion)
-	if err != nil {
-		return nil, err
-	}
-	outMessages, err := tlb.NewOutMsgDescrAugDict(req.Config.globalVersion)
-	if err != nil {
-		return nil, err
-	}
-	accountBlocks, err := tlb.NewShardAccountBlocksAugDict()
-	if err != nil {
-		return nil, err
-	}
-
 	master := &masterCollation{
 		oldExtra:        oldExtra,
 		oldInfo:         oldInfo,
@@ -385,19 +369,18 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 	// callback cannot move into a shared constructor either: the shard path must
 	// register it before preparePredecessor traces the previous state, while this
 	// path has already traced oldRoot above.
-	c := &collation{
-		ctx:        ctx,
-		builder:    b,
-		req:        masterCollationRequest(req),
-		header:     header,
-		shard:      owner,
-		config:     req.Config,
-		master:     master,
-		usage:      usage,
-		shardEndLT: newShardEndLTResolver(req.NeighborShardEndLT),
-		oldRoot:    oldRoot,
-		oldState:   oldState,
-		oldStats:   oldStats,
+	c, err := newCollation(&collationInit{
+		ctx:      ctx,
+		builder:  b,
+		request:  masterCollationRequest(req),
+		header:   header,
+		shard:    owner,
+		config:   req.Config,
+		master:   master,
+		usage:    usage,
+		oldRoot:  oldRoot,
+		oldState: oldState,
+		oldStats: oldStats,
 		accountSources: [2]predecessorAccountSource{{
 			shard:    oldState.ShardIdent,
 			accounts: oldState.Accounts.ShardAccounts,
@@ -410,33 +393,16 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 		blockCtx:            blockCtx,
 		limits:              newBlockLimitStatus(limits, header.StartLt, usage, storageCells, storageProofCells),
 		hardLTDelta:         limits.ltDelta[3],
+		queueInfo:           queueInfo,
 		queueSize:           queueSize,
-		oldQueueSize:        queueSize,
-		accounts:            accounts,
-		oldOutQueue: &tlb.OutMsgQueueAugDict{
-			AugmentedDictionary: queueInfo.OutQueue.Copy(),
-		},
-		outQueue:         outQueue,
-		processed:        queueInfo.ProcInfo,
-		processedMinMC:   processedMinMC,
-		processedRecords: processedRecords,
-		processedParsed:  true,
-		inMessages:       inMessages,
-		outMessages:      outMessages,
-		accountBlocks:    accountBlocks,
-		oldDispatchQueue: &tlb.DispatchQueueAugDict{
-			AugmentedDictionary: dispatchQueue.Copy(),
-		},
 		dispatchQueue:       dispatchQueue,
-		lanes:               make(map[[32]byte]*accountLane),
-		senderGenerated:     make(map[[32]byte]uint32),
-		lastDispatchEmitted: make(map[[32]byte]uint64),
-		unprocessedDeferred: make(map[[32]byte]uint32),
-		maxLT:               header.StartLt + 1,
-		externals:           make([]msgpool.ExternalFeedback, 0, len(req.Externals)),
+		processedRecords:    processedRecords,
+		processedMinMC:      processedMinMC,
 		fullCollated:        req.Config.capabilities&capFullCollatedData != 0,
+	})
+	if err != nil {
+		return nil, err
 	}
-	c.prepareAccountPathRecorder()
 	if err = c.prepareFullCollatedProofs(); err != nil {
 		return nil, err
 	}
@@ -648,12 +614,12 @@ func prepareMasterShardTopsWithTimePolicy(
 }
 
 func (m *masterCollation) initValueFlow(config *Config, stats *tlb.ShardStateStats) error {
-	fees, err := m.shardFees.LoadRootExtra()
-	if err != nil {
+	var fees cell.Slice
+	if err := m.shardFees.LoadRootExtraInto(&fees); err != nil {
 		return fmt.Errorf("load imported shard fees: %w", err)
 	}
 	var imported tlb.ShardFeeCreated
-	if err = loadExactSlice(&imported, fees); err != nil {
+	if err := loadExactSlice(&imported, &fees); err != nil {
 		return fmt.Errorf("decode imported shard fees: %w", err)
 	}
 	m.feesImported = imported.Fees
@@ -817,10 +783,14 @@ func validExtraCurrencyToMintParam(param *cell.Cell, items []cell.DictKV) bool {
 		return false
 	}
 	for _, item := range items {
-		if item.Key == nil || item.Key.Copy().BitsLeft() != 32 {
+		if item.Key == nil || item.Key.BitsLeft() != 32 {
 			return false
 		}
-		if item.Value == nil || !validExtraCurrencyMintAmount(item.Value.Copy()) {
+		if item.Value == nil {
+			return false
+		}
+		value := *item.Value
+		if !validExtraCurrencyMintAmount(&value) {
 			return false
 		}
 	}
@@ -1031,14 +1001,14 @@ func (c *collation) processMasterSpecials() error {
 
 // processMasterSpecial delivers one masterchain recover/mint message in-block,
 // hand-rolling the msg_import_imm$011 pair rather than routing through
-// deliverImmediate. That is not an accident of structure and must not be
+// retireGeneratedImmediate. That is not an accident of structure and must not be
 // "de-duplicated": the reference exempts exactly these two messages from the
 // processed bound, at collator.cpp:3667 `if (!is_special && ...)`, where
 // is_special is non-null only for create_special_transaction (collator.cpp:3161,
 // :3175-3178). Their created_lt is start_lt, ahead of every queue entry this
 // block can import, so advancing the bound with one would make the next import
 // fail the strict order check in advanceProcessedBound. Routing specials through
-// deliverImmediate would therefore break every masterchain block that mints or
+// retireGeneratedImmediate would therefore break every masterchain block that mints or
 // recovers fees AND imports an internal message.
 func (c *collation) processMasterSpecial(amount tlb.CurrencyCollection, destination []byte) (*cell.Cell, error) {
 	zero := [32]byte{}

@@ -302,14 +302,14 @@ func TestSemanticVerifierGasAccounting(t *testing.T) {
 	}
 
 	replay.transition.Config.globalVersion = 4
-	replay.specialTxs[root.HashKey()] = struct{}{}
+	replay.specialTxs.add(root.HashKey())
 	lane = &semanticAccountLane{}
 	err = replay.recordTransactionGas(lane, root, transaction, result)
 	if err != nil || lane.normalGas != 0 {
 		t.Fatalf("pre-v5 special transaction gas accounting: used=%d err=%v", lane.normalGas, err)
 	}
 
-	delete(replay.specialTxs, root.HashKey())
+	replay.specialTxs = semanticSpecialTransactions{}
 	replay.transition.Config.globalVersion = 5
 	replay.candidate.block.BlockInfo.GenUtime = 1_700_000_000
 	replay.candidate.block.BlockInfo.Shard.WorkchainID = 0
@@ -336,6 +336,20 @@ func TestSemanticVerifierGasAccounting(t *testing.T) {
 	err = replay.recordTransactionGas(lane, root, transaction, result)
 	if !errors.Is(err, ErrInvalidInput) || lane.normalGas != 11 {
 		t.Fatalf("expired gas override accounting: used=%d err=%v", lane.normalGas, err)
+	}
+}
+
+func TestSemanticSpecialTransactionsDeduplicate(t *testing.T) {
+	first := cell.Hash{0x11}
+	second := cell.Hash{0x22}
+	var transactions semanticSpecialTransactions
+
+	transactions.add(first)
+	transactions.add(first)
+	transactions.add(second)
+
+	if transactions.count != 2 || !transactions.contains(first) || !transactions.contains(second) {
+		t.Fatalf("special transactions = %+v, want two distinct hashes", transactions)
 	}
 }
 
@@ -715,7 +729,8 @@ func TestSemanticMasterRequiresConfiguredTickTockAccountBlock(t *testing.T) {
 }
 
 func TestSemanticMasterRejectsUnexplainedLibraryPublisherDelta(t *testing.T) {
-	previousStatsRoot, err := (tlb.ShardStateStats{Libraries: cell.NewDict(256)}).ToCell()
+	previousStats := &tlb.ShardStateStats{Libraries: cell.NewDict(256)}
+	previousStatsRoot, err := previousStats.ToCell()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -741,9 +756,10 @@ func TestSemanticMasterRejectsUnexplainedLibraryPublisherDelta(t *testing.T) {
 		t.Fatal(err)
 	}
 	replay := &semanticReplay{
-		previous:  &tlb.ShardStateUnsplit{Stats: previousStatsRoot},
-		candidate: &verifiedCandidate{stats: tlb.ShardStateStats{Libraries: libraries}},
-		accounts:  make(map[[32]byte]*semanticAccountResult),
+		transition: CandidateTransition{prepared: &preparedCandidateTransition{previousStats: previousStats}},
+		previous:   &tlb.ShardStateUnsplit{Stats: previousStatsRoot},
+		candidate:  &verifiedCandidate{stats: tlb.ShardStateStats{Libraries: libraries}},
+		accounts:   make(map[[32]byte]*semanticAccountResult),
 	}
 
 	err = replay.verifyMasterPublicLibraries()

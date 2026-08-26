@@ -877,7 +877,7 @@ func TestLocalNeighborProofTracesImportedMessageContents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = loadSemanticQueueEntry(queue.OutQueue, message.Key); err != nil {
+	if _, err = loadSemanticQueueEntry(queue.OutQueue, message.Key, nil); err != nil {
 		t.Fatalf("proven queue entry cannot be validated by the candidate consumer: %v", err)
 	}
 }
@@ -918,7 +918,7 @@ func TestLocalNeighborProofTracesProcessedQueuePrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = loadSemanticQueueEntry(incomplete.queue.OutQueue, messages[1].Key); err != nil {
+	if _, err = loadSemanticQueueEntry(incomplete.queue.OutQueue, messages[1].Key, nil); err != nil {
 		t.Fatal(err)
 	}
 	incompleteProof, err := incomplete.proof.CreateProof()
@@ -1026,7 +1026,7 @@ func TestWalkSemanticQueuePrefixAcceptsCXXTargetPathProof(t *testing.T) {
 	}
 	// C++ replace_by_prefix follows only the target child. An exact lookup has
 	// the same proof shape: the sibling on the other side stays pruned.
-	if _, err = loadSemanticQueueEntry(view.queue.OutQueue, inside.Key); err != nil {
+	if _, err = loadSemanticQueueEntry(view.queue.OutQueue, inside.Key, nil); err != nil {
 		t.Fatal(err)
 	}
 	proof, err := view.proof.CreateProof()

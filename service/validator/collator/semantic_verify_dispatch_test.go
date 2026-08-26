@@ -118,6 +118,7 @@ func newDispatchGateValidation(
 	candidate.block.Extra = &tlb.BlockExtra{Custom: custom}
 
 	hash := cell.Hash{0x5a}
+	descriptor := &semanticInDescriptor{tag: tag, root: imported}
 
 	return &semanticQueueValidation{
 		replay: &semanticReplay{
@@ -129,7 +130,7 @@ func newDispatchGateValidation(
 			OutQueueSize:  &queueSize,
 		}},
 		queueSize: queueSize,
-		in:        map[cell.Hash]*semanticInDescriptor{hash: {tag: tag, root: imported}},
-		inOrder:   []cell.Hash{hash},
+		in:        map[cell.Hash]*semanticInDescriptor{hash: descriptor},
+		inOrder:   []semanticInDescriptorEntry{{hash: hash, descriptor: descriptor}},
 	}
 }

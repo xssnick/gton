@@ -518,7 +518,7 @@ func TestVerifyRequeuedTransitOutDescriptor(t *testing.T) {
 	}
 
 	key := [32]byte(message.HashKey())
-	out, err := parseSemanticOutDescriptor(*outDescriptor.MustBeginParse(), key)
+	out, err := parseSemanticOutDescriptor(*outDescriptor.MustBeginParse(), key, nil)
 	if err != nil {
 		t.Fatalf("verify requeued transit outbound descriptor: %v", err)
 	}
@@ -526,7 +526,7 @@ func TestVerifyRequeuedTransitOutDescriptor(t *testing.T) {
 		t.Fatalf("requeued transit outbound tag = %d, want %d", out.tag, semanticOutTransitRequest)
 	}
 
-	in, err := parseSemanticInDescriptor(*inDescriptor.MustBeginParse(), key)
+	in, err := parseSemanticInDescriptor(*inDescriptor.MustBeginParse(), key, nil)
 	if err != nil {
 		t.Fatalf("verify requeued transit inbound descriptor: %v", err)
 	}
@@ -541,7 +541,7 @@ func TestVerifyRequeuedTransitOutDescriptor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = parseSemanticOutDescriptor(*withFee.MustBeginParse(), key); !errors.Is(err, ErrInvalidInput) {
+	if _, err = parseSemanticOutDescriptor(*withFee.MustBeginParse(), key, nil); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("requeued transit outbound descriptor with a fee error = %v, want invalid input", err)
 	}
 }

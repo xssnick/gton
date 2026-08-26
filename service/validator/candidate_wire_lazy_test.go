@@ -13,6 +13,51 @@ import (
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
+// decodeCanonical is the eager control for lazy-wire tests. Production never
+// needs both a decoded artifact and its canonical wire at the same boundary.
+func (c *candidateCodec) decodeCanonical(
+	wire []byte,
+	expected *simplex.CandidateID,
+) (*CandidateArtifact, []byte, error) {
+	artifact, err := c.decodeVerified(wire, expected)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var prepared *simplex.PreparedCandidate
+	if artifact.validationRoots != nil && artifact.validationRoots.block != nil {
+		var fileHash [32]byte
+		copy(fileHash[:], artifact.Candidate.Block.FileHash)
+		prepared, err = simplex.PrepareCandidate(
+			artifact.Candidate.Block.SeqNo,
+			artifact.validationRoots.block,
+			artifact.validationRoots.collated,
+			fileHash,
+			artifact.Candidate.CollatedFileHash,
+			simplex.PayloadCellHint(artifact.BlockBOC, artifact.CollatedData),
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	var canonical []byte
+	if prepared != nil {
+		canonical, err = simplex.SerializeCandidatePrepared(artifact.Candidate, prepared)
+	} else {
+		canonical, err = simplex.SerializeCandidate(
+			artifact.Candidate,
+			artifact.BlockBOC,
+			artifact.CollatedData,
+		)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return artifact, canonical, nil
+}
+
 // A received candidate must not pay for its canonical wire on receipt. The
 // measured cost — a combined BOC serialization plus an LZ4 pass, 3.27 s of CPU
 // per minute on the testnet validator — was being paid for every candidate on

@@ -273,7 +273,8 @@ func parseShardRegistryTree(
 	if node.IsSpecial() {
 		return fmt.Errorf("shard %016x tree node is nil or special", uint64(shardID))
 	}
-	loader, err := node.BeginParse()
+	var loader cell.Slice
+	err = node.BeginParseInto(&loader)
 	if err != nil {
 		return fmt.Errorf("parse shard %016x tree node: %w", uint64(shardID), err)
 	}
@@ -349,7 +350,8 @@ func parseShardDescriptorFields(descriptor *cell.Cell) (shardDescriptorFields, e
 	if descriptor == nil || descriptor.IsSpecial() {
 		return shardDescriptorFields{}, fmt.Errorf("descriptor is nil or special")
 	}
-	loader, err := descriptor.BeginParse()
+	var loader cell.Slice
+	err := descriptor.BeginParseInto(&loader)
 	if err != nil {
 		return shardDescriptorFields{}, fmt.Errorf("parse descriptor: %w", err)
 	}
@@ -362,7 +364,7 @@ func parseShardDescriptorFields(descriptor *cell.Cell) (shardDescriptorFields, e
 	switch magic {
 	case 0xa:
 		var value tlb.ShardDesc
-		if err = tlb.LoadFromCell(&value, loader, true); err != nil {
+		if err = tlb.LoadFromCell(&value, &loader, true); err != nil {
 			return shardDescriptorFields{}, fmt.Errorf("parse ShardDesc: %w", err)
 		}
 		fields = shardDescriptorFields{
@@ -388,7 +390,7 @@ func parseShardDescriptorFields(descriptor *cell.Cell) (shardDescriptorFields, e
 		}
 	case 0xb:
 		var value tlb.ShardDescB
-		if err = tlb.LoadFromCell(&value, loader, true); err != nil {
+		if err = tlb.LoadFromCell(&value, &loader, true); err != nil {
 			return shardDescriptorFields{}, fmt.Errorf("parse ShardDescB: %w", err)
 		}
 		fields = shardDescriptorFields{
@@ -801,7 +803,9 @@ func buildWorkchainShardTree(shardID int64, leaves []shardRegistryLeaf) (*cell.C
 		if err := leaf.StoreBoolBit(false); err != nil {
 			return nil, fmt.Errorf("store shard %016x leaf tag: %w", uint64(shardID), err)
 		}
-		if err := leaf.StoreBuilder(leaves[0].top.Descriptor.ToBuilder()); err != nil {
+		var descriptor cell.Builder
+		leaves[0].top.Descriptor.ToBuilderInto(&descriptor)
+		if err := leaf.StoreBuilder(&descriptor); err != nil {
 			return nil, fmt.Errorf("store shard %016x descriptor: %w", uint64(shardID), err)
 		}
 		return leaf.EndCell(), nil

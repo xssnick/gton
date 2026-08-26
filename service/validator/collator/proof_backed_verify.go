@@ -26,18 +26,18 @@ import (
 // validator already holds that state. Only shard validation switches.
 
 // proofBackedPredecessors re-points the ordered predecessors at the states
-// proven by the candidate's own collated data. The proofs are already bound to
-// these exact block ids — and, while a resident state is still available, to
-// its content — by verifyCollatedPredecessors, so this substitutes the source
-// of the cells without weakening what identifies them.
+// proven by the candidate's own collated data. verifyCollatedBlockState binds
+// each proof to the exact predecessor block id before its state root replaces
+// the resident source; the capsule separately retains the resident roots for
+// the content check when that binding has not already run.
 func proofBackedPredecessors(
 	collated *verifiedCollatedData,
 	first PreviousBlock,
 	second *PreviousBlock,
 ) (PreviousBlock, *PreviousBlock, error) {
-	state, err := collatedStateRoot(collated, first.ID)
+	state, err := verifyCollatedBlockState(collated, &first, "first predecessor")
 	if err != nil {
-		return PreviousBlock{}, nil, fmt.Errorf("%w: proven first predecessor state: %v", ErrInvalidInput, err)
+		return PreviousBlock{}, nil, err
 	}
 	first.State = state
 	first.Proven = true
@@ -45,9 +45,9 @@ func proofBackedPredecessors(
 		return first, nil, nil
 	}
 
-	state, err = collatedStateRoot(collated, second.ID)
+	state, err = verifyCollatedBlockState(collated, second, "second predecessor")
 	if err != nil {
-		return PreviousBlock{}, nil, fmt.Errorf("%w: proven second predecessor state: %v", ErrInvalidInput, err)
+		return PreviousBlock{}, nil, err
 	}
 	// The caller borrows this pointer from its request, so the substitution
 	// lands on a copy rather than on the request the session still owns.
@@ -56,6 +56,30 @@ func proofBackedPredecessors(
 	proven.Proven = true
 
 	return first, &proven, nil
+}
+
+// verifyResidentPredecessors binds the proof roots selected during stage 2 to
+// the resident states the caller supplied. Selection already parsed each block
+// proof once; repeating that parse here would add work only to recover roots
+// the capsule already owns, so this stage performs the remaining hash binding
+// at the same point in the rejection order as before.
+func (p *preparedValidationCandidate) verifyResidentPredecessors() error {
+	for i := range p.previous {
+		label := "first predecessor"
+		if i == 1 {
+			label = "second predecessor"
+		}
+		if p.previous[i].State.HashKeyAt(0) == p.resident[i].State.HashKeyAt(0) {
+			continue
+		}
+		if p.resident[i].ID.SeqNo == 0 {
+			return fmt.Errorf("%w: %s zerostate proof differs from supplied state", ErrInvalidInput, label)
+		}
+
+		return fmt.Errorf("%w: %s collated state differs from supplied state", ErrInvalidInput, label)
+	}
+
+	return nil
 }
 
 // provenPredecessorStates re-points an ordered predecessor list at the states
@@ -88,9 +112,10 @@ func provenPredecessorStates(
 	return proven, nil
 }
 
-// bindProofBackedCandidateState rebuilds the candidate state on top of the
-// proven predecessor and re-decodes every view the verifier and the replay take
-// from it.
+// bindProofBackedState rebuilds the candidate state on top of the proven
+// predecessor and re-decodes every view the verifier and the replay take from
+// it. The applied source and successor stay on the capsule so the structural
+// pass does not repeat the update applicability walk.
 //
 // The rebuilt root carries the same hash as the one restored from the resident
 // predecessor — both are the state update's target — so every structural check
@@ -100,8 +125,11 @@ func provenPredecessorStates(
 // statistics and queue here rather than trusting the earlier decode is the
 // point: the reference validator reads them off the virtualized state too, so a
 // proof that omits one has to fail on this node as well.
-func bindProofBackedCandidateState(verified *verifiedCandidate, oldRoot *cell.Cell) error {
-	stateRoot, err := applyVerifiedStateUpdate(verified, oldRoot.WithoutTrace())
+func (p *preparedValidationCandidate) bindProofBackedState(oldRoot *cell.Cell) error {
+	if p.verified.stateUpdate == nil {
+		return fmt.Errorf("%w: prepared candidate state update is absent", ErrInvalidInput)
+	}
+	stateRoot, err := p.verified.stateUpdate.ApplyTo(oldRoot.WithoutTrace())
 	if err != nil {
 		return fmt.Errorf(
 			"%w: apply candidate state update to the proven predecessor: %v",
@@ -130,24 +158,12 @@ func bindProofBackedCandidateState(verified *verifiedCandidate, oldRoot *cell.Ce
 		return err
 	}
 
-	verified.state = state
-	verified.stats = stats
-	verified.queue = queue
+	p.stateRoot = stateRoot
+	p.sourceRoot = oldRoot.HashKeyAt(0)
+	p.stateApplied = true
+	p.verified.state = state
+	p.verified.stats = stats
+	p.verified.queue = queue
 
 	return nil
-}
-
-// applyVerifiedStateUpdate applies this candidate's transition to one parent,
-// through the capsule whenever the verdict has already been decided for it.
-//
-// The capsule is absent only where nothing validated the update on this call —
-// there is no path in this package that applies without validating first, so
-// the fallback exists for the benchmarks and for a future caller, and it is the
-// same apply either way.
-func applyVerifiedStateUpdate(verified *verifiedCandidate, from *cell.Cell) (*cell.Cell, error) {
-	if verified.stateUpdate != nil {
-		return verified.stateUpdate.ApplyTo(from)
-	}
-
-	return cell.ApplyMerkleUpdate(from, verified.block.StateUpdate)
 }

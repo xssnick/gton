@@ -29,11 +29,8 @@ type verifiedCandidate struct {
 	outMessages   *tlb.OutMsgDescrAugDict
 	accountBlocks *tlb.ShardAccountBlocksAugDict
 	// accountBlockIndex is every AccountBlock as the structural walk decoded it,
-	// in ascending key order. It is a pointer, not a slice header: both
-	// verifyPrepared*Candidate start with `verified := *prepared`, and a pointer
-	// makes it unambiguous that the copies share one frozen structure. It is
-	// written once, by the structural pass, and read-only from then on; the
-	// candidate's life is its lifetime.
+	// in ascending key order. It is written once by the structural pass and is
+	// read-only from then on; the candidate's life is its lifetime.
 	accountBlockIndex *accountBlockIndex
 	collated          verifiedCollatedData
 	// stateUpdate is block.StateUpdate with its verdict already decided, and —
@@ -78,18 +75,22 @@ func VerifyShardCandidate(ctx context.Context, req ShardVerificationRequest) err
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	prepared, err := prepareVerificationCandidate(ctx, req.Masterchain.Config, req.Candidate)
+	previous := []PreviousBlock{req.Previous}
+	if req.Previous2 != nil {
+		previous = []PreviousBlock{req.Previous, *req.Previous2}
+	}
+	prepared, err := prepareVerificationCandidate(ctx, req.Masterchain.Config, req.Candidate, previous)
 	if err != nil {
 		return err
 	}
 
-	return verifyPreparedShardCandidate(ctx, req, &prepared.verified)
+	return verifyPreparedShardCandidate(ctx, req, prepared)
 }
 
 func verifyPreparedShardCandidate(
 	ctx context.Context,
 	req ShardVerificationRequest,
-	prepared *verifiedCandidate,
+	prepared *preparedValidationCandidate,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -98,11 +99,17 @@ func verifyPreparedShardCandidate(
 		return fmt.Errorf("%w: candidate transition verifier is absent", ErrInvalidInput)
 	}
 
+	if len(prepared.previous) == 0 || len(prepared.previous) > 2 || len(prepared.resident) != len(prepared.previous) {
+		return fmt.Errorf("%w: prepared shard predecessor set is malformed", ErrInvalidInput)
+	}
 	config := req.Masterchain.Config
-	previous := req.Previous
-	previous2 := req.Previous2
-	candidate := req.Candidate
-	verified := *prepared
+	previous := prepared.previous[0]
+	var previous2 *PreviousBlock
+	if len(prepared.previous) == 2 {
+		previous2 = &prepared.previous[1]
+	}
+	candidate := prepared.candidate
+	verified := &prepared.verified
 	header := &verified.block.BlockInfo
 	if !header.NotMaster {
 		return fmt.Errorf("%w: shard candidate declares a masterchain block", ErrInvalidInput)
@@ -134,32 +141,43 @@ func verifyPreparedShardCandidate(
 	form := residentPredecessor
 	if verified.collated.full {
 		form = provenPredecessor
-		if err := verifyCollatedPredecessors(&verified.collated, previous, previous2); err != nil {
-			return err
+		resident := prepared.resident[0]
+		var resident2 *PreviousBlock
+		if len(prepared.resident) == 2 {
+			resident2 = &prepared.resident[1]
 		}
-		proven, proven2, provenErr := proofBackedPredecessors(&verified.collated, previous, previous2)
-		if provenErr != nil {
-			return provenErr
-		}
-		previous, previous2 = proven, proven2
-
-		// The candidate state is rebound here rather than after the predecessor
-		// is prepared, so that the load history and the value flow read it from
-		// the proof too. The effective root is the merge pair when there are
-		// two, the single predecessor otherwise — the same root the preparation
-		// below arrives at, and cheap enough to derive twice.
-		provenRoot := previous.State
-		if previous2 != nil {
-			combined, combineErr := mechanicalSplitState(previous.State, previous2.State)
-			if combineErr != nil {
-				return fmt.Errorf("combine proven merge predecessors: %w", combineErr)
-			}
-			provenRoot = combined
-		}
-		if !req.stateProven {
-			if err := bindProofBackedCandidateState(&verified, provenRoot); err != nil {
+		if prepared.substituted {
+			if err := prepared.verifyResidentPredecessors(); err != nil {
 				return err
 			}
+		} else {
+			proven, proven2, provenErr := proofBackedPredecessors(&verified.collated, resident, resident2)
+			if provenErr != nil {
+				return provenErr
+			}
+			if proven2 == nil {
+				prepared.previous = []PreviousBlock{proven}
+			} else {
+				prepared.previous = []PreviousBlock{proven, *proven2}
+			}
+			prepared.substituted = true
+
+			provenRoot := proven.State
+			if proven2 != nil {
+				combined, combineErr := mechanicalSplitState(proven.State, proven2.State)
+				if combineErr != nil {
+					return fmt.Errorf("combine proven merge predecessors: %w", combineErr)
+				}
+				provenRoot = combined
+			}
+			if err := prepared.bindProofBackedState(provenRoot); err != nil {
+				return err
+			}
+		}
+		previous = prepared.previous[0]
+		previous2 = nil
+		if len(prepared.previous) == 2 {
+			previous2 = &prepared.previous[1]
 		}
 	}
 
@@ -208,10 +226,10 @@ func verifyPreparedShardCandidate(
 	if err = verifyBlockLTDelta(config, header, false); err != nil {
 		return err
 	}
-	if err = verifyShardLoadHistory(&topology, &firstState, &verified); err != nil {
+	if err = verifyShardLoadHistory(&topology, &firstState, verified); err != nil {
 		return err
 	}
-	if err = verifyShardMasterchainBindings(req, &topology, &firstState, secondState, &verified); err != nil {
+	if err = verifyShardMasterchainBindings(req, &topology, &firstState, secondState, verified); err != nil {
 		return err
 	}
 	if err = verifyBlockReference(&header.PrevRef.Prev1, &previous, &firstState, "first"); err != nil {
@@ -240,10 +258,10 @@ func verifyPreparedShardCandidate(
 	if err != nil {
 		return fmt.Errorf("prepare effective predecessor: %w", err)
 	}
-	if err = verifyStateTransition(predecessor.oldRoot, candidate.State, verified.block.StateUpdate); err != nil {
+	if err = prepared.verifyStateTransition(predecessor.oldRoot); err != nil {
 		return err
 	}
-	if err = verifyShardValueFlow(config, &predecessor, &verified); err != nil {
+	if err = verifyShardValueFlow(config, &predecessor, verified); err != nil {
 		return err
 	}
 	if err = verifyShardMinRefMCSeqno(header, &verified.queue); err != nil {
@@ -267,7 +285,7 @@ func verifyPreparedShardCandidate(
 		return fmt.Errorf("%w: shard state contains public libraries", ErrInvalidInput)
 	}
 
-	if err = verifyStateBalance(&verified); err != nil {
+	if err = verifyStateBalance(verified); err != nil {
 		return err
 	}
 
@@ -282,16 +300,12 @@ func verifyPreparedShardCandidate(
 		CollatedProofs:     &verified.collated,
 		NeighborShardEndLT: req.NeighborShardEndLT,
 		prepared: &preparedCandidateTransition{
-			candidate: &verified,
+			candidate: verified,
 			previous:  &predecessor.state,
 		},
 	}); err != nil {
 		return fmt.Errorf("verify candidate semantic transition: %w", err)
 	}
-	// This function works on its own copy so its mutations stay local, but the
-	// shape the replay counted is an output: it is the only place the caller can
-	// learn what it just validated without walking the block again.
-	prepared.shape = verified.shape
 
 	return nil
 }
@@ -502,18 +516,23 @@ func VerifyMasterCandidate(ctx context.Context, req MasterVerificationRequest) e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	prepared, err := prepareVerificationCandidate(ctx, req.Config, req.Candidate)
+	prepared, err := prepareVerificationCandidate(
+		ctx,
+		req.Config,
+		req.Candidate,
+		[]PreviousBlock{req.Previous},
+	)
 	if err != nil {
 		return err
 	}
 
-	return verifyPreparedMasterCandidate(ctx, req, &prepared.verified)
+	return verifyPreparedMasterCandidate(ctx, req, prepared)
 }
 
 func verifyPreparedMasterCandidate(
 	ctx context.Context,
 	req MasterVerificationRequest,
-	prepared *verifiedCandidate,
+	prepared *preparedValidationCandidate,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -525,10 +544,13 @@ func verifyPreparedMasterCandidate(
 		return err
 	}
 
+	if len(prepared.previous) != 1 {
+		return fmt.Errorf("%w: prepared masterchain predecessor set is malformed", ErrInvalidInput)
+	}
 	config := req.Config
-	previous := req.Previous
-	candidate := req.Candidate
-	verified := *prepared
+	previous := prepared.previous[0]
+	candidate := prepared.candidate
+	verified := &prepared.verified
 	header := &verified.block.BlockInfo
 	if header.NotMaster {
 		return fmt.Errorf("%w: master candidate declares a shardchain block", ErrInvalidInput)
@@ -560,7 +582,7 @@ func verifyPreparedMasterCandidate(
 	// is a pure function of that value. Repeating it here decoded the same
 	// state root and re-walked its accounts prefix a second time per candidate.
 	var previousState *tlb.ShardStateUnsplit
-	if req.previousState == nil {
+	if prepared.masterPredecessor == nil {
 		state, stateErr := verifyPredecessor("master", &previous)
 		if stateErr != nil {
 			return stateErr
@@ -572,10 +594,10 @@ func verifyPreparedMasterCandidate(
 		// state, and the way to say so is the tree it was parsed from. Comparing
 		// fields instead would accept a state from another fork at the same
 		// sequence number in the same shard, which agrees on all of them.
-		if req.previousState.root != previous.State {
+		if prepared.masterPredecessor.root != previous.State {
 			return fmt.Errorf("%w: supplied master predecessor state differs from its block id", ErrInvalidInput)
 		}
-		previousState = &req.previousState.state
+		previousState = &prepared.masterPredecessor.state
 	}
 	if previous.ID.Workchain != address.MasterchainID || previous.ID.Shard != math.MinInt64 ||
 		previousState.McStateExtra == nil {
@@ -593,17 +615,17 @@ func verifyPreparedMasterCandidate(
 	if err := verifyBlockLTDelta(config, header, true); err != nil {
 		return err
 	}
-	if err := verifyStateTransition(previous.State, candidate.State, verified.block.StateUpdate); err != nil {
+	if err := prepared.verifyStateTransition(previous.State); err != nil {
 		return err
 	}
-	masterState, err := loadMasterCandidateState(config, previousState, &verified, req.Groups)
+	masterState, err := loadMasterCandidateState(config, previousState, verified, req.Groups)
 	if err != nil {
 		return err
 	}
-	if err = verifyMasterExtras(&verified, &masterState); err != nil {
+	if err = verifyMasterExtras(verified, &masterState); err != nil {
 		return err
 	}
-	if err = verifyMasterValueFlow(config, &verified, &masterState); err != nil {
+	if err = verifyMasterValueFlow(config, verified, &masterState); err != nil {
 		return err
 	}
 	if err = verifyLoadHistory(
@@ -614,7 +636,7 @@ func verifyPreparedMasterCandidate(
 	); err != nil {
 		return err
 	}
-	registry, err := verifyMasterDeterministicTransition(req, previousState, &verified, &masterState)
+	registry, err := verifyMasterDeterministicTransition(req, previousState, verified, &masterState)
 	if err != nil {
 		return err
 	}
@@ -630,7 +652,7 @@ func verifyPreparedMasterCandidate(
 		}
 	}
 
-	if err = verifyStateBalance(&verified); err != nil {
+	if err = verifyStateBalance(verified); err != nil {
 		return err
 	}
 
@@ -644,7 +666,7 @@ func verifyPreparedMasterCandidate(
 		CollatedProofs:     &verified.collated,
 		NeighborShardEndLT: req.NeighborShardEndLT,
 		prepared: &preparedCandidateTransition{
-			candidate:     &verified,
+			candidate:     verified,
 			previous:      previousState,
 			minimumBurned: masterState.minimumBurned,
 			// The replay decodes the same predecessor statistics and block info
@@ -658,10 +680,6 @@ func verifyPreparedMasterCandidate(
 	}); err != nil {
 		return fmt.Errorf("verify candidate semantic transition: %w", err)
 	}
-	// This function works on its own copy so its mutations stay local, but the
-	// shape the replay counted is an output: it is the only place the caller can
-	// learn what it just validated without walking the block again.
-	prepared.shape = verified.shape
 
 	return nil
 }
@@ -671,8 +689,12 @@ func verifyPreparedMasterCandidate(
 // benchmarks and the tests. The session path never comes here: it builds the
 // same capsule across two stages, around the master-view resolution that stands
 // between the candidate bytes and the config every check below needs.
-func verifyCandidate(ctx context.Context, config *Config, candidate *Candidate) (verifiedCandidate, error) {
-	prepared, err := prepareVerificationCandidate(ctx, config, candidate)
+func verifyCandidate(
+	ctx context.Context,
+	config *Config,
+	candidate *Candidate,
+) (verifiedCandidate, error) {
+	prepared, err := prepareVerificationCandidate(ctx, config, candidate, nil)
 	if err != nil {
 		return verifiedCandidate{}, err
 	}
@@ -748,7 +770,8 @@ func verifyHeaderReferenceCells(root *cell.Cell, header *tlb.BlockHeader) error 
 		return nil
 	}
 
-	loader, err := previousRoot.BeginParse()
+	var loader cell.Slice
+	err = previousRoot.BeginParseInto(&loader)
 	if err != nil || loader.BitsLeft() != 0 || loader.RefsNum() != 2 {
 		return fmt.Errorf("%w: malformed merge predecessor references", ErrInvalidInput)
 	}
@@ -774,7 +797,8 @@ func verifyHeaderReferenceCells(root *cell.Cell, header *tlb.BlockHeader) error 
 }
 
 func verifyMcBlockDetails(root *cell.Cell, extra *tlb.McBlockExtra) error {
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return fmt.Errorf("%w: decode masterchain block extra: %v", ErrInvalidInput, err)
 	}
@@ -784,11 +808,11 @@ func verifyMcBlockDetails(root *cell.Cell, extra *tlb.McBlockExtra) error {
 	if _, err = loader.LoadBoolBit(); err != nil {
 		return fmt.Errorf("%w: decode masterchain key block flag: %v", ErrInvalidInput, err)
 	}
-	if _, err = loader.LoadDict(32); err != nil {
+	if _, err = loader.LoadOptionalDict(32); err != nil {
 		return fmt.Errorf("%w: decode masterchain shard hashes: %v", ErrInvalidInput, err)
 	}
 	var fees tlb.ShardFeesAugDict
-	if err = fees.LoadFromCell(loader); err != nil {
+	if err = fees.LoadFromCell(&loader); err != nil {
 		return fmt.Errorf("%w: decode exact masterchain shard fees: %v", ErrInvalidInput, err)
 	}
 	detailsRoot, err := loader.LoadRefCell()
@@ -943,11 +967,11 @@ func verifyPredecessorState(
 			err,
 		)
 	}
-	if previous.ID.SeqNo == 0 && !bytes.Equal(previous.ID.RootHash, previous.State.Hash()) {
+	if previous.ID.SeqNo == 0 && !equalCellHashBytes(previous.State, previous.ID.RootHash) {
 		return tlb.ShardStateUnsplit{}, fmt.Errorf("%w: %s zerostate hash differs from its id", ErrInvalidInput, label)
 	}
 	if previous.Block != nil {
-		if !bytes.Equal(previous.ID.RootHash, previous.Block.Hash()) {
+		if !equalCellHashBytes(previous.Block, previous.ID.RootHash) {
 			return tlb.ShardStateUnsplit{}, fmt.Errorf("%w: %s predecessor block root differs from its id", ErrInvalidInput, label)
 		}
 		var block tlb.Block
@@ -1007,6 +1031,27 @@ func verifyStateTransition(oldRoot, state, update *cell.Cell) error {
 		return fmt.Errorf("%w: load candidate state update target: %v", ErrInvalidInput, err)
 	}
 	if target.HashKeyAt(0) != state.HashKeyAt(0) {
+		return fmt.Errorf("%w: applied candidate state differs from supplied state", ErrInvalidInput)
+	}
+
+	return nil
+}
+
+// verifyStateTransition binds the structural pass to the transition prepared
+// by this call. Production preparation has already applied the update while it
+// built the exact successor tree used below, so matching that applied source is
+// sufficient and avoids a second source-proof walk. The exported standalone
+// route receives a successor from its caller and retains the full applicability
+// check above.
+func (p *preparedValidationCandidate) verifyStateTransition(oldRoot *cell.Cell) error {
+	if !p.stateApplied {
+		return verifyStateTransition(oldRoot, p.candidate.State, p.verified.block.StateUpdate)
+	}
+	if oldRoot.HashKeyAt(0) != p.sourceRoot {
+		return fmt.Errorf("%w: prepared state update source differs from effective predecessor", ErrInvalidInput)
+	}
+	if p.stateRoot == nil || p.candidate.State == nil ||
+		p.stateRoot.HashKeyAt(0) != p.candidate.State.HashKeyAt(0) {
 		return fmt.Errorf("%w: applied candidate state differs from supplied state", ErrInvalidInput)
 	}
 
@@ -1294,7 +1339,11 @@ func verifyCollatedData(
 	}
 	if roots == nil {
 		var err error
-		roots, err = cell.FromBOCMultiRoot(candidate.CollatedData)
+		// Candidate retains CollatedData until verification finishes, so the
+		// parsed roots can safely borrow its immutable payload.
+		roots, err = cell.FromBOCMultiRootWithOptions(candidate.CollatedData, cell.BOCParseOptions{
+			NoCopyPayload: true,
+		})
 		if err != nil {
 			return verifiedCollatedData{}, fmt.Errorf("%w: decode candidate collated data: %v", ErrInvalidInput, err)
 		}
@@ -1307,7 +1356,8 @@ func verifyCollatedData(
 }
 
 func isTopBlockDescrSet(root *cell.Cell) bool {
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return false
 	}
@@ -1316,7 +1366,8 @@ func isTopBlockDescrSet(root *cell.Cell) bool {
 }
 
 func verifyTopBlockDescrSet(root *cell.Cell) error {
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return err
 	}
@@ -1371,7 +1422,8 @@ func validateTopBlockDescr(root *cell.Cell, budget *tlbValidationBudget) error {
 	if root.IsSpecial() {
 		return fmt.Errorf("special TopBlockDescr cell")
 	}
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return err
 	}
@@ -1416,7 +1468,7 @@ func validateTopBlockDescr(root *cell.Cell, budget *tlbValidationBudget) error {
 	if length == 0 || length > uint64(maxShardTopChainLength) {
 		return fmt.Errorf("invalid TopBlockDescr chain length %d", length)
 	}
-	if err = validateTopBlockProofChain(loader, int(length), budget); err != nil {
+	if err = validateTopBlockProofChain(&loader, int(length), budget); err != nil {
 		return err
 	}
 
@@ -1456,7 +1508,8 @@ func validateTopBlockSignatures(root *cell.Cell, budget *tlbValidationBudget) er
 	if root.IsSpecial() {
 		return fmt.Errorf("special BlockSignatures cell")
 	}
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return err
 	}
@@ -1569,7 +1622,8 @@ func validateSignedCertificate(root *cell.Cell, budget *tlbValidationBudget) err
 	if root.IsSpecial() {
 		return fmt.Errorf("special SignedCertificate cell")
 	}
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return err
 	}
@@ -1584,7 +1638,7 @@ func validateSignedCertificate(root *cell.Cell, budget *tlbValidationBudget) err
 	if err = loader.SkipBits(256 + 32 + 32); err != nil {
 		return fmt.Errorf("load certificate: %w", err)
 	}
-	if err = validateCryptoSignature(loader, budget); err != nil {
+	if err = validateCryptoSignature(&loader, budget); err != nil {
 		return fmt.Errorf("invalid certificate signature: %w", err)
 	}
 	if loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
@@ -1640,11 +1694,12 @@ func loadInMsgDescriptors(root *cell.Cell, globalVersion uint32) (*tlb.InMsgDesc
 	if root == nil {
 		return nil, fmt.Errorf("dictionary cell is absent")
 	}
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return nil, err
 	}
-	dict, err := tlb.LoadInMsgDescrAugDict(loader, globalVersion)
+	dict, err := tlb.LoadInMsgDescrAugDict(&loader, globalVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -1668,11 +1723,12 @@ func loadOutMsgDescriptors(root *cell.Cell, globalVersion uint32) (*tlb.OutMsgDe
 	if root == nil {
 		return nil, fmt.Errorf("dictionary cell is absent")
 	}
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return nil, err
 	}
-	dict, err := tlb.LoadOutMsgDescrAugDict(loader, globalVersion)
+	dict, err := tlb.LoadOutMsgDescrAugDict(&loader, globalVersion)
 	if err != nil {
 		return nil, err
 	}

@@ -235,36 +235,36 @@ func (c *collation) buildValueFlow() (valueFlowParts, error) {
 }
 
 func loadAccountsBalance(accounts *tlb.ShardAccountsAugDict) (tlb.CurrencyCollection, error) {
-	extra, err := accounts.LoadRootExtra()
-	if err != nil {
+	var extra cell.Slice
+	if err := accounts.LoadRootExtraInto(&extra); err != nil {
 		return tlb.CurrencyCollection{}, fmt.Errorf("load accounts balance: %w", err)
 	}
 	var balance tlb.DepthBalanceInfo
-	if err = loadExactSlice(&balance, extra); err != nil {
+	if err := loadExactSlice(&balance, &extra); err != nil {
 		return tlb.CurrencyCollection{}, fmt.Errorf("decode accounts balance: %w", err)
 	}
 	return balance.Currencies, nil
 }
 
 func loadCurrencyExtra(dict *cell.AugmentedDictionary) (tlb.CurrencyCollection, error) {
-	extra, err := dict.LoadRootExtra()
-	if err != nil {
+	var extra cell.Slice
+	if err := dict.LoadRootExtraInto(&extra); err != nil {
 		return tlb.CurrencyCollection{}, err
 	}
 	var value tlb.CurrencyCollection
-	if err = loadExactSlice(&value, extra); err != nil {
+	if err := loadExactSlice(&value, &extra); err != nil {
 		return tlb.CurrencyCollection{}, err
 	}
 	return value, nil
 }
 
 func loadImportFees(dict *cell.AugmentedDictionary) (tlb.ImportFees, error) {
-	extra, err := dict.LoadRootExtra()
-	if err != nil {
+	var extra cell.Slice
+	if err := dict.LoadRootExtraInto(&extra); err != nil {
 		return tlb.ImportFees{}, err
 	}
 	var value tlb.ImportFees
-	if err = loadExactSlice(&value, extra); err != nil {
+	if err := loadExactSlice(&value, &extra); err != nil {
 		return tlb.ImportFees{}, err
 	}
 	return value, nil

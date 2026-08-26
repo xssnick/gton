@@ -47,7 +47,7 @@ type masterTopBlockDescrEnvelope struct {
 	target     ton.BlockIDExt
 	signatures *cell.Cell
 	length     int
-	chain      *cell.Slice
+	chain      cell.Slice
 }
 
 // parseMasterTopBlockDescrEnvelope decodes only the part of top_block_descr#d5
@@ -59,7 +59,8 @@ func parseMasterTopBlockDescrEnvelope(root *cell.Cell) (masterTopBlockDescrEnvel
 	if root == nil || root.IsSpecial() {
 		return masterTopBlockDescrEnvelope{}, fmt.Errorf("TopBlockDescr is nil or special")
 	}
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return masterTopBlockDescrEnvelope{}, fmt.Errorf("parse TopBlockDescr: %w", err)
 	}
@@ -68,7 +69,7 @@ func parseMasterTopBlockDescrEnvelope(root *cell.Cell) (masterTopBlockDescrEnvel
 		return masterTopBlockDescrEnvelope{}, fmt.Errorf("invalid TopBlockDescr tag")
 	}
 	var proofFor masterTopBlockDescrID
-	if err = tlb.LoadFromCell(&proofFor, loader); err != nil {
+	if err = tlb.LoadFromCell(&proofFor, &loader); err != nil {
 		return masterTopBlockDescrEnvelope{}, fmt.Errorf("decode TopBlockDescr target: %w", err)
 	}
 	// crypto/block/block-parse.cpp:2113-2124 ShardIdent::unpack reads the prefix
@@ -158,7 +159,7 @@ func validateMasterTopBlockDescrBinding(
 		return nil, fmt.Errorf("TopBlockDescr chain length is %d, shorter than required %d",
 			envelope.length, chainLength)
 	}
-	proofs, err := validateMasterTopProofChain(envelope.chain, envelope.length)
+	proofs, err := validateMasterTopProofChain(&envelope.chain, envelope.length)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +209,8 @@ func parseMasterTopChainLink(proof *cell.Cell) (masterTopChainLink, error) {
 	if err != nil {
 		return masterTopChainLink{}, fmt.Errorf("virtualize proof: %w", err)
 	}
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err = root.BeginParseInto(&loader)
 	if err != nil {
 		return masterTopChainLink{}, err
 	}

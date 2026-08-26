@@ -115,8 +115,51 @@ func (v *SemanticVerifier) VerifyCandidateTransition(ctx context.Context, transi
 	return nil
 }
 
+// semanticEnvelopeCache deduplicates envelope parses within one validation.
+// The same message envelope reaches the replay through up to five doors — the
+// inbound descriptor, the outbound descriptor, the candidate queue entry, the
+// predecessor queue entry and the dequeue check — and each used to parse it
+// from scratch: measured on the mainnet workload, 4 047 parses for 855
+// distinct envelopes. The parse is a pure function of the cell's content,
+// every downstream comparison is by hash (equalCell, HashKey), and the entries
+// die with the validation, so caching by content hash changes nothing
+// observable but the work. Reject parity survives too: within one candidate,
+// equal content is one node of the proof DAG, so the first parse's resolution
+// of that node is exactly the residency check every later door would repeat.
+//
+// Scoped to one replay on purpose: a process-wide cache would retain each
+// envelope's root and, through its refs, the whole proof DAG of a candidate
+// long past its validation — live-set growth, which is the one memory currency
+// this tree treats as expensive.
+type semanticEnvelopeCache struct {
+	entries sync.Map
+}
+
+// parse returns the cached envelope for the cell's content or parses and
+// caches it. Safe from the concurrent account lanes; on a race both sides
+// parse the same content and either result is correct, so LoadOrStore just
+// keeps the first. The nil receiver parses without caching — the neighbor
+// and masterchain paths use it.
+func (c *semanticEnvelopeCache) parse(root *cell.Cell) (*semanticEnvelope, error) {
+	if c == nil {
+		return parseSemanticEnvelope(root)
+	}
+	key := root.HashKey()
+	if cached, ok := c.entries.Load(key); ok {
+		return cached.(*semanticEnvelope), nil
+	}
+	envelope, err := parseSemanticEnvelope(root)
+	if err != nil {
+		return nil, err
+	}
+	cached, _ := c.entries.LoadOrStore(key, envelope)
+
+	return cached.(*semanticEnvelope), nil
+}
+
 type semanticReplay struct {
 	ctx        context.Context
+	envelopes  semanticEnvelopeCache
 	verifier   *SemanticVerifier
 	transition CandidateTransition
 	candidate  *verifiedCandidate
@@ -142,11 +185,11 @@ type semanticReplay struct {
 	accounts          map[[32]byte]*semanticAccountResult
 	consumedIn        map[cell.Hash]struct{}
 	consumedOut       map[cell.Hash]struct{}
-	specialTxs        map[cell.Hash]struct{}
+	specialTxs        semanticSpecialTransactions
 	parsedIn          map[cell.Hash]*semanticInDescriptor
 	parsedOut         map[cell.Hash]*semanticOutDescriptor
-	parsedInOrder     []cell.Hash
-	parsedOutOrder    []cell.Hash
+	parsedInOrder     []semanticInDescriptorEntry
+	parsedOutOrder    []semanticOutDescriptorEntry
 	messageProcessing []semanticMessageProcessing
 
 	// specials is the epoch's masterchain special-account identities, shared with
@@ -167,6 +210,33 @@ type semanticAccountResult struct {
 	final      *tvm.PreparedAccount
 	sequence   []semanticTransactionResult
 	outputTags [][]uint8
+}
+
+// semanticSpecialTransactions is the complete masterchain special-message
+// transaction set: fee recovery and mint, with duplicate roots collapsed.
+// Keeping the protocol's fixed cardinality in the representation avoids a map
+// allocation on every semantic replay.
+type semanticSpecialTransactions struct {
+	hashes [2]cell.Hash
+	count  int
+}
+
+func (s *semanticSpecialTransactions) add(hash cell.Hash) {
+	if s.contains(hash) || s.count == len(s.hashes) {
+		return
+	}
+	s.hashes[s.count] = hash
+	s.count++
+}
+
+func (s *semanticSpecialTransactions) contains(hash cell.Hash) bool {
+	for i := 0; i < s.count; i++ {
+		if s.hashes[i] == hash {
+			return true
+		}
+	}
+
+	return false
 }
 
 func newSemanticReplay(
@@ -208,7 +278,6 @@ func newSemanticReplay(
 		accounts:    make(map[[32]byte]*semanticAccountResult),
 		consumedIn:  make(map[cell.Hash]struct{}),
 		consumedOut: make(map[cell.Hash]struct{}),
-		specialTxs:  make(map[cell.Hash]struct{}),
 	}
 	if err := replay.loadMasterSpecialTransactions(); err != nil {
 		return nil, err
@@ -281,50 +350,10 @@ func (r *semanticReplay) loadMasterSpecialTransactions() error {
 		if err != nil {
 			return err
 		}
-		r.specialTxs[transactionRoot.HashKey()] = struct{}{}
+		r.specialTxs.add(transactionRoot.HashKey())
 	}
 
 	return nil
-}
-
-// masterPredecessorStats and masterPredecessorInfo return the predecessor
-// statistics and block info of a masterchain candidate. The structural verifier
-// decodes both before it hands the transition over, and re-deriving the info
-// means opening the creator statistics tail again — so its values are reused
-// when present.
-//
-// They stay separate because their consumers are: the execution context needs
-// both, while the public library check needs only the statistics and must keep
-// working on a predecessor that carries no McStateExtra at all.
-//
-// The fallback is real: a caller that supplies a CandidateTransition without a
-// prepared structural pass still gets a correct, if slower, decode.
-func (r *semanticReplay) masterPredecessorStats() (*tlb.ShardStateStats, error) {
-	if prepared := r.transition.prepared; prepared != nil && prepared.previousStats != nil {
-		return prepared.previousStats, nil
-	}
-
-	var stats tlb.ShardStateStats
-	if err := parseExact(&stats, r.previous.Stats); err != nil {
-		return nil, fmt.Errorf("%w: decode previous masterchain statistics for replay: %v", ErrInvalidInput, err)
-	}
-	return &stats, nil
-}
-
-func (r *semanticReplay) masterPredecessorInfo() (*tlb.McStateExtraBlockInfo, error) {
-	if prepared := r.transition.prepared; prepared != nil && prepared.previousInfo != nil {
-		return prepared.previousInfo, nil
-	}
-
-	var extra tlb.McStateExtra
-	if err := parseExact(&extra, r.previous.McStateExtra); err != nil {
-		return nil, fmt.Errorf("%w: decode previous masterchain extra for replay: %v", ErrInvalidInput, err)
-	}
-	info, err := parseMasterStateInfo(extra.Info)
-	if err != nil {
-		return nil, fmt.Errorf("%w: decode previous masterchain history for replay: %v", ErrInvalidInput, err)
-	}
-	return &info, nil
 }
 
 func (r *semanticReplay) newBlockContext() (*tvm.BlockContext, error) {
@@ -342,26 +371,24 @@ func (r *semanticReplay) newBlockContext() (*tvm.BlockContext, error) {
 		options.PrevBlocks = r.transition.Masterchain.PrevBlocks
 		options.Libraries = r.transition.Masterchain.Libraries
 	} else {
-		stats, err := r.masterPredecessorStats()
-		if err != nil {
-			return nil, err
+		prepared := r.transition.prepared
+		if prepared.previousStats == nil || prepared.previousInfo == nil {
+			return nil, fmt.Errorf("%w: masterchain predecessor views are absent", ErrInvalidInput)
 		}
-		info, err := r.masterPredecessorInfo()
-		if err != nil {
-			return nil, err
-		}
-		options.PrevBlocks, err = masterPrevBlocksTuple(
+		prevBlocks, err := masterPrevBlocksTuple(
 			r.transition.Previous.ID,
-			info,
+			prepared.previousInfo,
 			r.transition.Config.globalVersion,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("build semantic masterchain previous-block tuple: %w", err)
 		}
-		options.Libraries, err = masterExecutionLibraries(stats.Libraries)
+		options.PrevBlocks = prevBlocks
+		libraries, err := masterExecutionLibraries(prepared.previousStats.Libraries)
 		if err != nil {
 			return nil, err
 		}
+		options.Libraries = libraries
 	}
 
 	blockContext, err := r.transition.Config.execution.NewBlockContext(options)
@@ -416,23 +443,16 @@ func (r *semanticReplay) precheckAccountUpdates() error {
 		return fmt.Errorf("%w: shard account dictionary is absent", ErrInvalidInput)
 	}
 
-	err := oldAccounts.ScanDiff(newAccounts.AugmentedDictionary, true, func(
-		keyCell *cell.Cell,
-		oldValueExtra, newValueExtra *cell.Slice,
-	) error {
+	err := oldAccounts.ScanDiffRaw(newAccounts.AugmentedDictionary, true, func(view cell.AugDictDiffRawView) error {
 		if err := r.ctx.Err(); err != nil {
 			return err
 		}
 
-		keyLoader, err := keyCell.BeginParse()
-		if err != nil {
-			return fmt.Errorf("%w: load changed account key: %v", ErrInvalidInput, err)
-		}
 		var key [32]byte
-		if err = keyLoader.LoadSliceInto(key[:], 256); err != nil ||
-			keyLoader.BitsLeft() != 0 || keyLoader.RefsNum() != 0 {
+		if view.KeyBits != 256 || len(view.Key) != len(key) {
 			return fmt.Errorf("%w: changed account key is malformed", ErrInvalidInput)
 		}
+		copy(key[:], view.Key)
 
 		// The structural pass had to decode every entry to reach its transaction
 		// augmentation, so this is a binary search over what it recorded rather
@@ -444,7 +464,7 @@ func (r *semanticReplay) precheckAccountUpdates() error {
 		entry, indexed := r.accountBlockIndex.find(key)
 		if !indexed {
 			var loadErr error
-			if entry, loadErr = r.loadChangedAccountBlock(keyCell); loadErr != nil {
+			if entry, loadErr = r.loadChangedAccountBlock(key); loadErr != nil {
 				return fmt.Errorf("%w: changed account %x has no AccountBlock: %v", ErrInvalidInput, key, loadErr)
 			}
 		}
@@ -455,15 +475,15 @@ func (r *semanticReplay) precheckAccountUpdates() error {
 			return fmt.Errorf("%w: AccountBlock address differs from changed account %x", ErrInvalidInput, key)
 		}
 
-		oldAccount, err := semanticDiffAccount(oldValueExtra)
+		oldAccount, err := semanticDiffAccount(view.OldValueExtra, view.HasOld)
 		if err != nil {
 			return fmt.Errorf("%w: decode predecessor ShardAccount %x: %v", ErrInvalidInput, key, err)
 		}
-		newAccount, err := semanticDiffAccount(newValueExtra)
+		newAccount, err := semanticDiffAccount(view.NewValueExtra, view.HasNew)
 		if err != nil {
 			return fmt.Errorf("%w: decode candidate ShardAccount %x: %v", ErrInvalidInput, key, err)
 		}
-		if newValueExtra != nil {
+		if view.HasNew {
 			addr := address.NewAddress(0, byte(r.candidate.block.BlockInfo.Shard.WorkchainID), key[:])
 			if _, err = tvm.PrepareAccount(newAccount, addr); err != nil {
 				return fmt.Errorf("%w: validate candidate ShardAccount %x: %v", ErrInvalidInput, key, err)
@@ -474,10 +494,10 @@ func (r *semanticReplay) precheckAccountUpdates() error {
 			return fmt.Errorf("%w: decode AccountBlock state update %x: %v", ErrInvalidInput, key, entry.updateErr)
 		}
 		accountUpdate := &entry.update
-		if !bytes.Equal(accountUpdate.OldHash, oldAccount.Account.Hash()) {
+		if !equalCellHashBytes(oldAccount.Account, accountUpdate.OldHash) {
 			return fmt.Errorf("%w: AccountBlock %x old hash differs from predecessor state", ErrInvalidInput, key)
 		}
-		if !bytes.Equal(accountUpdate.NewHash, newAccount.Account.Hash()) {
+		if !equalCellHashBytes(newAccount.Account, accountUpdate.NewHash) {
 			return fmt.Errorf("%w: AccountBlock %x new hash differs from candidate state", ErrInvalidInput, key)
 		}
 
@@ -502,35 +522,45 @@ func (r *semanticReplay) precheckAccountUpdates() error {
 // index carries so the caller reports them from one place. Both are recorded
 // rather than raised here: exactErr is reported before the address match and
 // updateErr after it, which is the order the two rejections had.
-func (r *semanticReplay) loadChangedAccountBlock(keyCell *cell.Cell) (*accountBlockEntry, error) {
-	blockValue, err := r.accountBlocks.LoadValue(keyCell)
-	if err != nil {
+func (r *semanticReplay) loadChangedAccountBlock(key [32]byte) (*accountBlockEntry, error) {
+	var blockValue cell.Slice
+	if err := r.accountBlocks.LoadValueByBytesKeyInto(key[:], &blockValue); err != nil {
 		return nil, err
 	}
 	entry := &accountBlockEntry{}
-	entry.exactErr = loadExactSlice(&entry.block, blockValue)
+	entry.exactErr = loadExactSlice(&entry.block, &blockValue)
 	entry.updateErr = parseExact(&entry.update, entry.block.StateUpdate)
 
 	return entry, nil
 }
 
-func semanticDiffAccount(valueExtra *cell.Slice) (*tlb.ShardAccount, error) {
-	if valueExtra == nil {
+func semanticDiffAccount(valueExtra cell.Slice, present bool) (*tlb.ShardAccount, error) {
+	if !present {
 		return &tlb.ShardAccount{
 			Account:       cell.BeginCell().MustStoreBoolBit(false).EndCell(),
 			LastTransHash: make([]byte, 32),
 		}, nil
 	}
 
-	value := valueExtra.Copy()
-	if err := (tlb.AugShardAccounts{}).SkipExtra(value); err != nil {
+	value := valueExtra
+	if err := (tlb.AugShardAccounts{}).SkipExtra(&value); err != nil {
 		return nil, err
 	}
 	var account tlb.ShardAccount
-	if err := loadExactSlice(&account, value); err != nil {
+	if err := loadExactSlice(&account, &value); err != nil {
 		return nil, err
 	}
 	return &account, nil
+}
+
+func equalCellHashBytes(root *cell.Cell, expected []byte) bool {
+	if len(expected) != 32 {
+		return false
+	}
+	var hash cell.Hash
+	copy(hash[:], expected)
+
+	return root.HashKey() == hash
 }
 
 // verifyAccounts replays every account block. Accounts are independent — a lane
@@ -793,7 +823,7 @@ func (r *semanticReplay) replayAccount(lane *semanticAccountLane) error {
 		return fmt.Errorf("%w: decode account block state update %x: %v", ErrInvalidInput, key, entry.updateErr)
 	}
 	accountUpdate := &entry.update
-	if !bytes.Equal(accountUpdate.OldHash, original.Account.Hash()) {
+	if !equalCellHashBytes(original.Account, accountUpdate.OldHash) {
 		return fmt.Errorf("%w: account block %x old hash differs from predecessor state", ErrInvalidInput, key)
 	}
 
@@ -849,7 +879,7 @@ func (r *semanticReplay) replayAccount(lane *semanticAccountLane) error {
 			!bytes.Equal(transaction.PrevTxHash[:], currentShardAccount.LastTransHash) {
 			return fmt.Errorf("%w: transaction %x:%d previous transaction pointer mismatch", ErrInvalidInput, key, lt)
 		}
-		if !bytes.Equal(transaction.OldHash[:], currentShardAccount.Account.Hash()) {
+		if currentShardAccount.Account.HashKey() != cell.Hash(transaction.OldHash) {
 			return fmt.Errorf("%w: transaction %x:%d old account hash mismatch", ErrInvalidInput, key, lt)
 		}
 		inboundRoot := transaction.InMsg
@@ -898,7 +928,7 @@ func (r *semanticReplay) replayAccount(lane *semanticAccountLane) error {
 		if len(result.OutMessages) != int(transaction.OutMsgCount) {
 			return fmt.Errorf("%w: transaction %x:%d output count differs from replay", ErrInvalidInput, key, lt)
 		}
-		if !bytes.Equal(transaction.NewHash[:], result.NextAccount.ShardAccount().Account.Hash()) {
+		if result.NextAccount.ShardAccount().Account.HashKey() != cell.Hash(transaction.NewHash) {
 			return fmt.Errorf("%w: transaction %x:%d new account hash differs from replay", ErrInvalidInput, key, lt)
 		}
 		if err = r.recordTransactionGas(lane, root, &transaction, result); err != nil {
@@ -925,7 +955,7 @@ func (r *semanticReplay) replayAccount(lane *semanticAccountLane) error {
 	if transactions == 0 {
 		return fmt.Errorf("%w: account block %x has no transactions", ErrInvalidInput, key)
 	}
-	if !bytes.Equal(accountUpdate.NewHash, current.ShardAccount().Account.Hash()) {
+	if !equalCellHashBytes(current.ShardAccount().Account, accountUpdate.NewHash) {
 		return fmt.Errorf("%w: account block %x new hash differs from replay", ErrInvalidInput, key)
 	}
 
@@ -966,7 +996,7 @@ func (r *semanticReplay) recordTransactionGas(
 	if transaction.Kind != tlb.TransactionKindOrdinary {
 		return nil
 	}
-	if _, special := r.specialTxs[transactionRoot.HashKey()]; special {
+	if r.specialTxs.contains(transactionRoot.HashKey()) {
 		return nil
 	}
 	_, specialAccount := r.specials.set[account]
@@ -1051,8 +1081,8 @@ func semanticLoadAccount(
 	accounts *tlb.ShardAccountsAugDict,
 	key [32]byte,
 ) (*tlb.ShardAccount, bool, error) {
-	keyCell := cell.BeginCell().MustStoreSlice(key[:], 256).EndCell()
-	value, err := accounts.LoadValue(keyCell)
+	var value cell.Slice
+	err := accounts.LoadValueByBytesKeyInto(key[:], &value)
 	if isMissingKey(err) {
 		return &tlb.ShardAccount{
 			Account:       cell.BeginCell().MustStoreBoolBit(false).EndCell(),
@@ -1064,7 +1094,7 @@ func semanticLoadAccount(
 	}
 
 	var account tlb.ShardAccount
-	if err = loadExactSlice(&account, value); err != nil {
+	if err = loadExactSlice(&account, &value); err != nil {
 		return nil, false, fmt.Errorf("%w: decode predecessor account %x: %v", ErrInvalidInput, key, err)
 	}
 
@@ -1182,7 +1212,7 @@ func (r *semanticReplay) verifyTransactionDescriptors(
 	moneyImported := tlb.CurrencyCollection{}
 	moneyExported := tlb.CurrencyCollection{}
 	externalInitiated := false
-	_, specialTransaction := r.specialTxs[transactionRoot.HashKey()]
+	specialTransaction := r.specialTxs.contains(transactionRoot.HashKey())
 	if inboundMessage != nil {
 		binding, err := r.verifyInboundTransactionDescriptor(lane, inboundRoot, transactionRoot)
 		if err != nil {
@@ -1369,7 +1399,8 @@ func semanticTransactionInbound(root *cell.Cell, expected bool) (*cell.Cell, err
 	if err != nil {
 		return nil, fmt.Errorf("load transaction IO: %v", err)
 	}
-	loader, err := io.BeginParse()
+	var loader cell.Slice
+	err = io.BeginParseInto(&loader)
 	if err != nil {
 		return nil, fmt.Errorf("parse transaction IO: %v", err)
 	}

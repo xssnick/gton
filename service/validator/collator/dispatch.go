@@ -126,7 +126,7 @@ func (c *collation) processDispatchQueue() error {
 					// Phase 1 may already have removed the account because its sender
 					// threshold was reached, and this second removal is then a no-op.
 					if !removeAccount {
-						if err = current.Delete(dispatchAccountKey(source.AccountID)); err != nil {
+						if err = current.DeleteByBytesKey(source.AccountID[:]); err != nil {
 							return fmt.Errorf("remove capped dispatch account %x: %w", source.AccountID, err)
 						}
 					}
@@ -228,11 +228,11 @@ func minimumDispatchAccount(queue *tlb.DispatchQueueAugDict) (DispatchAccount, e
 	}
 
 	current := queue.AugmentedDictionary.Copy()
-	rootExtra, err := current.LoadRootExtra()
-	if err != nil {
+	var rootExtra cell.Slice
+	if err := current.LoadRootExtraInto(&rootExtra); err != nil {
 		return DispatchAccount{}, fmt.Errorf("%w: load dispatch queue root augmentation: %v", ErrInvalidInput, err)
 	}
-	minimumLT, err := dispatchMinimumLT(rootExtra)
+	minimumLT, err := dispatchMinimumLT(&rootExtra)
 	if err != nil {
 		return DispatchAccount{}, fmt.Errorf("%w: dispatch queue root augmentation: %v", ErrInvalidInput, err)
 	}
@@ -247,27 +247,32 @@ func minimumDispatchAccount(queue *tlb.DispatchQueueAugDict) (DispatchAccount, e
 		if common.BitsSize() > remaining || common.RefsNum() != 0 {
 			return DispatchAccount{}, fmt.Errorf("%w: invalid dispatch queue common prefix", ErrInvalidInput)
 		}
-		if err = accountKey.StoreBuilder(common.ToBuilder()); err != nil {
+		var commonBuilder cell.Builder
+		common.ToBuilderInto(&commonBuilder)
+		if err = accountKey.StoreBuilder(&commonBuilder); err != nil {
 			return DispatchAccount{}, fmt.Errorf("%w: append dispatch account prefix: %v", ErrInvalidInput, err)
 		}
 		if common.BitsSize() == remaining {
 			if accountKey.BitsUsed() != 256 {
 				return DispatchAccount{}, fmt.Errorf("%w: dispatch account key has %d bits", ErrInvalidInput, accountKey.BitsUsed())
 			}
-			key := accountKey.EndCell().MustBeginParse()
-			keyBytes, loadErr := key.LoadSlice(256)
+			var key cell.Slice
+			loadErr := accountKey.EndCell().BeginParseInto(&key)
+			var selected DispatchAccount
+			if loadErr == nil {
+				loadErr = key.LoadSliceInto(selected.AccountID[:], 256)
+			}
 			if loadErr != nil || key.BitsLeft() != 0 || key.RefsNum() != 0 {
 				return DispatchAccount{}, fmt.Errorf("%w: invalid dispatch account key", ErrInvalidInput)
 			}
-			var selected DispatchAccount
-			copy(selected.AccountID[:], keyBytes)
 			return selected, nil
 		}
 
 		// The fork augmentation is min(left, right). Prefer the left branch
 		// when both sides contain the same minimum, which gives the canonical
 		// lexicographically smallest account.
-		leftPrefix := common.ToBuilder().MustStoreUInt(0, 1).EndCell()
+		common.ToBuilderInto(&commonBuilder)
+		leftPrefix := commonBuilder.MustStoreUInt(0, 1).EndCell()
 		left := current.Copy()
 		ok, cutErr := left.CutPrefixSubdict(leftPrefix, true)
 		if cutErr != nil {
@@ -276,11 +281,12 @@ func minimumDispatchAccount(queue *tlb.DispatchQueueAugDict) (DispatchAccount, e
 		if !ok || left.IsEmpty() {
 			return DispatchAccount{}, fmt.Errorf("%w: left dispatch queue branch is absent", ErrInvalidInput)
 		}
-		leftExtra, loadErr := left.LoadRootExtra()
+		var leftExtra cell.Slice
+		loadErr := left.LoadRootExtraInto(&leftExtra)
 		if loadErr != nil {
 			return DispatchAccount{}, fmt.Errorf("%w: load left dispatch queue augmentation: %v", ErrInvalidInput, loadErr)
 		}
-		leftMinimum, loadErr := dispatchMinimumLT(leftExtra)
+		leftMinimum, loadErr := dispatchMinimumLT(&leftExtra)
 		if loadErr != nil {
 			return DispatchAccount{}, fmt.Errorf("%w: left dispatch queue augmentation: %v", ErrInvalidInput, loadErr)
 		}
@@ -290,7 +296,8 @@ func minimumDispatchAccount(queue *tlb.DispatchQueueAugDict) (DispatchAccount, e
 			current = left
 		} else {
 			branch = 1
-			rightPrefix := common.ToBuilder().MustStoreUInt(1, 1).EndCell()
+			common.ToBuilderInto(&commonBuilder)
+			rightPrefix := commonBuilder.MustStoreUInt(1, 1).EndCell()
 			ok, cutErr = current.CutPrefixSubdict(rightPrefix, true)
 			if cutErr != nil {
 				return DispatchAccount{}, fmt.Errorf("%w: cut right dispatch queue branch: %v", ErrInvalidInput, cutErr)
@@ -298,11 +305,12 @@ func minimumDispatchAccount(queue *tlb.DispatchQueueAugDict) (DispatchAccount, e
 			if !ok || current.IsEmpty() {
 				return DispatchAccount{}, fmt.Errorf("%w: right dispatch queue branch is absent", ErrInvalidInput)
 			}
-			rightExtra, rightErr := current.LoadRootExtra()
+			var rightExtra cell.Slice
+			rightErr := current.LoadRootExtraInto(&rightExtra)
 			if rightErr != nil {
 				return DispatchAccount{}, fmt.Errorf("%w: load right dispatch queue augmentation: %v", ErrInvalidInput, rightErr)
 			}
-			rightMinimum, rightErr := dispatchMinimumLT(rightExtra)
+			rightMinimum, rightErr := dispatchMinimumLT(&rightExtra)
 			if rightErr != nil {
 				return DispatchAccount{}, fmt.Errorf("%w: right dispatch queue augmentation: %v", ErrInvalidInput, rightErr)
 			}
@@ -328,13 +336,13 @@ func dispatchMinimumLT(extra *cell.Slice) (uint64, error) {
 }
 
 func loadAccountDispatchQueue(queue *tlb.DispatchQueueAugDict, accountID [32]byte) (*tlb.AccountDispatchQueue, error) {
-	value, err := queue.LoadValue(dispatchAccountKey(accountID))
-	if err != nil {
+	var value cell.Slice
+	if err := queue.LoadValueByBytesKeyInto(accountID[:], &value); err != nil {
 		return nil, err
 	}
 
 	var accountQueue tlb.AccountDispatchQueue
-	if err = loadExactSlice(&accountQueue, value); err != nil {
+	if err := loadExactSlice(&accountQueue, &value); err != nil {
 		return nil, err
 	}
 	return &accountQueue, nil
@@ -354,7 +362,11 @@ func (c *collation) loadPredecessorDispatchValue(accountID [32]byte) (*cell.Slic
 		if source.queue == nil {
 			return nil, cell.ErrNoSuchKeyInDict
 		}
-		return source.queue.LoadValue(dispatchAccountKey(accountID))
+		value := new(cell.Slice)
+		if err := source.queue.LoadValueByBytesKeyInto(accountID[:], value); err != nil {
+			return nil, err
+		}
+		return value, nil
 	}
 
 	return nil, fmt.Errorf("%w: dispatch account %x is outside predecessor shards", ErrInvalidInput, accountID)
@@ -378,7 +390,10 @@ func minimumDispatchLT(queue *tlb.AccountDispatchQueue) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	loader := key.MustBeginParse()
+	var loader cell.Slice
+	if err = key.BeginParseInto(&loader); err != nil {
+		return 0, err
+	}
 	lt, err := loader.LoadUInt(64)
 	if err != nil || loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
 		return 0, fmt.Errorf("invalid dispatch message key")
@@ -394,10 +409,11 @@ func updateDispatchScanQueue(
 	removeAccount bool,
 ) error {
 	if removeAccount {
-		return queue.Delete(dispatchAccountKey(accountID))
+		return queue.DeleteByBytesKey(accountID[:])
 	}
 
-	if _, err := accountQueue.Messages.LoadValueAndDelete(dispatchLTKey(lt)); err != nil {
+	var discarded cell.Slice
+	if err := accountQueue.Messages.LoadValueAndDeleteByUintKeyInto(lt, &discarded); err != nil {
 		return err
 	}
 	accountQueue.Count--
@@ -512,8 +528,8 @@ func (c *collation) removeDispatchEntry(accountID [32]byte, lt uint64) (*tlb.Enq
 	if oldAccount == nil {
 		return nil, fmt.Errorf("%w: predecessor dispatch account %x is absent", ErrInvalidInput, accountID)
 	}
-	oldValue, err := oldAccount.Messages.LoadValue(dispatchLTKey(lt))
-	if err != nil {
+	var oldValue cell.Slice
+	if err := oldAccount.Messages.LoadValueByUintKeyInto(lt, &oldValue); err != nil {
 		return nil, fmt.Errorf("%w: load predecessor dispatch message %x:%d: %v", ErrInvalidInput, accountID, lt, err)
 	}
 
@@ -521,12 +537,12 @@ func (c *collation) removeDispatchEntry(accountID [32]byte, lt uint64) (*tlb.Enq
 	if err != nil {
 		return nil, fmt.Errorf("%w: load dispatch account %x: %v", ErrInvalidInput, accountID, err)
 	}
-	_, err = accountQueue.Messages.LoadValueAndDelete(dispatchLTKey(lt))
-	if err != nil {
+	var discarded cell.Slice
+	if err = accountQueue.Messages.LoadValueAndDeleteByUintKeyInto(lt, &discarded); err != nil {
 		return nil, fmt.Errorf("%w: remove dispatch message %x:%d: %v", ErrInvalidInput, accountID, lt, err)
 	}
 	var enqueued tlb.EnqueuedMsg
-	if err = loadExactSlice(&enqueued, oldValue); err != nil {
+	if err = loadExactSlice(&enqueued, &oldValue); err != nil {
 		return nil, fmt.Errorf("%w: decode dispatch message %x:%d: %v", ErrInvalidInput, accountID, lt, err)
 	}
 
@@ -573,14 +589,16 @@ func storeAccountDispatchQueue(
 		if !accountQueue.Messages.IsEmpty() {
 			return fmt.Errorf("account dispatch count reached zero with messages remaining")
 		}
-		return queue.Delete(dispatchAccountKey(accountID))
+		return queue.DeleteByBytesKey(accountID[:])
 	}
 
 	value, err := accountQueue.ToCell()
 	if err != nil {
 		return err
 	}
-	return queue.Set(dispatchAccountKey(accountID), value)
+	var builder cell.Builder
+	value.ToBuilderInto(&builder)
+	return queue.SetBuilderByBytesKey(accountID[:], &builder)
 }
 
 func (c *collation) registerDispatchOp(force bool) error {
@@ -624,14 +642,6 @@ func compareDispatchAccounts(left, right DispatchAccount) int {
 	return bytes.Compare(left.AccountID[:], right.AccountID[:])
 }
 
-func dispatchAccountKey(accountID [32]byte) *cell.Cell {
-	return cell.BeginCell().MustStoreSlice(accountID[:], 256).EndCell()
-}
-
-func dispatchLTKey(lt uint64) *cell.Cell {
-	return cell.BeginCell().MustStoreUInt(lt, 64).EndCell()
-}
-
 func (c *collation) isMasterSpecialAccount(accountID [32]byte) (bool, error) {
 	if c.shard.Workchain != address.MasterchainID {
 		return false, nil
@@ -669,7 +679,8 @@ func (c *collation) shouldDeferGenerated(
 	if c.unprocessedDeferred[sourceID] != 0 {
 		return true, nil
 	}
-	_, err := c.dispatchQueue.LoadValue(dispatchAccountKey(sourceID))
+	var value cell.Slice
+	err := c.dispatchQueue.LoadValueByBytesKeyInto(sourceID[:], &value)
 	if err == nil {
 		return true, nil
 	}
@@ -715,7 +726,9 @@ func (c *collation) deferGenerated(message *newMessage, sourceID [32]byte) error
 	if accountQueue.Count == maxOutMsgQueueSize {
 		return fmt.Errorf("%w: dispatch account %x count overflow", ErrInvalidInput, sourceID)
 	}
-	inserted, err := accountQueue.Messages.SetWithMode(dispatchLTKey(message.lt), enqueued, cell.DictSetModeAdd)
+	var value cell.Builder
+	enqueued.ToBuilderInto(&value)
+	inserted, err := accountQueue.Messages.SetBuilderByUintKeyWithMode(message.lt, &value, cell.DictSetModeAdd)
 	if err != nil {
 		return fmt.Errorf("defer generated message %x: %w", message.hash, err)
 	}

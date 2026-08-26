@@ -407,12 +407,12 @@ func (a *LocalAcquisition) prewarmDispatchQueue(
 		if selectErr != nil {
 			return fmt.Errorf("dispatch prewarm account %x minimum: %w", source.AccountID, selectErr)
 		}
-		value, selectErr := accountQueue.Messages.LoadValue(dispatchLTKey(lt))
-		if selectErr != nil {
+		var value cell.Slice
+		if selectErr := accountQueue.Messages.LoadValueByUintKeyInto(lt, &value); selectErr != nil {
 			return fmt.Errorf("dispatch prewarm account %x message %d: %w", source.AccountID, lt, selectErr)
 		}
 		var enqueued tlb.EnqueuedMsg
-		if selectErr = loadExactSlice(&enqueued, value); selectErr != nil {
+		if selectErr = loadExactSlice(&enqueued, &value); selectErr != nil {
 			return fmt.Errorf("dispatch prewarm account %x message %d: %w", source.AccountID, lt, selectErr)
 		}
 		if enqueued.EnqueuedLT != lt {
@@ -429,7 +429,7 @@ func (a *LocalAcquisition) prewarmDispatchQueue(
 		}
 		messages = append(messages, message)
 
-		if selectErr = queue.Delete(dispatchAccountKey(source.AccountID)); selectErr != nil {
+		if selectErr = queue.DeleteByBytesKey(source.AccountID[:]); selectErr != nil {
 			return fmt.Errorf("dispatch prewarm remove account %x: %w", source.AccountID, selectErr)
 		}
 	}

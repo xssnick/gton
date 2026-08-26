@@ -48,6 +48,7 @@ const (
 	DefaultMempoolBytesLimit              = 256 << 20
 	DefaultPerAddressLimit                = 256
 	DefaultTTL                            = 10 * time.Minute
+	DefaultIncludedRetryDelay             = 10 * time.Second
 	DefaultAccountRejectRetryDelay        = time.Second
 	DefaultAccountRejectRetryLimit uint32 = 3
 )
@@ -67,6 +68,10 @@ type Config struct {
 	// injected clocks are reclaimed on pool operations so deterministic
 	// clocks do not need wall-time goroutines.
 	TTL time.Duration
+	// IncludedRetryDelay is how long an external accepted into a candidate
+	// stays unavailable while that candidate either reaches the applied chain
+	// or loses. Zero uses ten seconds.
+	IncludedRetryDelay time.Duration
 	// AccountRejectRetryDelay is how long an account-rejected external stays
 	// unavailable before the pool offers it to a collator again. Zero uses one
 	// second.
@@ -93,6 +98,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.TTL <= 0 {
 		c.TTL = DefaultTTL
+	}
+	if c.IncludedRetryDelay <= 0 {
+		c.IncludedRetryDelay = DefaultIncludedRetryDelay
 	}
 	if c.AccountRejectRetryDelay == 0 {
 		c.AccountRejectRetryDelay = DefaultAccountRejectRetryDelay
@@ -143,12 +151,14 @@ type Stats struct {
 	OverflowAddress uint64
 	Expired         uint64
 
-	InvalidDeleted    uint64
-	RejectedDelayed   uint64
-	RejectedRetried   uint64
-	RejectedExhausted uint64
-	RejectedPressure  uint64
-	StaleFeedback     uint64
+	InvalidDeleted      uint64
+	IncludedQuarantined uint64
+	IncludedReleased    uint64
+	RejectedDelayed     uint64
+	RejectedRetried     uint64
+	RejectedExhausted   uint64
+	RejectedPressure    uint64
+	StaleFeedback       uint64
 
 	AppliedRequested uint64
 	AppliedDeleted   uint64

@@ -359,8 +359,9 @@ func TestAccountRejectedDelayedRetriedAndBounded(t *testing.T) {
 	requireEqual(t, st.RejectedExhausted, uint64(1), "exhaustion counted")
 }
 
-func TestIncludedAndSkippedFeedbackStayPooled(t *testing.T) {
-	env := newPoolEnv(t)
+func TestIncludedFeedbackQuarantinesBeforeRetry(t *testing.T) {
+	const quarantine = 10 * time.Second
+	env := newPoolEnv(t, func(c *Config) { c.IncludedRetryDelay = quarantine })
 	env.mustAdd(buildExtMsg(t, 0, testAddr(0x5c), bodyWithTag(1), msgOpts{}), 0)
 
 	selected := env.pool.SelectForBlock(allShard, 1)[0]
@@ -370,6 +371,14 @@ func TestIncludedAndSkippedFeedbackStayPooled(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
+	if next := env.pool.SelectForBlock(allShard, 1); len(next) != 0 {
+		t.Fatalf("included message remained selectable: %d", len(next))
+	}
+	env.clock.advance(quarantine - time.Nanosecond)
+	if next := env.pool.SelectForBlock(allShard, 1); len(next) != 0 {
+		t.Fatalf("included message retried before quarantine elapsed: %d", len(next))
+	}
+	env.clock.advance(time.Nanosecond)
 	next := env.pool.SelectForBlock(allShard, 1)[0]
 	if next.Reference().Generation == selected.Reference().Generation {
 		t.Fatal("completed generation must advance")
@@ -384,7 +393,39 @@ func TestIncludedAndSkippedFeedbackStayPooled(t *testing.T) {
 	if afterSkip.Reference().Generation != next.Reference().Generation {
 		t.Fatal("limit-skipped feedback must not consume a selection generation")
 	}
-	requireEqual(t, env.pool.Stats().Pooled, 1, "retryable outcomes stay pooled")
+	stats := env.pool.Stats()
+	requireEqual(t, stats.Pooled, 1, "retryable outcomes stay pooled")
+	requireEqual(t, stats.IncludedQuarantined, uint64(1), "quarantine counted")
+	requireEqual(t, stats.IncludedReleased, uint64(1), "release counted")
+}
+
+func TestIncludedFeedbackQuarantinesNormalizedVariants(t *testing.T) {
+	const quarantine = 10 * time.Second
+	env := newPoolEnv(t, func(c *Config) { c.IncludedRetryDelay = quarantine })
+	addr := testAddr(0x5e)
+	body := bodyWithTag(1)
+	first := env.mustAdd(buildExtMsg(t, 0, addr, body, msgOpts{importFee: 0}), 0)
+	second := env.mustAdd(buildExtMsg(t, 0, addr, body, msgOpts{importFee: 777}), 0)
+	requireEqual(t, first.HashNorm, second.HashNorm, "normalized variants match")
+
+	selected := env.pool.SelectForBlock(allShard, 1)[0]
+	if err := env.pool.Complete([]ExternalFeedback{{
+		Ref:     selected.Reference(),
+		Outcome: ExternalIncluded,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if retry := env.pool.SelectForBlock(allShard, 0); len(retry) != 0 {
+		t.Fatalf("normalized variants remained selectable: %d", len(retry))
+	}
+
+	env.clock.advance(quarantine)
+	if retry := env.pool.SelectForBlock(allShard, 0); len(retry) != 2 {
+		t.Fatalf("released normalized variants = %d, want two", len(retry))
+	}
+	stats := env.pool.Stats()
+	requireEqual(t, stats.IncludedQuarantined, uint64(2), "both variants quarantined")
+	requireEqual(t, stats.IncludedReleased, uint64(2), "both variants released")
 }
 
 func TestSkippedFeedbackCannotHideConcurrentExecutionResult(t *testing.T) {
@@ -419,6 +460,7 @@ func TestIncludedFeedbackDoesNotResetAccountRejectBudget(t *testing.T) {
 	if err := env.pool.Complete([]ExternalFeedback{{Ref: retry.Reference(), Outcome: ExternalIncluded}}); err != nil {
 		t.Fatal(err)
 	}
+	env.clock.advance(DefaultIncludedRetryDelay)
 	afterIncluded := env.pool.SelectForBlock(allShard, 1)[0]
 	if err := env.pool.Complete([]ExternalFeedback{{Ref: afterIncluded.Reference(), Outcome: ExternalNotAccepted}}); err != nil {
 		t.Fatal(err)
@@ -493,6 +535,28 @@ func TestEraseAppliedByNormalizedHash(t *testing.T) {
 	requireEqual(t, st.AppliedRequested, uint64(1), "applied requested")
 	requireEqual(t, st.AppliedDeleted, uint64(2), "applied deleted")
 	requireEqual(t, len(env.pool.expiry), 0, "expiry records removed")
+}
+
+func TestEraseAppliedRemovesQuarantinedMessageImmediately(t *testing.T) {
+	env := newPoolEnv(t)
+	added := env.mustAdd(buildExtMsg(t, 0, testAddr(0x0e), bodyWithTag(1), msgOpts{}), 0)
+	selected := env.pool.SelectForBlock(allShard, 1)[0]
+	if err := env.pool.Complete([]ExternalFeedback{{
+		Ref:     selected.Reference(),
+		Outcome: ExternalIncluded,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	env.pool.EraseApplied([][32]byte{added.HashNorm})
+	env.clock.advance(DefaultIncludedRetryDelay)
+	if retry := env.pool.SelectForBlock(allShard, 1); len(retry) != 0 {
+		t.Fatalf("applied message returned after quarantine: %d", len(retry))
+	}
+	stats := env.pool.Stats()
+	requireEqual(t, stats.Pooled, 0, "applied quarantined message erased")
+	requireEqual(t, stats.AppliedDeleted, uint64(1), "applied deletion counted")
+	requireEqual(t, stats.IncludedReleased, uint64(0), "erased quarantine not released")
 }
 
 func TestEraseAppliedManyNormalizedVariants(t *testing.T) {

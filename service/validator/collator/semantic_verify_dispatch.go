@@ -26,8 +26,8 @@ type semanticDispatchChange struct {
 func (v *semanticQueueValidation) applyDispatchChanges() error {
 	orders := make(map[[32]byte][]semanticDispatchOrder)
 	changes := make(map[[32]byte]*semanticDispatchChange)
-	for _, hash := range v.inOrder {
-		descriptor := v.in[hash]
+	for _, entry := range v.inOrder {
+		hash, descriptor := entry.hash, entry.descriptor
 		if descriptor.tag != semanticInDeferredFinal && descriptor.tag != semanticInDeferredTransit {
 			continue
 		}
@@ -52,12 +52,12 @@ func (v *semanticQueueValidation) applyDispatchChanges() error {
 		if err != nil {
 			return fmt.Errorf("%w: load deferred source %x: %v", ErrInvalidInput, accountID, err)
 		}
-		value, err := accountQueue.Messages.LoadValueAndDelete(dispatchLTKey(envelope.internal.CreatedLT))
-		if err != nil {
+		var value cell.Slice
+		if err := accountQueue.Messages.LoadValueAndDeleteByUintKeyInto(envelope.internal.CreatedLT, &value); err != nil {
 			return fmt.Errorf("%w: deferred inbound message %x is absent from DispatchQueue", ErrInvalidInput, hash)
 		}
 		var enqueued tlb.EnqueuedMsg
-		if err = loadExactSlice(&enqueued, value); err != nil {
+		if err = loadExactSlice(&enqueued, &value); err != nil {
 			return fmt.Errorf("%w: decode deferred inbound message %x: %v", ErrInvalidInput, hash, err)
 		}
 		withoutEmission := envelope.value
@@ -99,8 +99,8 @@ func (v *semanticQueueValidation) applyDispatchChanges() error {
 		})
 	}
 
-	for _, hash := range v.outOrder {
-		descriptor := v.out[hash]
+	for _, entry := range v.outOrder {
+		hash, descriptor := entry.hash, entry.descriptor
 		if descriptor.tag != semanticOutNewDeferred {
 			continue
 		}
@@ -134,9 +134,11 @@ func (v *semanticQueueValidation) applyDispatchChanges() error {
 		if err != nil {
 			return err
 		}
-		inserted, err := accountQueue.Messages.SetWithMode(
-			dispatchLTKey(envelope.internal.CreatedLT),
-			enqueued,
+		var value cell.Builder
+		enqueued.ToBuilderInto(&value)
+		inserted, err := accountQueue.Messages.SetBuilderByUintKeyWithMode(
+			envelope.internal.CreatedLT,
+			&value,
 			cell.DictSetModeAdd,
 		)
 		if err != nil || !inserted {
@@ -253,8 +255,9 @@ func (v *semanticQueueValidation) verifyDispatchOrder(changes map[[32]byte]*sema
 		return nil
 	}
 
-	for _, hash := range v.inOrder {
-		switch v.in[hash].tag {
+	for _, entry := range v.inOrder {
+		hash, descriptor := entry.hash, entry.descriptor
+		switch descriptor.tag {
 		case semanticInExternal, semanticInDeferredFinal, semanticInDeferredTransit:
 			continue
 		default:
@@ -263,7 +266,7 @@ func (v *semanticQueueValidation) verifyDispatchOrder(changes map[[32]byte]*sema
 			// can postpone until the dispatch queues drain. C++ therefore ands
 			// !is_special_in_msg() into the same gate
 			// (validate-query.cpp:4053-4056, is_special_in_msg at :3901-3904).
-			if v.isMasterSpecial(v.in[hash].root) {
+			if v.isMasterSpecial(descriptor.root) {
 				continue
 			}
 			return fmt.Errorf(
@@ -395,7 +398,10 @@ func dispatchDictionaryBoundary(messages *cell.Dictionary, maximum bool) (uint64
 	if err != nil {
 		return 0, err
 	}
-	loader := key.MustBeginParse()
+	var loader cell.Slice
+	if err = key.BeginParseInto(&loader); err != nil {
+		return 0, err
+	}
 	lt, err := loader.LoadUInt(64)
 	if err != nil || loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
 		return 0, fmt.Errorf("dispatch key is malformed")

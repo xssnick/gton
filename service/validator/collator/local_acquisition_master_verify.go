@@ -3,6 +3,7 @@ package collator
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 
@@ -101,7 +102,8 @@ func loadMasterTopBlockDescrSet(roots []*cell.Cell) (*cell.Dictionary, error) {
 		if result != nil {
 			return nil, fmt.Errorf("%w: candidate has duplicate shard top descriptor sets", ErrInvalidInput)
 		}
-		loader, err := root.BeginParse()
+		var loader cell.Slice
+		err := root.BeginParseInto(&loader)
 		if err != nil {
 			return nil, fmt.Errorf("%w: parse shard top descriptor set: %v", ErrInvalidInput, err)
 		}
@@ -124,12 +126,11 @@ func loadValidationTopBlockDescr(descriptors *cell.Dictionary, block ton.BlockID
 	if descriptors == nil {
 		return nil, fmt.Errorf("%w: candidate has no shard top descriptor set", ErrInvalidInput)
 	}
-	key := cell.BeginCell().
-		MustStoreInt(int64(block.Workchain), 32).
-		MustStoreUInt(uint64(block.Shard), 64).
-		EndCell()
-	value, err := descriptors.LoadValue(key)
-	if err != nil {
+	var key [12]byte
+	binary.BigEndian.PutUint32(key[:4], uint32(block.Workchain))
+	binary.BigEndian.PutUint64(key[4:], uint64(block.Shard))
+	var value cell.Slice
+	if err := descriptors.LoadValueByBytesKeyInto(key[:], &value); err != nil {
 		return nil, fmt.Errorf(
 			"%w: collated TopBlockDescr for %d:%016x is absent",
 			ErrInvalidInput,
@@ -172,7 +173,7 @@ func parseValidationTopBlockDescr(
 	if signatureSet == nil || signatureSet.SignatureCount() == 0 {
 		return nil, fmt.Errorf("TopBlockDescr has empty validator signatures")
 	}
-	proofs, err := validateMasterTopProofChain(envelope.chain, envelope.length)
+	proofs, err := validateMasterTopProofChain(&envelope.chain, envelope.length)
 	if err != nil {
 		return nil, err
 	}

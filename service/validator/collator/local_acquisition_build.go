@@ -436,10 +436,32 @@ func (a *LocalAcquisition) resolveChain(
 			return localResolvedChain{}, fmt.Errorf(
 				"%w: speculative base does not bind the build request", ErrCandidateConflict)
 		}
+		base := clonePreviousBlock(spec.state.block)
+		// The base is normally uncommitted, so its position cannot be pinned and
+		// seeding is banned here. Installing its lineage as branch candidate
+		// nodes lets the cut resolve through CandidateTip — the pipelined
+		// successor's route — instead. When the base is already applied the
+		// lineage is empty and the plain pin-at-cut resolution below is right.
+		queueBase, lineage, err := a.ensureSpeculativeLineageLocked(ctx, managed, base)
+		if err != nil {
+			return localResolvedChain{}, err
+		}
+		if !lineage {
+			return localResolvedChain{
+				previous: []PreviousBlock{base},
+				master:   managed.master,
+			}, nil
+		}
+		tip, err := blockRootKey(base.ID)
+		if err != nil {
+			return localResolvedChain{}, err
+		}
 
 		return localResolvedChain{
-			previous: []PreviousBlock{clonePreviousBlock(spec.state.block)},
-			master:   managed.master,
+			previous:     []PreviousBlock{base},
+			queueBase:    queueBase,
+			candidateTip: &tip,
+			master:       managed.master,
 		}, nil
 	}
 	if pending := request.PreviousPending; pending != nil {
@@ -934,12 +956,20 @@ func (a *LocalAcquisition) recordCandidateLocked(
 	state.queueTip = &queueID
 	if chain.candidateTip == nil {
 		state.queueBase = clonePreviousBlocks(chain.previous)
-	} else {
-		parent, exists := managed.blocks[*chain.candidateTip]
-		if !exists || parent.queueTip == nil {
+	} else if parent, exists := managed.blocks[*chain.candidateTip]; exists {
+		if parent.queueTip == nil {
 			return fmt.Errorf("%w: candidate queue parent is unavailable", ErrAcquisitionNotReady)
 		}
 		state.queueBase = clonePreviousBlocks(parent.queueBase)
+	} else if len(chain.queueBase) != 0 {
+		// An adopted bet's tip is a foreign candidate: its node lives in the
+		// message branch, installed by the speculative lineage, but it was
+		// never recorded here — recordCandidateLocked only ever sees blocks
+		// this node built. The chain carries the lineage's committed root for
+		// exactly this case.
+		state.queueBase = clonePreviousBlocks(chain.queueBase)
+	} else {
+		return fmt.Errorf("%w: candidate queue parent is unavailable", ErrAcquisitionNotReady)
 	}
 	delta, err := a.installCandidateDeltaLocked(
 		managed, chain, derivation.root, built.ID, queueID, derivation.startLT, true, hints,
@@ -1113,7 +1143,7 @@ func parseCandidateBlock(id ton.BlockIDExt, boc []byte) (*cell.Cell, tlb.Block, 
 	if err != nil {
 		return nil, tlb.Block{}, fmt.Errorf("%w: decode candidate BOC: %v", ErrInvalidInput, err)
 	}
-	if !bytes.Equal(root.Hash(), id.RootHash) {
+	if !equalCellHashBytes(root, id.RootHash) {
 		return nil, tlb.Block{}, fmt.Errorf("%w: candidate root differs from its block ID", ErrInvalidInput)
 	}
 	var block tlb.Block
@@ -1242,6 +1272,218 @@ func (a *LocalAcquisition) ensureCandidateBase(
 	}
 
 	return nil
+}
+
+// speculativeLineageCap bounds the parent walk from a bet's base down to the
+// applied frontier. The frontier normally trails the base by the apply lag —
+// two to four blocks — so sixteen is not a tuning knob but a statement that a
+// node further behind than that has no business betting: its bet would be built
+// over a lineage the pool has not confirmed for six-plus seconds.
+const speculativeLineageCap = 16
+
+// ensureSpeculativeLineageLocked makes a bet's base a regular candidate node of
+// the session's message branch, so the bet's acquisition can take the exact
+// same route a pipelined successor takes: CandidateTip into the branch's
+// candidate chain, no pinning of uncommitted positions, no seeding.
+//
+// The base is a foreign candidate — validated by this node, notarized by
+// nobody yet — and so are its recent ancestors. None of them went through
+// recordCandidateLocked, which only ever sees blocks this node built, so the
+// branch has no nodes for them; and their positions are ahead of the pool's
+// applied frontier, so they cannot be pinned either. This walks parents from
+// the base until a block the pool can pin (the applied frontier, tracked for
+// every applied block — foreign ones included — by the validator's apply feed),
+// then installs one candidate node per uncommitted ancestor, bottom-up, each
+// carrying the queue delta derived from its block root. Deltas are O(changes)
+// where the seed this replaces was O(queue): the ban on seeding here is what
+// broke the bet, and the ban is right — a seed walks the whole outbound queue
+// under the session lock that AdvanceConsensusBase needs to open the window.
+//
+// Everything here is idempotent on purpose: the commit of an adopted bet
+// resolves the same chain again, finds every node present, and installs
+// nothing. Failures wrap ErrAcquisitionNotReady — the bet declines exactly as
+// it does today, and the speculative_failed outcome counts it.
+//
+// The second return is the lineage's committed root, for the caller to carry as
+// the chain's queueBase. When the base itself is already applied there is no
+// lineage to build and the caller should resolve the old way; that is the
+// (nil, false) return.
+func (a *LocalAcquisition) ensureSpeculativeLineageLocked(
+	ctx context.Context,
+	managed *localAcquisitionSession,
+	base PreviousBlock,
+) ([]PreviousBlock, bool, error) {
+	source := targetShardIdent(groups.ShardID{Workchain: base.ID.Workchain, Shard: base.ID.Shard})
+
+	type lineageLink struct {
+		block   PreviousBlock
+		key     [32]byte
+		ref     msgpool.SourceRef
+		startLT uint64
+	}
+	pin := func(id ton.BlockIDExt) (bool, error) {
+		ref, err := localSourceRef(id)
+		if err != nil {
+			return false, err
+		}
+		pinErr := managed.branch.PinSource(source, ref)
+		if pinErr == nil {
+			return true, nil
+		}
+		if !errors.Is(pinErr, msgpool.ErrCutNotReady) {
+			// ErrCutStale means another fork or a history floor; anything else
+			// is a real fault. Neither is a lineage this bet may build on.
+			return false, fmt.Errorf("%w: speculative lineage anchor: %v", ErrAcquisitionNotReady, pinErr)
+		}
+		return false, nil
+	}
+
+	var links []lineageLink
+	currentID := base.ID
+	currentBlock := &base
+	var root PreviousBlock
+	// lowestParent is set when the walk stops at a node the branch already
+	// holds: the lowest new link then hangs from it by Parent, because a
+	// Base-form insert would re-root a chain whose lower half already exists.
+	var lowestParent *[32]byte
+	uncommitted := false
+	for {
+		pinned, err := pin(currentID)
+		if err != nil {
+			return nil, false, err
+		}
+		if pinned {
+			// The lineage roots here: at or behind the applied frontier, and
+			// the pin this probe just took is the one the candidate base
+			// snapshot needs anyway. Only the identity matters downstream —
+			// queueBase travels as CandidateSource idents — so the block body
+			// is deliberately never loaded for it.
+			root = PreviousBlock{ID: cloneBlockID(currentID)}
+			break
+		}
+		uncommitted = true
+		if len(links) == speculativeLineageCap {
+			return nil, false, fmt.Errorf(
+				"%w: speculative lineage runs more than %d blocks past the applied frontier",
+				ErrAcquisitionNotReady, speculativeLineageCap)
+		}
+		// Above the frontier: this block must become (or already be) a
+		// candidate node, and only now is its body worth resolving.
+		if currentBlock == nil {
+			resolved, _, resolveErr := a.resolveBlock(ctx, managed, currentID)
+			if resolveErr != nil {
+				return nil, false, fmt.Errorf("%w: resolve speculative lineage block %d: %v",
+					ErrAcquisitionNotReady, currentID.SeqNo, resolveErr)
+			}
+			currentBlock = &resolved
+		}
+		key, err := blockRootKey(currentID)
+		if err != nil {
+			return nil, false, err
+		}
+		ref, err := localSourceRef(currentID)
+		if err != nil {
+			return nil, false, err
+		}
+		exists := managed.branch.HasCandidate(key)
+		parentID, startLT, err := shardParentBlockID(currentID, currentBlock.Block)
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: speculative lineage parent of %d: %v",
+				ErrAcquisitionNotReady, currentID.SeqNo, err)
+		}
+		if !exists {
+			links = append(links, lineageLink{block: *currentBlock, key: key, ref: ref, startLT: startLT})
+		}
+		if exists {
+			existing := key
+			lowestParent = &existing
+			// The node is already in the branch, and a branch node keeps its
+			// parent by pointer, so everything below is already connected. The
+			// walk continues down only to name the committed root for
+			// queueBase; it resolves and installs nothing further.
+			for {
+				pinned, err = pin(parentID)
+				if err != nil {
+					return nil, false, err
+				}
+				if pinned {
+					root = PreviousBlock{ID: cloneBlockID(parentID)}
+					break
+				}
+				parentBlock, _, resolveErr := a.resolveBlock(ctx, managed, parentID)
+				if resolveErr != nil {
+					return nil, false, fmt.Errorf("%w: resolve speculative lineage block %d: %v",
+						ErrAcquisitionNotReady, parentID.SeqNo, resolveErr)
+				}
+				if parentID, _, err = shardParentBlockID(parentBlock.ID, parentBlock.Block); err != nil {
+					return nil, false, fmt.Errorf("%w: speculative lineage parent of %d: %v",
+						ErrAcquisitionNotReady, parentBlock.ID.SeqNo, err)
+				}
+			}
+			break
+		}
+		currentID = parentID
+		currentBlock = nil
+	}
+
+	if !uncommitted {
+		// The base itself is applied: nothing to install, and the ordinary
+		// pin-at-cut path serves this bet as it stands.
+		return nil, false, nil
+	}
+	for i := len(links) - 1; i >= 0; i-- {
+		link := links[i]
+		delta, err := managed.branch.DeltaFromBlockRoot(source, link.ref, link.block.Block, link.startLT)
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: derive speculative lineage delta %d: %v",
+				ErrAcquisitionNotReady, link.block.ID.SeqNo, err)
+		}
+		request := msgpool.CandidateRequest{ID: link.key, Seqno: link.block.ID.SeqNo, Delta: delta}
+		switch {
+		case i == len(links)-1 && lowestParent != nil:
+			request.Parent = lowestParent
+		case i == len(links)-1:
+			request.Base = candidateSources([]PreviousBlock{root})
+		default:
+			parent := links[i+1].key
+			request.Parent = &parent
+		}
+		if err = managed.branch.AddCandidate(request); err != nil {
+			return nil, false, fmt.Errorf("%w: install speculative lineage node %d: %v",
+				ErrAcquisitionNotReady, link.block.ID.SeqNo, err)
+		}
+	}
+
+	return []PreviousBlock{root}, true, nil
+}
+
+// shardParentBlockID reads a shard block's single parent out of its header.
+// Split and merge boundaries are refused: a bet across a reshard would need
+// the two-parent forms, and a reshard is precisely when a bet's guess about
+// the next window's base is worthless anyway.
+func shardParentBlockID(id ton.BlockIDExt, root *cell.Cell) (ton.BlockIDExt, uint64, error) {
+	var block tlb.Block
+	if err := parseExact(&block, root); err != nil {
+		return ton.BlockIDExt{}, 0, fmt.Errorf("decode block header: %w", err)
+	}
+	info := block.BlockInfo
+	if info.PrevRef.Pruned {
+		return ton.BlockIDExt{}, 0, errors.New("parent references are pruned")
+	}
+	if info.AfterMerge || info.AfterSplit || info.PrevRef.Prev2 != nil {
+		return ton.BlockIDExt{}, 0, errors.New("parent is across a split or merge boundary")
+	}
+	if id.SeqNo == 0 || info.PrevRef.Prev1.SeqNo != id.SeqNo-1 {
+		return ton.BlockIDExt{}, 0, errors.New("parent reference does not precede the block")
+	}
+
+	return ton.BlockIDExt{
+		Workchain: id.Workchain,
+		Shard:     id.Shard,
+		SeqNo:     info.PrevRef.Prev1.SeqNo,
+		RootHash:  append([]byte(nil), info.PrevRef.Prev1.RootHash...),
+		FileHash:  append([]byte(nil), info.PrevRef.Prev1.FileHash...),
+	}, info.StartLt, nil
 }
 
 func uint64Pointer(value uint64) *uint64 {

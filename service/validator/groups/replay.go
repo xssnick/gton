@@ -403,8 +403,7 @@ func indexBufferedMasterchainStates(
 		}
 
 		key := replayKey(state.Block)
-		var stateRoot [32]byte
-		copy(stateRoot[:], state.Root.Hash())
+		stateRoot := [32]byte(state.Root.HashKey())
 		if existing, exists := indexed[key]; exists {
 			if stateRoots[key] != stateRoot || !storage.SameBlockIDs(existing.PrevRefs, state.PrevRefs) {
 				return nil, nil, fmt.Errorf(

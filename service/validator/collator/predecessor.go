@@ -506,20 +506,20 @@ func filterOutQueue(queue *tlb.OutMsgQueueAugDict, owner, target tlb.ShardIdent)
 }
 
 func queuedCurrentPrefix(value *cell.Slice, key *cell.Cell) (msgpool.AccountPrefix, error) {
-	keyLoader, err := key.BeginParse()
-	if err != nil {
-		return msgpool.AccountPrefix{}, err
-	}
-	keyBits, err := keyLoader.LoadSlice(352)
+	var keyLoader cell.Slice
+	err := key.BeginParseInto(&keyLoader)
 	if err != nil {
 		return msgpool.AccountPrefix{}, err
 	}
 	var queueKey msgpool.QueueKey
-	copy(queueKey[:], keyBits)
+	if err = keyLoader.LoadSliceInto(queueKey[:], 352); err != nil {
+		return msgpool.AccountPrefix{}, err
+	}
 
 	// Filter hands out the live value slice; the decode consumes it, so the
 	// copy is the ownership boundary rather than a defensive clone.
-	entry, err := parseQueueEntry(value.Copy(), queueKey)
+	valueCopy := *value
+	entry, err := parseQueueEntry(&valueCopy, queueKey)
 	if err != nil {
 		return msgpool.AccountPrefix{}, err
 	}

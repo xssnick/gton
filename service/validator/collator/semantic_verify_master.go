@@ -80,8 +80,8 @@ func (r *semanticReplay) loadSemanticMessageOrder() (
 	processed := r.messageProcessing
 	var emitted []semanticMessageEmission
 
-	for _, hash := range r.parsedInOrder {
-		descriptor := r.parsedIn[hash]
+	for _, entry := range r.parsedInOrder {
+		hash, descriptor := entry.hash, entry.descriptor
 		if err := r.ctx.Err(); err != nil {
 			return nil, nil, err
 		}
@@ -98,8 +98,8 @@ func (r *semanticReplay) loadSemanticMessageOrder() (
 		}
 	}
 
-	for _, hash := range r.parsedOutOrder {
-		descriptor := r.parsedOut[hash]
+	for _, entry := range r.parsedOutOrder {
+		hash, descriptor := entry.hash, entry.descriptor
 		if err := r.ctx.Err(); err != nil {
 			return nil, nil, err
 		}
@@ -346,7 +346,8 @@ func (r *semanticReplay) verifyMasterSpecialMessages() error {
 // accepts transit constructors, which carry no transaction, and every caller
 // here dereferences the transaction reference.
 func semanticSpecialImportDescriptor(name string, root *cell.Cell) (*cell.Cell, *cell.Cell, error) {
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: parse %s descriptor: %v", ErrInvalidInput, name, err)
 	}
@@ -354,11 +355,11 @@ func semanticSpecialImportDescriptor(name string, root *cell.Cell) (*cell.Cell, 
 	if err != nil || tag != semanticInImmediate {
 		return nil, nil, fmt.Errorf("%w: %s descriptor is not msg_import_imm", ErrInvalidInput, name)
 	}
-	envelopeRoot, transactionRoot, err := semanticLoadTwoRefs(loader)
+	envelopeRoot, transactionRoot, err := semanticLoadTwoRefs(&loader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: decode %s descriptor references: %v", ErrInvalidInput, name, err)
 	}
-	fee, err := semanticLoadCoins(loader)
+	fee, err := semanticLoadCoins(&loader)
 	if err != nil || !fee.IsZero() || loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
 		return nil, nil, fmt.Errorf("%w: %s descriptor has a non-zero fee or trailing data", ErrInvalidInput, name)
 	}
@@ -419,7 +420,7 @@ func (r *semanticReplay) verifyMasterSpecialMessage(
 	if _, consumed := r.consumedIn[messageHash]; !consumed {
 		return fmt.Errorf("%w: %s message is not processed by an account transaction", ErrInvalidInput, name)
 	}
-	if _, special := r.specialTxs[transactionRoot.HashKey()]; !special {
+	if !r.specialTxs.contains(transactionRoot.HashKey()) {
 		return fmt.Errorf("%w: %s transaction is not registered as special", ErrInvalidInput, name)
 	}
 
@@ -502,10 +503,11 @@ func verifyMasterSpecialEnvelope(
 }
 
 func (r *semanticReplay) verifyMasterPublicLibraries() error {
-	previousStats, err := r.masterPredecessorStats()
-	if err != nil {
-		return err
+	prepared := r.transition.prepared
+	if prepared == nil || prepared.previousStats == nil {
+		return fmt.Errorf("%w: masterchain predecessor statistics are absent", ErrInvalidInput)
 	}
+	previousStats := prepared.previousStats
 	// The dictionary is shared with the structural pass now, and this function
 	// mutates it through addLibraryPublisher/removeLibraryPublisher, so the copy
 	// below is what keeps that sharing safe.

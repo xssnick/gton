@@ -53,15 +53,16 @@ func SupportedSoftware() tlb.GlobalVersion {
 }
 
 type collation struct {
-	// waves is the inbound-internal wave loop's reusable state: the plan arena,
-	// the wave map and the worker pool, built once per collation instead of once
-	// per wave.
-	waves         waveState
-	externalWaves externalWaveState
+	// Wave state owns the reusable plan arenas, dependency indexes and worker
+	// pools for inbound internals, externals and generated messages.
+	waves          waveState
+	externalWaves  externalWaveState
+	generatedWaves generatedWaveState
 	// outboundVisited is recordOutboundMessageReads' dedup set, kept across the
 	// messages of a collation rather than allocated per message. Only the retire
 	// goroutine walks emitted messages, so one scratch set serves them all.
-	outboundVisited map[cell.Hash]struct{}
+	outboundVisited       map[cell.Hash]struct{}
+	outboundSafetyVisited map[*cell.Cell]struct{}
 
 	ctx      context.Context
 	builder  *Builder
@@ -113,19 +114,24 @@ type collation struct {
 	accountMutationDiff *cell.AugmentedDictionaryDiff
 	oldOutQueue         *tlb.OutMsgQueueAugDict
 	outQueue            *tlb.OutMsgQueueAugDict
-	// queuePendingDelete holds out-queue removals not yet applied; they are
-	// flushed together before each root sample and at finish.
-	queuePendingDelete  []*cell.Cell
-	queuePendingSet     map[msgpool.QueueKey]struct{}
-	processed           *cell.Dictionary
-	processedMinMC      uint32
-	inMessages          *tlb.InMsgDescrAugDict
-	outMessages         *tlb.OutMsgDescrAugDict
-	accountBlocks       *tlb.ShardAccountBlocksAugDict
-	oldDispatchQueue    *tlb.DispatchQueueAugDict
-	oldDispatchAccounts map[[32]byte]*tlb.AccountDispatchQueue
-	dispatchQueue       *tlb.DispatchQueueAugDict
-	dispatchChanged     map[[32]byte]struct{}
+	// Queue mutations are accumulated by kind. Switching from adds to deletes
+	// or back flushes the older kind first, so observation order stays the same
+	// as the former per-entry mutations while runs of one kind share a descent.
+	queuePendingAdd         []queuePendingAdd
+	queuePendingAddEntries  []cell.AugmentedBytesEntry
+	queuePendingAddSet      map[msgpool.QueueKey]struct{}
+	queuePendingDelete      []msgpool.QueueKey
+	queuePendingDeleteViews [][]byte
+	queuePendingDeleteSet   map[msgpool.QueueKey]struct{}
+	processed               *cell.Dictionary
+	processedMinMC          uint32
+	inMessages              *tlb.InMsgDescrAugDict
+	outMessages             *tlb.OutMsgDescrAugDict
+	accountBlocks           *tlb.ShardAccountBlocksAugDict
+	oldDispatchQueue        *tlb.DispatchQueueAugDict
+	oldDispatchAccounts     map[[32]byte]*tlb.AccountDispatchQueue
+	dispatchQueue           *tlb.DispatchQueueAugDict
+	dispatchChanged         map[[32]byte]struct{}
 
 	lanes map[[32]byte]*accountLane
 	// accountStorageProofs holds one traced storage-stat proof builder per
@@ -204,6 +210,116 @@ type collation struct {
 	// paths, so they are collected here and replayed into the proof closure
 	// once the block is built. Only full collated data needs them.
 	immediateQueueKeys []msgpool.QueueKey
+}
+
+// collationInit is the common mutable working set prepared by the shard and
+// masterchain entry points. Chain-specific validation stays with those entry
+// points; this value only carries inputs whose ownership and initialization are
+// identical once the predecessor has been accepted.
+type collationInit struct {
+	ctx      context.Context
+	builder  *Builder
+	request  collationRequest
+	header   tlb.BlockHeader
+	shard    msgpool.ShardIdent
+	topology shardTopology
+	config   *Config
+	master   *masterCollation
+
+	usage               *cell.ReadSet
+	oldRoot             *cell.Cell
+	oldState            tlb.ShardStateUnsplit
+	oldStats            tlb.ShardStateStats
+	accountSources      [2]predecessorAccountSource
+	dispatchSources     [2]predecessorDispatchSource
+	dispatchSourceCount int
+	blockCtx            *tvm.BlockContext
+	limits              *blockLimitStatus
+	hardLTDelta         uint64
+	queueInfo           tlb.OutMsgQueueInfo
+	queueSize           uint64
+	dispatchQueue       *tlb.DispatchQueueAugDict
+	processedRecords    []tlb.ProcessedUptoRecord
+	processedMinMC      uint32
+
+	fullCollated          bool
+	collatedProofEstimate *proofSizeEstimator
+}
+
+// newCollation establishes the non-nil dictionaries and scratch state shared
+// by both chain variants. Copies here are ownership boundaries: old and mutable
+// queue roots must remain independent while the candidate is assembled.
+func newCollation(init *collationInit) (*collation, error) {
+	accounts := &tlb.ShardAccountsAugDict{
+		AugmentedDictionary: init.oldState.Accounts.ShardAccounts.Copy(),
+	}
+	oldOutQueue := &tlb.OutMsgQueueAugDict{
+		AugmentedDictionary: init.queueInfo.OutQueue.Copy(),
+	}
+	outQueue := &tlb.OutMsgQueueAugDict{
+		AugmentedDictionary: init.queueInfo.OutQueue.Copy(),
+	}
+	inMessages, err := tlb.NewInMsgDescrAugDict(init.config.globalVersion)
+	if err != nil {
+		return nil, err
+	}
+	outMessages, err := tlb.NewOutMsgDescrAugDict(init.config.globalVersion)
+	if err != nil {
+		return nil, err
+	}
+	accountBlocks, err := tlb.NewShardAccountBlocksAugDict()
+	if err != nil {
+		return nil, err
+	}
+
+	c := &collation{
+		ctx:                 init.ctx,
+		builder:             init.builder,
+		req:                 init.request,
+		header:              init.header,
+		shard:               init.shard,
+		topology:            init.topology,
+		config:              init.config,
+		master:              init.master,
+		usage:               init.usage,
+		shardEndLT:          newShardEndLTResolver(init.request.neighborShardEndLT),
+		oldRoot:             init.oldRoot,
+		oldState:            init.oldState,
+		oldStats:            init.oldStats,
+		accountSources:      init.accountSources,
+		dispatchSources:     init.dispatchSources,
+		dispatchSourceCount: init.dispatchSourceCount,
+		blockCtx:            init.blockCtx,
+		limits:              init.limits,
+		hardLTDelta:         init.hardLTDelta,
+		queueSize:           init.queueSize,
+		oldQueueSize:        init.queueSize,
+		accounts:            accounts,
+		oldOutQueue:         oldOutQueue,
+		outQueue:            outQueue,
+		processed:           init.queueInfo.ProcInfo,
+		processedMinMC:      init.processedMinMC,
+		processedRecords:    init.processedRecords,
+		processedParsed:     true,
+		inMessages:          inMessages,
+		outMessages:         outMessages,
+		accountBlocks:       accountBlocks,
+		oldDispatchQueue: &tlb.DispatchQueueAugDict{
+			AugmentedDictionary: init.dispatchQueue.Copy(),
+		},
+		dispatchQueue:         init.dispatchQueue,
+		lanes:                 make(map[[32]byte]*accountLane),
+		senderGenerated:       make(map[[32]byte]uint32),
+		lastDispatchEmitted:   make(map[[32]byte]uint64),
+		unprocessedDeferred:   make(map[[32]byte]uint32),
+		maxLT:                 init.header.StartLt + 1,
+		externals:             make([]msgpool.ExternalFeedback, 0, len(init.request.externals)),
+		fullCollated:          init.fullCollated,
+		collatedProofEstimate: init.collatedProofEstimate,
+	}
+	c.prepareAccountPathRecorder()
+
+	return c, nil
 }
 
 // BuildShard constructs a shardchain candidate from selected external and
@@ -416,7 +532,7 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 	fullCollated := req.Masterchain.Config.capabilities&capFullCollatedData != 0
 	var collatedProofEstimate *proofSizeEstimator
 	if fullCollated {
-		// The estimator and the callback are one unit: every insert into the
+		// The estimator and its callbacks are one unit: every insert into the
 		// read record has to report to this estimator, because the collated
 		// proof is selected from what the estimator was told. An estimator
 		// opened without the callback would silently lose those hashes from the
@@ -424,6 +540,7 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 		// still verifies locally. collated_proof_selection_test.go pins it.
 		collatedProofEstimate = newProofSizeEstimator(b.readSetHint())
 		usage.SetRecordCallback(collatedProofEstimate.addLoadedCell)
+		usage.SetRecordManyCallback(collatedProofEstimate.addLoadedCells)
 	}
 	predecessor, err := preparePredecessor(req, usage)
 	if err != nil {
@@ -520,70 +637,35 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 		return nil, err
 	}
 
-	accounts := &tlb.ShardAccountsAugDict{AugmentedDictionary: oldState.Accounts.ShardAccounts.Copy()}
-	outQueue := &tlb.OutMsgQueueAugDict{AugmentedDictionary: queueInfo.OutQueue.Copy()}
-	inMessages, err := tlb.NewInMsgDescrAugDict(req.Masterchain.Config.globalVersion)
-	if err != nil {
-		return nil, err
-	}
-	outMessages, err := tlb.NewOutMsgDescrAugDict(req.Masterchain.Config.globalVersion)
-	if err != nil {
-		return nil, err
-	}
-	accountBlocks, err := tlb.NewShardAccountBlocksAugDict()
-	if err != nil {
-		return nil, err
-	}
-
-	maxLT := header.StartLt + 1
-
-	c := &collation{
-		ctx:                 ctx,
-		builder:             b,
-		req:                 shardCollationRequest(req),
-		header:              header,
-		shard:               owner,
-		topology:            predecessor.topology,
-		config:              req.Masterchain.Config,
-		usage:               usage,
-		shardEndLT:          newShardEndLTResolver(req.NeighborShardEndLT),
-		oldRoot:             oldRoot,
-		oldState:            oldState,
-		oldStats:            oldStats,
-		accountSources:      predecessor.accountSources,
-		dispatchSources:     predecessor.dispatchSources,
-		dispatchSourceCount: predecessor.dispatchSourceCount,
-		blockCtx:            blockCtx,
-		limits:              newBlockLimitStatus(limits, header.StartLt, usage, storageCells, storageProofCells),
-		hardLTDelta:         hardLTDelta,
-		queueSize:           queueSize,
-		oldQueueSize:        queueSize,
-		accounts:            accounts,
-		oldOutQueue: &tlb.OutMsgQueueAugDict{
-			AugmentedDictionary: queueInfo.OutQueue.Copy(),
-		},
-		outQueue:         outQueue,
-		processed:        queueInfo.ProcInfo,
-		processedMinMC:   processedMinMC,
-		processedRecords: processedRecords,
-		processedParsed:  true,
-		inMessages:       inMessages,
-		outMessages:      outMessages,
-		accountBlocks:    accountBlocks,
-		oldDispatchQueue: &tlb.DispatchQueueAugDict{
-			AugmentedDictionary: dispatchQueue.Copy(),
-		},
+	c, err := newCollation(&collationInit{
+		ctx:                   ctx,
+		builder:               b,
+		request:               shardCollationRequest(req),
+		header:                header,
+		shard:                 owner,
+		topology:              predecessor.topology,
+		config:                req.Masterchain.Config,
+		usage:                 usage,
+		oldRoot:               oldRoot,
+		oldState:              oldState,
+		oldStats:              oldStats,
+		accountSources:        predecessor.accountSources,
+		dispatchSources:       predecessor.dispatchSources,
+		dispatchSourceCount:   predecessor.dispatchSourceCount,
+		blockCtx:              blockCtx,
+		limits:                newBlockLimitStatus(limits, header.StartLt, usage, storageCells, storageProofCells),
+		hardLTDelta:           hardLTDelta,
+		queueInfo:             queueInfo,
+		queueSize:             queueSize,
 		dispatchQueue:         dispatchQueue,
-		lanes:                 make(map[[32]byte]*accountLane),
-		senderGenerated:       make(map[[32]byte]uint32),
-		lastDispatchEmitted:   make(map[[32]byte]uint64),
-		unprocessedDeferred:   make(map[[32]byte]uint32),
-		maxLT:                 maxLT,
-		externals:             make([]msgpool.ExternalFeedback, 0, len(req.Externals)),
+		processedRecords:      processedRecords,
+		processedMinMC:        processedMinMC,
 		fullCollated:          fullCollated,
 		collatedProofEstimate: collatedProofEstimate,
+	})
+	if err != nil {
+		return nil, err
 	}
-	c.prepareAccountPathRecorder()
 	if fullCollated {
 		if err = c.prepareFullCollatedProofs(); err != nil {
 			return nil, err
@@ -592,7 +674,7 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 		for i := 0; i < c.previousCount(); i++ {
 			previous := c.previousAt(i)
 			if previous.ID.SeqNo == 0 {
-				if !bytes.Equal(previous.ID.RootHash, previous.State.WithoutTrace().Hash()) {
+				if !equalCellHashBytes(previous.State.WithoutTrace(), previous.ID.RootHash) {
 					return nil, fmt.Errorf("%w: previous zerostate root differs from its block id", ErrInvalidInput)
 				}
 				continue
@@ -1615,7 +1697,7 @@ func (c *collation) buildPreviousBlockStateProof(previous *PreviousBlock) (*cell
 	if blockRoot == nil {
 		return nil, fmt.Errorf("%w: full collated data requires the previous block root", ErrInvalidInput)
 	}
-	if !bytes.Equal(blockRoot.Hash(), previous.ID.RootHash) {
+	if !equalCellHashBytes(blockRoot, previous.ID.RootHash) {
 		return nil, fmt.Errorf("%w: previous block root differs from its block id", ErrInvalidInput)
 	}
 
@@ -1636,7 +1718,8 @@ func (c *collation) buildPreviousBlockStateProof(previous *PreviousBlock) (*cell
 	}
 
 	usage := cell.NewReadSet(blockRoot.WithoutTrace())
-	loader, err := usage.Root().BeginParse()
+	var loader cell.Slice
+	err := usage.Root().BeginParseInto(&loader)
 	if err != nil {
 		return nil, fmt.Errorf("build previous block proof: %w", err)
 	}
@@ -1659,7 +1742,8 @@ func (c *collation) buildPreviousBlockStateProof(previous *PreviousBlock) (*cell
 	if loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
 		return nil, fmt.Errorf("%w: previous block has trailing data", ErrInvalidInput)
 	}
-	if _, err = stateUpdate.BeginParse(); err != nil {
+	var updateLoader cell.Slice
+	if err = stateUpdate.BeginParseInto(&updateLoader); err != nil {
 		return nil, fmt.Errorf("load previous state update for proof: %w", err)
 	}
 

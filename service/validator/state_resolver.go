@@ -953,7 +953,10 @@ func (r *stateResolver) loadFinalizedChainState(
 }
 
 func candidateGenUtime(collatedData []byte) (time.Time, error) {
-	roots, err := cell.FromBOCMultiRoot(collatedData)
+	roots, err := cell.FromBOCMultiRootWithOptions(
+		collatedData,
+		cell.BOCParseOptions{NoCopyPayload: true},
+	)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("validator runtime: decode collated data time: %w", err)
 	}
@@ -967,7 +970,8 @@ func candidateGenUtime(collatedData []byte) (time.Time, error) {
 
 func candidateGenUtimeMSFromRoots(roots []*cell.Cell) (uint64, error) {
 	for _, root := range roots {
-		loader, loadErr := root.BeginParse()
+		var loader cell.Slice
+		loadErr := root.BeginParseInto(&loader)
 		if loadErr != nil || loader.BitsLeft() < 128 {
 			continue
 		}

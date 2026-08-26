@@ -44,8 +44,8 @@ func (v *semanticQueueValidation) verifyProcessedInfo() error {
 			return err
 		}
 	}
-	for _, hash := range v.inOrder {
-		descriptor := v.in[hash]
+	for _, entry := range v.inOrder {
+		hash, descriptor := entry.hash, entry.descriptor
 		if descriptor.tag != semanticInFinal && descriptor.tag != semanticInTransit {
 			continue
 		}

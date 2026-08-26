@@ -10,8 +10,8 @@ import (
 )
 
 func (v *semanticQueueValidation) applyOutQueueChanges() error {
-	for _, hash := range v.outOrder {
-		descriptor := v.out[hash]
+	for _, entry := range v.outOrder {
+		hash, descriptor := entry.hash, entry.descriptor
 		if err := v.replay.ctx.Err(); err != nil {
 			return err
 		}
@@ -292,16 +292,12 @@ func semanticOptionalLTEqual(left, right *uint64) bool {
 
 func (v *semanticQueueValidation) enqueue(envelope *semanticEnvelope) error {
 	key := msgpool.MakeQueueKey(envelope.next, envelope.message.HashKey())
-	keyCell := cell.BeginCell().MustStoreSlice(key[:], 352).EndCell()
-	value, extra, err := v.candidate.OutQueue.LoadValueExtra(keyCell)
-	if err != nil {
+	var value, extra cell.Slice
+	if err := v.candidate.OutQueue.LoadValueExtraByBytesKeyInto(key[:], &value, &extra); err != nil {
 		return fmt.Errorf("%w: outbound queue has no new message leaf", ErrInvalidInput)
 	}
-	raw, err := value.ToCell()
-	if err != nil {
-		return fmt.Errorf("%w: materialize new outbound queue leaf: %v", ErrInvalidInput, err)
-	}
-	entry, err := parseSemanticQueueEntry(keyCell, value, extra)
+	rawValue := value
+	entry, err := parseSemanticQueueEntryKeyWithMode(key, &value, &extra, false, semanticQueueLeafCells{}, &v.replay.envelopes)
 	if err != nil {
 		return err
 	}
@@ -327,7 +323,9 @@ func (v *semanticQueueValidation) enqueue(envelope *semanticEnvelope) error {
 	// dequeue only accepts entries enqueued before StartLt, so no key is both
 	// added and removed by one block. The collator guards the mirror hazard on
 	// its side with queueDeletePending.
-	inserted, err := v.outQueue.SetWithMode(keyCell, raw, cell.DictSetModeAdd)
+	var queueValue cell.Builder
+	rawValue.ToBuilderInto(&queueValue)
+	inserted, err := v.outQueue.SetBuilderByBytesKeyWithMode(key[:], &queueValue, cell.DictSetModeAdd)
 	if err != nil {
 		return err
 	}
@@ -354,12 +352,11 @@ func (v *semanticQueueValidation) dequeue(
 	envelopeHash cell.Hash,
 ) (semanticQueueEntry, error) {
 	key := msgpool.MakeQueueKey(next, hash)
-	keyCell := cell.BeginCell().MustStoreSlice(key[:], 352).EndCell()
-	value, err := v.outQueue.LoadValueAndDelete(keyCell)
-	if err != nil {
+	var value cell.Slice
+	if err := v.outQueue.LoadValueAndDeleteByBytesKeyInto(key[:], &value); err != nil {
 		return semanticQueueEntry{}, fmt.Errorf("%w: outbound queue entry is absent", ErrInvalidInput)
 	}
-	entry, err := parseSemanticQueueEntry(keyCell, value, nil)
+	entry, err := parseSemanticQueueEntryKeyWithMode(key, &value, nil, false, semanticQueueLeafCells{}, &v.replay.envelopes)
 	if err != nil {
 		return semanticQueueEntry{}, err
 	}
@@ -379,13 +376,13 @@ func (v *semanticQueueValidation) dequeue(
 
 func (v *semanticQueueValidation) requireQueueAbsent(envelope *semanticEnvelope) error {
 	key := msgpool.MakeQueueKey(envelope.next, envelope.message.HashKey())
-	keyCell := cell.BeginCell().MustStoreSlice(key[:], 352).EndCell()
-	if _, err := v.old.OutQueue.LoadValue(keyCell); err == nil {
+	var value cell.Slice
+	if err := v.old.OutQueue.LoadValueByBytesKeyInto(key[:], &value); err == nil {
 		return fmt.Errorf("%w: message exists in predecessor outbound queue", ErrInvalidInput)
 	} else if !isMissingKey(err) {
 		return err
 	}
-	if _, err := v.candidate.OutQueue.LoadValue(keyCell); err == nil {
+	if err := v.candidate.OutQueue.LoadValueByBytesKeyInto(key[:], &value); err == nil {
 		return fmt.Errorf("%w: message exists in candidate outbound queue", ErrInvalidInput)
 	} else if !isMissingKey(err) {
 		return err

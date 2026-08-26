@@ -115,6 +115,16 @@ type semanticQueueEntry struct {
 	descr    tlb.ProcessedMsgDescr
 }
 
+type semanticInDescriptorEntry struct {
+	hash       cell.Hash
+	descriptor *semanticInDescriptor
+}
+
+type semanticOutDescriptorEntry struct {
+	hash       cell.Hash
+	descriptor *semanticOutDescriptor
+}
+
 type semanticQueueValidation struct {
 	replay *semanticReplay
 	target msgpool.ShardIdent
@@ -134,8 +144,8 @@ type semanticQueueValidation struct {
 	// two validators rejecting the same block report the same reason -- the same
 	// property mergeAccountLanes goes serial to get. The maps stay for the point
 	// lookups in verifyReimport and verifyTransitRewrite.
-	inOrder  []cell.Hash
-	outOrder []cell.Hash
+	inOrder  []semanticInDescriptorEntry
+	outOrder []semanticOutDescriptorEntry
 
 	processedMax     semanticMessageBound
 	minimumEnqueued  semanticMessageBound
@@ -173,25 +183,35 @@ func (r *semanticReplay) prepareQueueValidation() (*semanticQueueValidation, err
 // descriptor replay and validates both changed EnqueuedMsg values. The final
 // root comparison alone cannot detect a pruned cell required by that pass.
 func (v *semanticQueueValidation) precheckOutQueueUpdate() error {
-	err := v.old.OutQueue.ScanDiff(v.candidate.OutQueue.AugmentedDictionary, true, func(
-		keyCell *cell.Cell,
-		oldValueExtra, newValueExtra *cell.Slice,
-	) error {
-		for _, valueExtra := range []*cell.Slice{oldValueExtra, newValueExtra} {
-			if valueExtra == nil {
+	err := v.old.OutQueue.ScanDiffRaw(v.candidate.OutQueue.AugmentedDictionary, true, func(view cell.AugDictDiffRawView) error {
+		var key msgpool.QueueKey
+		if view.KeyBits != 352 || len(view.Key) != len(key) {
+			return fmt.Errorf("%w: outbound queue key is malformed", ErrInvalidInput)
+		}
+		copy(key[:], view.Key)
+
+		for side := 0; side < 2; side++ {
+			hasValue := view.HasOld
+			valueExtra := view.OldValueExtra
+			if side == 1 {
+				hasValue = view.HasNew
+				valueExtra = view.NewValueExtra
+			}
+			if !hasValue {
 				continue
 			}
-			value := valueExtra.Copy()
-			if err := (tlb.AugOutMsgQueue{}).SkipExtra(value); err != nil {
+			value := valueExtra
+			if err := (tlb.AugOutMsgQueue{}).SkipExtra(&value); err != nil {
 				return fmt.Errorf("%w: decode outbound queue augmentation: %v", ErrInvalidInput, err)
 			}
-			entry, err := parseSemanticQueueEntry(keyCell, value, nil)
+			entry, err := parseSemanticQueueEntryKeyWithMode(key, &value, nil, false, semanticQueueLeafCells{}, &v.replay.envelopes)
 			if err != nil {
 				return err
 			}
 			// EnqueuedMsg's generated validator opens an indirect Anything body
 			// root. Its descendants remain opaque.
-			if _, err = entry.envelope.internal.Body.BeginParse(); err != nil {
+			var body cell.Slice
+			if err = entry.envelope.internal.Body.BeginParseInto(&body); err != nil {
 				return fmt.Errorf("%w: open outbound queue message body: %v", ErrInvalidInput, err)
 			}
 		}
@@ -214,12 +234,9 @@ func (v *semanticQueueValidation) precheckDispatchQueueUpdate() error {
 	if err != nil {
 		return fmt.Errorf("%w: decode candidate dispatch queue: %v", ErrInvalidInput, err)
 	}
-	err = v.dispatch.ScanDiff(candidate.AugmentedDictionary, true, func(
-		_ *cell.Cell,
-		oldValueExtra, newValueExtra *cell.Slice,
-	) error {
-		if oldValueExtra != nil {
-			oldAccount, parseErr := dispatchDiffAccount(oldValueExtra)
+	err = v.dispatch.ScanDiffRaw(candidate.AugmentedDictionary, true, func(view cell.AugDictDiffRawView) error {
+		if view.HasOld {
+			oldAccount, parseErr := dispatchDiffAccount(view.OldValueExtra)
 			if parseErr != nil {
 				return fmt.Errorf("%w: decode predecessor dispatch account: %v", ErrInvalidInput, parseErr)
 			}
@@ -227,8 +244,8 @@ func (v *semanticQueueValidation) precheckDispatchQueueUpdate() error {
 				return fmt.Errorf("%w: load predecessor dispatch account maximum: %v", ErrInvalidInput, parseErr)
 			}
 		}
-		if newValueExtra != nil {
-			newAccount, parseErr := dispatchDiffAccount(newValueExtra)
+		if view.HasNew {
+			newAccount, parseErr := dispatchDiffAccount(view.NewValueExtra)
 			if parseErr != nil {
 				return fmt.Errorf("%w: decode candidate dispatch account: %v", ErrInvalidInput, parseErr)
 			}
@@ -334,53 +351,30 @@ func semanticPredecessorQueueSize(r *semanticReplay, queue *tlb.OutMsgQueueInfo)
 	return uint64(count), nil
 }
 
-func parseSemanticQueueEntry(
-	keyCell *cell.Cell,
-	value *cell.Slice,
-	extra *cell.Slice,
-) (semanticQueueEntry, error) {
-	return parseSemanticQueueEntryWithMode(keyCell, value, extra, false, semanticQueueLeafCells{})
-}
-
-func parseSemanticNeighborQueueEntry(
-	keyCell *cell.Cell,
-	value *cell.Slice,
-	extra *cell.Slice,
-) (semanticQueueEntry, error) {
-	return parseSemanticQueueEntryWithMode(keyCell, value, extra, true, semanticQueueLeafCells{})
-}
-
-// parseSemanticNeighborQueueEntryLoaded is parseSemanticNeighborQueueEntry over
-// cells the caller has already taken out of storage. Handing them in is what
+// parseSemanticNeighborQueueEntryLoaded parses cells the caller has already
+// taken out of storage. Handing them in is what
 // lets walkSemanticQueuePrefix raise a load failure from the loading step
 // instead of from the parse; see materialiseSemanticQueueLeaf for why that
 // distinction is load-bearing and not tidiness.
 func parseSemanticNeighborQueueEntryLoaded(
-	keyCell *cell.Cell,
+	key msgpool.QueueKey,
 	value *cell.Slice,
 	extra *cell.Slice,
 	leaf semanticQueueLeafCells,
 ) (semanticQueueEntry, error) {
-	return parseSemanticQueueEntryWithMode(keyCell, value, extra, true, leaf)
+	return parseSemanticQueueEntryKeyWithMode(key, value, extra, true, leaf, nil)
 }
 
-func parseSemanticQueueEntryWithMode(
-	keyCell *cell.Cell,
+func parseSemanticQueueEntryKeyWithMode(
+	key msgpool.QueueKey,
 	value *cell.Slice,
 	extra *cell.Slice,
 	neighborProof bool,
 	leaf semanticQueueLeafCells,
+	envelopes *semanticEnvelopeCache,
 ) (semanticQueueEntry, error) {
-	keyLoader := keyCell.MustBeginParse()
-	keyBytes, err := keyLoader.LoadSlice(352)
-	if err != nil || keyLoader.BitsLeft() != 0 || keyLoader.RefsNum() != 0 {
-		return semanticQueueEntry{}, fmt.Errorf("%w: outbound queue key is malformed", ErrInvalidInput)
-	}
-	var key msgpool.QueueKey
-	copy(key[:], keyBytes)
-
 	var enqueued tlb.EnqueuedMsg
-	if err = loadExactSlice(&enqueued, value); err != nil {
+	if err := loadExactSlice(&enqueued, value); err != nil {
 		return semanticQueueEntry{}, fmt.Errorf("%w: decode outbound queue entry %x: %v", ErrInvalidInput, key, err)
 	}
 	// A caller that already materialised the entry's cells hands them in, and
@@ -391,10 +385,11 @@ func parseSemanticQueueEntryWithMode(
 		envelopeRoot = leaf.envelope
 	}
 	var envelope *semanticEnvelope
+	var err error
 	if neighborProof {
 		envelope, err = parseSemanticNeighborEnvelopeLoaded(envelopeRoot, leaf.message)
 	} else {
-		envelope, err = parseSemanticEnvelope(envelopeRoot)
+		envelope, err = envelopes.parse(envelopeRoot)
 	}
 	if err != nil {
 		return semanticQueueEntry{}, fmt.Errorf("%w: decode outbound queue envelope %x: %v", ErrInvalidInput, key, err)
@@ -427,8 +422,9 @@ func parseSemanticQueueEntryWithMode(
 func loadSemanticQueueEntry(
 	queue *tlb.OutMsgQueueAugDict,
 	key msgpool.QueueKey,
+	envelopes *semanticEnvelopeCache,
 ) (semanticQueueEntry, error) {
-	return loadSemanticQueueEntryWithMode(queue, key, false)
+	return loadSemanticQueueEntryWithMode(queue, key, false, envelopes)
 }
 
 // loadSemanticQueueEntryFromNeighbor reads an entry out of a neighbour's queue,
@@ -446,20 +442,27 @@ func loadSemanticQueueEntryFromNeighbor(
 	queue *tlb.OutMsgQueueAugDict,
 	key msgpool.QueueKey,
 ) (semanticQueueEntry, error) {
-	return loadSemanticQueueEntryWithMode(queue, key, true)
+	return loadSemanticQueueEntryWithMode(queue, key, true, nil)
 }
 
 func loadSemanticQueueEntryWithMode(
 	queue *tlb.OutMsgQueueAugDict,
 	key msgpool.QueueKey,
 	neighborProof bool,
+	envelopes *semanticEnvelopeCache,
 ) (semanticQueueEntry, error) {
-	keyCell := cell.BeginCell().MustStoreSlice(key[:], 352).EndCell()
-	value, extra, err := queue.LoadValueExtra(keyCell)
-	if err != nil {
+	var value, extra cell.Slice
+	if err := queue.LoadValueExtraByBytesKeyInto(key[:], &value, &extra); err != nil {
 		return semanticQueueEntry{}, err
 	}
-	return parseSemanticQueueEntryWithMode(keyCell, value, extra, neighborProof, semanticQueueLeafCells{})
+	return parseSemanticQueueEntryKeyWithMode(
+		key,
+		&value,
+		&extra,
+		neighborProof,
+		semanticQueueLeafCells{},
+		envelopes,
+	)
 }
 
 func (v *semanticQueueValidation) verifyQueueRoots() error {
@@ -491,11 +494,21 @@ func (v *semanticQueueValidation) verifyMergedQueueCleanup() error {
 			return err
 		}
 		item := iterator.View()
-		key, keyErr := item.Key.ToCell()
-		if keyErr != nil {
-			return keyErr
+		var keyLoader cell.Slice
+		item.Key.CopyInto(&keyLoader)
+		var key msgpool.QueueKey
+		keyErr := keyLoader.LoadSliceInto(key[:], 352)
+		if keyErr != nil || keyLoader.BitsLeft() != 0 || keyLoader.RefsNum() != 0 {
+			return fmt.Errorf("%w: outbound queue key is malformed", ErrInvalidInput)
 		}
-		entry, parseErr := parseSemanticQueueEntry(key, &item.Value, &item.Extra)
+		entry, parseErr := parseSemanticQueueEntryKeyWithMode(
+			key,
+			&item.Value,
+			&item.Extra,
+			false,
+			semanticQueueLeafCells{},
+			&v.replay.envelopes,
+		)
 		if parseErr != nil {
 			return parseErr
 		}
@@ -518,7 +531,8 @@ func (v *semanticQueueValidation) verifyMergedQueueCleanup() error {
 		if !delivered {
 			continue
 		}
-		if _, err = v.candidate.OutQueue.LoadValue(key); err == nil {
+		var value cell.Slice
+		if err = v.candidate.OutQueue.LoadValueBySliceKeyInto(&item.Key, &value); err == nil {
 			return fmt.Errorf("%w: delivered message %x remains after merge", ErrInvalidInput, entry.descr.Hash)
 		} else if !isMissingKey(err) {
 			return err

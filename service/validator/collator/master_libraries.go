@@ -108,7 +108,8 @@ func accountPublicLibraries(state *tlb.AccountState) (map[[32]byte]publicLibrary
 		return nil, err
 	}
 	for i := range items {
-		keyBytes, loadErr := items[i].Key.LoadSlice(256)
+		var key [32]byte
+		loadErr := items[i].Key.LoadSliceInto(key[:], 256)
 		if loadErr != nil || items[i].Key.BitsLeft() != 0 {
 			return nil, fmt.Errorf("library %d has a malformed key", i)
 		}
@@ -120,8 +121,6 @@ func accountPublicLibraries(state *tlb.AccountState) (map[[32]byte]publicLibrary
 		if loadErr != nil || items[i].Value.BitsLeft() != 0 || items[i].Value.RefsNum() != 0 {
 			return nil, fmt.Errorf("library %d value is malformed", i)
 		}
-		var key [32]byte
-		copy(key[:], keyBytes)
 		// A public entry whose key is not the referenced cell hash does not count
 		// as public; the account dictionary itself is still structurally valid.
 		if public && root.HashKey() == key {
@@ -174,8 +173,8 @@ func addLibraryPublisher(
 	key, publisher [32]byte,
 	root *cell.Cell,
 ) error {
-	keyCell := cell.BeginCell().MustStoreSlice(key[:], 256).EndCell()
-	value, err := libraries.LoadValue(keyCell)
+	var value cell.Slice
+	err := libraries.LoadValueByBytesKeyInto(key[:], &value)
 	var descriptor globalLibrary
 	mode := cell.DictSetModeReplace
 	if isMissingKey(err) {
@@ -184,13 +183,16 @@ func addLibraryPublisher(
 	} else if err != nil {
 		return fmt.Errorf("load public library %x: %w", key, err)
 	} else {
-		descriptor, err = parseGlobalLibrary(value, key)
+		descriptor, err = parseGlobalLibrary(&value, key)
 		if err != nil {
 			return fmt.Errorf("decode public library %x: %w", key, err)
 		}
 	}
-	publisherKey := cell.BeginCell().MustStoreSlice(publisher[:], 256).EndCell()
-	inserted, err := descriptor.publishers.SetWithMode(publisherKey, cell.BeginCell().EndCell(), cell.DictSetModeAdd)
+	inserted, err := descriptor.publishers.SetBuilderByBytesKeyWithMode(
+		publisher[:],
+		cell.BeginCell(),
+		cell.DictSetModeAdd,
+	)
 	if err != nil {
 		return fmt.Errorf("add publisher %x to public library %x: %w", publisher, key, err)
 	}
@@ -201,7 +203,9 @@ func addLibraryPublisher(
 	if err != nil {
 		return err
 	}
-	changed, err := libraries.SetWithMode(keyCell, serialized, mode)
+	var valueBuilder cell.Builder
+	serialized.ToBuilderInto(&valueBuilder)
+	changed, err := libraries.SetBuilderByBytesKeyWithMode(key[:], &valueBuilder, mode)
 	if err != nil {
 		return fmt.Errorf("store public library %x: %w", key, err)
 	}
@@ -216,24 +220,22 @@ func removeLibraryPublisher(
 	key, publisher [32]byte,
 	root *cell.Cell,
 ) error {
-	keyCell := cell.BeginCell().MustStoreSlice(key[:], 256).EndCell()
-	value, err := libraries.LoadValue(keyCell)
-	if err != nil {
+	var value cell.Slice
+	if err := libraries.LoadValueByBytesKeyInto(key[:], &value); err != nil {
 		return fmt.Errorf("%w: public library %x being removed is absent", ErrInvalidInput, key)
 	}
-	descriptor, err := parseGlobalLibrary(value, key)
+	descriptor, err := parseGlobalLibrary(&value, key)
 	if err != nil {
 		return fmt.Errorf("decode public library %x: %w", key, err)
 	}
 	if descriptor.root.HashKey() != root.HashKey() {
 		return fmt.Errorf("%w: account and global roots of public library %x disagree", ErrInvalidInput, key)
 	}
-	publisherKey := cell.BeginCell().MustStoreSlice(publisher[:], 256).EndCell()
-	if err = descriptor.publishers.Delete(publisherKey); err != nil {
+	if err = descriptor.publishers.DeleteByBytesKey(publisher[:]); err != nil {
 		return fmt.Errorf("%w: public library %x does not list publisher %x", ErrInvalidInput, key, publisher)
 	}
 	if descriptor.publishers.IsEmpty() {
-		if err = libraries.Delete(keyCell); err != nil {
+		if err = libraries.DeleteByBytesKey(key[:]); err != nil {
 			return fmt.Errorf("remove public library %x: %w", key, err)
 		}
 		return nil
@@ -243,7 +245,9 @@ func removeLibraryPublisher(
 	if err != nil {
 		return err
 	}
-	changed, err := libraries.SetWithMode(keyCell, serialized, cell.DictSetModeReplace)
+	var valueBuilder cell.Builder
+	serialized.ToBuilderInto(&valueBuilder)
+	changed, err := libraries.SetBuilderByBytesKeyWithMode(key[:], &valueBuilder, cell.DictSetModeReplace)
 	if err != nil {
 		return fmt.Errorf("store public library %x: %w", key, err)
 	}
@@ -274,7 +278,7 @@ func parseGlobalLibrary(value *cell.Slice, key [32]byte) (globalLibrary, error) 
 		return globalLibrary{}, fmt.Errorf("load publishers: %w", err)
 	}
 	for i := range items {
-		if _, loadErr := items[i].Key.LoadSlice(256); loadErr != nil || items[i].Key.BitsLeft() != 0 ||
+		if loadErr := items[i].Key.SkipBits(256); loadErr != nil || items[i].Key.BitsLeft() != 0 ||
 			items[i].Value.BitsLeft() != 0 || items[i].Value.RefsNum() != 0 {
 			return globalLibrary{}, fmt.Errorf("publisher %d is malformed", i)
 		}
@@ -290,7 +294,9 @@ func serializeGlobalLibrary(descriptor globalLibrary) (*cell.Cell, error) {
 	if err := b.StoreRef(descriptor.root); err != nil {
 		return nil, err
 	}
-	if err := b.StoreBuilder(descriptor.publishers.AsCell().ToBuilder()); err != nil {
+	var publishers cell.Builder
+	descriptor.publishers.AsCell().ToBuilderInto(&publishers)
+	if err := b.StoreBuilder(&publishers); err != nil {
 		return nil, fmt.Errorf("serialize public library publishers: %w", err)
 	}
 	return b.EndCell(), nil

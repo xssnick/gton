@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"testing"
+	"time"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -229,5 +230,39 @@ func TestExternalWavesProduceTheSequentialBlock(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestExternalWaveDiscardDoesNotCountAsDiscardedInternal(t *testing.T) {
+	fixture := newExternalWaveFixture(t, 2, 0, 1)
+	c, err := testBuilder().prepare(context.Background(), fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.externalWaves.start(c, 1)
+
+	plans, lastProcLT := c.planExternalWave(fixture.request.Externals)
+	if len(plans) != len(fixture.request.Externals) {
+		t.Fatalf("planned %d externals, want %d", len(plans), len(fixture.request.Externals))
+	}
+	result, stop, err := c.runExternalWave(
+		fixture.request.Externals,
+		0,
+		plans,
+		lastProcLT,
+		time.Now().Add(-time.Second),
+		1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stop || result.stop != ExternalStopDeadline {
+		t.Fatalf("external wave stop = (%v, %v), want deadline", stop, result.stop)
+	}
+	if c.stats.ExternalAttempts != 0 {
+		t.Fatalf("external attempts = %d after discard, want 0", c.stats.ExternalAttempts)
+	}
+	if c.stats.InternalsDiscarded != 0 {
+		t.Fatalf("discarded internals = %d after external-only discard, want 0", c.stats.InternalsDiscarded)
 	}
 }

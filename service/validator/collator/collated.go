@@ -104,7 +104,8 @@ func verifyCollatedRoots(roots []*cell.Cell, genUtime uint32) (verifiedCollatedD
 			continue
 		}
 
-		loader, err := root.BeginParse()
+		var loader cell.Slice
+		err := root.BeginParseInto(&loader)
 		if err != nil || loader.BitsLeft() < 32 {
 			continue
 		}
@@ -188,11 +189,11 @@ func verifyCollatedPredecessors(
 	first PreviousBlock,
 	second *PreviousBlock,
 ) error {
-	if err := verifyCollatedBlockState(data, &first, "first predecessor"); err != nil {
+	if _, err := verifyCollatedBlockState(data, &first, "first predecessor"); err != nil {
 		return err
 	}
 	if second != nil {
-		if err := verifyCollatedBlockState(data, second, "second predecessor"); err != nil {
+		if _, err := verifyCollatedBlockState(data, second, "second predecessor"); err != nil {
 			return err
 		}
 	}
@@ -200,40 +201,44 @@ func verifyCollatedPredecessors(
 	return nil
 }
 
-func verifyCollatedBlockState(data *verifiedCollatedData, block *PreviousBlock, label string) error {
+func verifyCollatedBlockState(
+	data *verifiedCollatedData,
+	block *PreviousBlock,
+	label string,
+) (*cell.Cell, error) {
 	rootHash, err := blockIDRootHash(block.ID)
 	if err != nil {
-		return fmt.Errorf("%w: %s: %v", ErrInvalidInput, label, err)
+		return nil, fmt.Errorf("%w: %s: %v", ErrInvalidInput, label, err)
 	}
 	root := data.virtualRoots[rootHash]
 	if root == nil {
-		return fmt.Errorf("%w: %s block proof is absent from full collated data", ErrInvalidInput, label)
+		return nil, fmt.Errorf("%w: %s block proof is absent from full collated data", ErrInvalidInput, label)
 	}
 
 	if block.ID.SeqNo == 0 {
 		if root.HashKeyAt(0) != block.State.HashKeyAt(0) {
-			return fmt.Errorf("%w: %s zerostate proof differs from supplied state", ErrInvalidInput, label)
+			return nil, fmt.Errorf("%w: %s zerostate proof differs from supplied state", ErrInvalidInput, label)
 		}
-		return nil
+		return root, nil
 	}
 
 	stateUpdate, err := collatedBlockStateUpdate(root)
 	if err != nil {
-		return fmt.Errorf("%w: decode %s collated block proof: %v", ErrInvalidInput, label, err)
+		return nil, fmt.Errorf("%w: decode %s collated block proof: %v", ErrInvalidInput, label, err)
 	}
 	stateProof, err := stateUpdate.PeekRef(1)
 	if err != nil {
-		return fmt.Errorf("%w: load %s collated state hash: %v", ErrInvalidInput, label, err)
+		return nil, fmt.Errorf("%w: load %s collated state hash: %v", ErrInvalidInput, label, err)
 	}
 	stateRoot := data.virtualRoots[stateProof.HashKeyAt(0)]
 	if stateRoot == nil {
-		return fmt.Errorf("%w: %s state proof is absent from full collated data", ErrInvalidInput, label)
+		return nil, fmt.Errorf("%w: %s state proof is absent from full collated data", ErrInvalidInput, label)
 	}
 	if stateRoot.HashKeyAt(0) != block.State.HashKeyAt(0) {
-		return fmt.Errorf("%w: %s collated state differs from supplied state", ErrInvalidInput, label)
+		return nil, fmt.Errorf("%w: %s collated state differs from supplied state", ErrInvalidInput, label)
 	}
 
-	return nil
+	return stateRoot, nil
 }
 
 func verifyCollatedNeighborStates(data *verifiedCollatedData, neighbors []Neighbor) error {
@@ -436,7 +441,8 @@ func collatedStateRoot(data *verifiedCollatedData, id ton.BlockIDExt) (*cell.Cel
 }
 
 func collatedBlockStateUpdate(root *cell.Cell) (*cell.Cell, error) {
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return nil, err
 	}

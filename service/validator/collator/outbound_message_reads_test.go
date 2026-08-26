@@ -49,7 +49,7 @@ func TestOutboundMessageReadsRecordTheSameSetDetachedOrNot(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			c := outboundReadsCollation()
-			c.recordOutboundMessageReads(test.root)
+			c.recordOutboundMessageReads(test.root, false)
 			got := map[cell.Hash]struct{}{}
 			for hash := range want {
 				if c.usage.RecordedCell(hash) != nil {
@@ -80,8 +80,8 @@ func TestOutboundMessageReadsRecordEveryMessageThroughTheSharedScratch(t *testin
 	secondRoot := cell.BeginCell().MustStoreRef(second).MustStoreRef(shared).EndCell()
 
 	c := outboundReadsCollation()
-	c.recordOutboundMessageReads(firstRoot)
-	c.recordOutboundMessageReads(secondRoot)
+	c.recordOutboundMessageReads(firstRoot, false)
+	c.recordOutboundMessageReads(secondRoot, false)
 
 	for name, want := range map[string]*cell.Cell{
 		"first message leaf":  first,
@@ -93,5 +93,80 @@ func TestOutboundMessageReadsRecordEveryMessageThroughTheSharedScratch(t *testin
 		if c.usage.RecordedCell(want.HashKey()) == nil {
 			t.Fatalf("%s was not recorded", name)
 		}
+	}
+}
+
+func TestGeneratedParallelSafetyRejectsTracedChildren(t *testing.T) {
+	trace := cell.NewTraceForListener(cell.NewReadSet(nil))
+	child := cell.BeginCell().MustStoreUInt(0x71, 8).EndCell().WithTrace(trace)
+	root := cell.BeginCell().MustStoreRef(child).EndCell()
+
+	c := outboundReadsCollation()
+	parallelSafe := c.recordOutboundMessageReads(root, true)
+	if c.usage.RecordedCell(root.HashKey()) == nil {
+		t.Fatal("root was not recorded")
+	}
+	if c.usage.RecordedCell(child.HashKey()) == nil {
+		t.Fatal("traced child was not recorded")
+	}
+	if parallelSafe {
+		t.Fatal("generated safety certification accepted a traced child")
+	}
+}
+
+func TestGeneratedParallelSafetyRejectsEqualHashTraceWrappers(t *testing.T) {
+	loads := 0
+	trace := cell.NewTrace(cell.TraceHooks{OnLoad: func(*cell.Cell) { loads++ }})
+	raw := cell.BeginCell().MustStoreUInt(0x72, 8).EndCell()
+	traced := raw.WithTrace(trace)
+	root := cell.BeginCell().MustStoreRef(raw).MustStoreRef(traced).EndCell()
+
+	c := outboundReadsCollation()
+	parallelSafe := c.recordOutboundMessageReads(root, true)
+	if loads != 0 {
+		t.Fatalf("canonical hash-dedup walk notified the second equal-hash wrapper %d times", loads)
+	}
+	if parallelSafe {
+		t.Fatal("generated safety certification accepted a traced equal-hash wrapper")
+	}
+}
+
+func TestGeneratedParallelSafetyRejectsVirtualizedCells(t *testing.T) {
+	branch := cell.BeginCell().
+		MustStoreUInt(0xBEEF, 16).
+		MustStoreRef(cell.BeginCell().MustStoreUInt(1, 1).EndCell()).
+		EndCell()
+	root := cell.BeginCell().
+		MustStoreUInt(0, 1).
+		MustStoreRef(branch).
+		EndCell()
+
+	proof, err := root.CreateProof(cell.CreateProofSkeleton())
+	if err != nil {
+		t.Fatalf("create proof: %v", err)
+	}
+	body, err := cell.UnwrapProofVirtualized(proof, root.Hash())
+	if err != nil {
+		t.Fatalf("unwrap virtualized proof: %v", err)
+	}
+
+	c := outboundReadsCollation()
+	if c.recordOutboundMessageReads(body, true) {
+		t.Fatal("generated safety certification accepted a virtualized cell")
+	}
+}
+
+func TestGeneratedParallelSafetyRejectsMessagesBeyondTheWalkDepth(t *testing.T) {
+	root := cell.BeginCell().MustStoreUInt(1, 1).EndCell()
+	for range maxOutboundMessageRecordDepth + 1 {
+		root = cell.BeginCell().MustStoreRef(root).EndCell()
+	}
+
+	c := outboundReadsCollation()
+	if c.recordOutboundMessageReads(root, true) {
+		t.Fatal("generated safety certification accepted a message beyond the walk depth")
+	}
+	if got, want := c.usage.Size(), maxOutboundMessageRecordDepth+1; got != want {
+		t.Fatalf("recorded %d cells before the depth bound, want %d", got, want)
 	}
 }

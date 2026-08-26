@@ -27,12 +27,13 @@ func (v *semanticQueueValidation) loadDescriptors() error {
 		if keyErr != nil {
 			return keyErr
 		}
-		descriptor, parseErr := parseSemanticInDescriptor(item.Value, hash)
+		descriptor, parseErr := parseSemanticInDescriptor(item.Value, hash, &v.replay.envelopes)
 		if parseErr != nil {
 			return parseErr
 		}
-		v.in[cell.Hash(hash)] = descriptor
-		v.inOrder = append(v.inOrder, cell.Hash(hash))
+		key := cell.Hash(hash)
+		v.in[key] = descriptor
+		v.inOrder = append(v.inOrder, semanticInDescriptorEntry{hash: key, descriptor: descriptor})
 		// The tag is already decoded here, so the candidate's message mix costs
 		// nothing beyond these increments. This phase runs before the account
 		// lanes start, so the write is single-threaded.
@@ -64,12 +65,13 @@ func (v *semanticQueueValidation) loadDescriptors() error {
 		if keyErr != nil {
 			return keyErr
 		}
-		descriptor, parseErr := parseSemanticOutDescriptor(item.Value, hash)
+		descriptor, parseErr := parseSemanticOutDescriptor(item.Value, hash, &v.replay.envelopes)
 		if parseErr != nil {
 			return parseErr
 		}
-		v.out[cell.Hash(hash)] = descriptor
-		v.outOrder = append(v.outOrder, cell.Hash(hash))
+		key := cell.Hash(hash)
+		v.out[key] = descriptor
+		v.outOrder = append(v.outOrder, semanticOutDescriptorEntry{hash: key, descriptor: descriptor})
 	}
 	if err = iterator.Err(); err != nil {
 		return fmt.Errorf("%w: iterate outbound descriptors: %v", ErrInvalidInput, err)
@@ -79,16 +81,16 @@ func (v *semanticQueueValidation) loadDescriptors() error {
 }
 
 func semanticDescriptorKey(key *cell.Slice) ([32]byte, error) {
-	bits, err := key.LoadSlice(256)
+	var hash [32]byte
+	err := key.LoadSliceInto(hash[:], 256)
 	if err != nil || key.BitsLeft() != 0 || key.RefsNum() != 0 {
 		return [32]byte{}, fmt.Errorf("%w: message descriptor key is malformed", ErrInvalidInput)
 	}
-	var hash [32]byte
-	copy(hash[:], bits)
+
 	return hash, nil
 }
 
-func parseSemanticInDescriptor(value cell.Slice, key [32]byte) (*semanticInDescriptor, error) {
+func parseSemanticInDescriptor(value cell.Slice, key [32]byte, envelopes *semanticEnvelopeCache) (*semanticInDescriptor, error) {
 	raw, err := value.ToCell()
 	if err != nil {
 		return nil, fmt.Errorf("%w: materialize inbound descriptor %x: %v", ErrInvalidInput, key, err)
@@ -143,14 +145,14 @@ func parseSemanticInDescriptor(value cell.Slice, key [32]byte) (*semanticInDescr
 	if descriptor.tag == semanticInExternal {
 		descriptor.message = first
 	} else {
-		descriptor.envelope, err = parseSemanticEnvelope(first)
+		descriptor.envelope, err = envelopes.parse(first)
 		if err != nil {
 			return nil, fmt.Errorf("%w: inbound descriptor %x envelope: %v", ErrInvalidInput, key, err)
 		}
 		descriptor.message = descriptor.envelope.message
 	}
 	if descriptor.tag == semanticInTransit || descriptor.tag == semanticInDeferredTransit {
-		descriptor.outEnvelope, err = parseSemanticEnvelope(second)
+		descriptor.outEnvelope, err = envelopes.parse(second)
 		if err != nil {
 			return nil, fmt.Errorf("%w: inbound descriptor %x rewritten envelope: %v", ErrInvalidInput, key, err)
 		}
@@ -165,7 +167,7 @@ func parseSemanticInDescriptor(value cell.Slice, key [32]byte) (*semanticInDescr
 	return descriptor, nil
 }
 
-func parseSemanticOutDescriptor(value cell.Slice, key [32]byte) (*semanticOutDescriptor, error) {
+func parseSemanticOutDescriptor(value cell.Slice, key [32]byte, envelopes *semanticEnvelopeCache) (*semanticOutDescriptor, error) {
 	raw, err := value.ToCell()
 	if err != nil {
 		return nil, fmt.Errorf("%w: materialize outbound descriptor %x: %v", ErrInvalidInput, key, err)
@@ -211,12 +213,11 @@ func parseSemanticOutDescriptor(value cell.Slice, key [32]byte) (*semanticOutDes
 		}
 		if short {
 			descriptor.tag = semanticOutDequeueShort
-			envelopeHash, loadErr := loader.LoadSlice(256)
+			loadErr := loader.LoadSliceInto(descriptor.envelopeHash[:], 256)
 			if loadErr != nil {
 				err = loadErr
 				break
 			}
-			copy(descriptor.envelopeHash[:], envelopeHash)
 			workchain, loadErr := loader.LoadInt(32)
 			if loadErr != nil {
 				err = loadErr
@@ -247,7 +248,7 @@ func parseSemanticOutDescriptor(value cell.Slice, key [32]byte) (*semanticOutDes
 	}
 
 	if descriptor.tag != semanticOutExternal && descriptor.tag != semanticOutDequeueShort {
-		descriptor.envelope, err = parseSemanticEnvelope(first)
+		descriptor.envelope, err = envelopes.parse(first)
 		if err != nil {
 			return nil, fmt.Errorf("%w: outbound descriptor %x envelope: %v", ErrInvalidInput, key, err)
 		}
@@ -284,7 +285,14 @@ func semanticLoadCoins(loader *cell.Slice) (tlb.Coins, error) {
 	return coins, err
 }
 
+// semanticEnvelopeParseProbe, when set, observes every real (cache-missing)
+// envelope parse. Test-only; nil in production.
+var semanticEnvelopeParseProbe func(*cell.Cell)
+
 func parseSemanticEnvelope(root *cell.Cell) (*semanticEnvelope, error) {
+	if semanticEnvelopeParseProbe != nil {
+		semanticEnvelopeParseProbe(root)
+	}
 	var envelope tlb.MsgEnvelope
 	if err := parseExact(&envelope, root); err != nil {
 		return nil, err
@@ -353,12 +361,13 @@ func parseSemanticNeighborEnvelopeLoaded(root, loaded *cell.Cell) (*semanticEnve
 	if loaded != nil {
 		envelope.Msg = loaded
 	}
-	message, err := envelope.Msg.BeginParse()
+	var message cell.Slice
+	err := envelope.Msg.BeginParseInto(&message)
 	if err != nil {
 		return nil, fmt.Errorf("open internal message: %w", err)
 	}
 	var info semanticInternalMessageInfo
-	if err = tlb.LoadFromCell(&info, message); err != nil {
+	if err = tlb.LoadFromCell(&info, &message); err != nil {
 		return nil, fmt.Errorf("message is not internal: %w", err)
 	}
 	internal := tlb.InternalMessage{
@@ -467,15 +476,15 @@ func semanticRoutingCommonBits(left, right msgpool.AccountPrefix) int {
 }
 
 func (v *semanticQueueValidation) verifyDescriptorCoverage() error {
-	for _, hash := range v.inOrder {
-		descriptor := v.in[hash]
+	for _, entry := range v.inOrder {
+		hash, descriptor := entry.hash, entry.descriptor
 		_, consumed := v.replay.consumedIn[hash]
 		if (descriptor.transaction != nil) != consumed {
 			return fmt.Errorf("%w: inbound descriptor %x transaction coverage mismatch", ErrInvalidInput, hash)
 		}
 	}
-	for _, hash := range v.outOrder {
-		descriptor := v.out[hash]
+	for _, entry := range v.outOrder {
+		hash, descriptor := entry.hash, entry.descriptor
 		_, consumed := v.replay.consumedOut[hash]
 		if (descriptor.transaction != nil) != consumed {
 			return fmt.Errorf("%w: outbound descriptor %x transaction coverage mismatch", ErrInvalidInput, hash)

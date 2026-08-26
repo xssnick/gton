@@ -319,8 +319,7 @@ func (t *Tracker) project(previous *Snapshot, input ApplyInput) (ApplyResult, er
 	if state.IsKeyState && !state.RotatedAllShards {
 		return ApplyResult{}, errors.New("key masterchain state did not rotate all shards")
 	}
-	var configRootHash [32]byte
-	copy(configRootHash[:], state.ConfigRoot.Hash())
+	configRootHash := [32]byte(state.ConfigRoot.HashKey())
 	var config *Config
 	if previous != nil && previous.ConfigRootHash == configRootHash {
 		config = previous.Config

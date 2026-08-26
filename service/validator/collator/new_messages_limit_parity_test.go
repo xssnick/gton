@@ -74,7 +74,7 @@ func pendingInShardMessage(
 // extra_out_msgs-- and before the enqueue_only latch at :4858-4863.
 //
 // Before this port processNewMessages read only the c.blockFull FIELD, and that
-// field is written in three places — deliverImmediate (execute.go, the port of
+// field is written in three places — completeGeneratedImmediate (execute.go, the port of
 // collator.cpp:3727-3731), processInternals (imports.go) and
 // processDispatchQueue (dispatch.go). None of them covers work that grows the
 // estimate WITHOUT an immediate delivery, and enqueue() is exactly that: it
@@ -400,10 +400,10 @@ func TestInternalMsgTimeoutIsCheckedByEveryInternalPhase(t *testing.T) {
 		// The loop lives in processInternalsFrom; processInternals is the
 		// from-zero wrapper and the top-up is the resumed one, and both reach the
 		// budget through it.
-		"processInternalsFrom": "imports.go",
-		"processDispatchQueue": "dispatch.go",
-		"processNewMessages":   "execute.go",
-		"deliverImmediate":     "execute.go",
+		"processInternalsFrom":       "imports.go",
+		"processDispatchQueue":       "dispatch.go",
+		"checkNewMessageTop":         "execute.go",
+		"completeGeneratedImmediate": "execute.go",
 	}
 	found := map[string]int{}
 	for function, file := range want {
@@ -463,7 +463,9 @@ func TestInternalMsgTimeoutIsInertWithoutADeadline(t *testing.T) {
 // process_one_new_message, the latter only after the `enqueue || defer` exit at
 // :3649-3663 and only when `!is_special`.
 //
-// Our two are importInternal (imports.go) and deliverImmediate (execute.go).
+// Our two are retireInternal (imports.go) and retireGeneratedImmediate
+// (execute.go), the two points where a processed internal actually becomes part
+// of the block.
 // Nothing else in this package would notice a third: adding an advance to
 // enqueue() would compile, pass every existing test, and silently raise the lt
 // floor for later transactions on the strength of work the block never performed
@@ -517,7 +519,7 @@ func TestProcessedBoundHasExactlyTwoCallSites(t *testing.T) {
 	// that a message executed ahead of its admission (processInternalsInWaves)
 	// moves the floor only once it is actually admitted, in queue order. The
 	// feed count is unchanged; only the function it sits in has a new name.
-	want := map[string]int{"retireInternal": 1, "deliverImmediate": 1}
+	want := map[string]int{"retireInternal": 1, "retireGeneratedImmediate": 1}
 	if len(sites) != len(want) {
 		t.Fatalf("%s is called from %v, want exactly %v. A third feed for the processed bound is a "+
 			"consensus-visible change: it moves the floor that every later transaction's lt is "+

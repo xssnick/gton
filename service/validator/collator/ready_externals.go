@@ -60,6 +60,29 @@ type readyExternalStats struct {
 	shape readyExternalShape
 }
 
+// readyExternalAttempt owns the bookkeeping shared by every external batch in
+// one collation attempt. The shard and masterchain loops retain their distinct
+// schedules; only admission accounting and transcript capture live here.
+type readyExternalAttempt struct {
+	transcript *[]ExternalInput
+	live       *readyExternalStats
+	stop       ExternalStopReason
+}
+
+func (a *readyExternalAttempt) record(
+	inputs []ExternalInput,
+	result externalBatchResult,
+	err error,
+	failurePhase string,
+) {
+	a.live.batches++
+	*a.transcript = append(*a.transcript, inputs[:result.consumed]...)
+	a.stop = result.stop
+	if err != nil {
+		a.live.failedAt = failurePhase
+	}
+}
+
 // readyExternalShape is the minimum needed to reconstruct which route an attempt
 // took without a candidate to read it off.
 type readyExternalShape struct {
@@ -244,14 +267,17 @@ func (b *Builder) buildShardReadyAttempt(
 	}
 	defer cancel()
 
-	stop := ExternalStopUnknown
+	ready := readyExternalAttempt{
+		transcript: transcript,
+		live:       live,
+	}
 	// Written by a defer, not after the loop. Assigned at the tail it was only
 	// ever set on success, which is what made external_stop="unknown" mean
 	// nothing but "it failed" on all 71 field events. The shape snapshot goes the
 	// same way, because the candidate that carries those counters is nil on every
 	// failing return.
 	defer func() {
-		live.stop = stop
+		live.stop = ready.stop
 		live.observe(c, len(req.Externals))
 	}()
 
@@ -262,19 +288,16 @@ func (b *Builder) buildShardReadyAttempt(
 	// up and close together when the whole collation returned, charging the
 	// external stage once per batch for the entire remaining build.
 	if len(req.Externals) > 0 {
-		live.batches++
 		timer := c.req.assembly.start(CollationStageExecuteExternalMessages)
 		result, processErr := c.processExternalBatch(req.Externals, processUntil)
+		ready.record(req.Externals, result, processErr, externalPhasePreAdmittedBatch)
 		timer.stop()
-		*transcript = append(*transcript, req.Externals[:result.consumed]...)
-		stop, err = result.stop, processErr
-		if err != nil {
-			live.failedAt = externalPhasePreAdmittedBatch
-			return nil, err
+		if processErr != nil {
+			return nil, processErr
 		}
 	}
 	for {
-		for stop == ExternalStopUnknown {
+		for ready.stop == ExternalStopUnknown {
 			// A closed intake takes nothing out of the pool at all. Every
 			// message TakeReady returned would get the same skip verdict, at
 			// the price of a snapshot, a parse and an account prewarm each —
@@ -298,14 +321,11 @@ func (b *Builder) buildShardReadyAttempt(
 				live.failedAt = externalPhaseTakeReadyBatch
 				return nil, prepareErr
 			}
-			live.batches++
 			result, processErr := c.processExternalBatch(inputs, processUntil)
+			ready.record(inputs, result, processErr, externalPhaseTakeReadyBatch)
 			timer.stop()
-			*transcript = append(*transcript, inputs[:result.consumed]...)
-			stop, err = result.stop, processErr
-			if err != nil {
-				live.failedAt = externalPhaseTakeReadyBatch
-				return nil, err
+			if processErr != nil {
+				return nil, processErr
 			}
 		}
 
@@ -314,24 +334,24 @@ func (b *Builder) buildShardReadyAttempt(
 			timer.stop()
 			// The phase every one of the field's seven external_batches==1 events
 			// died in, and the only one that can raise the order violation:
-			// advanceProcessedBound's "generated" caller is deliverImmediate, which
+			// advanceProcessedBound's "generated" caller is retireGeneratedImmediate, which
 			// is reachable from here alone.
 			live.failedAt = externalPhaseProcessNewMessages
 			return nil, err
 		}
-		if stop != ExternalStopUnknown {
+		if ready.stop != ExternalStopUnknown {
 			timer.stop()
 			break
 		}
 		c.updateCollatedEstimate()
 		if !c.limits.fits(LoadSoft) {
 			timer.stop()
-			stop = ExternalStopSoftLimit
+			ready.stop = ExternalStopSoftLimit
 			break
 		}
 		timer.stop()
 		if waitUntil.IsZero() {
-			stop = externalPhaseStop(c, ExternalStopReadyDrained)
+			ready.stop = externalPhaseStop(c, ExternalStopReadyDrained)
 			break
 		}
 
@@ -357,7 +377,7 @@ func (b *Builder) buildShardReadyAttempt(
 		live.wait += time.Since(started)
 		if nextErr != nil {
 			if errors.Is(nextErr, context.DeadlineExceeded) && errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
-				stop = externalPhaseStop(c, ExternalStopDeadline)
+				ready.stop = externalPhaseStop(c, ExternalStopDeadline)
 				break
 			}
 			live.failedAt = externalPhaseWait
@@ -380,14 +400,11 @@ func (b *Builder) buildShardReadyAttempt(
 			live.failedAt = externalPhaseWaitedBatch
 			return nil, prepareErr
 		}
-		live.batches++
 		result, processErr := c.processExternalBatch(inputs, processUntil)
+		ready.record(inputs, result, processErr, externalPhaseWaitedBatch)
 		timer.stop()
-		*transcript = append(*transcript, inputs[:result.consumed]...)
-		stop, err = result.stop, processErr
-		if err != nil {
-			live.failedAt = externalPhaseWaitedBatch
-			return nil, err
+		if processErr != nil {
+			return nil, processErr
 		}
 	}
 
@@ -502,30 +519,30 @@ func (b *Builder) buildMasterReadyAttempt(
 	}
 	defer c.stopWaves()
 
-	stop := ExternalStopUnknown
+	ready := readyExternalAttempt{
+		transcript: transcript,
+		live:       live,
+	}
 	defer func() {
-		live.stop = stop
+		live.stop = ready.stop
 		live.observe(c, len(req.Externals))
 	}()
 
 	if len(req.Externals) > 0 {
-		live.batches++
 		timer := c.req.assembly.start(CollationStageExecuteExternalMessages)
 		result, processErr := c.processExternalBatch(req.Externals, processUntil)
+		ready.record(req.Externals, result, processErr, externalPhasePreAdmittedBatch)
 		timer.stop()
-		*transcript = append(*transcript, req.Externals[:result.consumed]...)
-		stop, err = result.stop, processErr
-		if err != nil {
-			live.failedAt = externalPhasePreAdmittedBatch
-			return nil, err
+		if processErr != nil {
+			return nil, processErr
 		}
 	}
-	for stop == ExternalStopUnknown {
+	for ready.stop == ExternalStopUnknown {
 		timer := c.req.assembly.start(CollationStageExecuteExternalMessages)
 		snapshots := stream.TakeReady(batchLimit)
 		if len(snapshots) == 0 {
 			timer.stop()
-			stop = ExternalStopReadyDrained
+			ready.stop = ExternalStopReadyDrained
 			break
 		}
 		inputs, prepareErr := prepareExternalSnapshots(snapshots)
@@ -534,14 +551,11 @@ func (b *Builder) buildMasterReadyAttempt(
 			live.failedAt = externalPhaseTakeReadyBatch
 			return nil, prepareErr
 		}
-		live.batches++
 		result, processErr := c.processExternalBatch(inputs, processUntil)
+		ready.record(inputs, result, processErr, externalPhaseTakeReadyBatch)
 		timer.stop()
-		*transcript = append(*transcript, inputs[:result.consumed]...)
-		stop, err = result.stop, processErr
-		if err != nil {
-			live.failedAt = externalPhaseTakeReadyBatch
-			return nil, err
+		if processErr != nil {
+			return nil, processErr
 		}
 	}
 

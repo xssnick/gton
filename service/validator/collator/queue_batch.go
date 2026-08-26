@@ -9,35 +9,138 @@ import (
 	"github.com/xssnick/gton/service/validator/msgpool"
 )
 
+type queuePendingAddKind uint8
+
+const (
+	queuePendingAddGenerated queuePendingAddKind = iota
+	queuePendingAddTransit
+)
+
+type queuePendingAdd struct {
+	key   msgpool.QueueKey
+	value *cell.Cell
+	kind  queuePendingAddKind
+}
+
+func (a queuePendingAdd) mutationError(err error) error {
+	if a.kind == queuePendingAddTransit {
+		return fmt.Errorf("enqueue transit message: %w", err)
+	}
+	return fmt.Errorf("enqueue generated message: %w", err)
+}
+
+func (a queuePendingAdd) duplicateError() error {
+	if a.kind == queuePendingAddTransit {
+		return fmt.Errorf("%w: duplicate transit queue key %x", ErrInvalidInput, a.key)
+	}
+	return fmt.Errorf("%w: duplicate outbound queue key %x", ErrInvalidInput, a.key)
+}
+
+// deferQueueAdd checks Add semantics immediately, then keeps the value for the
+// next bulk write. The absence lookup is deliberate: delaying an existing-key
+// failure until a root sample would let later message side effects run first.
+// It is cheaper than a mutation and also records the predecessor path at the
+// same point the former per-entry Set did. Repeated pending keys are caught by
+// the in-memory set because they are not visible in the dictionary yet.
+func (c *collation) deferQueueAdd(key msgpool.QueueKey, value *cell.Cell, kind queuePendingAddKind) error {
+	if len(c.queuePendingDelete) != 0 {
+		if err := c.flushQueueDeletes(); err != nil {
+			return err
+		}
+	}
+
+	add := queuePendingAdd{key: key, value: value, kind: kind}
+	if _, exists := c.queuePendingAddSet[key]; exists {
+		return add.duplicateError()
+	}
+
+	var existing cell.Slice
+	err := c.outQueue.LoadValueByBytesKeyInto(key[:], &existing)
+	switch {
+	case err == nil:
+		return add.duplicateError()
+	case !isMissingKey(err):
+		return add.mutationError(err)
+	}
+
+	if c.queuePendingAddSet == nil {
+		c.queuePendingAddSet = make(map[msgpool.QueueKey]struct{}, 64)
+	}
+	c.queuePendingAddSet[key] = struct{}{}
+	c.queuePendingAdd = append(c.queuePendingAdd, add)
+	return nil
+}
+
+// flushQueueAdds applies one uninterrupted run of Add operations in a single
+// Patricia descent. All duplicate decisions were made in deferQueueAdd, in
+// canonical message order, so SetMany is only the materialization step.
+func (c *collation) flushQueueAdds() error {
+	if len(c.queuePendingAdd) == 0 {
+		return nil
+	}
+
+	c.queuePendingAddEntries = c.queuePendingAddEntries[:0]
+	for i := range c.queuePendingAdd {
+		add := &c.queuePendingAdd[i]
+		c.queuePendingAddEntries = append(c.queuePendingAddEntries, cell.AugmentedBytesEntry{
+			Key:   add.key[:],
+			Value: add.value,
+			Mode:  cell.DictSetModeAdd,
+		})
+	}
+	if err := c.outQueue.SetManyByBytes(c.queuePendingAddEntries, collationParallelism); err != nil {
+		return c.queuePendingAdd[0].mutationError(err)
+	}
+
+	clear(c.queuePendingAdd)
+	clear(c.queuePendingAddEntries)
+	c.queuePendingAdd = c.queuePendingAdd[:0]
+	c.queuePendingAddEntries = c.queuePendingAddEntries[:0]
+	clear(c.queuePendingAddSet)
+	return nil
+}
+
 // deferQueueDelete queues one out-queue removal for the next flush. The
 // pending set is what keeps deferred semantics identical to immediate ones: a
 // second dequeue of the same key must fail as absent, and an enqueue landing
 // on a pending key must see the delete applied first.
-func (c *collation) deferQueueDelete(key msgpool.QueueKey, keyCell *cell.Cell) {
-	if c.queuePendingSet == nil {
-		c.queuePendingSet = make(map[msgpool.QueueKey]struct{}, 64)
+func (c *collation) deferQueueDelete(key msgpool.QueueKey) error {
+	if err := c.flushQueueAdds(); err != nil {
+		return err
 	}
-	c.queuePendingSet[key] = struct{}{}
-	c.queuePendingDelete = append(c.queuePendingDelete, keyCell)
+	if c.queuePendingDeleteSet == nil {
+		c.queuePendingDeleteSet = make(map[msgpool.QueueKey]struct{}, 64)
+	}
+	c.queuePendingDeleteSet[key] = struct{}{}
+	c.queuePendingDelete = append(c.queuePendingDelete, key)
+	return nil
 }
 
 func (c *collation) queueDeletePending(key msgpool.QueueKey) bool {
-	_, pending := c.queuePendingSet[key]
+	_, pending := c.queuePendingDeleteSet[key]
 	return pending
 }
 
-// flushQueueDeletes applies the pending removals in one descent. It runs
-// before every read that must see them: the root samples the limiter takes on
-// the queue-op cadence, the closing proof of the cleanup phase, and finish.
+// flushQueueDeletes is the queue's observation barrier: additions land first,
+// then pending removals. It runs before every root sample and at finish, while
+// lookup/delete paths call flushQueueAdds directly before observing a value.
 func (c *collation) flushQueueDeletes() error {
+	if err := c.flushQueueAdds(); err != nil {
+		return err
+	}
 	if len(c.queuePendingDelete) == 0 {
 		return nil
 	}
-	if err := c.outQueue.DeleteMany(c.queuePendingDelete, collationParallelism); err != nil {
+	c.queuePendingDeleteViews = c.queuePendingDeleteViews[:0]
+	for i := range c.queuePendingDelete {
+		c.queuePendingDeleteViews = append(c.queuePendingDeleteViews, c.queuePendingDelete[i][:])
+	}
+	if err := c.outQueue.DeleteManyByBytes(c.queuePendingDeleteViews, collationParallelism); err != nil {
 		return fmt.Errorf("%w: outbound queue deletes did not apply: %v", ErrInvalidInput, err)
 	}
 	c.queuePendingDelete = c.queuePendingDelete[:0]
-	clear(c.queuePendingSet)
+	c.queuePendingDeleteViews = c.queuePendingDeleteViews[:0]
+	clear(c.queuePendingDeleteSet)
 	return nil
 }
 
@@ -53,29 +156,28 @@ func (c *collation) traceOutQueueValidationClosure() error {
 	// this was the longest of the closure's five tasks once the account
 	// replay was split, 37 ms on the testnet validator, and it has the same
 	// shape — sibling loads and augmentation checks along changed paths.
-	return c.oldOutQueue.ScanDiffParallel(c.outQueue.AugmentedDictionary, true, func(
-		keyCell *cell.Cell,
-		oldValueExtra, newValueExtra *cell.Slice,
-	) error {
+	return c.oldOutQueue.ScanDiffParallelRaw(c.outQueue.AugmentedDictionary, true, func(view cell.AugDictDiffRawView) error {
 		var value cell.Slice
-		if oldValueExtra != nil {
-			oldValueExtra.CopyInto(&value)
+		if view.HasOld {
+			view.OldValueExtra.CopyInto(&value)
 			if err := (tlb.AugOutMsgQueue{}).SkipExtra(&value); err != nil {
 				return fmt.Errorf("%w: decode predecessor outbound queue augmentation %s: %v",
-					ErrInvalidInput, queueDiffKeyLabel(keyCell), err)
+					ErrInvalidInput, queueDiffKeyLabel(view.Key, view.KeyBits), err)
 			}
 			if err := traceQueueEntryClosure(&value); err != nil {
-				return fmt.Errorf("trace predecessor outbound queue entry %s: %w", queueDiffKeyLabel(keyCell), err)
+				return fmt.Errorf("trace predecessor outbound queue entry %s: %w",
+					queueDiffKeyLabel(view.Key, view.KeyBits), err)
 			}
 		}
-		if newValueExtra != nil {
-			newValueExtra.CopyInto(&value)
+		if view.HasNew {
+			view.NewValueExtra.CopyInto(&value)
 			if err := (tlb.AugOutMsgQueue{}).SkipExtra(&value); err != nil {
 				return fmt.Errorf("%w: decode candidate outbound queue augmentation %s: %v",
-					ErrInvalidInput, queueDiffKeyLabel(keyCell), err)
+					ErrInvalidInput, queueDiffKeyLabel(view.Key, view.KeyBits), err)
 			}
 			if err := traceQueueEntryClosure(&value); err != nil {
-				return fmt.Errorf("trace candidate outbound queue entry %s: %w", queueDiffKeyLabel(keyCell), err)
+				return fmt.Errorf("trace candidate outbound queue entry %s: %w",
+					queueDiffKeyLabel(view.Key, view.KeyBits), err)
 			}
 		}
 
@@ -86,16 +188,8 @@ func (c *collation) traceOutQueueValidationClosure() error {
 // queueDiffKeyLabel renders a diff key for an error message. Formatting is the
 // only thing the key is wanted for on this path, so it is decoded on the
 // failure path instead of once per entry on the hot one.
-func queueDiffKeyLabel(keyCell *cell.Cell) string {
-	if keyCell == nil {
-		return "<absent>"
-	}
-	var key msgpool.QueueKey
-	loader, err := keyCell.BeginParse()
-	if err != nil {
-		return "<unreadable>"
-	}
-	if err = loader.LoadSliceInto(key[:], 352); err != nil {
+func queueDiffKeyLabel(key []byte, keyBits uint) string {
+	if keyBits != 352 || len(key) != len(msgpool.QueueKey{}) {
 		return "<unreadable>"
 	}
 	return fmt.Sprintf("%x", key)

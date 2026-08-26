@@ -253,7 +253,10 @@ func TestVerifyInboundMessagesSkipsProcessedForLocalReimport(t *testing.T) {
 			// A locally re-dequeued message is paired with msg_export_deq_imm.
 			localHash: {tag: semanticOutDequeueImmediate},
 		},
-		inOrder: []cell.Hash{localHash, neighborHash},
+		inOrder: []semanticInDescriptorEntry{
+			{hash: localHash, descriptor: localDescriptor},
+			{hash: neighborHash, descriptor: neighborDescriptor},
+		},
 		sources: []semanticQueueSource{{
 			neighbor: &Neighbor{Shard: sibling},
 			owner:    sibling,

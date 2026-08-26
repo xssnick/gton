@@ -240,6 +240,7 @@ func TestFullCollatedSpeculativeSplitQueuePrefixRequiresExactImports(t *testing.
 		descriptor, parseErr := parseSemanticInDescriptor(
 			*descriptorByHash(t, inMessages.AugmentedDictionary, hash),
 			hash,
+			nil,
 		)
 		if parseErr != nil {
 			t.Fatalf("parse exact InMsg %x: %v", hash, parseErr)

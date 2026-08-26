@@ -94,7 +94,8 @@ func exactConfigAddress(root *cell.Cell) ([]byte, error) {
 }
 
 func exactBits256(root *cell.Cell) ([]byte, error) {
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +245,8 @@ func validateValidatorRegistryConfigParameter(raw tlb.BlockchainConfig) error {
 	if err != nil {
 		return err
 	}
-	loader, err := parameter.BeginParse()
+	var loader cell.Slice
+	err = parameter.BeginParseInto(&loader)
 	if err != nil {
 		return err
 	}
@@ -255,7 +257,7 @@ func validateValidatorRegistryConfigParameter(raw tlb.BlockchainConfig) error {
 	if constructor != validatorRegistryConfigConstructor {
 		return fmt.Errorf("unsupported validator registry constructor #%08x", constructor)
 	}
-	if _, err = loader.LoadSlice(256); err != nil {
+	if err = loader.SkipBits(256); err != nil {
 		return err
 	}
 	if _, err = loader.LoadUInt(32); err != nil {
@@ -266,7 +268,7 @@ func validateValidatorRegistryConfigParameter(raw tlb.BlockchainConfig) error {
 		return err
 	}
 	if hasNewCodeHash {
-		if _, err = loader.LoadSlice(256); err != nil {
+		if err = loader.SkipBits(256); err != nil {
 			return err
 		}
 	}
@@ -281,18 +283,19 @@ func validateOracleBridgeParameter(raw tlb.BlockchainConfig, id uint32) error {
 	if err != nil {
 		return err
 	}
-	loader, err := parameter.BeginParse()
+	var loader cell.Slice
+	err = parameter.BeginParseInto(&loader)
 	if err != nil {
 		return err
 	}
-	if _, err = loader.LoadSlice(512); err != nil {
+	if err = loader.SkipBits(512); err != nil {
 		return err
 	}
 	oracles, err := loader.LoadDict(256)
 	if err != nil {
 		return err
 	}
-	if _, err = loader.LoadSlice(256); err != nil {
+	if err = loader.SkipBits(256); err != nil {
 		return err
 	}
 	if loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
@@ -306,7 +309,8 @@ func validateJettonBridgeParameter(raw tlb.BlockchainConfig, id uint32) error {
 	if err != nil {
 		return err
 	}
-	loader, err := parameter.BeginParse()
+	var loader cell.Slice
+	err = parameter.BeginParseInto(&loader)
 	if err != nil {
 		return err
 	}
@@ -314,7 +318,7 @@ func validateJettonBridgeParameter(raw tlb.BlockchainConfig, id uint32) error {
 	if err != nil {
 		return err
 	}
-	if _, err = loader.LoadSlice(512); err != nil {
+	if err = loader.SkipBits(512); err != nil {
 		return err
 	}
 	oracles, err := loader.LoadDict(256)
@@ -337,7 +341,7 @@ func validateJettonBridgeParameter(raw tlb.BlockchainConfig, id uint32) error {
 		if err = validateJettonBridgePrices(prices); err != nil {
 			return err
 		}
-		if _, err = loader.LoadSlice(256); err != nil {
+		if err = loader.SkipBits(256); err != nil {
 			return err
 		}
 	default:
@@ -350,7 +354,8 @@ func validateJettonBridgeParameter(raw tlb.BlockchainConfig, id uint32) error {
 }
 
 func validateJettonBridgePrices(root *cell.Cell) error {
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return err
 	}

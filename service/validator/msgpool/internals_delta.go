@@ -27,7 +27,8 @@ func routedDeltasFromBlockRoot(
 	if err != nil {
 		return nil, err
 	}
-	loader, err := outDescr.BeginParse()
+	var loader cell.Slice
+	err = outDescr.BeginParseInto(&loader)
 	if err != nil {
 		return nil, fmt.Errorf("msgpool: cannot parse OutMsgDescr: %w", err)
 	}
@@ -109,8 +110,8 @@ func routedDeltasFromBlockRoot(
 			}
 			// msg_export_deq_short$1101 msg_env_hash:bits256
 			// next_workchain:int32 next_addr_pfx:uint64 import_block_lt:uint64
-			envHash, err := v.LoadSlice(256)
-			if err != nil {
+			var hash [32]byte
+			if err := v.LoadSliceInto(hash[:], 256); err != nil {
 				return fmt.Errorf("cannot load dequeued envelope hash: %w", err)
 			}
 			workchain, err := v.LoadInt(32)
@@ -121,8 +122,6 @@ func routedDeltasFromBlockRoot(
 			if err != nil {
 				return fmt.Errorf("cannot load dequeue next prefix: %w", err)
 			}
-			var hash [32]byte
-			copy(hash[:], envHash)
 			sink.removeByEnvHash(AccountPrefix{Workchain: int32(workchain), Prefix: prefix}, hash)
 			return nil
 
@@ -245,7 +244,8 @@ func (s *routedSink) removeByEnvHash(hop AccountPrefix, envHash [32]byte) {
 // transitInputEnvelope extracts the old queued envelope from
 // msg_import_tr$101, the reimport record carried by msg_export_tr_req.
 func transitInputEnvelope(imported *cell.Cell) (*cell.Cell, error) {
-	v, err := imported.BeginParse()
+	var v cell.Slice
+	err := imported.BeginParseInto(&v)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse msg_export_tr_req import: %w", err)
 	}
@@ -380,7 +380,8 @@ func filterSeedPrefixes(prefixes []*cell.Cell, router destinationRouter, only in
 // key prefix carries. It reports ok=false for anything shorter than the
 // workchain, which cannot be narrowed at all.
 func seedPrefixRoute(prefix *cell.Cell) (AccountPrefix, int, bool) {
-	slice, err := prefix.BeginParse()
+	var slice cell.Slice
+	err := prefix.BeginParseInto(&slice)
 	if err != nil {
 		return AccountPrefix{}, 0, false
 	}
@@ -549,7 +550,8 @@ func decodeRoutedQueueEntry(
 	top SourceRef,
 ) (*InternalMessage, error) {
 	var enqueued tlb.EnqueuedMsg
-	if err := tlb.LoadFromCell(&enqueued, value.Copy()); err != nil {
+	valueCopy := *value
+	if err := tlb.LoadFromCell(&enqueued, &valueCopy); err != nil {
 		return nil, fmt.Errorf("cannot decode enqueued message: %w", err)
 	}
 	msg, err := InternalMessageFromEnvelope(enqueued.Msg)
@@ -669,7 +671,8 @@ func QueueSizeFromStateRoot(stateRoot *cell.Cell) (uint64, error) {
 // StateOutMsgQueueInfo walks a ShardStateUnsplit root to its parsed
 // OutMsgQueueInfo, touching only the state magic and the first reference.
 func StateOutMsgQueueInfo(stateRoot *cell.Cell) (*tlb.OutMsgQueueInfo, error) {
-	loader, err := stateRoot.BeginParse()
+	var loader cell.Slice
+	err := stateRoot.BeginParseInto(&loader)
 	if err != nil {
 		return nil, fmt.Errorf("msgpool: cannot parse state root: %w", err)
 	}
@@ -683,12 +686,13 @@ func StateOutMsgQueueInfo(stateRoot *cell.Cell) (*tlb.OutMsgQueueInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("msgpool: state root has no out-queue info: %w", err)
 	}
-	infoLoader, err := infoCell.BeginParse()
+	var infoLoader cell.Slice
+	err = infoCell.BeginParseInto(&infoLoader)
 	if err != nil {
 		return nil, fmt.Errorf("msgpool: cannot parse out-queue info: %w", err)
 	}
 	var queueInfo tlb.OutMsgQueueInfo
-	if err = tlb.LoadFromCell(&queueInfo, infoLoader); err != nil {
+	if err = tlb.LoadFromCell(&queueInfo, &infoLoader); err != nil {
 		return nil, fmt.Errorf("msgpool: cannot decode out-queue info: %w", err)
 	}
 	return &queueInfo, nil
@@ -707,16 +711,18 @@ func StateOutMsgQueueInfo(stateRoot *cell.Cell) (*tlb.OutMsgQueueInfo, error) {
 // addr_std/addr_var split and the anycast rewrite behind every derived key
 // stay bit-identical.
 func InternalMessageFromEnvelope(envCell *cell.Cell) (*InternalMessage, error) {
-	envLoader, err := envCell.BeginParse()
+	var envLoader cell.Slice
+	err := envCell.BeginParseInto(&envLoader)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse message envelope: %w", err)
 	}
 	var env tlb.MsgEnvelope
-	if err = env.LoadFromCell(envLoader); err != nil {
+	if err = env.LoadFromCell(&envLoader); err != nil {
 		return nil, fmt.Errorf("cannot decode message envelope: %w", err)
 	}
 
-	msgLoader, err := env.Msg.BeginParse()
+	var msgLoader cell.Slice
+	err = env.Msg.BeginParseInto(&msgLoader)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse enveloped message: %w", err)
 	}
@@ -750,16 +756,16 @@ func InternalMessageFromEnvelope(envCell *cell.Cell) (*InternalMessage, error) {
 	}
 	// value:CurrencyCollection — grams, then the extra-currency HashmapE,
 	// whose root is a reference and therefore costs a single bit here.
-	if err = skipGrams(msgLoader); err != nil {
+	if err = skipGrams(&msgLoader); err != nil {
 		return nil, fmt.Errorf("cannot skip enveloped message value: %w", err)
 	}
 	if _, err = msgLoader.LoadBoolBit(); err != nil {
 		return nil, fmt.Errorf("cannot skip enveloped message extra currencies: %w", err)
 	}
-	if err = skipGrams(msgLoader); err != nil {
+	if err = skipGrams(&msgLoader); err != nil {
 		return nil, fmt.Errorf("cannot skip enveloped message ihr fee: %w", err)
 	}
-	if err = skipGrams(msgLoader); err != nil {
+	if err = skipGrams(&msgLoader); err != nil {
 		return nil, fmt.Errorf("cannot skip enveloped message forward fee: %w", err)
 	}
 	createdLT, err := msgLoader.LoadUInt(64)

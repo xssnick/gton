@@ -2726,6 +2726,164 @@ func retryableProductionError(err error) bool {
 		!errors.Is(err, ErrCollatedRootNotFound)
 }
 
+// windowProducer owns one attempt to produce a leader window. The record and
+// active session are immutable snapshots. parent, previous and future belong to
+// the producer goroutine; producerSlot and successors are the only state touched
+// by the handoff callbacks running on build goroutines.
+type windowProducer struct {
+	service       *Service
+	job           *productionJob
+	managed       *managedCollatorSession
+	record        SessionRecord
+	activeSession ActivatedSession
+	chain         MetricChain
+	end           uint32
+
+	parent   simplex.ParentID
+	previous *CandidateArtifact
+	future   *candidateBuildFuture
+
+	successors   successorSlot
+	producerSlot atomic.Uint32
+
+	acceptSuccessor func(SuccessorOffer)
+	revokeSuccessor func([32]byte, PipelineHandoffOutcome)
+}
+
+func (p *windowProducer) stop() {
+	// Cancel both before joining either. The two builds then unwind beside each
+	// other rather than one after the other, which matters because this runs
+	// with productionMu held and a superseding consensus progress waits only
+	// waitProductionBarrier for it.
+	parked := p.successors.closeCancelled()
+	if p.future != nil {
+		p.future.cancel()
+	}
+	if parked != nil {
+		<-parked.done
+	}
+	if p.future != nil {
+		<-p.future.done
+	}
+}
+
+// revokeHandoff withdraws a parked successor named by the predecessor root it
+// was started on. Named rather than blanket: by the time a revoke arrives the
+// slot may already hold a successor from a later, valid offer, and taking that
+// one down would turn a recovered retry into a lost slot.
+func (p *windowProducer) revokeHandoff(root [32]byte, outcome PipelineHandoffOutcome) {
+	if parked := p.successors.takeIf(root); parked != nil {
+		// Joined, not merely cancelled: revokeOffered drops the successor's
+		// queue node the moment this returns, and a successor still unwinding
+		// could install that node afterwards and leave the branch holding one
+		// for a block that never existed. revokeOffered is what keeps the wait
+		// off the caller.
+		parked.stop()
+		p.service.observePipelineHandoff(p.chain, outcome)
+	}
+}
+
+// acceptHandoff starts the next slot's build as soon as the predecessor has
+// installed all state that build may read. It runs on the block-BOC branch of
+// the predecessor's collation and, of the producer-owned mutable state, only
+// touches the mutex-guarded successor slot.
+func (p *windowProducer) acceptHandoff(offer SuccessorOffer) {
+	outcome := PipelineHandoffDeclinedBusy
+	defer func() {
+		p.service.observePipelineHandoff(p.chain, outcome)
+	}()
+
+	if p.record.Session.Shard.IsMasterchain() {
+		outcome = PipelineHandoffDeclinedMasterchain
+
+		return
+	}
+	next := offer.predecessorSlot + 1
+	if next <= p.producerSlot.Load() {
+		outcome = PipelineHandoffDeclinedBusy
+
+		return
+	}
+	if next >= p.end {
+		outcome = PipelineHandoffDeclinedWindowEnd
+
+		return
+	}
+	if p.job.ctx.Err() != nil {
+		outcome = PipelineHandoffDeclinedWindowEnd
+
+		return
+	}
+	lead := time.Until(buildStartTime(p.record, next))
+	if lead >= maxPipelinedBuildLead(p.record) {
+		outcome = PipelineHandoffDeclinedLead
+
+		return
+	}
+	// The only empty-policy evaluation the next slot gets, and it is taken
+	// from the state the predecessor produced rather than resolved again —
+	// resolving would mean taking the session lock in front of the commit that
+	// is about to need it. Safe in one direction only, and it is the direction
+	// that holds: the shard predicate is LastMCFinalizedSeqno+8 < nextSeqno
+	// (simplex/produce_policy.go), the watermark only ever grows and nextSeqno
+	// is fixed by this predecessor, so the predicate goes from "empty" to
+	// "collate" and never back. A verdict of "collate" taken early still reads
+	// "collate" at the slot, while an early "empty" only forfeits the head
+	// start: the loop reaches the slot and runs the full check on schedule.
+	if p.managed.shouldGenerateEmpty(false, offer.Policy) {
+		outcome = PipelineHandoffDeclinedEmpty
+
+		return
+	}
+
+	pending := offer
+	request := slotBuildRequest(
+		p.activeSession,
+		p.record,
+		p.job.window,
+		next,
+		simplex.ParentID{},
+		nil,
+	)
+	request.PreviousPending = &pending
+	request.excludeExternals = offer.Exclude
+	request.onSuccessor = p.acceptSuccessor
+	request.revokeSuccessor = p.revokeSuccessor
+	started := p.service.startBuildFuture(
+		p.job.ctx,
+		request,
+		hardBuildDeadline(p.record, next),
+	)
+	if !p.successors.install(started, [32]byte(offer.ID.RootHash)) {
+		// The slot is closed or already holds a successor; this one was never
+		// anybody's and is cancelled where it was started. This runs on the
+		// predecessor's block-BOC branch, which its own collation joins before
+		// returning a candidate, so a wait here would hold up the block that
+		// made the offer.
+		started.abandon()
+
+		return
+	}
+	outcome = PipelineHandoffStarted
+	if offer.adopt != nil {
+		offer.adopt()
+	}
+	if p.service.opts.Observer != nil {
+		// Both series, and both for the same reason: every slot must report its
+		// build-start lateness exactly once, or the series stops describing the
+		// producer and starts describing which slots happened to be pipelined.
+		// A build begun at or before its schedule is not late, which the
+		// observer's clamp already says; build_lead is where the head start
+		// itself is readable.
+		p.service.opts.Observer.ObserveScheduleLateness(
+			p.chain,
+			ScheduleEventBuildStart,
+			time.Since(buildStartTime(p.record, next)),
+		)
+		p.service.opts.Observer.ObserveScheduleLateness(p.chain, ScheduleEventBuildLead, lead)
+	}
+}
+
 func (s *Service) runProduction(job *productionJob) error {
 	managed := job.session
 	if err := job.ctx.Err(); err != nil {
@@ -2744,45 +2902,25 @@ func (s *Service) runProduction(job *productionJob) error {
 		return ErrStaleWindow
 	}
 
-	parent := record.Update.CurrentBase
-	var previous *CandidateArtifact
-	var future *candidateBuildFuture
-	// successors is where a build that handed itself over early parks the next
-	// slot's build until the loop reaches that slot. It is closed by the same
-	// defer that stops the current future, so a window that ends anywhere takes
-	// its speculative successor with it.
-	var successors successorSlot
+	producer := &windowProducer{
+		service:       s,
+		job:           job,
+		managed:       managed,
+		record:        record,
+		activeSession: activeSession,
+		chain:         chain,
+		end:           job.window.ID.StartSlot + record.Session.SlotsPerLeaderWindow,
+		parent:        record.Update.CurrentBase,
+	}
 	// producerSlot is where the loop has got to. A build can be committed at a
 	// later slot than the one it was requested for — a soft-timeout carry-over
 	// does exactly that — so the slot a handoff names is the slot its build was
 	// asked for, not the slot its block will occupy. Offering a successor for a
 	// slot the producer has already reached is offering work nobody can adopt.
-	var producerSlot atomic.Uint32
-	producerSlot.Store(job.window.ID.StartSlot)
-	defer func() {
-		// Cancel both before joining either. The two builds then unwind beside
-		// each other rather than one after the other, which matters because this
-		// runs with productionMu held and a superseding consensus progress waits
-		// only waitProductionBarrier for it.
-		parked := successors.closeCancelled()
-		if future != nil {
-			future.cancel()
-		}
-		if parked != nil {
-			<-parked.done
-		}
-		if future != nil {
-			<-future.done
-		}
-	}()
-	// advance carries the consensus lineage into the next slot. Every branch
-	// that emits a candidate must go through it: a branch that chains the next
-	// candidate to a stale parent is consensus-visible and nothing else catches it.
-	advance := func(artifact CandidateArtifact) {
-		parent, previous = successorLineage(artifact)
-	}
-	end := job.window.ID.StartSlot + record.Session.SlotsPerLeaderWindow
-	if end < job.window.ID.StartSlot {
+	producer.producerSlot.Store(job.window.ID.StartSlot)
+	defer producer.stop()
+
+	if producer.end < job.window.ID.StartSlot {
 		return errors.New("collator runtime: leader window overflows slot space")
 	}
 	// pipeline starts the next slot's build the instant this slot's candidate
@@ -2807,123 +2945,12 @@ func (s *Service) runProduction(job *productionJob) error {
 	// set sooner. The reference draws the same line: it starts masterchain
 	// collation at the slot, not before it.
 	//
-	// This runs on the block-BOC branch of the predecessor's own collation, not
-	// on this goroutine, so it touches nothing the producer owns except the slot
-	// it parks its result in — which is mutex-guarded for exactly that reason.
-	// revokeHandoff withdraws a parked successor named by the predecessor root it
-	// was started on. Named rather than blanket: by the time a revoke arrives the
-	// slot may already hold a successor from a later, valid offer, and taking
-	// that one down would turn a recovered retry into a lost slot.
-	revokeHandoff := func(root [32]byte, outcome PipelineHandoffOutcome) {
-		if parked := successors.takeIf(root); parked != nil {
-			// Joined, not merely cancelled: revokeOffered drops the successor's
-			// queue node the moment this returns, and a successor still
-			// unwinding could install that node afterwards and leave the branch
-			// holding one for a block that never existed. revokeOffered is what
-			// keeps the wait off the caller.
-			parked.stop()
-			s.observePipelineHandoff(chain, outcome)
-		}
-	}
-	// The callback is reached through a pointer because it installs itself on the
-	// requests it starts: a successor must be able to hand over in turn, or the
-	// pipeline stops after one slot.
-	type handoffFunc struct{ fn func(SuccessorOffer) }
-	var onHandoffRef atomic.Pointer[handoffFunc]
-	onHandoff := func(offer SuccessorOffer) {
-		outcome := PipelineHandoffDeclinedBusy
-		var started *candidateBuildFuture
-		defer func() {
-			s.observePipelineHandoff(chain, outcome)
-			if started == nil && outcome != PipelineHandoffStarted {
-				return
-			}
-		}()
-
-		if record.Session.Shard.IsMasterchain() {
-			outcome = PipelineHandoffDeclinedMasterchain
-
-			return
-		}
-		next := offer.predecessorSlot + 1
-		if next <= producerSlot.Load() {
-			outcome = PipelineHandoffDeclinedBusy
-
-			return
-		}
-		if next >= end {
-			outcome = PipelineHandoffDeclinedWindowEnd
-
-			return
-		}
-		if job.ctx.Err() != nil {
-			outcome = PipelineHandoffDeclinedWindowEnd
-
-			return
-		}
-		lead := time.Until(buildStartTime(record, next))
-		if lead >= maxPipelinedBuildLead(record) {
-			outcome = PipelineHandoffDeclinedLead
-
-			return
-		}
-		// The only empty-policy evaluation the next slot gets, and it is taken
-		// from the state the predecessor produced rather than resolved again —
-		// resolving would mean taking the session lock in front of the commit
-		// that is about to need it. Safe in one direction only, and it is the
-		// direction that holds: the shard predicate is
-		// LastMCFinalizedSeqno+8 < nextSeqno (simplex/produce_policy.go), the
-		// watermark only ever grows and nextSeqno is fixed by this predecessor,
-		// so the predicate goes from "empty" to "collate" and never back. A
-		// verdict of "collate" taken early still reads "collate" at the slot,
-		// while an early "empty" only forfeits the head start: the loop reaches
-		// the slot and runs the full check on schedule.
-		if managed.shouldGenerateEmpty(false, offer.Policy) {
-			outcome = PipelineHandoffDeclinedEmpty
-
-			return
-		}
-
-		pending := offer
-		request := slotBuildRequest(
-			activeSession, record, job.window, next,
-			simplex.ParentID{}, nil,
-		)
-		request.PreviousPending = &pending
-		request.excludeExternals = offer.Exclude
-		request.onSuccessor = onHandoffRef.Load().fn
-		request.revokeSuccessor = revokeHandoff
-		started = s.startBuildFuture(job.ctx, request, hardBuildDeadline(record, next))
-		if !successors.install(started, [32]byte(offer.ID.RootHash)) {
-			// The slot is closed or already holds a successor; this one was never
-			// anybody's and is cancelled where it was started. This runs on the
-			// predecessor's block-BOC branch, which its own collation joins
-			// before returning a candidate, so a wait here would hold up the
-			// block that made the offer.
-			started.abandon()
-
-			return
-		}
-		outcome = PipelineHandoffStarted
-		if offer.adopt != nil {
-			offer.adopt()
-		}
-		if s.opts.Observer != nil {
-			// Both series, and both for the same reason: every slot must report
-			// its build-start lateness exactly once, or the series stops
-			// describing the producer and starts describing which slots happened
-			// to be pipelined. A build begun at or before its schedule is not
-			// late, which the observer's clamp already says; build_lead is where
-			// the head start itself is readable.
-			s.opts.Observer.ObserveScheduleLateness(
-				chain,
-				ScheduleEventBuildStart,
-				time.Since(buildStartTime(record, next)),
-			)
-			s.opts.Observer.ObserveScheduleLateness(chain, ScheduleEventBuildLead, lead)
-		}
-	}
-	onHandoffRef.Store(&handoffFunc{fn: onHandoff})
+	// acceptHandoff runs on the block-BOC branch of the predecessor's own
+	// collation, not on this goroutine, so it touches nothing the producer owns
+	// except the slot it parks its result in — which is mutex-guarded for exactly
+	// that reason.
+	producer.acceptSuccessor = producer.acceptHandoff
+	producer.revokeSuccessor = producer.revokeHandoff
 	// A first slot begun before this window was observed, collected only when the
 	// window opened on the very base it was started on. The empty-block verdict
 	// it needed was taken when the bet was placed, from the state that base
@@ -2937,16 +2964,19 @@ func (s *Service) runProduction(job *productionJob) error {
 	// offer is the slot 0 to slot 1 boundary — the one boundary in the window
 	// that the pipeline could not cover, because when a speculative build hands
 	// over there is no producer yet to hand to.
-	if adopted, handoff, taken := managed.speculation.takeMatching(job.window.ID.StartSlot, parent); taken {
-		future = adopted
-		s.observePipelineHandoff(chain, PipelineHandoffSpeculativeAdopted)
+	if adopted, handoff, taken := producer.managed.speculation.takeMatching(
+		job.window.ID.StartSlot,
+		producer.parent,
+	); taken {
+		producer.future = adopted
+		s.observePipelineHandoff(producer.chain, PipelineHandoffSpeculativeAdopted)
 		if s.opts.Observer != nil {
 			// The head start actually realized: how long the speculative build had
 			// been running when the window opened. It is the whole quantity this
 			// change exists to produce, and it is reported on the same series a
 			// pipelined build reports its lead on.
 			s.opts.Observer.ObserveScheduleLateness(
-				chain,
+				producer.chain,
 				ScheduleEventBuildLead,
 				time.Since(adopted.started),
 			)
@@ -2954,325 +2984,381 @@ func (s *Service) runProduction(job *productionJob) error {
 		// Ownership of the parked offer moves to this producer along with the
 		// build: from here a withdrawal reaches revokeHandoff, which knows the
 		// successor that was really started and the queue node it installed.
-		if offer := handoff.adopt(revokeHandoff); offer != nil {
-			onHandoff(*offer)
+		if offer := handoff.adopt(producer.revokeSuccessor); offer != nil {
+			producer.acceptSuccessor(*offer)
 		}
 	}
-	for slot := job.window.ID.StartSlot; slot < end; slot++ {
-		producerSlot.Store(slot)
-		// Adopt whatever the previous slot handed over, but only if it was built
-		// on the predecessor this producer went on to commit. A size-limit retry
-		// rebuilds that block and moves its root, so a mismatched offer does not
-		// describe a stale state — it describes one that never existed.
-		if future == nil {
-			if parked, root := successors.take(); parked != nil {
-				// Two questions, and both must answer yes. The root is whether
-				// the offer describes the predecessor this producer went on to
-				// commit — a size-limit retry rebuilds that block and moves its
-				// hash, so a mismatched offer does not describe a stale state,
-				// it describes one that never existed.
-				//
-				// Viability is whether the build can still serve at all. A
-				// successor that gave the slot back — its acquisition may not
-				// seed while the predecessor is still finishing, and says so
-				// with ErrAcquisitionNotReady — has already failed by now.
-				// Adopting it would make that refusal the slot's error and send
-				// the whole window back through produceWindowWithRetry, which
-				// re-restores and re-emits every slot already on the wire.
-				// Declining costs the head start and nothing else: the loop
-				// below starts this slot's build on schedule.
-				switch {
-				case previous == nil || len(previous.Candidate.Block.RootHash) != 32 ||
-					root != [32]byte(previous.Candidate.Block.RootHash):
-					parked.abandon()
-					s.observePipelineHandoff(chain, PipelineHandoffAbandonedSuperseded)
-				case !parked.viable(time.Now()):
-					parked.abandon()
-					s.observePipelineHandoff(chain, PipelineHandoffAbandonedFailed)
-				default:
-					future = parked
-					s.observePipelineHandoffPickup(chain, parked.request)
-				}
-			}
+	for slot := job.window.ID.StartSlot; slot < producer.end; slot++ {
+		if err := producer.runSlot(slot); err != nil {
+			return err
 		}
-		stored, err := s.opts.Storage.Candidate(job.ctx, job.window.ID, slot)
-		if err == nil {
-			if future != nil {
-				// Unreachable by construction: this branch emits directly and
-				// never goes through persistAndEmit, so the hook cannot have
-				// fired from a resumed slot, and the markers this reads are
-				// written in slot order by this same goroutine. Kept because
-				// without it a build started for this slot would hold the
-				// acquisition session while the slot is restored instead.
-				future.stop()
-				future = nil
-			}
-			productionStarted := s.metricStageStarted()
-			remembered, found := managed.recallEmitted(job.window.ID, slot)
-			artifact, artifactErr := s.artifactFromRecord(record.Session, job.window, stored, remembered, found)
-			if artifactErr != nil {
-				s.observeCandidateProduction(chain, CandidateKindRecovered, productionStarted, artifactErr)
+	}
 
-				return artifactErr
-			}
-			if artifact.Candidate.Parent != parent {
-				s.observeCandidateProduction(
-					chain,
-					CandidateKindRecovered,
-					productionStarted,
-					ErrCandidateConflict,
-				)
+	return nil
+}
 
-				return ErrCandidateConflict
-			}
-			var finalizedAnchor *ton.BlockIDExt
-			if previous == nil && record.Update.HasFinalizedBlock &&
-				sameBlockID(artifact.Candidate.Block, record.Update.FinalizedBlock) {
-				anchor := cloneBlockID(record.Update.FinalizedBlock)
-				finalizedAnchor = &anchor
-			}
-			restore := BuildRequest{
-				Session:         activeSession,
-				Update:          record.Update,
-				Slot:            slot,
-				Leader:          job.window.Leader,
-				Parent:          parent,
-				Previous:        previous,
-				FinalizedAnchor: finalizedAnchor,
-			}
-			stageStarted := s.metricStageStarted()
-			if err = s.opts.Pipeline.RestoreCandidate(job.ctx, restore, artifact); err != nil {
-				s.observeMetricStage(chain, CollationStageRestoreCandidate, stageStarted)
-				s.observeCandidateProduction(chain, CandidateKindRecovered, productionStarted, err)
-
-				return fmt.Errorf("collator runtime: restore candidate state: %w", err)
-			}
-			s.observeMetricStage(chain, CollationStageRestoreCandidate, stageStarted)
-			stageStarted = s.metricStageStarted()
-			if err = waitUntil(job.ctx, broadcastTime(record, slot)); err != nil {
-				s.observeMetricStage(chain, CollationStageWaitBroadcastSlot, stageStarted)
-				s.observeCandidateProduction(chain, CandidateKindRecovered, productionStarted, err)
-
-				return err
-			}
-			s.observeMetricStage(chain, CollationStageWaitBroadcastSlot, stageStarted)
-			if s.opts.Observer != nil {
-				s.opts.Observer.ObserveScheduleLateness(
-					chain,
-					ScheduleEventBroadcast,
-					time.Since(broadcastTime(record, slot)),
-				)
-			}
-			stageStarted = s.metricStageStarted()
-			if err = s.opts.Emit(job.ctx, artifact); err != nil {
-				s.observeMetricStage(chain, CollationStageDeliverCandidate, stageStarted)
-				s.observeCandidateProduction(chain, CandidateKindRecovered, productionStarted, err)
-
-				return fmt.Errorf("collator runtime: emit recovered candidate: %w", err)
-			}
-			s.observeMetricStage(chain, CollationStageDeliverCandidate, stageStarted)
-			s.observeCandidateProduction(chain, CandidateKindRecovered, productionStarted, nil)
-			advance(artifact)
-			continue
-		}
-		if !errors.Is(err, ErrNotFound) {
-			return fmt.Errorf("collator runtime: load candidate: %w", err)
-		}
-
-		request := slotBuildRequest(activeSession, record, job.window, slot, parent, previous)
-		request.onSuccessor = onHandoff
-		request.revokeSuccessor = revokeHandoff
-		// emitEmpty commits this slot as an empty candidate. It deliberately does
-		// not touch future: the soft-timeout path keeps its live build for the
-		// next slot, and the commit always carries the current slot's request
-		// rather than the one the surviving future was started from.
-		emitEmpty := func(block ton.BlockIDExt) error {
-			started := time.Now()
-			stageStarted := s.metricStageStarted()
-			artifact, emptyErr := s.signEmptyArtifact(record.Session, job.window, slot, parent, block)
-			s.observeMetricStage(chain, CollationStageSignCandidate, stageStarted)
-			if emptyErr != nil {
-				s.observeCandidateProduction(chain, CandidateKindEmpty, started, emptyErr)
-
-				return emptyErr
-			}
-			s.logCollatedCandidate(request, &artifact.Candidate, 0, 0, nil, time.Since(started))
-			if emptyErr = s.persistAndEmit(job.ctx, managed, record, artifact, &CandidateCommit{
-				Request:  request,
-				Artifact: artifact,
-			}, started, CandidateKindEmpty); emptyErr != nil {
-				return emptyErr
-			}
-			advance(artifact)
-
-			return nil
-		}
-		if future == nil {
-			if err = waitUntil(job.ctx, buildStartTime(record, slot)); err != nil {
-				return err
-			}
-			// The first shard slot cannot be scheduled one target rate before a
-			// window whose start time is only established after resolving its base.
-			// C++ starts it immediately too. Counting that inherent deficit makes
-			// build_start p95 converge on TargetRate instead of showing carry-over
-			// from the preceding slot, which is the actionable lateness here.
-			if s.opts.Observer != nil &&
-				(record.Session.Shard.IsMasterchain() || slot != job.window.ID.StartSlot) {
-				s.opts.Observer.ObserveScheduleLateness(
-					chain,
-					ScheduleEventBuildStart,
-					time.Since(buildStartTime(record, slot)),
-				)
-			}
-			if parent.Exists {
-				stageStarted := s.metricStageStarted()
-				state, stateErr := s.opts.Pipeline.ResolveCandidateState(job.ctx, request)
-				s.observeMetricStage(chain, CollationStageResolveCandidateState, stageStarted)
-				if stateErr != nil {
-					return fmt.Errorf("collator runtime: resolve candidate state for slot %d: %w", slot, stateErr)
-				}
-				if managed.shouldGenerateEmpty(record.Session.Shard.IsMasterchain(), state) {
-					if err = emitEmpty(state.Block); err != nil {
-						return err
-					}
-					continue
-				}
-			}
-			future = s.startBuildFuture(job.ctx, request, hardBuildDeadline(record, slot))
-		}
-
-		result, softTimeout, waitErr := awaitBuildUntil(job.ctx, future, softBuildDeadline(record, slot))
-		if waitErr != nil {
-			return waitErr
-		}
-		if softTimeout {
-			if !managed.allowEmptyOnGenerationFailure(record.Update.NoEmptyBlocksOnErrTimeout) {
-				if s.opts.Observer != nil {
-					// Distinct from an ordinary wait: this producer is not slow, it
-					// is forbidden to emit the empty block that would end the wait
-					// because the session has not finalized for
-					// NoEmptyBlocksOnErrTimeout. Reported as the same action, the
-					// two are indistinguishable — and in the field this one was the
-					// reason both Go nodes stayed silent in their own windows.
-					s.opts.Observer.ObserveCollationDeadline(
-						chain,
-						CollationDeadlineSoft,
-						DeadlineActionWaitNoEmpty,
-					)
-				}
-				result, waitErr = awaitBuild(job.ctx, future)
-				if waitErr != nil {
-					return waitErr
-				}
-				softTimeout = false
-			}
-		}
-		if softTimeout {
-			decision, decisionErr := s.opts.Pipeline.SoftTimeout(job.ctx, SoftTimeoutRequest{
-				Active:  future.request,
-				Current: request,
-			})
-			if decisionErr != nil {
-				if s.opts.Observer != nil {
-					s.opts.Observer.ObserveCollationDeadline(
-						chain,
-						CollationDeadlineSoft,
-						DeadlineActionAbort,
-					)
-				}
-
-				return fmt.Errorf("collator runtime: decide soft timeout for slot %d: %w", slot, decisionErr)
-			}
-			switch decision.Action {
-			case SoftTimeoutWait:
-				if s.opts.Observer != nil {
-					s.opts.Observer.ObserveCollationDeadline(
-						chain,
-						CollationDeadlineSoft,
-						DeadlineActionWait,
-					)
-				}
-				result, waitErr = awaitBuild(job.ctx, future)
-				if waitErr != nil {
-					return waitErr
-				}
-			case SoftTimeoutEmitEmpty:
-				if s.opts.Observer != nil {
-					s.opts.Observer.ObserveCollationDeadline(
-						chain,
-						CollationDeadlineSoft,
-						DeadlineActionEmitEmpty,
-					)
-				}
-				if err = emitEmpty(decision.Block); err != nil {
-					return err
-				}
-				continue
+func (p *windowProducer) runSlot(slot uint32) error {
+	p.producerSlot.Store(slot)
+	// Adopt whatever the previous slot handed over, but only if it was built
+	// on the predecessor this producer went on to commit. A size-limit retry
+	// rebuilds that block and moves its root, so a mismatched offer does not
+	// describe a stale state — it describes one that never existed.
+	if p.future == nil {
+		if parked, root := p.successors.take(); parked != nil {
+			// Two questions, and both must answer yes. The root is whether
+			// the offer describes the predecessor this producer went on to
+			// commit — a size-limit retry rebuilds that block and moves its
+			// hash, so a mismatched offer does not describe a stale state,
+			// it describes one that never existed.
+			//
+			// Viability is whether the build can still serve at all. A
+			// successor that gave the slot back — its acquisition may not
+			// seed while the predecessor is still finishing, and says so
+			// with ErrAcquisitionNotReady — has already failed by now.
+			// Adopting it would make that refusal the slot's error and send
+			// the whole window back through produceWindowWithRetry, which
+			// re-restores and re-emits every slot already on the wire.
+			// Declining costs the head start and nothing else: the loop
+			// below starts this slot's build on schedule.
+			switch {
+			case p.previous == nil || len(p.previous.Candidate.Block.RootHash) != 32 ||
+				root != [32]byte(p.previous.Candidate.Block.RootHash):
+				parked.abandon()
+				p.service.observePipelineHandoff(p.chain, PipelineHandoffAbandonedSuperseded)
+			case !parked.viable(time.Now()):
+				parked.abandon()
+				p.service.observePipelineHandoff(p.chain, PipelineHandoffAbandonedFailed)
 			default:
-				if s.opts.Observer != nil {
-					s.opts.Observer.ObserveCollationDeadline(
-						chain,
-						CollationDeadlineSoft,
-						DeadlineActionAbort,
-					)
-				}
+				p.future = parked
+				p.service.observePipelineHandoffPickup(p.chain, parked.request)
+			}
+		}
+	}
+	stored, err := p.service.opts.Storage.Candidate(p.job.ctx, p.job.window.ID, slot)
+	if err == nil {
+		if p.future != nil {
+			// Unreachable by construction: this branch emits directly and
+			// never goes through persistAndEmit, so the hook cannot have
+			// fired from a resumed slot, and the markers this reads are
+			// written in slot order by this same goroutine. Kept because
+			// without it a build started for this slot would hold the
+			// acquisition session while the slot is restored instead.
+			p.future.stop()
+			p.future = nil
+		}
+		productionStarted := p.service.metricStageStarted()
+		remembered, found := p.managed.recallEmitted(p.job.window.ID, slot)
+		artifact, artifactErr := p.service.artifactFromRecord(
+			p.record.Session,
+			p.job.window,
+			stored,
+			remembered,
+			found,
+		)
+		if artifactErr != nil {
+			p.service.observeCandidateProduction(p.chain, CandidateKindRecovered, productionStarted, artifactErr)
 
-				return fmt.Errorf("%w: pipeline returned an invalid soft-timeout action", ErrCandidateConflict)
-			}
+			return artifactErr
 		}
-		finishedFuture := future
-		future.stop()
-		future = nil
-		if result.err != nil {
-			if errors.Is(result.err, context.DeadlineExceeded) && !time.Now().Before(finishedFuture.hardDeadline) {
-				if s.opts.Observer != nil {
-					s.opts.Observer.ObserveCollationDeadline(
-						chain,
-						CollationDeadlineHard,
-						DeadlineActionAbort,
-					)
-				}
-				return fmt.Errorf(
-					"%w for slot %d: %v",
-					errHardBuildDeadline,
-					finishedFuture.request.Slot,
-					result.err,
-				)
-			}
-			return fmt.Errorf("collator runtime: build slot %d: %w", slot, result.err)
+		if artifact.Candidate.Parent != p.parent {
+			p.service.observeCandidateProduction(
+				p.chain,
+				CandidateKindRecovered,
+				productionStarted,
+				ErrCandidateConflict,
+			)
+
+			return ErrCandidateConflict
 		}
-		// Pipeline is public and may retain the pointer it returns. Take ownership
-		// before signing so later extension-side mutation cannot change the bytes
-		// being persisted or the metadata consumed by CommitCandidate.
-		built := s.ownBuiltCandidate(result.candidate)
-		stageStarted := s.metricStageStarted()
-		artifact, err := s.signArtifact(record.Session, job.window, slot, parent, built)
-		s.observeMetricStage(chain, CollationStageSignCandidate, stageStarted)
-		if err != nil {
-			s.observeCandidateProduction(chain, CandidateKindBlock, finishedFuture.started, err)
+		var finalizedAnchor *ton.BlockIDExt
+		if p.previous == nil && p.record.Update.HasFinalizedBlock &&
+			sameBlockID(artifact.Candidate.Block, p.record.Update.FinalizedBlock) {
+			anchor := cloneBlockID(p.record.Update.FinalizedBlock)
+			finalizedAnchor = &anchor
+		}
+		restore := BuildRequest{
+			Session:         p.activeSession,
+			Update:          p.record.Update,
+			Slot:            slot,
+			Leader:          p.job.window.Leader,
+			Parent:          p.parent,
+			Previous:        p.previous,
+			FinalizedAnchor: finalizedAnchor,
+		}
+		stageStarted := p.service.metricStageStarted()
+		if err = p.service.opts.Pipeline.RestoreCandidate(p.job.ctx, restore, artifact); err != nil {
+			p.service.observeMetricStage(p.chain, CollationStageRestoreCandidate, stageStarted)
+			p.service.observeCandidateProduction(p.chain, CandidateKindRecovered, productionStarted, err)
+
+			return fmt.Errorf("collator runtime: restore candidate state: %w", err)
+		}
+		p.service.observeMetricStage(p.chain, CollationStageRestoreCandidate, stageStarted)
+		stageStarted = p.service.metricStageStarted()
+		if err = waitUntil(p.job.ctx, broadcastTime(p.record, slot)); err != nil {
+			p.service.observeMetricStage(p.chain, CollationStageWaitBroadcastSlot, stageStarted)
+			p.service.observeCandidateProduction(p.chain, CandidateKindRecovered, productionStarted, err)
 
 			return err
 		}
-		s.logCollatedCandidate(
+		p.service.observeMetricStage(p.chain, CollationStageWaitBroadcastSlot, stageStarted)
+		if p.service.opts.Observer != nil {
+			p.service.opts.Observer.ObserveScheduleLateness(
+				p.chain,
+				ScheduleEventBroadcast,
+				time.Since(broadcastTime(p.record, slot)),
+			)
+		}
+		stageStarted = p.service.metricStageStarted()
+		if err = p.service.opts.Emit(p.job.ctx, artifact); err != nil {
+			p.service.observeMetricStage(p.chain, CollationStageDeliverCandidate, stageStarted)
+			p.service.observeCandidateProduction(p.chain, CandidateKindRecovered, productionStarted, err)
+
+			return fmt.Errorf("collator runtime: emit recovered candidate: %w", err)
+		}
+		p.service.observeMetricStage(p.chain, CollationStageDeliverCandidate, stageStarted)
+		p.service.observeCandidateProduction(p.chain, CandidateKindRecovered, productionStarted, nil)
+		p.parent, p.previous = successorLineage(artifact)
+		return nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("collator runtime: load candidate: %w", err)
+	}
+
+	request := slotBuildRequest(
+		p.activeSession,
+		p.record,
+		p.job.window,
+		slot,
+		p.parent,
+		p.previous,
+	)
+	request.onSuccessor = p.acceptSuccessor
+	request.revokeSuccessor = p.revokeSuccessor
+	// emitEmpty commits this slot as an empty candidate. It deliberately does
+	// not touch future: the soft-timeout path keeps its live build for the
+	// next slot, and the commit always carries the current slot's request
+	// rather than the one the surviving future was started from.
+	emitEmpty := func(block ton.BlockIDExt) error {
+		started := time.Now()
+		stageStarted := p.service.metricStageStarted()
+		artifact, emptyErr := p.service.signEmptyArtifact(
+			p.record.Session,
+			p.job.window,
+			slot,
+			p.parent,
+			block,
+		)
+		p.service.observeMetricStage(p.chain, CollationStageSignCandidate, stageStarted)
+		if emptyErr != nil {
+			p.service.observeCandidateProduction(p.chain, CandidateKindEmpty, started, emptyErr)
+
+			return emptyErr
+		}
+		p.service.logCollatedCandidate(
 			request,
 			&artifact.Candidate,
-			len(built.BlockBOC),
-			len(built.CollatedData),
-			&built.Stats,
-			result.elapsed,
+			0,
+			0,
+			nil,
+			time.Since(started),
 		)
-		if err = s.persistAndEmit(job.ctx, managed, record, artifact, &CandidateCommit{
+		if emptyErr = p.service.persistAndEmit(
+			p.job.ctx,
+			p.managed,
+			p.record,
+			artifact,
+			&CandidateCommit{
+				Request:  request,
+				Artifact: artifact,
+			},
+			started,
+			CandidateKindEmpty,
+		); emptyErr != nil {
+			return emptyErr
+		}
+		p.parent, p.previous = successorLineage(artifact)
+
+		return nil
+	}
+	if p.future == nil {
+		if err = waitUntil(p.job.ctx, buildStartTime(p.record, slot)); err != nil {
+			return err
+		}
+		// The first shard slot cannot be scheduled one target rate before a
+		// window whose start time is only established after resolving its base.
+		// C++ starts it immediately too. Counting that inherent deficit makes
+		// build_start p95 converge on TargetRate instead of showing carry-over
+		// from the preceding slot, which is the actionable lateness here.
+		if p.service.opts.Observer != nil &&
+			(p.record.Session.Shard.IsMasterchain() || slot != p.job.window.ID.StartSlot) {
+			p.service.opts.Observer.ObserveScheduleLateness(
+				p.chain,
+				ScheduleEventBuildStart,
+				time.Since(buildStartTime(p.record, slot)),
+			)
+		}
+		if p.parent.Exists {
+			stageStarted := p.service.metricStageStarted()
+			state, stateErr := p.service.opts.Pipeline.ResolveCandidateState(p.job.ctx, request)
+			p.service.observeMetricStage(p.chain, CollationStageResolveCandidateState, stageStarted)
+			if stateErr != nil {
+				return fmt.Errorf("collator runtime: resolve candidate state for slot %d: %w", slot, stateErr)
+			}
+			if p.managed.shouldGenerateEmpty(p.record.Session.Shard.IsMasterchain(), state) {
+				if err = emitEmpty(state.Block); err != nil {
+					return err
+				}
+				return nil
+			}
+		}
+		p.future = p.service.startBuildFuture(p.job.ctx, request, hardBuildDeadline(p.record, slot))
+	}
+
+	result, softTimeout, waitErr := awaitBuildUntil(p.job.ctx, p.future, softBuildDeadline(p.record, slot))
+	if waitErr != nil {
+		return waitErr
+	}
+	if softTimeout {
+		if !p.managed.allowEmptyOnGenerationFailure(p.record.Update.NoEmptyBlocksOnErrTimeout) {
+			if p.service.opts.Observer != nil {
+				// Distinct from an ordinary wait: this producer is not slow, it
+				// is forbidden to emit the empty block that would end the wait
+				// because the session has not finalized for
+				// NoEmptyBlocksOnErrTimeout. Reported as the same action, the
+				// two are indistinguishable — and in the field this one was the
+				// reason both Go nodes stayed silent in their own windows.
+				p.service.opts.Observer.ObserveCollationDeadline(
+					p.chain,
+					CollationDeadlineSoft,
+					DeadlineActionWaitNoEmpty,
+				)
+			}
+			result, waitErr = awaitBuild(p.job.ctx, p.future)
+			if waitErr != nil {
+				return waitErr
+			}
+			softTimeout = false
+		}
+	}
+	if softTimeout {
+		decision, decisionErr := p.service.opts.Pipeline.SoftTimeout(p.job.ctx, SoftTimeoutRequest{
+			Active:  p.future.request,
+			Current: request,
+		})
+		if decisionErr != nil {
+			if p.service.opts.Observer != nil {
+				p.service.opts.Observer.ObserveCollationDeadline(
+					p.chain,
+					CollationDeadlineSoft,
+					DeadlineActionAbort,
+				)
+			}
+
+			return fmt.Errorf("collator runtime: decide soft timeout for slot %d: %w", slot, decisionErr)
+		}
+		switch decision.Action {
+		case SoftTimeoutWait:
+			if p.service.opts.Observer != nil {
+				p.service.opts.Observer.ObserveCollationDeadline(
+					p.chain,
+					CollationDeadlineSoft,
+					DeadlineActionWait,
+				)
+			}
+			result, waitErr = awaitBuild(p.job.ctx, p.future)
+			if waitErr != nil {
+				return waitErr
+			}
+		case SoftTimeoutEmitEmpty:
+			if p.service.opts.Observer != nil {
+				p.service.opts.Observer.ObserveCollationDeadline(
+					p.chain,
+					CollationDeadlineSoft,
+					DeadlineActionEmitEmpty,
+				)
+			}
+			if err = emitEmpty(decision.Block); err != nil {
+				return err
+			}
+			return nil
+		default:
+			if p.service.opts.Observer != nil {
+				p.service.opts.Observer.ObserveCollationDeadline(
+					p.chain,
+					CollationDeadlineSoft,
+					DeadlineActionAbort,
+				)
+			}
+
+			return fmt.Errorf("%w: pipeline returned an invalid soft-timeout action", ErrCandidateConflict)
+		}
+	}
+	finishedFuture := p.future
+	p.future.stop()
+	p.future = nil
+	if result.err != nil {
+		if errors.Is(result.err, context.DeadlineExceeded) && !time.Now().Before(finishedFuture.hardDeadline) {
+			if p.service.opts.Observer != nil {
+				p.service.opts.Observer.ObserveCollationDeadline(
+					p.chain,
+					CollationDeadlineHard,
+					DeadlineActionAbort,
+				)
+			}
+			return fmt.Errorf(
+				"%w for slot %d: %v",
+				errHardBuildDeadline,
+				finishedFuture.request.Slot,
+				result.err,
+			)
+		}
+		return fmt.Errorf("collator runtime: build slot %d: %w", slot, result.err)
+	}
+	// Pipeline is public and may retain the pointer it returns. Take ownership
+	// before signing so later extension-side mutation cannot change the bytes
+	// being persisted or the metadata consumed by CommitCandidate.
+	built := p.service.ownBuiltCandidate(result.candidate)
+	stageStarted := p.service.metricStageStarted()
+	artifact, err := p.service.signArtifact(
+		p.record.Session,
+		p.job.window,
+		slot,
+		p.parent,
+		built,
+	)
+	p.service.observeMetricStage(p.chain, CollationStageSignCandidate, stageStarted)
+	if err != nil {
+		p.service.observeCandidateProduction(p.chain, CandidateKindBlock, finishedFuture.started, err)
+
+		return err
+	}
+	p.service.logCollatedCandidate(
+		request,
+		&artifact.Candidate,
+		len(built.BlockBOC),
+		len(built.CollatedData),
+		&built.Stats,
+		result.elapsed,
+	)
+	if err = p.service.persistAndEmit(
+		p.job.ctx,
+		p.managed,
+		p.record,
+		artifact,
+		&CandidateCommit{
 			// A future can survive an emitted empty slot. Its built state still
 			// extends the same block, but the signed candidate belongs to the
 			// current slot and parent.
 			Request:  request,
 			Built:    built,
 			Artifact: artifact,
-		}, finishedFuture.started, CandidateKindBlock); err != nil {
-			return err
-		}
-		advance(artifact)
+		},
+		finishedFuture.started,
+		CandidateKindBlock,
+	); err != nil {
+		return err
 	}
+	p.parent, p.previous = successorLineage(artifact)
 
 	return nil
 }

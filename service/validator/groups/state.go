@@ -141,16 +141,16 @@ func ParseState(input StateInput) (*State, error) {
 		return nil, err
 	}
 
-	stateLoader, err := root.BeginParse()
-	if err != nil {
+	var stateLoader cell.Slice
+	if err = root.BeginParseInto(&stateLoader); err != nil {
 		return nil, fmt.Errorf("parse masterchain state root: %w", err)
 	}
 
 	var shardState tlb.ShardStateUnsplit
-	if err = tlb.LoadFromCell(&shardState, stateLoader); err != nil {
+	if err = tlb.LoadFromCell(&shardState, &stateLoader); err != nil {
 		return nil, fmt.Errorf("parse masterchain state: %w", err)
 	}
-	if err = requireEmptySlice(stateLoader, "masterchain state"); err != nil {
+	if err = requireEmptySlice(&stateLoader, "masterchain state"); err != nil {
 		return nil, err
 	}
 	if err = validateMasterchainStateHeader(shardState, input.Block); err != nil {
@@ -160,16 +160,16 @@ func ParseState(input StateInput) (*State, error) {
 		return nil, errors.New("masterchain state extra is absent")
 	}
 
-	extraLoader, err := shardState.McStateExtra.BeginParse()
-	if err != nil {
+	var extraLoader cell.Slice
+	if err = shardState.McStateExtra.BeginParseInto(&extraLoader); err != nil {
 		return nil, fmt.Errorf("parse masterchain state extra root: %w", err)
 	}
 
 	var extra tlb.McStateExtra
-	if err = tlb.LoadFromCell(&extra, extraLoader); err != nil {
+	if err = tlb.LoadFromCell(&extra, &extraLoader); err != nil {
 		return nil, fmt.Errorf("parse masterchain state extra: %w", err)
 	}
-	if err = requireEmptySlice(extraLoader, "masterchain state extra"); err != nil {
+	if err = requireEmptySlice(&extraLoader, "masterchain state extra"); err != nil {
 		return nil, err
 	}
 	if extra.ConfigParams.Config.Params == nil || extra.ConfigParams.Config.Params.AsCell() == nil {
@@ -457,13 +457,13 @@ func validShardIdentPrefix(ident tlb.ShardIdent) bool {
 }
 
 func parseStateInfo(root *cell.Cell) (*tlb.McStateExtraBlockInfo, error) {
-	loader, err := root.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err := root.BeginParseInto(&loader); err != nil {
 		return nil, fmt.Errorf("parse masterchain state info root: %w", err)
 	}
 
 	var info tlb.McStateExtraBlockInfo
-	if err = tlb.LoadFromCell(&info, loader); err != nil {
+	if err := tlb.LoadFromCell(&info, &loader); err != nil {
 		return nil, fmt.Errorf("parse masterchain state info: %w", err)
 	}
 	if info.Flags&1 != 0 {
@@ -482,7 +482,7 @@ func parseStateInfo(root *cell.Cell) (*tlb.McStateExtraBlockInfo, error) {
 			return nil, fmt.Errorf("consume masterchain block create stats: %w", err)
 		}
 	}
-	if err = requireEmptySlice(loader, "masterchain state info"); err != nil {
+	if err := requireEmptySlice(&loader, "masterchain state info"); err != nil {
 		return nil, err
 	}
 	return &info, nil
@@ -534,12 +534,12 @@ func parseShardDescriptions(shardHashes *cell.Dictionary, masterchainSeqno uint3
 			return nil, fmt.Errorf("load shard hashes workchain %d tree: %w", workchainID, err)
 		}
 
-		treeLoader, err := treeRoot.BeginParse()
-		if err != nil {
+		var treeLoader cell.Slice
+		if err = treeRoot.BeginParseInto(&treeLoader); err != nil {
 			return nil, fmt.Errorf("parse shard hashes workchain %d tree root: %w", workchainID, err)
 		}
 		var tree tlb.BinTree
-		if err = tree.LoadFromCell(treeLoader); err != nil {
+		if err = tree.LoadFromCell(&treeLoader); err != nil {
 			return nil, fmt.Errorf("parse shard hashes workchain %d tree: %w", workchainID, err)
 		}
 		err = tree.Walk(func(path *cell.Cell, value *cell.Cell) error {
@@ -571,8 +571,8 @@ func parseShardDescriptions(shardHashes *cell.Dictionary, masterchainSeqno uint3
 }
 
 func shardFromTreePath(workchain int32, path *cell.Cell) (ShardID, error) {
-	loader, err := path.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err := path.BeginParseInto(&loader); err != nil {
 		return ShardID{}, fmt.Errorf("parse shard tree path: %w", err)
 	}
 	if loader.RefsNum() != 0 || loader.BitsLeft() > maxShardDepth {
@@ -598,8 +598,8 @@ func parseShardDescription(shard ShardID, root *cell.Cell) (ShardDescription, er
 	if root.IsSpecial() {
 		return ShardDescription{}, fmt.Errorf("shard description %v is special", shard)
 	}
-	loader, err := root.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err = root.BeginParseInto(&loader); err != nil {
 		return ShardDescription{}, fmt.Errorf("parse shard description %v root: %w", shard, err)
 	}
 	magic, err := loader.LoadUInt(4)
@@ -611,7 +611,7 @@ func parseShardDescription(shard ShardID, root *cell.Cell) (ShardDescription, er
 	switch magic {
 	case 0xa:
 		var description tlb.ShardDesc
-		if err = tlb.LoadFromCell(&description, loader, true); err != nil {
+		if err = tlb.LoadFromCell(&description, &loader, true); err != nil {
 			return ShardDescription{}, fmt.Errorf("parse shard description %v: %w", shard, err)
 		}
 		decoded = decodedShardDescription{
@@ -626,7 +626,7 @@ func parseShardDescription(shard ShardID, root *cell.Cell) (ShardDescription, er
 		}
 	case 0xb:
 		var description tlb.ShardDescB
-		if err = tlb.LoadFromCell(&description, loader, true); err != nil {
+		if err = tlb.LoadFromCell(&description, &loader, true); err != nil {
 			return ShardDescription{}, fmt.Errorf("parse shard description %v: %w", shard, err)
 		}
 		decoded = decodedShardDescription{
@@ -642,7 +642,7 @@ func parseShardDescription(shard ShardID, root *cell.Cell) (ShardDescription, er
 	default:
 		return ShardDescription{}, fmt.Errorf("shard description %v has unknown magic %x", shard, magic)
 	}
-	if err = requireEmptySlice(loader, "shard description"); err != nil {
+	if err = requireEmptySlice(&loader, "shard description"); err != nil {
 		return ShardDescription{}, fmt.Errorf("shard %v: %w", shard, err)
 	}
 	if decoded.Flags != 0 {

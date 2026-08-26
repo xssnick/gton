@@ -164,7 +164,6 @@ func TestApplyPlansAreRecordedOnlyWhereOneIsApplied(t *testing.T) {
 	backed, err := runLazyBudgetValidation(t, provenReq, proven, nil, NewSemanticVerifier(tvm.NewTVM()),
 		func(verification *ShardVerificationRequest) {
 			verification.Neighbors = collatedNeighborQueues(t, provenReq, proven)
-			verification.stateProven = true
 		})
 	if err != nil {
 		t.Fatalf("validate a proof-backed shard candidate: %v", err)

@@ -69,7 +69,10 @@ func (c *collation) escalateToMediumMark() {
 // (lt, hash) order until the normal limit class is exhausted; the remainder
 // stays unimported and forces generated messages into the queue.
 func (c *collation) processInternals() error {
-	return c.processInternalsFrom(0)
+	if err := c.processInternalsFrom(0); err != nil {
+		return err
+	}
+	return c.flushQueueAdds()
 }
 
 // internalsRemain reports whether the canonical order has messages the block
@@ -124,7 +127,10 @@ func (c *collation) topUpInternals() error {
 	c.toppedUp = true
 	c.escalateToMediumMark()
 
-	return c.processInternalsFrom(c.internalsCursor)
+	if err := c.processInternalsFrom(c.internalsCursor); err != nil {
+		return err
+	}
+	return c.flushQueueAdds()
 }
 
 func (c *collation) processInternalsFrom(from int) error {
@@ -223,10 +229,13 @@ type internalPlan struct {
 	// error, or the full block, a sequential run would have reported.
 	err error
 
-	// executes marks a plan a wave will emulate off the main goroutine. It is
-	// what tells retirement whether to run the transaction itself or to wait for
-	// the worker that already did.
-	executes bool
+	// executes marks a plan the wave machinery emulates through a lane tracer,
+	// either inline or on a worker. It tells retirement to consume that result
+	// instead of executing the transaction itself.
+	executes  bool
+	started   bool
+	dependsOn *internalPlan
+	follows   *internalPlan
 
 	// Set by speculateInternal, read by retireInternal.
 	lane    *accountLane
@@ -387,6 +396,9 @@ func (c *collation) retireInternal(plan *internalPlan) error {
 	var lane *accountLane
 	var err error
 	if plan.executes {
+		if !plan.started {
+			return fmt.Errorf("%w: inbound internal plan %x was not started", ErrInvalidInput, hash)
+		}
 		result, lane, err = c.commitSpeculated(plan)
 	} else {
 		result, lane, err = c.executePrepared(plan.prepared, 0)
@@ -456,6 +468,9 @@ func (c *collation) relayInternal(
 	destination msgpool.AccountPrefix,
 ) error {
 	if c.queueSize == maxOutMsgQueueSize {
+		if err := c.flushQueueAdds(); err != nil {
+			return err
+		}
 		return fmt.Errorf("%w: outbound queue size overflow", ErrInvalidInput)
 	}
 	curBits, nextBits, err := performHypercubeRouting(next, destination, c.shard, 0)
@@ -503,22 +518,12 @@ func (c *collation) relayInternal(
 
 	nextHop := msgpool.InterpolatePrefix(next, destination, nextBits)
 	key := msgpool.MakeQueueKey(nextHop, msg.Root.HashKey())
-	if c.queueDeletePending(key) {
-		if err = c.flushQueueDeletes(); err != nil {
-			return err
-		}
-	}
-	keyCell := cell.BeginCell().MustStoreSlice(key[:], 352).EndCell()
 	enqueued, err := (tlb.EnqueuedMsg{EnqueuedLT: c.header.StartLt, Msg: envelopeCell}).ToCell()
 	if err != nil {
 		return err
 	}
-	inserted, err := c.outQueue.SetWithMode(keyCell, enqueued, cell.DictSetModeAdd)
-	if err != nil {
-		return fmt.Errorf("enqueue transit message: %w", err)
-	}
-	if !inserted {
-		return fmt.Errorf("%w: duplicate transit queue key %x", ErrInvalidInput, key)
+	if err = c.deferQueueAdd(key, enqueued, queuePendingAddTransit); err != nil {
+		return err
 	}
 	c.queueSize++
 	c.stats.EnqueuedMessages++
@@ -549,11 +554,14 @@ func standardTransitFee(config *Config, remaining *big.Int) *big.Int {
 // dequeueOwn removes a re-imported message from the collation out-queue,
 // verifying that the queued envelope is the exact imported cell.
 func (c *collation) dequeueOwn(msg *msgpool.InternalMessage) error {
+	if err := c.flushQueueAdds(); err != nil {
+		return err
+	}
 	if c.queueDeletePending(msg.Key) {
 		return fmt.Errorf("%w: own-queue entry %x is absent", ErrInvalidInput, msg.Key)
 	}
-	keyCell := cell.BeginCell().MustStoreSlice(msg.Key[:], 352).EndCell()
-	value, err := c.outQueue.LoadValue(keyCell)
+	var value cell.Slice
+	err := c.outQueue.LoadValueByBytesKeyInto(msg.Key[:], &value)
 	if isMissingKey(err) {
 		return fmt.Errorf("%w: own-queue entry %x is absent", ErrInvalidInput, msg.Key)
 	}
@@ -561,7 +569,7 @@ func (c *collation) dequeueOwn(msg *msgpool.InternalMessage) error {
 		return fmt.Errorf("dequeue own message %x: %w", msg.Key, err)
 	}
 	var enqueued tlb.EnqueuedMsg
-	if err = loadExactSlice(&enqueued, value); err != nil {
+	if err = loadExactSlice(&enqueued, &value); err != nil {
 		return fmt.Errorf("%w: decode own-queue entry %x: %v", ErrInvalidInput, msg.Key, err)
 	}
 	if enqueued.Msg.HashKey() != msg.EnvelopeCell.HashKey() {
@@ -570,7 +578,9 @@ func (c *collation) dequeueOwn(msg *msgpool.InternalMessage) error {
 	if c.queueSize == 0 {
 		return fmt.Errorf("%w: outbound queue size underflow", ErrInvalidInput)
 	}
-	c.deferQueueDelete(msg.Key, keyCell)
+	if err = c.deferQueueDelete(msg.Key); err != nil {
+		return err
+	}
 	c.queueSize--
 	return c.registerQueueOp()
 }
@@ -585,7 +595,7 @@ func (c *collation) dequeueOwn(msg *msgpool.InternalMessage) error {
 // two calls to update_last_proc_int_msg and no more:
 //
 //	collator.cpp:3956  the inbound queue import     <-> imports.go importInternal
-//	collator.cpp:3668  process_one_new_message      <-> execute.go deliverImmediate
+//	collator.cpp:3668  process_one_new_message      <-> execute.go retireGeneratedImmediate
 //
 // The second is reached only AFTER the `if (enqueue || defer) { ... return; }`
 // exit at collator.cpp:3649-3663 and is additionally gated on `!is_special`. So
@@ -595,7 +605,7 @@ func (c *collation) dequeueOwn(msg *msgpool.InternalMessage) error {
 // enqueue_message's own `LogicalTime enqueued_lt = msg.lt;`
 // (collator.cpp:4743, stored at :4794-4795) which likewise never touches
 // last_proc_int_msg_. The defer branch takes the same early exit on both sides,
-// and specials are routed around deliverImmediate on purpose (master.go), which
+// and specials are routed around retireGeneratedImmediate on purpose (master.go), which
 // is the `!is_special` gate.
 //
 // The reason it cannot diverge is structural rather than incidental: the bound

@@ -67,6 +67,14 @@ type preparedValidationCandidate struct {
 	// sourceRoot is the level-0 hash of the single root the update was applied
 	// to: previous[0].State, or the merged root over two predecessors.
 	sourceRoot cell.Hash
+	// stateApplied records that this capsule already applied stateUpdate to
+	// sourceRoot. The structural pass can then bind its effective predecessor by
+	// hash instead of walking the same update a second time with MayApply.
+	stateApplied bool
+	// masterPredecessor is the parse the acquisition stage produced while
+	// resolving the exact masterchain predecessor view. Exported verification
+	// leaves it nil and performs the standalone predecessor check itself.
+	masterPredecessor *acquiredPredecessorState
 
 	// ---- stage 3: config-bound update verdict/apply and structural views ----
 
@@ -181,6 +189,7 @@ func prepareVerificationCandidate(
 	ctx context.Context,
 	config *Config,
 	candidate *Candidate,
+	previous []PreviousBlock,
 ) (*preparedValidationCandidate, error) {
 	if config == nil {
 		return nil, fmt.Errorf("%w: candidate verification config is absent", ErrInvalidInput)
@@ -198,7 +207,7 @@ func prepareVerificationCandidate(
 		return nil, err
 	}
 
-	p := &preparedValidationCandidate{}
+	p := &preparedValidationCandidate{resident: previous, previous: previous}
 	if err := p.prepareBlock(ctx, candidate, nil); err != nil {
 		return nil, err
 	}
@@ -251,7 +260,11 @@ func (p *preparedValidationCandidate) prepareBlock(
 	// and the local path serializes it from the tree it built.
 	if root == nil {
 		var err error
-		root, err = cell.FromBOC(candidate.BlockBOC)
+		// Candidate owns BlockBOC for the full validation lifetime. Parsed cells
+		// can therefore borrow its immutable payload without an arena copy.
+		root, err = cell.FromBOCWithOptions(candidate.BlockBOC, cell.BOCParseOptions{
+			NoCopyPayload: true,
+		})
 		if err != nil {
 			return fmt.Errorf("%w: decode candidate block boc: %v", ErrInvalidInput, err)
 		}
@@ -259,7 +272,7 @@ func (p *preparedValidationCandidate) prepareBlock(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !bytes.Equal(candidate.ID.RootHash, root.Hash()) {
+	if !equalCellHashBytes(root, candidate.ID.RootHash) {
 		return fmt.Errorf("%w: candidate block root hash mismatch", ErrInvalidInput)
 	}
 
@@ -437,6 +450,7 @@ func (p *preparedValidationCandidate) bindConfig(ctx context.Context, config *Co
 		}
 		p.stateRoot = stateRoot
 		p.sourceRoot = sourceRoot
+		p.stateApplied = true
 		p.verified.state = state
 		p.stateParsed = true
 		candidate.State = stateRoot

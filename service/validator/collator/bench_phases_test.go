@@ -206,14 +206,23 @@ func verifyWithPhases(tb testing.TB, req ShardVerificationRequest, timer *phaseT
 	}
 	req.Semantics = &phaseSemantics{verifier: semantics, timer: timer, tb: tb}
 
-	var verified verifiedCandidate
+	previous := []PreviousBlock{req.Previous}
+	if req.Previous2 != nil {
+		previous = append(previous, *req.Previous2)
+	}
+	var prepared *preparedValidationCandidate
 	timer.run(tb, "decode", func() error {
 		var err error
-		verified, err = verifyCandidate(ctx, req.Masterchain.Config, req.Candidate)
+		prepared, err = prepareVerificationCandidate(
+			ctx,
+			req.Masterchain.Config,
+			req.Candidate,
+			previous,
+		)
 		return err
 	})
 	timer.run(tb, "structural", func() error {
-		return verifyPreparedShardCandidate(ctx, req, &verified)
+		return verifyPreparedShardCandidate(ctx, req, prepared)
 	})
 	timer.nest("structural", verificationPhases[2:]...)
 }

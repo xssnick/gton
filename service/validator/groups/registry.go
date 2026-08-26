@@ -205,8 +205,8 @@ func parseValidatorRegistryConfig(configCell *cell.Cell) (validatorRegistryConfi
 		return validatorRegistryConfig{}, ErrNotFound
 	}
 
-	loader, err := configCell.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err := configCell.BeginParseInto(&loader); err != nil {
 		return validatorRegistryConfig{}, err
 	}
 	constructor, err := loader.LoadUInt(32)
@@ -217,11 +217,11 @@ func parseValidatorRegistryConfig(configCell *cell.Cell) (validatorRegistryConfi
 		return validatorRegistryConfig{}, fmt.Errorf("unsupported constructor #%08x", constructor)
 	}
 
-	contractAddress, err := loadBytes32(loader, "contract_address")
+	contractAddress, err := loadBytes32(&loader, "contract_address")
 	if err != nil {
 		return validatorRegistryConfig{}, err
 	}
-	maxCollators, err := loadUint32(loader, "max_collators_per_validator")
+	maxCollators, err := loadUint32(&loader, "max_collators_per_validator")
 	if err != nil {
 		return validatorRegistryConfig{}, err
 	}
@@ -230,11 +230,11 @@ func parseValidatorRegistryConfig(configCell *cell.Cell) (validatorRegistryConfi
 		return validatorRegistryConfig{}, fmt.Errorf("load new_code_hash presence: %w", err)
 	}
 	if hasNewCodeHash {
-		if _, err = loadBytes32(loader, "new_code_hash"); err != nil {
+		if _, err = loadBytes32(&loader, "new_code_hash"); err != nil {
 			return validatorRegistryConfig{}, err
 		}
 	}
-	if err = requireEmpty(loader); err != nil {
+	if err = requireEmpty(&loader); err != nil {
 		return validatorRegistryConfig{}, err
 	}
 
@@ -252,12 +252,12 @@ func isSpecialContract(state *State, config *Config, contractAddress [32]byte) b
 		return false
 	}
 
-	loader, err := config.fundamentalContracts.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err := config.fundamentalContracts.BeginParseInto(&loader); err != nil {
 		return false
 	}
 	contracts, err := loader.LoadDict(256)
-	if err != nil || requireEmpty(loader) != nil {
+	if err != nil || requireEmpty(&loader) != nil {
 		return false
 	}
 	_, err = contracts.LoadValueByBytesKey(contractAddress[:])
@@ -284,15 +284,15 @@ func loadValidatorRegistryData(state *State, contractAddress [32]byte) (*cell.Ce
 		return nil, err
 	}
 
-	accountLoader, err := shardAccount.Account.BeginParse()
-	if err != nil {
+	var accountLoader cell.Slice
+	if err = shardAccount.Account.BeginParseInto(&accountLoader); err != nil {
 		return nil, err
 	}
 	var account tlb.AccountState
-	if err = tlb.LoadFromCell(&account, accountLoader); err != nil {
+	if err = tlb.LoadFromCell(&account, &accountLoader); err != nil {
 		return nil, err
 	}
-	if err = requireEmpty(accountLoader); err != nil {
+	if err = requireEmpty(&accountLoader); err != nil {
 		return nil, err
 	}
 	if !account.IsValid || account.Status != tlb.AccountStatusActive ||
@@ -304,8 +304,8 @@ func loadValidatorRegistryData(state *State, contractAddress [32]byte) (*cell.Ce
 }
 
 func parseValidatorRegistryStorage(data *cell.Cell) (*cell.Dictionary, error) {
-	loader, err := data.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err := data.BeginParseInto(&loader); err != nil {
 		return nil, err
 	}
 	constructor, err := loader.LoadUInt(32)
@@ -320,10 +320,10 @@ func parseValidatorRegistryStorage(data *cell.Cell) (*cell.Dictionary, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err = loadUint32(loader, "last_cleanup_key_block_seqno"); err != nil {
+	if _, err = loadUint32(&loader, "last_cleanup_key_block_seqno"); err != nil {
 		return nil, err
 	}
-	if err = requireEmpty(loader); err != nil {
+	if err = requireEmpty(&loader); err != nil {
 		return nil, err
 	}
 
@@ -365,8 +365,8 @@ func parseValidatorRegistryValidator(value *cell.Slice) (*cell.Cell, error) {
 }
 
 func parseValidatorRegistryEntry(entry *cell.Cell, limit uint32) ([][32]byte, error) {
-	loader, err := entry.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err := entry.BeginParseInto(&loader); err != nil {
 		return nil, err
 	}
 	constructor, err := loader.LoadUInt(32)
@@ -380,10 +380,10 @@ func parseValidatorRegistryEntry(entry *cell.Cell, limit uint32) ([][32]byte, er
 	if err != nil {
 		return nil, err
 	}
-	if err = parseValidatorRegistryShardSet(loader); err != nil {
+	if err = parseValidatorRegistryShardSet(&loader); err != nil {
 		return nil, err
 	}
-	if err = requireEmpty(loader); err != nil {
+	if err = requireEmpty(&loader); err != nil {
 		return nil, err
 	}
 
@@ -395,15 +395,15 @@ func parseValidatorRegistryEntry(entry *cell.Cell, limit uint32) ([][32]byte, er
 			return false, nil
 		}
 
-		keyLoader, err := key.BeginParse()
+		var keyLoader cell.Slice
+		if err := key.BeginParseInto(&keyLoader); err != nil {
+			return false, err
+		}
+		id, err := loadBytes32(&keyLoader, "collator ADNL ID")
 		if err != nil {
 			return false, err
 		}
-		id, err := loadBytes32(keyLoader, "collator ADNL ID")
-		if err != nil {
-			return false, err
-		}
-		if err = requireEmpty(keyLoader); err != nil {
+		if err = requireEmpty(&keyLoader); err != nil {
 			return false, err
 		}
 		result = append(result, id)
@@ -426,7 +426,7 @@ func parseValidatorRegistryShardSet(loader *cell.Slice) error {
 		return fmt.Errorf("monitoring shard depth %d exceeds %d", depth, validatorRegistryMaxShardSetDepth)
 	}
 
-	_, err = loader.LoadSlice(uint(1) << depth)
+	err = loader.SkipBits(uint(1) << depth)
 	if err != nil {
 		return fmt.Errorf("load monitoring shard mask: %w", err)
 	}

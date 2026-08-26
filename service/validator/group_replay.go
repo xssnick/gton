@@ -1,7 +1,6 @@
 package validator
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -169,7 +168,7 @@ func (h *GroupTracker) bufferLocked(event hooks.BlockAppliedEvent) error {
 	if existing, exists := h.buffered[key]; exists {
 		// Cell.Hash is a read of bytes precomputed at finalization, so the
 		// buffered state root needs no separate hash field.
-		if existing.Root.Hash() == nil || !bytes.Equal(existing.Root.Hash(), event.CurrentState.Hash()) ||
+		if existing.Root.HashKey() != event.CurrentState.HashKey() ||
 			!storage.SameBlockIDs(existing.PrevRefs, event.Meta.PrevRefs) {
 			return fmt.Errorf("conflicting buffered masterchain state %s", storage.FormatBlockRef(event.Meta.ID))
 		}

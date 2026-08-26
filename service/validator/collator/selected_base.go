@@ -47,7 +47,7 @@ func NewSelectedBaseState(
 		blockRoot.IsSpecial() || blockRoot.Level() != 0 || stateRoot.IsSpecial() || stateRoot.Level() != 0 {
 		return nil, fmt.Errorf("%w: selected base roots are invalid", ErrInvalidInput)
 	}
-	if !bytes.Equal(blockRoot.Hash(), block.RootHash) {
+	if !equalCellHashBytes(blockRoot, block.RootHash) {
 		return nil, fmt.Errorf("%w: selected base block root differs from its id", ErrInvalidInput)
 	}
 	fileHash := sha256.Sum256(blockBOC)

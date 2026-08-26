@@ -24,12 +24,21 @@ const (
 
 const accountRejectRetrySoftLimit = 1024
 
+type retryReason uint8
+
+const (
+	retryNone retryReason = iota
+	retryIncluded
+	retryAccountRejected
+)
+
 // entry is one pooled message.
 type entry struct {
 	msg         *ExternalMessage
 	priority    int
 	deleteAt    time.Time
 	retryAt     time.Time
+	retryReason retryReason
 	generation  uint64
 	retryCount  uint32
 	expiryIndex int
@@ -116,7 +125,8 @@ type statCounters struct {
 	dedupSkipped, priorityBumps               uint64
 	added, overflowMempool, overflowBytes     uint64
 	overflowAddress, expired                  uint64
-	invalidDeleted, rejectedDelayed           uint64
+	invalidDeleted, includedQuarantined       uint64
+	includedReleased, rejectedDelayed         uint64
 	rejectedRetried, rejectedExhausted        uint64
 	rejectedPressure                          uint64
 	staleFeedback, appliedReq, appliedDeleted uint64
@@ -448,6 +458,7 @@ func (p *Pool) insertLocked(msg *ExternalMessage, priority int, now time.Time) e
 		generation:  1,
 		expiryIndex: -1,
 	}
+	msg.poolEntry = e
 	slab.entries[msg.Hash] = e
 	slab.byAddr[key]++
 	p.byHash[msg.Hash] = e
@@ -531,8 +542,9 @@ func (p *Pool) eraseLocked(e *entry) {
 
 // Complete applies collation outcomes to the selection generation that
 // produced them. Invalid messages are removed, account-rejected messages are
-// delayed for a bounded number of retry generations, and included or skipped
-// messages stay pooled. Feedback for an older generation is ignored.
+// delayed for a bounded number of retry generations, included messages are
+// quarantined, and skipped messages stay ready. Feedback for an older
+// generation is ignored.
 func (p *Pool) Complete(feedback []ExternalFeedback) error {
 	for i, result := range feedback {
 		switch result.Outcome {
@@ -558,7 +570,7 @@ func (p *Pool) Complete(feedback []ExternalFeedback) error {
 
 		switch result.Outcome {
 		case ExternalIncluded:
-			e.generation++
+			p.quarantineIncludedLocked(e, now)
 		case ExternalInvalid:
 			p.eraseLocked(e)
 			p.stats.invalidDeleted++
@@ -577,6 +589,7 @@ func (p *Pool) Complete(feedback []ExternalFeedback) error {
 			e.generation++
 			e.retryCount++
 			e.retryAt = now.Add(p.cfg.AccountRejectRetryDelay)
+			e.retryReason = retryAccountRejected
 			p.stats.rejectedDelayed++
 		case ExternalSkippedLimit:
 			// No TVM attempt happened, so this feedback must not consume the
@@ -584,6 +597,16 @@ func (p *Pool) Complete(feedback []ExternalFeedback) error {
 		}
 	}
 	return nil
+}
+
+func (p *Pool) quarantineIncludedLocked(included *entry, now time.Time) {
+	retryAt := now.Add(p.cfg.IncludedRetryDelay)
+	for _, e := range p.byNorm[included.msg.HashNorm] {
+		e.generation++
+		e.retryAt = retryAt
+		e.retryReason = retryIncluded
+		p.stats.includedQuarantined++
+	}
 }
 
 // EraseApplied removes every message whose normalized hash was imported by
@@ -606,7 +629,13 @@ func (p *Pool) reactivateDueLocked(e *entry, now time.Time) {
 		return
 	}
 	e.retryAt = time.Time{}
-	p.stats.rejectedRetried++
+	switch e.retryReason {
+	case retryIncluded:
+		p.stats.includedReleased++
+	case retryAccountRejected:
+		p.stats.rejectedRetried++
+	}
+	e.retryReason = retryNone
 }
 
 // expireLocked drains every due live entry. Indexed removals keep the heap in
@@ -666,22 +695,24 @@ func (p *Pool) Stats() Stats {
 	defer p.mu.Unlock()
 	p.expireLocked(now)
 	return Stats{
-		DedupSkipped:      p.stats.dedupSkipped,
-		PriorityBumps:     p.stats.priorityBumps,
-		Added:             p.stats.added,
-		OverflowMempool:   p.stats.overflowMempool,
-		OverflowBytes:     p.stats.overflowBytes,
-		OverflowAddress:   p.stats.overflowAddress,
-		Expired:           p.stats.expired,
-		InvalidDeleted:    p.stats.invalidDeleted,
-		RejectedDelayed:   p.stats.rejectedDelayed,
-		RejectedRetried:   p.stats.rejectedRetried,
-		RejectedExhausted: p.stats.rejectedExhausted,
-		RejectedPressure:  p.stats.rejectedPressure,
-		StaleFeedback:     p.stats.staleFeedback,
-		AppliedRequested:  p.stats.appliedReq,
-		AppliedDeleted:    p.stats.appliedDeleted,
-		Pooled:            p.totalCount,
-		PooledBytes:       p.totalBytes,
+		DedupSkipped:        p.stats.dedupSkipped,
+		PriorityBumps:       p.stats.priorityBumps,
+		Added:               p.stats.added,
+		OverflowMempool:     p.stats.overflowMempool,
+		OverflowBytes:       p.stats.overflowBytes,
+		OverflowAddress:     p.stats.overflowAddress,
+		Expired:             p.stats.expired,
+		InvalidDeleted:      p.stats.invalidDeleted,
+		IncludedQuarantined: p.stats.includedQuarantined,
+		IncludedReleased:    p.stats.includedReleased,
+		RejectedDelayed:     p.stats.rejectedDelayed,
+		RejectedRetried:     p.stats.rejectedRetried,
+		RejectedExhausted:   p.stats.rejectedExhausted,
+		RejectedPressure:    p.stats.rejectedPressure,
+		StaleFeedback:       p.stats.staleFeedback,
+		AppliedRequested:    p.stats.appliedReq,
+		AppliedDeleted:      p.stats.appliedDeleted,
+		Pooled:              p.totalCount,
+		PooledBytes:         p.totalBytes,
 	}
 }

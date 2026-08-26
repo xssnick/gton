@@ -160,55 +160,113 @@ func newProofSizeEstimator(expectedReadCells int) *proofSizeEstimator {
 	return e
 }
 
+// A batch is deliberately smaller than the estimator. Taking all sixteen
+// shards around a cached traversal would make the batch fast in isolation but
+// stop every other validation-closure task until it completed. Eight shards
+// preserve parallel progress, while the cell ceiling prevents a pathologically
+// concentrated batch from holding even that subset for an unbounded interval.
+const (
+	proofEstimatorBatchMaxShards = proofEstimatorShards / 2
+	proofEstimatorBatchMaxCells  = 64
+)
+
 func (e *proofSizeEstimator) addLoadedCell(root *cell.Cell) {
-	hash := root.HashKey()
-	var refBuf [4]cell.Hash
-	refs := refBuf[:root.RefsNum()]
+	charge := makeProofEstimatorLoadedCellCharge(root)
+	e.lockShards(charge.mask)
+	if !e.sealed {
+		e.addLoadedCellLocked(&charge)
+	}
+	e.unlockShards(charge.mask)
+}
+
+// addLoadedCells is the callback for ReadSet.RecordMany. Consecutive cells are
+// coalesced while their combined charge touches at most half the estimator
+// shards, then applied under that one lock set. Each chunk remains an atomic
+// sequence of the same per-cell charges addLoadedCell makes: size cannot observe
+// a loaded parent without its child boundaries, but unrelated closure tasks can
+// keep progressing through the other half of the shards.
+func (e *proofSizeEstimator) addLoadedCells(roots []*cell.Cell) {
+	var charges [proofEstimatorBatchMaxCells]proofEstimatorLoadedCellCharge
+	for windowStart := 0; windowStart < len(roots); {
+		windowEnd := min(windowStart+len(charges), len(roots))
+		window := charges[:windowEnd-windowStart]
+		for i, root := range roots[windowStart:windowEnd] {
+			window[i] = makeProofEstimatorLoadedCellCharge(root)
+		}
+
+		for start := 0; start < len(window); {
+			mask := uint32(0)
+			end := start
+			for end < len(window) {
+				next := mask | window[end].mask
+				if mask != 0 && bits.OnesCount32(next) > proofEstimatorBatchMaxShards {
+					break
+				}
+				mask = next
+				end++
+			}
+
+			e.lockShards(mask)
+			if !e.sealed {
+				for i := start; i < end; i++ {
+					e.addLoadedCellLocked(&window[i])
+				}
+			}
+			e.unlockShards(mask)
+			start = end
+		}
+		windowStart = windowEnd
+	}
+}
+
+type proofEstimatorLoadedCellCharge struct {
+	hash        cell.Hash
+	refs        [4]cell.Hash
+	loadedBytes uint64
+	mask        uint32
+	refsCount   uint8
+}
+
+func makeProofEstimatorLoadedCellCharge(root *cell.Cell) proofEstimatorLoadedCellCharge {
+	charge := proofEstimatorLoadedCellCharge{
+		hash:        root.HashKey(),
+		refsCount:   uint8(root.RefsNum()),
+		loadedBytes: uint64(5+(root.BitsSize()+7)/8) + uint64(root.RefsNum())*3,
+	}
+	refs := charge.refs[:charge.refsCount]
 	for i := range refs {
 		refs[i] = root.MustRefHashAt(i)
 	}
-	loadedBytes := uint64(5+(root.BitsSize()+7)/8) + uint64(len(refs))*3
+	charge.mask = proofEstimatorChargeMask(charge.hash, refs)
+	return charge
+}
 
-	// The hashes above are read before any lock is taken: they are what names
-	// the shards to take, and a reference read that had to page a cell in would
-	// re-enter this callback. Explicit unlock rather than defer, because this
-	// runs tens of thousands of times per block.
-	mask := proofEstimatorChargeMask(hash, refs)
-	e.lockShards(mask)
-	if !e.sealed {
-		shard := &e.shards[proofEstimatorShardOf(hash)]
-		prior := shard.seen.observe(hash, proofSeenLoaded|proofSeenSelected, proofSeenBoundary)
-		if prior&proofSeenLoaded == 0 {
-			if prior&proofSeenBoundary != 0 {
-				// The cell stood in as a pruned branch until now; it is charged
-				// at its loaded size instead. The stand-in was charged to this
-				// same shard — only an observation of this hash could have put
-				// it there — so the subtraction cannot take a shard below zero.
-				//
-				// Keyed on the boundary flag, not on the entry merely existing:
-				// an entry an execution read created was never charged the
-				// boundary, and subtracting one it never paid is how a split
-				// estimate goes backwards.
-				shard.bytes -= estimatedPrunedBranchBytes
-			}
-			shard.bytes += loadedBytes
+// addLoadedCellLocked applies one loaded-cell charge. The caller holds every
+// shard named by charge.mask, so this function may be shared by the single and
+// batched paths without nested locking or recalculating cell hashes under lock.
+func (e *proofSizeEstimator) addLoadedCellLocked(charge *proofEstimatorLoadedCellCharge) {
+	shard := &e.shards[proofEstimatorShardOf(charge.hash)]
+	prior := shard.seen.observe(charge.hash, proofSeenLoaded|proofSeenSelected, proofSeenBoundary)
+	if prior&proofSeenLoaded != 0 {
+		return
+	}
+	if prior&proofSeenBoundary != 0 {
+		// The cell stood in as a pruned branch until now; it is charged at
+		// its loaded size instead. The stand-in was charged to this same
+		// shard, so the subtraction cannot take the shard below zero.
+		shard.bytes -= estimatedPrunedBranchBytes
+	}
+	shard.bytes += charge.loadedBytes
 
-			// The children are charged under the same held locks as the cell
-			// itself, as the rest of one indivisible step. A size() landing
-			// between the two halves would report the cell without the pruned
-			// boundaries that come with it — fewer bytes than the estimator ever
-			// holds, at a point where the number decides what the block admits.
-			for _, ref := range refs {
-				child := &e.shards[proofEstimatorShardOf(ref)]
-				if child.seen.observe(ref, proofSeenBoundary, 0) == 0 {
-					// Nothing has seen this child yet, so it is charged as the
-					// pruned branch it will be serialized as.
-					child.bytes += estimatedPrunedBranchBytes
-				}
-			}
+	// The children are charged under the same held locks as the cell itself,
+	// as the rest of one indivisible step. A size() landing between the two
+	// halves would report a value the estimator never logically holds.
+	for _, ref := range charge.refs[:charge.refsCount] {
+		child := &e.shards[proofEstimatorShardOf(ref)]
+		if child.seen.observe(ref, proofSeenBoundary, 0) == 0 {
+			child.bytes += estimatedPrunedBranchBytes
 		}
 	}
-	e.unlockShards(mask)
 }
 
 // addExecutionRead marks a cell the transaction executor loaded as belonging in

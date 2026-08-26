@@ -273,6 +273,7 @@ type newMessage struct {
 	transaction      *cell.Cell
 	metadata         *tlb.MsgMetadata
 	index            uint32
+	parallelSafe     bool
 	dispatchEnvelope *cell.Cell
 }
 
@@ -461,128 +462,104 @@ func (c *collation) processExternalBatch(
 // until the normal limit class fills up; everything else — and the remainder
 // after the cutoff — is enqueued.
 func (c *collation) processNewMessages(enqueueOnly bool) error {
+	if workers := c.generatedWaveParallelism(enqueueOnly); workers > 0 {
+		if err := c.processNewMessagesInWaves(enqueueOnly, workers); err != nil {
+			return err
+		}
+		return c.flushQueueAdds()
+	}
+
 	for c.new.Len() > 0 {
 		if err := c.ctx.Err(); err != nil {
 			return err
 		}
-		// Parity with collator.cpp:4847-4854, which re-reads the normal limit
-		// class and the soft timeout at the TOP of every heap item — before
-		// extra_out_msgs-- and before the enqueue_only latch, which is why both
-		// checks sit above popMin here. Reading only the c.blockFull FIELD (the
-		// pre-fix behaviour) misses every way the estimate grows without an
-		// immediate delivery: enqueue() charges cells through insert() and
-		// re-proofs the queue root every 64 ops, so a drain could cross the
-		// normal class and keep executing in-block messages the reference would
-		// have enqueued. deliverImmediate's own post-delivery check
-		// (:377-379, the port of collator.cpp:3727-3731) covers only the
-		// delivery path.
-		c.updateCollatedEstimate()
-		if !c.limits.fits(c.fullMark()) {
-			c.blockFull = true
-		}
-		if !c.blockFull && c.internalMsgExpired() {
-			c.blockFull = true
-			c.blockFullTimeout = true
-			c.stats.InternalMsgTimeouts++
-		}
-		item := c.new.popMin()
-		c.limits.extraOutMsgs--
-		if c.blockFull || c.haveUnprocessedDispatchQueue {
-			enqueueOnly = true
-		}
-
-		switch item.parsed.MsgType {
-		case tlb.MsgTypeExternalOut:
-			out, err := descriptor(0b000, 3, item.root, item.transaction) // msg_export_ext$000
-			if err != nil {
-				return err
-			}
-			if err = c.insert(c.outMessages.AugmentedDictionary, &c.outDescr, item.root, out); err != nil {
-				return err
-			}
-			continue
-		case tlb.MsgTypeInternal:
-		default:
-			return fmt.Errorf("%w: transaction emitted an inbound external message", ErrInvalidInput)
-		}
-
-		internal := item.parsed.AsInternal()
-		source, err := accountPrefixFromAddress(internal.SrcAddr)
-		if err != nil || !c.shard.ContainsPrefix(source) {
-			return fmt.Errorf("%w: generated message source is outside the current shard", ErrInvalidInput)
-		}
-		destination, err := accountPrefixFromAddress(internal.DstAddr)
-		if err != nil {
-			return fmt.Errorf("%w: generated message destination: %v", ErrInvalidInput, err)
-		}
-		sourceID, err := accountIDFromAddress(internal.SrcAddr)
-		if err != nil {
-			return fmt.Errorf("%w: generated message source: %v", ErrInvalidInput, err)
-		}
-
-		if item.dispatchEnvelope != nil {
-			pending := c.unprocessedDeferred[sourceID]
-			if pending == 0 {
-				return fmt.Errorf("%w: dispatch message %x has no pending source entry", ErrInvalidInput, item.hash)
-			}
-			if pending == 1 {
-				delete(c.unprocessedDeferred, sourceID)
-			} else {
-				c.unprocessedDeferred[sourceID] = pending - 1
-			}
-		} else {
-			deferMessage, deferErr := c.shouldDeferGenerated(&item, source, sourceID)
-			if deferErr != nil {
-				return deferErr
-			}
-			if deferMessage {
-				if err = c.deferGenerated(&item, sourceID); err != nil {
-					return err
-				}
-				continue
-			}
-		}
-
-		if enqueueOnly || !c.shard.ContainsPrefix(destination) {
-			if err = c.enqueue(&item, source, destination); err != nil {
-				return err
-			}
-			continue
-		}
-		c.prewarmImmediateAccount(internal.DstAddr)
-		if err = c.deliverImmediate(&item, internal, destination); err != nil {
+		c.checkNewMessageTop()
+		if err := c.processNextNewMessage(&enqueueOnly); err != nil {
 			return err
 		}
 	}
-	return nil
+	return c.flushQueueAdds()
 }
 
-// deliverImmediate executes a generated in-shard message in the same block:
+func (c *collation) checkNewMessageTop() {
+	// Parity with collator.cpp:4847-4854, which re-reads the normal limit
+	// class and the soft timeout at the TOP of every heap item — before
+	// extra_out_msgs-- and before the enqueue_only latch, which is why both
+	// checks sit above popMin here. Reading only the c.blockFull FIELD (the
+	// pre-fix behaviour) misses every way the estimate grows without an
+	// immediate delivery: enqueue() charges cells through insert() and
+	// re-proofs the queue root every 64 ops, so a drain could cross the
+	// normal class and keep executing in-block messages the reference would
+	// have enqueued. completeGeneratedImmediate's own post-delivery check
+	// covers only the delivery path.
+	c.updateCollatedEstimate()
+	if !c.limits.fits(c.fullMark()) {
+		c.blockFull = true
+	}
+	if !c.blockFull && c.internalMsgExpired() {
+		c.blockFull = true
+		c.blockFullTimeout = true
+		c.stats.InternalMsgTimeouts++
+	}
+}
+
+func (c *collation) processNextNewMessage(enqueueOnly *bool) error {
+	plan := generatedPlan{item: c.new.popMin()}
+	return c.retireGeneratedPlan(&plan, enqueueOnly)
+}
+
+// retireGeneratedImmediate executes or commits one generated in-shard message:
 // the message is wrapped into a use_dest_bits=96 envelope carrying the full
 // forward fee, the consuming transaction runs after the creating one, and the
 // descriptors form the msg_import_imm/msg_export_imm pair.
-func (c *collation) deliverImmediate(
-	item *newMessage,
-	internal *tlb.InternalMessage,
-	destination msgpool.AccountPrefix,
-) error {
+func (c *collation) retireGeneratedImmediate(plan *generatedPlan) error {
+	item := &plan.item
 	if err := c.advanceProcessedBound("generated", item.lt, item.hash); err != nil {
 		return err
 	}
-	prepared, err := tvm.PrepareMessage(item.root)
-	if err != nil {
-		return fmt.Errorf("%w: generated message %x: %v", ErrInvalidInput, item.hash, err)
+	var (
+		result *tvm.TransactionExecutionResult
+		lane   *accountLane
+		err    error
+	)
+	if plan.started {
+		result, lane, err = c.commitGeneratedPlan(plan)
+	} else {
+		prepared := plan.prepared
+		if prepared == nil {
+			var prepareErr error
+			prepared, prepareErr = tvm.PrepareMessage(item.root)
+			if prepareErr != nil {
+				return fmt.Errorf("%w: generated message %x: %v", ErrInvalidInput, item.hash, prepareErr)
+			}
+		}
+		result, lane, err = c.executePrepared(prepared, item.lt)
+		if err != nil {
+			return fmt.Errorf("execute generated message %x: %w", item.hash, err)
+		}
 	}
-	result, lane, err := c.executePrepared(prepared, item.lt)
 	if err != nil {
 		return fmt.Errorf("execute generated message %x: %w", item.hash, err)
 	}
-	if err = c.ctx.Err(); err != nil {
+	if err := c.ctx.Err(); err != nil {
 		return err
 	}
+	return c.completeGeneratedImmediate(plan, result, lane)
+}
+
+func (c *collation) completeGeneratedImmediate(
+	plan *generatedPlan,
+	result *tvm.TransactionExecutionResult,
+	lane *accountLane,
+) error {
+	item := &plan.item
 	c.prewarmGeneratedOutputs(result)
 
-	var envelopeCell, in *cell.Cell
+	var (
+		envelopeCell *cell.Cell
+		in           *cell.Cell
+		err          error
+	)
 	if item.dispatchEnvelope != nil {
 		var envelope tlb.MsgEnvelope
 		if err = parseExact(&envelope, item.dispatchEnvelope); err != nil {
@@ -594,12 +571,12 @@ func (c *collation) deliverImmediate(
 		envelopeCell, err = (tlb.MsgEnvelope{
 			CurAddr:         tlb.IntermediateAddress{Type: tlb.IntermediateAddressRegular, UseDestBits: routingAddressBits},
 			NextAddr:        tlb.IntermediateAddress{Type: tlb.IntermediateAddressRegular, UseDestBits: routingAddressBits},
-			FwdFeeRemaining: internal.FwdFee,
+			FwdFeeRemaining: plan.internal.FwdFee,
 			Msg:             item.root,
 			Metadata:        item.metadata,
 		}).ToCell()
 		if err == nil {
-			in, err = descriptorFee(0b011, 3, envelopeCell, result.TransactionCell, internal.FwdFee) // msg_import_imm$011
+			in, err = descriptorFee(0b011, 3, envelopeCell, result.TransactionCell, plan.internal.FwdFee) // msg_import_imm$011
 		}
 	}
 	if err != nil {
@@ -620,7 +597,7 @@ func (c *collation) deliverImmediate(
 			// The envelope routes straight to the destination, so this is the
 			// key the validator will prove absent. Recorded rather than looked
 			// up here: a lookup taken now would land in the state update.
-			c.immediateQueueKeys = append(c.immediateQueueKeys, msgpool.MakeQueueKey(destination, item.hash))
+			c.immediateQueueKeys = append(c.immediateQueueKeys, msgpool.MakeQueueKey(plan.destination, item.hash))
 		}
 	}
 
@@ -645,6 +622,9 @@ func (c *collation) deliverImmediate(
 
 func (c *collation) enqueue(item *newMessage, source, destination msgpool.AccountPrefix) error {
 	if c.queueSize == maxOutMsgQueueSize {
+		if err := c.flushQueueAdds(); err != nil {
+			return err
+		}
 		return fmt.Errorf("%w: outbound queue size overflow", ErrInvalidInput)
 	}
 
@@ -707,24 +687,12 @@ func (c *collation) enqueue(item *newMessage, source, destination msgpool.Accoun
 
 	nextHop := msgpool.InterpolatePrefix(source, destination, nextBits)
 	key := msgpool.MakeQueueKey(nextHop, item.hash)
-	if c.queueDeletePending(key) {
-		// The sequential order deleted this key before re-adding it; apply the
-		// pending removals so Add mode sees the same dictionary it always did.
-		if err = c.flushQueueDeletes(); err != nil {
-			return err
-		}
-	}
-	keyCell := cell.BeginCell().MustStoreSlice(key[:], 352).EndCell()
 	enqueued, err := (tlb.EnqueuedMsg{EnqueuedLT: item.lt, Msg: envelopeCell}).ToCell()
 	if err != nil {
 		return err
 	}
-	inserted, err := c.outQueue.SetWithMode(keyCell, enqueued, cell.DictSetModeAdd)
-	if err != nil {
-		return fmt.Errorf("enqueue generated message: %w", err)
-	}
-	if !inserted {
-		return fmt.Errorf("%w: duplicate outbound queue key %x", ErrInvalidInput, key)
+	if err = c.deferQueueAdd(key, enqueued, queuePendingAddGenerated); err != nil {
+		return err
 	}
 	c.queueSize++
 	c.stats.EnqueuedMessages++
@@ -900,7 +868,7 @@ func (c *collation) resolveLaneWith(key [32]byte, speculative bool) (*accountLan
 		lane.tracer.speculate()
 	}
 	keyCell := cell.BeginCell().MustStoreSlice(key[:], 256).EndCell()
-	value, accountPath, err := c.loadPredecessorAccount(lane.tracer, key, keyCell)
+	value, accountPath, err := c.loadPredecessorAccount(lane.tracer, key)
 	originallyExists := true
 	var shardAccount tlb.ShardAccount
 	if isMissingKey(err) {
@@ -911,7 +879,7 @@ func (c *collation) resolveLaneWith(key [32]byte, speculative bool) (*accountLan
 		}
 	} else if err != nil {
 		return nil, err
-	} else if err = loadExactSlice(&shardAccount, value); err != nil {
+	} else if err = loadExactSlice(&shardAccount, &value); err != nil {
 		return nil, fmt.Errorf("decode shard account %x: %w", key, err)
 	}
 
@@ -998,8 +966,7 @@ func (c *collation) sharedAccountStorageProof(stat *cell.Cell) *cell.MerkleProof
 func (c *collation) loadPredecessorAccount(
 	tracer *laneTracer,
 	key [32]byte,
-	keyCell *cell.Cell,
-) (*cell.Slice, []*cell.Cell, error) {
+) (cell.Slice, []*cell.Cell, error) {
 	prefix := binary.BigEndian.Uint64(key[:8])
 	for _, source := range c.accountSources {
 		if source.accounts == nil {
@@ -1023,14 +990,15 @@ func (c *collation) loadPredecessorAccount(
 		view := &tlb.ShardAccountsAugDict{
 			AugmentedDictionary: source.accounts.CopyWithTrace(cell.CombineTraces(tracer.trace, recorder.trace)),
 		}
-		value, err := view.LoadValue(keyCell)
-		if value != nil {
+		var value cell.Slice
+		err := view.LoadValueByBytesKeyInto(key[:], &value)
+		if err == nil {
 			value.SetTrace(value.Trace().WithoutTrace(recorder.trace))
 		}
 		return value, recorder.path, err
 	}
 
-	return nil, nil, fmt.Errorf("%w: account %x is outside predecessor shards", ErrInvalidInput, key)
+	return cell.Slice{}, nil, fmt.Errorf("%w: account %x is outside predecessor shards", ErrInvalidInput, key)
 }
 
 // accountEstimateSampleInterval preserves the reference estimator's pacing
@@ -1072,12 +1040,12 @@ func (c *collation) registerOutputs(
 	}
 
 	c.new = slices.Grow(c.new, len(result.OutMessages))
-	for _, output := range result.OutMessages {
-		c.recordOutboundMessageReads(output.Cell)
-	}
+	certifyGenerated := c.generatedWaveParallelism(false) > 0
 	var metadata *tlb.MsgMetadata
 	metadataResolved := false
 	for index, output := range result.OutMessages {
+		certifyParallel := certifyGenerated && output.Msg.MsgType == tlb.MsgTypeInternal
+		parallelSafe := c.recordOutboundMessageReads(output.Cell, certifyParallel)
 		lt := uint64(0)
 		var messageMetadata *tlb.MsgMetadata
 		switch output.Msg.MsgType {
@@ -1100,13 +1068,14 @@ func (c *collation) registerOutputs(
 			lt = output.Msg.AsExternalOut().CreatedLT
 		}
 		c.new.push(newMessage{
-			lt:          lt,
-			hash:        output.Cell.HashKey(),
-			root:        output.Cell,
-			parsed:      output.Msg,
-			transaction: result.TransactionCell,
-			metadata:    messageMetadata,
-			index:       uint32(index),
+			lt:           lt,
+			hash:         output.Cell.HashKey(),
+			root:         output.Cell,
+			parsed:       output.Msg,
+			transaction:  result.TransactionCell,
+			metadata:     messageMetadata,
+			index:        uint32(index),
+			parallelSafe: parallelSafe,
 		})
 		c.limits.extraOutMsgs++
 		c.stats.NewMessages++
@@ -1129,7 +1098,8 @@ func (c *collation) insert(
 func (c *collation) insertKeyed(
 	dict *cell.AugmentedDictionary,
 	batch *descriptorBatch,
-	key, descriptor *cell.Cell,
+	key cell.Hash,
+	descriptor *cell.Cell,
 ) error {
 	batch.addKeyed(key, descriptor)
 	if err := c.limits.storage.AddCell(descriptor); err != nil {
@@ -1187,7 +1157,7 @@ func (c *collation) finishAccounts() error {
 
 	accounts := make([]cell.AugmentedEntry, 0, len(builds))
 	accountDeletes := make([]*cell.Cell, 0)
-	blocks := make([]cell.AugmentedEntry, 0, len(builds))
+	blocks := make([]cell.AugmentedBytesEntry, 0, len(builds))
 	for i := range builds {
 		build := &builds[i]
 		if build.err != nil {
@@ -1246,7 +1216,7 @@ func (c *collation) finishAccounts() error {
 	}
 	// Add mode makes SetMany reject a repeated account, which is the duplicate
 	// account block check the per-entry insert used to make.
-	if err := c.accountBlocks.SetMany(blocks, collationParallelism); err != nil {
+	if err := c.accountBlocks.SetManyByBytes(blocks, collationParallelism); err != nil {
 		return fmt.Errorf("%w: account block insert did not apply: %v", ErrInvalidInput, err)
 	}
 	return nil
@@ -1260,7 +1230,7 @@ type accountLaneBuild struct {
 	lane        *accountLane
 	entry       cell.AugmentedEntry
 	deleted     bool
-	block       cell.AugmentedEntry
+	block       cell.AugmentedBytesEntry
 	storageStat *cell.Cell
 	err         error
 }
@@ -1317,10 +1287,12 @@ func buildAccountLane(build *accountLaneBuild) {
 	}
 	build.entry, build.deleted = entry, deleted
 
-	stateUpdate, err := tlb.ToCell(tlb.HashUpdate{
-		OldHash: lane.original.Account.Hash(),
-		NewHash: lane.current.ShardAccount().Account.Hash(),
-	})
+	oldHash := lane.original.Account.HashKey()
+	newHash := lane.current.ShardAccount().Account.HashKey()
+	stateUpdate, err := (tlb.HashUpdate{
+		OldHash: oldHash[:],
+		NewHash: newHash[:],
+	}).ToCell()
 	if err != nil {
 		build.err = err
 		return
@@ -1339,8 +1311,8 @@ func buildAccountLane(build *accountLaneBuild) {
 		build.err = err
 		return
 	}
-	build.block = cell.AugmentedEntry{
-		Key:   lane.laneKey(),
+	build.block = cell.AugmentedBytesEntry{
+		Key:   lane.key[:],
 		Value: accountBlock,
 		Mode:  cell.DictSetModeAdd,
 	}
@@ -1351,13 +1323,13 @@ func buildAccountLane(build *accountLaneBuild) {
 	}
 }
 
-func dispatchDiffAccount(valueExtra *cell.Slice) (*tlb.AccountDispatchQueue, error) {
-	value := valueExtra.Copy()
-	if err := (tlb.AugDispatchQueue{}).SkipExtra(value); err != nil {
+func dispatchDiffAccount(valueExtra cell.Slice) (*tlb.AccountDispatchQueue, error) {
+	value := valueExtra
+	if err := (tlb.AugDispatchQueue{}).SkipExtra(&value); err != nil {
 		return nil, err
 	}
 	var account tlb.AccountDispatchQueue
-	if err := loadExactSlice(&account, value); err != nil {
+	if err := loadExactSlice(&account, &value); err != nil {
 		return nil, err
 	}
 	return &account, nil
@@ -1383,13 +1355,13 @@ func buildAccountTransactions(lane *accountLane) (*tlb.AccountTransactionsAugDic
 	slices.SortFunc(lane.transactions, func(left, right accountTransaction) int {
 		return cmp.Compare(left.startLT, right.startLT)
 	})
-	entries := make([]cell.AugmentedEntry, len(lane.transactions))
+	entries := make([]cell.AugmentedUintEntry, len(lane.transactions))
 	for i, transaction := range lane.transactions {
 		if i > 0 && transaction.startLT == lane.transactions[i-1].startLT {
 			return nil, fmt.Errorf("%w: duplicate transaction lt %d", ErrInvalidInput, transaction.startLT)
 		}
-		entries[i] = cell.AugmentedEntry{
-			Key:   cell.BeginCell().MustStoreUInt(transaction.startLT, 64).EndCell(),
+		entries[i] = cell.AugmentedUintEntry{
+			Key:   transaction.startLT,
 			Value: cell.BeginCell().MustStoreRef(transaction.root).EndCell(),
 			Mode:  cell.DictSetModeAdd,
 		}
@@ -1399,7 +1371,7 @@ func buildAccountTransactions(lane *accountLane) (*tlb.AccountTransactionsAugDic
 	if err != nil {
 		return nil, err
 	}
-	if err = transactions.SetMany(entries); err != nil {
+	if err = transactions.SetManyByUint(entries); err != nil {
 		return nil, fmt.Errorf("%w: transactions of account %x did not apply: %v", ErrInvalidInput, lane.key, err)
 	}
 	return transactions, nil
@@ -1460,7 +1432,9 @@ func currencyZero(value tlb.CurrencyCollection) bool {
 // in its proof, so charging them to the collated-size estimate would shrink the
 // block for bytes that are never emitted.
 // recordOutboundMessageReads records everything reachable from an emitted
-// message.
+// message. When certifyParallel is set, the same descent also verifies that no
+// cell can carry a trace or another shape unsafe to inspect from a generated
+// worker.
 //
 // A contract can put a predecessor subtree into a message without the machine
 // ever opening it: PUSHREF pushes a reference without registering a load, and a
@@ -1486,9 +1460,15 @@ func currencyZero(value tlb.CurrencyCollection) bool {
 // traversal record — which is exactly what recording them unbilled is avoiding.
 // Only the root is copied; PeekRef on an untraced cell returns the reference
 // itself.
-func (c *collation) recordOutboundMessageReads(root *cell.Cell) {
+//
+// Recording and certification deliberately keep different visited sets. The
+// proof record deduplicates by hash, while certification deduplicates by
+// pointer: equal-hash wrappers may carry different traces, and skipping the
+// traced wrapper would let a worker write into a serial lane recorder. The two
+// recursion flags preserve both rules while sharing one PeekRef walk.
+func (c *collation) recordOutboundMessageReads(root *cell.Cell, certifyParallel bool) bool {
 	if root == nil {
-		return
+		return false
 	}
 	// Cleared per message, though recording is idempotent and a stale set would
 	// mostly just skip cells already in the record. The one place it would not
@@ -1500,29 +1480,66 @@ func (c *collation) recordOutboundMessageReads(root *cell.Cell) {
 	} else {
 		clear(c.outboundVisited)
 	}
-	var walk func(cur *cell.Cell, depth int)
-	walk = func(cur *cell.Cell, depth int) {
-		if cur == nil || depth > maxOutboundMessageRecordDepth {
-			return
-		}
-		hash := cur.HashKey()
-		if _, seen := c.outboundVisited[hash]; seen {
-			return
-		}
-		c.outboundVisited[hash] = struct{}{}
-		c.recordExecutionRead(cur)
-		if cur.IsSpecial() {
-			return
-		}
-		for i := 0; i < int(cur.RefsNum()); i++ {
-			ref, err := cur.PeekRef(i)
-			if err != nil {
-				return
-			}
-			walk(ref, depth+1)
+	if certifyParallel {
+		if c.outboundSafetyVisited == nil {
+			c.outboundSafetyVisited = make(map[*cell.Cell]struct{}, 64)
+		} else {
+			clear(c.outboundSafetyVisited)
 		}
 	}
-	walk(root.WithoutTrace(), 0)
+
+	parallelSafe := certifyParallel && root.Trace() == nil
+	return c.walkOutboundMessage(root.WithoutTrace(), 0, true, parallelSafe) && parallelSafe
+}
+
+func (c *collation) walkOutboundMessage(cur *cell.Cell, depth int, record, certify bool) bool {
+	if cur == nil || (!record && !certify) {
+		return true
+	}
+	if depth > maxOutboundMessageRecordDepth {
+		return !certify
+	}
+
+	recordChildren := false
+	if record {
+		hash := cur.HashKey()
+		if _, seen := c.outboundVisited[hash]; !seen {
+			c.outboundVisited[hash] = struct{}{}
+			c.recordExecutionRead(cur)
+			recordChildren = !cur.IsSpecial()
+		}
+	}
+
+	certifyChildren := false
+	parallelSafe := true
+	if certify {
+		unsafe := cur.Trace() != nil || cur.IsSpecial() || cur.IsLazy() ||
+			cur.IsVirtualized() || cur.Level() != 0
+		if unsafe {
+			parallelSafe = false
+		} else if _, seen := c.outboundSafetyVisited[cur]; !seen {
+			c.outboundSafetyVisited[cur] = struct{}{}
+			certifyChildren = true
+		}
+	}
+	if !recordChildren && !certifyChildren {
+		return parallelSafe
+	}
+
+	for i := 0; i < int(cur.RefsNum()); i++ {
+		ref, err := cur.PeekRef(i)
+		if err != nil {
+			if certifyChildren {
+				parallelSafe = false
+			}
+			return parallelSafe
+		}
+		if !c.walkOutboundMessage(ref, depth+1, recordChildren, certifyChildren) {
+			parallelSafe = false
+			certifyChildren = false
+		}
+	}
+	return parallelSafe
 }
 
 // maxOutboundMessageRecordDepth bounds the walk at the cell depth limit, so a

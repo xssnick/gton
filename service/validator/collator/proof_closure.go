@@ -150,9 +150,7 @@ func (c *collation) traceProcessedQueueValidationClosure() error {
 	// collated-size estimator is the same set either way; the stamp is what says
 	// the collection is that walk's and not some other one's.
 	if c.claimedPrefix.serves(c.oldOutQueue, c.shard, c.processedClaim) {
-		for _, parsed := range c.claimedPrefix.cells {
-			c.usage.Record(parsed)
-		}
+		c.usage.RecordMany(c.claimedPrefix.cells)
 		c.claimedPrefix.release()
 
 		return c.ctx.Err()
@@ -190,14 +188,14 @@ func (c *collation) traceProcessedQueueValidationClosure() error {
 // removes the class.
 func (c *collation) traceImmediateQueueValidationClosure() error {
 	for _, key := range c.immediateQueueKeys {
-		keyCell := cell.BeginCell().MustStoreSlice(key[:], 352).EndCell()
-		if _, err := c.oldOutQueue.LoadValue(keyCell); err != nil && !isMissingKey(err) {
+		var value cell.Slice
+		if err := c.oldOutQueue.LoadValueByBytesKeyInto(key[:], &value); err != nil && !isMissingKey(err) {
 			return fmt.Errorf("trace predecessor queue absence %x: %w", key, err)
 		}
 		// The candidate queue is walked too, because the validator walks it and
 		// its untouched nodes are the predecessor's own cells: a key whose path
 		// the block reshaped resolves through cells only this walk reaches.
-		if _, err := c.outQueue.LoadValue(keyCell); err != nil && !isMissingKey(err) {
+		if err := c.outQueue.LoadValueByBytesKeyInto(key[:], &value); err != nil && !isMissingKey(err) {
 			return fmt.Errorf("trace candidate queue absence %x: %w", key, err)
 		}
 	}
@@ -222,10 +220,10 @@ func (c *collation) traceAccountValidationClosure() error {
 		return c.accountMutationDiff.ReplayParallel(collationParallelism)
 	}
 
-	return c.oldState.Accounts.ShardAccounts.ScanDiffParallel(
+	return c.oldState.Accounts.ShardAccounts.ScanDiffParallelRaw(
 		c.accounts.AugmentedDictionary,
 		true,
-		func(_ *cell.Cell, _, _ *cell.Slice) error { return nil },
+		func(cell.AugDictDiffRawView) error { return nil },
 		collationParallelism,
 	)
 }
@@ -249,35 +247,30 @@ func (c *collation) traceAccountValidationClosure() error {
 // it in the closure, a validator running on proofs meets a pruned branch on an
 // ordinary account that merely happens to sit next to a deferring one.
 func (c *collation) traceDispatchQueueValidationClosure() error {
-	err := c.oldDispatchQueue.ScanDiff(c.dispatchQueue.AugmentedDictionary, true, func(
-		keyCell *cell.Cell,
-		oldValueExtra, newValueExtra *cell.Slice,
-	) error {
-		keyLoader, err := keyCell.BeginParse()
-		if err != nil {
-			return fmt.Errorf("%w: load dispatch diff key: %v", ErrInvalidInput, err)
-		}
+	err := c.oldDispatchQueue.ScanDiffRaw(c.dispatchQueue.AugmentedDictionary, true, func(view cell.AugDictDiffRawView) error {
 		var accountID [32]byte
-		if err = keyLoader.LoadSliceInto(accountID[:], 256); err != nil {
-			return fmt.Errorf("%w: decode dispatch diff key: %v", ErrInvalidInput, err)
+		if view.KeyBits != 256 || len(view.Key) != len(accountID) {
+			return fmt.Errorf("%w: dispatch diff key is malformed", ErrInvalidInput)
 		}
+		copy(accountID[:], view.Key)
 
 		var oldAccount *tlb.AccountDispatchQueue
-		if oldValueExtra != nil {
+		if view.HasOld {
 			var traced bool
 			oldAccount, traced = c.oldDispatchAccounts[accountID]
 			if !traced {
+				var err error
 				oldAccount, err = c.loadPredecessorDispatchAccount(accountID)
 				if err != nil {
 					return fmt.Errorf("%w: decode predecessor dispatch account: %v", ErrInvalidInput, err)
 				}
 			}
-			if _, _, err = oldAccount.Messages.LoadMax(); err != nil {
+			if _, _, err := oldAccount.Messages.LoadMax(); err != nil {
 				return fmt.Errorf("%w: load predecessor dispatch account maximum: %v", ErrInvalidInput, err)
 			}
 		}
-		if newValueExtra != nil {
-			newAccount, err := dispatchDiffAccount(newValueExtra)
+		if view.HasNew {
+			newAccount, err := dispatchDiffAccount(view.NewValueExtra)
 			if err != nil {
 				return fmt.Errorf("%w: decode candidate dispatch account: %v", ErrInvalidInput, err)
 			}
@@ -289,7 +282,8 @@ func (c *collation) traceDispatchQueueValidationClosure() error {
 			// same minimum through the immutable predecessor source so a reused leaf
 			// is retained in the previous-state proof.
 			if oldAccount != nil {
-				_, oldErr := oldAccount.Messages.LoadValue(minimum)
+				var value cell.Slice
+				oldErr := oldAccount.Messages.LoadValueInto(minimum, &value)
 				if oldErr != nil && !isMissingKey(oldErr) {
 					return fmt.Errorf("%w: load candidate dispatch account minimum from predecessor: %v", ErrInvalidInput, oldErr)
 				}

@@ -95,11 +95,11 @@ func validateMasterShardFees(input masterShardFeesValidationInput) (tlb.ShardFee
 		}
 	}
 
-	rootExtra, err := input.fees.LoadRootExtra()
-	if err != nil {
+	var rootExtra cell.Slice
+	if err := input.fees.LoadRootExtraInto(&rootExtra); err != nil {
 		return tlb.ShardFeeCreated{}, fmt.Errorf("%w: load ShardFees root extra: %v", ErrInvalidInput, err)
 	}
-	total, err := loadMasterShardFeeCreated(rootExtra)
+	total, err := loadMasterShardFeeCreated(&rootExtra)
 	if err != nil {
 		return tlb.ShardFeeCreated{}, fmt.Errorf("%w: decode ShardFees root extra: %v", ErrInvalidInput, err)
 	}
@@ -107,11 +107,11 @@ func validateMasterShardFees(input masterShardFeesValidationInput) (tlb.ShardFee
 }
 
 func loadMasterShardFeeCreated(loader *cell.Slice) (tlb.ShardFeeCreated, error) {
-	check := loader.Copy()
-	if err := validateMasterShardCurrencySlice(check); err != nil {
+	check := *loader
+	if err := validateMasterShardCurrencySlice(&check); err != nil {
 		return tlb.ShardFeeCreated{}, fmt.Errorf("fees: %w", err)
 	}
-	if err := validateMasterShardCurrencySlice(check); err != nil {
+	if err := validateMasterShardCurrencySlice(&check); err != nil {
 		return tlb.ShardFeeCreated{}, fmt.Errorf("created funds: %w", err)
 	}
 	if check.BitsLeft() != 0 || check.RefsNum() != 0 {
@@ -141,7 +141,7 @@ func validateMasterShardCurrencySlice(loader *cell.Slice) error {
 		}
 	}
 
-	extra, err := loader.LoadDict(32)
+	extra, err := loader.LoadOptionalDict(32)
 	if err != nil {
 		return fmt.Errorf("load extra currencies: %w", err)
 	}
@@ -181,7 +181,8 @@ func validateMasterShardCurrencySlice(loader *cell.Slice) error {
 }
 
 func loadMasterShardFeesKey(key *cell.Cell) (shardRegistryKey, error) {
-	loader, err := key.BeginParse()
+	var loader cell.Slice
+	err := key.BeginParseInto(&loader)
 	if err != nil {
 		return shardRegistryKey{}, err
 	}

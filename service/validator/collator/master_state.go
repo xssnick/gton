@@ -470,13 +470,12 @@ func masterConfigRootFromAccounts(accounts *tlb.ShardAccountsAugDict, accountID 
 	if len(accountID) != 32 {
 		return nil, fmt.Errorf("%w: configuration account id is malformed", ErrInvalidInput)
 	}
-	key := cell.BeginCell().MustStoreSlice(accountID, 256).EndCell()
-	value, err := accounts.LoadValue(key)
-	if err != nil {
+	var value cell.Slice
+	if err := accounts.LoadValueByBytesKeyInto(accountID, &value); err != nil {
 		return nil, fmt.Errorf("load configuration account: %w", err)
 	}
 	var shardAccount tlb.ShardAccount
-	if err = loadExactSlice(&shardAccount, value); err != nil {
+	if err := loadExactSlice(&shardAccount, &value); err != nil {
 		return nil, fmt.Errorf("decode configuration account: %w", err)
 	}
 	addr := address.NewAddress(0, 0xff, accountID)
@@ -488,7 +487,8 @@ func masterConfigRootFromAccounts(accounts *tlb.ShardAccountsAugDict, accountID 
 	if state.Status != tlb.AccountStatusActive || state.StateInit == nil || state.StateInit.Data == nil {
 		return nil, fmt.Errorf("%w: configuration account is not active or has no data", ErrInvalidInput)
 	}
-	data, err := state.StateInit.Data.BeginParse()
+	var data cell.Slice
+	err = state.StateInit.Data.BeginParseInto(&data)
 	if err != nil {
 		return nil, fmt.Errorf("parse configuration account data: %w", err)
 	}
@@ -559,8 +559,13 @@ func nextMasterBlockHistory(
 	if err != nil {
 		return nil, tlb.ExtBlkRef{}, fmt.Errorf("serialize previous masterchain reference: %w", err)
 	}
-	key := cell.BeginCell().MustStoreUInt(uint64(previousID.SeqNo), 32).EndCell()
-	inserted, err := prevBlocks.SetWithMode(key, value, cell.DictSetModeAdd)
+	var valueBuilder cell.Builder
+	value.ToBuilderInto(&valueBuilder)
+	inserted, err := prevBlocks.SetBuilderByUintKeyWithMode(
+		uint64(previousID.SeqNo),
+		&valueBuilder,
+		cell.DictSetModeAdd,
+	)
 	if err != nil {
 		return nil, tlb.ExtBlkRef{}, fmt.Errorf("update previous masterchain block history: %w", err)
 	}
@@ -611,7 +616,8 @@ func writableOldMCBlocks(old *tlb.OldMcBlocksInfoAugDict) (*cell.AugmentedDictio
 	if err != nil {
 		return nil, fmt.Errorf("serialize old masterchain block history: %w", err)
 	}
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err = root.BeginParseInto(&loader)
 	if err != nil {
 		return nil, err
 	}

@@ -468,7 +468,7 @@ func putUint32(dst []byte, at int, value uint32) int {
 }
 
 func serializeCandidatePayload(candidate Candidate, blockBOC, collatedData []byte) (*candidatePayload, error) {
-	blockRoot, err := cell.FromBOC(blockBOC)
+	blockRoot, err := cell.FromBOCWithOptions(blockBOC, cell.BOCParseOptions{NoCopyPayload: true})
 	if err != nil {
 		return nil, fmt.Errorf("simplex: parse candidate block BOC: %w", err)
 	}
@@ -486,11 +486,15 @@ func serializeCandidatePayload(candidate Candidate, blockBOC, collatedData []byt
 	if !canonicalBlock {
 		return nil, fmt.Errorf("simplex: candidate block BOC is not canonical mode 31")
 	}
-	if !bytes.Equal(blockRoot.Hash(), candidate.Block.RootHash) {
+	rootHash := blockRoot.HashKey()
+	if !bytes.Equal(rootHash[:], candidate.Block.RootHash) {
 		return nil, fmt.Errorf("simplex: candidate block root hash does not match block BOC")
 	}
 
-	collatedRoots, err := cell.FromBOCMultiRoot(collatedData)
+	collatedRoots, err := cell.FromBOCMultiRootWithOptions(
+		collatedData,
+		cell.BOCParseOptions{NoCopyPayload: true},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("simplex: parse candidate collated data: %w", err)
 	}

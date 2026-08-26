@@ -358,7 +358,9 @@ func TestBuildAccountLanesFanOutMatchesSequentialBuild(t *testing.T) {
 		if got.entry.Mode != want.entry.Mode {
 			t.Fatalf("lane %x: account write mode %v against %v", lanes[i].key, got.entry.Mode, want.entry.Mode)
 		}
-		assertSameCell(t, lanes[i].key, "account block key", got.block.Key, want.block.Key)
+		if !bytes.Equal(got.block.Key, want.block.Key) {
+			t.Fatalf("lane %x: account block keys differ", lanes[i].key)
+		}
 		assertSameCell(t, lanes[i].key, "account block", got.block.Value, want.block.Value)
 		assertSameCell(t, lanes[i].key, "storage stat", got.storageStat, want.storageStat)
 	}

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/validator/msgpool"
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
@@ -444,8 +445,25 @@ func TestSpeculativeChainResolvesTheCarriedBaseWithoutTheSession(t *testing.T) {
 	}
 	// Empty on purpose: the resolution must not consult it. A session in the
 	// window before ours holds that window's base here, never the one a bet is
-	// placed on.
+	// placed on. The pool carries the base's own position as applied, which is
+	// the one case the speculative resolution still takes the plain path —
+	// no lineage, no candidate tip; the lineage cases live in
+	// speculative_lineage_test.go.
+	destination := blockShardIdent(built.ID)
+	pool := msgpool.New(msgpool.Config{})
+	t.Cleanup(pool.Close)
+	if err = pool.Internals().ReconcileDestinations([]msgpool.ShardIdent{destination}); err != nil {
+		t.Fatal(err)
+	}
+	baseRef, err := localSourceRef(built.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.Internals().Seed(destination, destination, baseRef, nil, 0); err != nil {
+		t.Fatal(err)
+	}
 	managed := &localAcquisitionSession{
+		branch:     openLocalTestBranch(t, pool, destination),
 		candidates: map[simplex.CandidateID]localCandidateState{},
 		blocks:     map[[32]byte]localCandidateState{},
 	}
@@ -461,7 +479,7 @@ func TestSpeculativeChainResolvesTheCarriedBaseWithoutTheSession(t *testing.T) {
 		speculative: &speculativeBase{state: base, at: time.Unix(1787464000, 0)},
 	}
 
-	chain, err := (&LocalAcquisition{}).resolveChain(context.Background(), managed, request)
+	chain, err := (&LocalAcquisition{messages: pool}).resolveChain(context.Background(), managed, request)
 	if err != nil {
 		t.Fatal(err)
 	}

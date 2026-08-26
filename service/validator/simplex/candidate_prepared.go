@@ -135,7 +135,7 @@ func newPreparedCandidate(
 
 		return prepared, func() { close(prepared.ready) }
 	}
-	copy(prepared.rootHash[:], blockRoot.Hash())
+	prepared.rootHash = [32]byte(blockRoot.HashKey())
 
 	// The reference orders the combined BOC block-root first, then the collated
 	// roots, and this slice is the only place that order is applied on the

@@ -189,11 +189,13 @@ func formatStatus(status StatusSnapshot) string {
 	)
 	fmt.Fprintf(
 		&b,
-		"  overflow_pool=%d overflow_bytes=%d overflow_address=%d invalid=%d retry_delayed=%d retry_retried=%d retry_exhausted=%d retry_pressure=%d stale_feedback=%d applied_requested=%d\n",
+		"  overflow_pool=%d overflow_bytes=%d overflow_address=%d invalid=%d included_quarantined=%d included_released=%d retry_delayed=%d retry_retried=%d retry_exhausted=%d retry_pressure=%d stale_feedback=%d applied_requested=%d\n",
 		status.External.OverflowMempool,
 		status.External.OverflowBytes,
 		status.External.OverflowAddress,
 		status.External.InvalidDeleted,
+		status.External.IncludedQuarantined,
+		status.External.IncludedReleased,
 		status.External.RejectedDelayed,
 		status.External.RejectedRetried,
 		status.External.RejectedExhausted,

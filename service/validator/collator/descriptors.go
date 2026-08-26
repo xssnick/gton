@@ -88,20 +88,24 @@ const descriptorFlushMask = 63
 // could forget to wire.
 type descriptorBatch struct {
 	ops     uint64
-	pending []cell.AugmentedEntry
+	pending []descriptorEntry
+	entries []cell.AugmentedBytesEntry
+}
+
+type descriptorEntry struct {
+	key   cell.Hash
+	value *cell.Cell
 }
 
 // descriptorKey is the message-hash key both descriptor dictionaries use.
-func descriptorKey(message *cell.Cell) *cell.Cell {
-	hash := message.HashKey()
-	return cell.BeginCell().MustStoreSlice(hash[:], 256).EndCell()
+func descriptorKey(message *cell.Cell) cell.Hash {
+	return message.HashKey()
 }
 
-func (b *descriptorBatch) addKeyed(key, descriptor *cell.Cell) {
-	b.pending = append(b.pending, cell.AugmentedEntry{
-		Key:   key,
-		Value: descriptor,
-		Mode:  cell.DictSetModeAdd,
+func (b *descriptorBatch) addKeyed(key cell.Hash, descriptor *cell.Cell) {
+	b.pending = append(b.pending, descriptorEntry{
+		key:   key,
+		value: descriptor,
 	})
 }
 
@@ -123,13 +127,22 @@ func (b *descriptorBatch) flush(dict *cell.AugmentedDictionary) error {
 	if len(b.pending) == 0 {
 		return nil
 	}
-	if err := dict.SetMany(b.pending, collationParallelism); err != nil {
+	b.entries = b.entries[:0]
+	for i := range b.pending {
+		b.entries = append(b.entries, cell.AugmentedBytesEntry{
+			Key:   b.pending[i].key[:],
+			Value: b.pending[i].value,
+			Mode:  cell.DictSetModeAdd,
+		})
+	}
+	if err := dict.SetManyByBytes(b.entries, collationParallelism); err != nil {
 		if hash, found := b.duplicateMessage(dict); found {
 			return fmt.Errorf("%w: duplicate message descriptor %x", ErrInvalidInput, hash)
 		}
 		return fmt.Errorf("%w: message descriptors: %w", ErrInvalidInput, err)
 	}
 	b.pending = b.pending[:0]
+	b.entries = b.entries[:0]
 	return nil
 }
 
@@ -138,22 +151,16 @@ func (b *descriptorBatch) flush(dict *cell.AugmentedDictionary) error {
 // message hash is what an operator needs; recovering it costs a scan, which is
 // affordable because collation is failing anyway.
 func (b *descriptorBatch) duplicateMessage(dict *cell.AugmentedDictionary) ([]byte, bool) {
-	seen := make(map[string]struct{}, len(b.pending))
+	seen := make(map[[32]byte]struct{}, len(b.pending))
 	for _, entry := range b.pending {
-		slice, err := entry.Key.BeginParse()
-		if err != nil {
-			continue
+		hash := [32]byte(entry.key)
+		if _, repeated := seen[hash]; repeated {
+			return hash[:], true
 		}
-		hash, err := slice.LoadSlice(256)
-		if err != nil {
-			continue
-		}
-		if _, repeated := seen[string(hash)]; repeated {
-			return hash, true
-		}
-		seen[string(hash)] = struct{}{}
-		if _, err = dict.LoadValueWithExtra(entry.Key); err == nil {
-			return hash, true
+		seen[hash] = struct{}{}
+		var value cell.Slice
+		if err := dict.LoadValueByBytesKeyInto(hash[:], &value); err == nil {
+			return hash[:], true
 		}
 	}
 	return nil, false

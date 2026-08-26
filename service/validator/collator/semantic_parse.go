@@ -58,7 +58,7 @@ func (m *semanticInternalMessageInfo) LoadFromCell(loader *cell.Slice) error {
 	if err = m.Amount.LoadFromCell(loader); err != nil {
 		return fmt.Errorf("failed to load amount: %w", err)
 	}
-	if m.ExtraCurrencies, err = loader.LoadDict(32); err != nil {
+	if m.ExtraCurrencies, err = loader.LoadOptionalDict(32); err != nil {
 		return fmt.Errorf("failed to load extra currencies: %w", err)
 	}
 	if err = m.IHRFee.LoadFromCell(loader); err != nil {

@@ -262,8 +262,8 @@ func TestBuildMasterActivatesMissingWorkchain(t *testing.T) {
 		t.Fatal(err)
 	}
 	wc := workchains[0]
-	if wc == nil || !bytes.Equal(tops[0].Block.RootHash, wc.zeroStateRootHash) ||
-		!bytes.Equal(tops[0].Block.FileHash, wc.zeroStateFileHash) {
+	if wc == nil || !bytes.Equal(tops[0].Block.RootHash, wc.zeroStateRootHash[:]) ||
+		!bytes.Equal(tops[0].Block.FileHash, wc.zeroStateFileHash[:]) {
 		t.Fatalf("activated workchain zero state = %+v", tops[0].Block)
 	}
 
@@ -1372,7 +1372,7 @@ func assertMasterBuildSpecials(
 		// Assert against the decoder that actually decides on the validation
 		// path, so a masterchain descriptor the builder emits and the validator
 		// would reject cannot pass here.
-		if _, err := parseSemanticInDescriptor(*descriptor.MustBeginParse(), [32]byte(messageHash)); err != nil {
+		if _, err := parseSemanticInDescriptor(*descriptor.MustBeginParse(), [32]byte(messageHash), nil); err != nil {
 			t.Fatalf("parse %s descriptor: %v", special.name, err)
 		}
 	}

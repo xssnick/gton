@@ -105,7 +105,7 @@ func TestPreparedValidationCandidateIsTheOnlyParse(t *testing.T) {
 	if prepared.verified.block.StateUpdate != update {
 		t.Fatal("bindConfig replaced the block parse")
 	}
-	if err = verifyPreparedShardCandidate(t.Context(), shardVerificationRequest(req, prepared.candidate), &prepared.verified); err != nil {
+	if err = verifyPreparedShardCandidate(t.Context(), shardVerificationRequest(req, prepared.candidate), prepared); err != nil {
 		t.Fatalf("verify the candidate the capsule prepared: %v", err)
 	}
 }
@@ -553,17 +553,27 @@ func TestMasterVerificationReusesTheAcquiredPredecessorState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify the predecessor the acquisition resolves: %v", err)
 	}
-	reused := request
-	reused.previousState = &acquiredPredecessorState{root: request.Previous.State, state: acquired}
-	if err = VerifyMasterCandidate(t.Context(), reused); err != nil {
+	verifyWithAcquired := func(previous *acquiredPredecessorState) error {
+		prepared, prepareErr := prepareVerificationCandidate(
+			t.Context(),
+			request.Config,
+			request.Candidate,
+			[]PreviousBlock{request.Previous},
+		)
+		if prepareErr != nil {
+			return prepareErr
+		}
+		prepared.masterPredecessor = previous
+
+		return verifyPreparedMasterCandidate(t.Context(), request, prepared)
+	}
+	if err = verifyWithAcquired(&acquiredPredecessorState{root: request.Previous.State, state: acquired}); err != nil {
 		t.Fatalf("verify with the already verified predecessor: %v", err)
 	}
 
 	foreign := acquired
 	foreign.GlobalID++
-	changed := request
-	changed.previousState = &acquiredPredecessorState{root: request.Previous.State, state: foreign}
-	err = VerifyMasterCandidate(t.Context(), changed)
+	err = verifyWithAcquired(&acquiredPredecessorState{root: request.Previous.State, state: foreign})
 	if err == nil || !strings.Contains(err.Error(), "global id differs from predecessor state") {
 		t.Fatalf("foreign predecessor state error = %v, want the supplied state to be the one used", err)
 	}
@@ -579,12 +589,10 @@ func TestMasterVerificationReusesTheAcquiredPredecessorState(t *testing.T) {
 	if err = parseExact(&reparsed, request.Previous.State.ToBuilder().EndCell()); err != nil {
 		t.Fatal(err)
 	}
-	elsewhere := request
-	elsewhere.previousState = &acquiredPredecessorState{
+	err = verifyWithAcquired(&acquiredPredecessorState{
 		root:  request.Previous.State.ToBuilder().EndCell(),
 		state: reparsed,
-	}
-	err = VerifyMasterCandidate(t.Context(), elsewhere)
+	})
 	if err == nil || !strings.Contains(err.Error(), "supplied master predecessor state differs from its block id") {
 		t.Fatalf("state of another tree error = %v, want the plumbing assertion", err)
 	}
@@ -777,8 +785,7 @@ func TestValidatedSuccessorLeavesVerificationOnTheProofBackedRoot(t *testing.T) 
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
 	verification.Neighbors = collatedNeighborQueues(t, req, candidate)
-	verification.stateProven = prepared.verified.collated.full
-	if err = verifyPreparedShardCandidate(t.Context(), verification, &prepared.verified); err != nil {
+	if err = verifyPreparedShardCandidate(t.Context(), verification, prepared); err != nil {
 		t.Fatalf("verify on the proof-backed successor with nothing resident: %v", err)
 	}
 
@@ -869,7 +876,7 @@ func runLazyBudgetValidation(
 	if announce != nil && prepared.substituted {
 		announce(prepared.verified.stateUpdate)
 	}
-	if err = verifyPreparedShardCandidate(t.Context(), verification, &prepared.verified); err != nil {
+	if err = verifyPreparedShardCandidate(t.Context(), verification, prepared); err != nil {
 		return nil, err
 	}
 
@@ -1076,7 +1083,6 @@ func TestLiveSuccessorApplyLazyLoadBudgetOnProofBackedValidation(t *testing.T) {
 
 	proven := func(request *ShardVerificationRequest) {
 		request.Neighbors = collatedNeighborQueues(t, req, candidate)
-		request.stateProven = true
 	}
 
 	// Today: validation reads the candidate's proofs, so a store-shaped parent

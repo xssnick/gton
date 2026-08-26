@@ -385,6 +385,7 @@ func newValidatorStackFactory(composition validatorStackComposition) hooks.Exten
 		}
 
 		log := node.Logger.With().Str("component", "validator_network").Logger()
+		hooks.RaiseGCPercent(log)
 		manager, err := validatornet.NewManager(validatornet.ManagerOptions{
 			PrivateOverlays:  node.PrivateOverlays,
 			BlockBroadcasts:  node.BlockBroadcasts,

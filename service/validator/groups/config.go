@@ -247,8 +247,8 @@ func parseCatchainConfig(configCell *cell.Cell) (CatchainConfig, error) {
 		}, nil
 	}
 
-	s, err := configCell.BeginParse()
-	if err != nil {
+	var s cell.Slice
+	if err := configCell.BeginParseInto(&s); err != nil {
 		return CatchainConfig{}, err
 	}
 
@@ -277,24 +277,24 @@ func parseCatchainConfig(configCell *cell.Cell) (CatchainConfig, error) {
 		return CatchainConfig{}, fmt.Errorf("unsupported constructor #%02x", constructor)
 	}
 
-	result.MasterchainLifetime, err = loadUint32(s, "mc_catchain_lifetime")
+	result.MasterchainLifetime, err = loadUint32(&s, "mc_catchain_lifetime")
 	if err != nil {
 		return CatchainConfig{}, err
 	}
-	result.ShardLifetime, err = loadUint32(s, "shard_catchain_lifetime")
+	result.ShardLifetime, err = loadUint32(&s, "shard_catchain_lifetime")
 	if err != nil {
 		return CatchainConfig{}, err
 	}
-	result.ShardValidatorsLifetime, err = loadUint32(s, "shard_validators_lifetime")
+	result.ShardValidatorsLifetime, err = loadUint32(&s, "shard_validators_lifetime")
 	if err != nil {
 		return CatchainConfig{}, err
 	}
-	result.ShardValidators, err = loadUint32(s, "shard_validators_num")
+	result.ShardValidators, err = loadUint32(&s, "shard_validators_num")
 	if err != nil {
 		return CatchainConfig{}, err
 	}
 
-	if err = requireEmpty(s); err != nil {
+	if err = requireEmpty(&s); err != nil {
 		return CatchainConfig{}, err
 	}
 	if result.MasterchainLifetime == 0 || result.ShardLifetime == 0 ||
@@ -310,8 +310,8 @@ func parseConsensusLimits(configCell *cell.Cell) (uint32, uint32, error) {
 		return defaultCandidateSizeLimit, defaultCandidateSizeLimit, nil
 	}
 
-	s, err := configCell.BeginParse()
-	if err != nil {
+	var s cell.Slice
+	if err := configCell.BeginParseInto(&s); err != nil {
 		return 0, 0, err
 	}
 
@@ -362,15 +362,15 @@ func parseConsensusLimits(configCell *cell.Cell) (uint32, uint32, error) {
 		"attempt_duration",
 		"catchain_max_deps",
 	} {
-		if _, err = loadUint32(s, field); err != nil {
+		if _, err = loadUint32(&s, field); err != nil {
 			return 0, 0, err
 		}
 	}
-	maxBlockSize, err := loadUint32(s, "max_block_bytes")
+	maxBlockSize, err := loadUint32(&s, "max_block_bytes")
 	if err != nil {
 		return 0, 0, err
 	}
-	maxCollatedDataSize, err := loadUint32(s, "max_collated_bytes")
+	maxCollatedDataSize, err := loadUint32(&s, "max_collated_bytes")
 	if err != nil {
 		return 0, 0, err
 	}
@@ -380,10 +380,10 @@ func parseConsensusLimits(configCell *cell.Cell) (uint32, uint32, error) {
 	if _, err = s.LoadUInt(16); err != nil {
 		return 0, 0, fmt.Errorf("load proto_version: %w", err)
 	}
-	if _, err = loadUint32(s, "catchain_max_blocks_coeff"); err != nil {
+	if _, err = loadUint32(&s, "catchain_max_blocks_coeff"); err != nil {
 		return 0, 0, err
 	}
-	if err = requireEmpty(s); err != nil {
+	if err = requireEmpty(&s); err != nil {
 		return 0, 0, err
 	}
 
@@ -396,8 +396,8 @@ func parseNewConsensusConfig(configCell *cell.Cell) (NewConsensusConfig, error) 
 		return NewConsensusConfig{}, nil
 	}
 
-	s, err := configCell.BeginParse()
-	if err != nil {
+	var s cell.Slice
+	if err := configCell.BeginParseInto(&s); err != nil {
 		return NewConsensusConfig{}, err
 	}
 
@@ -409,16 +409,16 @@ func parseNewConsensusConfig(configCell *cell.Cell) (NewConsensusConfig, error) 
 		return NewConsensusConfig{}, fmt.Errorf("unsupported constructor #%02x", constructor)
 	}
 
-	masterchain, err := parseMaybeSimplexConfig(s)
+	masterchain, err := parseMaybeSimplexConfig(&s)
 	if err != nil {
 		return NewConsensusConfig{}, fmt.Errorf("masterchain config: %w", err)
 	}
 
-	shard, err := parseMaybeSimplexConfig(s)
+	shard, err := parseMaybeSimplexConfig(&s)
 	if err != nil {
 		return NewConsensusConfig{}, fmt.Errorf("shard config: %w", err)
 	}
-	if err = requireEmpty(s); err != nil {
+	if err = requireEmpty(&s); err != nil {
 		return NewConsensusConfig{}, err
 	}
 
@@ -447,8 +447,8 @@ func parseMaybeSimplexConfig(s *cell.Slice) (*SimplexConfig, error) {
 }
 
 func parseSimplexConfig(configCell *cell.Cell) (SimplexConfig, error) {
-	s, err := configCell.BeginParse()
-	if err != nil {
+	var s cell.Slice
+	if err := configCell.BeginParseInto(&s); err != nil {
 		return SimplexConfig{}, err
 	}
 
@@ -475,12 +475,12 @@ func parseSimplexConfig(configCell *cell.Cell) (SimplexConfig, error) {
 		if err != nil {
 			return SimplexConfig{}, fmt.Errorf("load use_quic: %w", err)
 		}
-		result.SlotsPerLeaderWindow, err = loadUint32(s, "slots_per_leader_window")
+		result.SlotsPerLeaderWindow, err = loadUint32(&s, "slots_per_leader_window")
 		if err != nil {
 			return SimplexConfig{}, err
 		}
 
-		entries, err := parseHashmapE(s, 8)
+		entries, err := parseHashmapE(&s, 8)
 		if err != nil {
 			return SimplexConfig{}, fmt.Errorf("noncritical_params: %w", err)
 		}
@@ -500,7 +500,7 @@ func parseSimplexConfig(configCell *cell.Cell) (SimplexConfig, error) {
 		return SimplexConfig{}, fmt.Errorf("unsupported constructor #%02x", constructor)
 	}
 
-	if err = requireEmpty(s); err != nil {
+	if err = requireEmpty(&s); err != nil {
 		return SimplexConfig{}, err
 	}
 	if result.SlotsPerLeaderWindow == 0 {
@@ -511,8 +511,8 @@ func parseSimplexConfig(configCell *cell.Cell) (SimplexConfig, error) {
 }
 
 func parseValidatorSet(setCell *cell.Cell) (ValidatorSet, error) {
-	s, err := setCell.BeginParse()
-	if err != nil {
+	var s cell.Slice
+	if err := setCell.BeginParseInto(&s); err != nil {
 		return ValidatorSet{}, err
 	}
 
@@ -525,11 +525,11 @@ func parseValidatorSet(setCell *cell.Cell) (ValidatorSet, error) {
 	}
 
 	var result ValidatorSet
-	result.Since, err = loadUint32(s, "utime_since")
+	result.Since, err = loadUint32(&s, "utime_since")
 	if err != nil {
 		return ValidatorSet{}, err
 	}
-	result.Until, err = loadUint32(s, "utime_until")
+	result.Until, err = loadUint32(&s, "utime_until")
 	if err != nil {
 		return ValidatorSet{}, err
 	}
@@ -566,11 +566,11 @@ func parseValidatorSet(setCell *cell.Cell) (ValidatorSet, error) {
 			return ValidatorSet{}, errors.New("declared total weight must be positive")
 		}
 
-		entries, err = parseHashmapE(s, 16)
+		entries, err = parseHashmapE(&s, 16)
 		if err != nil {
 			return ValidatorSet{}, fmt.Errorf("validator dictionary: %w", err)
 		}
-		if err = requireEmpty(s); err != nil {
+		if err = requireEmpty(&s); err != nil {
 			return ValidatorSet{}, err
 		}
 	}
@@ -707,11 +707,11 @@ func parseHashmapNode(root *cell.Cell, keyBits, offset uint, prefix [32]byte, en
 		return errors.New("dictionary contains a special cell")
 	}
 
-	s, err := root.BeginParse()
-	if err != nil {
+	var s cell.Slice
+	if err := root.BeginParseInto(&s); err != nil {
 		return err
 	}
-	offset, err = parseHashmapLabel(s, keyBits, offset, &prefix)
+	offset, err = parseHashmapLabel(&s, keyBits, offset, &prefix)
 	if err != nil {
 		return err
 	}

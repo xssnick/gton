@@ -195,8 +195,8 @@ func validateMasterShardActivation(
 	if item.fields.seqno != 0 {
 		return fmt.Errorf("new shard %s starts with seqno %d", formatShardRegistryKey(key), item.fields.seqno)
 	}
-	if !bytes.Equal(item.fields.rootHash, workchain.zeroStateRootHash) ||
-		!bytes.Equal(item.fields.fileHash, workchain.zeroStateFileHash) {
+	if !bytes.Equal(item.fields.rootHash, workchain.zeroStateRootHash[:]) ||
+		!bytes.Equal(item.fields.fileHash, workchain.zeroStateFileHash[:]) {
 		return fmt.Errorf("new shard %s has incorrect zero-state hashes", formatShardRegistryKey(key))
 	}
 	if item.fields.endLT >= input.startLT {

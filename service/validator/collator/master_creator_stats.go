@@ -207,22 +207,33 @@ func verifyBlockCreateStatsUpdate(
 	}
 
 	changed := make(map[[32]byte]struct{}, len(increments))
-	if err = previousDict.ScanDiff(next.dict, func(key *cell.Cell, oldValue, newValue *cell.Slice) error {
-		creator, keyErr := creatorStatsKeyBytes(key)
-		if keyErr != nil {
-			return keyErr
+	if err = previousDict.ScanDiffRaw(next.dict, func(view cell.DictDiffRawView) error {
+		var creator [32]byte
+		if view.KeyBits != creatorStatsKeyBits || len(view.Key) != len(creator) {
+			return fmt.Errorf("creator statistics key has invalid size")
 		}
+		copy(creator[:], view.Key)
 		changed[creator] = struct{}{}
 
-		oldEntry, decodeErr := decodeCreatorStatsValue(oldValue)
-		if decodeErr != nil {
-			return fmt.Errorf("previous creator statistics %x: %w", creator, decodeErr)
+		var oldEntry creatorStats
+		if view.HasOld {
+			oldValue := view.OldValue
+			var decodeErr error
+			oldEntry, decodeErr = loadCreatorStats(&oldValue)
+			if decodeErr != nil {
+				return fmt.Errorf("previous creator statistics %x: %w", creator, decodeErr)
+			}
 		}
-		newEntry, decodeErr := decodeCreatorStatsValue(newValue)
-		if decodeErr != nil {
-			return fmt.Errorf("resulting creator statistics %x: %w", creator, decodeErr)
+		var newEntry creatorStats
+		if view.HasNew {
+			newValue := view.NewValue
+			var decodeErr error
+			newEntry, decodeErr = loadCreatorStats(&newValue)
+			if decodeErr != nil {
+				return fmt.Errorf("resulting creator statistics %x: %w", creator, decodeErr)
+			}
 		}
-		return verifyOneCreatorStatsUpdate(creator, oldEntry, newEntry, newValue != nil, increments[creator], now)
+		return verifyOneCreatorStatsUpdate(creator, oldEntry, newEntry, view.HasNew, increments[creator], now)
 	}); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
@@ -286,29 +297,6 @@ func verifyOneCreatorStatsUpdate(
 		return fmt.Errorf("creator %x contains two zero counters", creator)
 	}
 	return nil
-}
-
-// decodeCreatorStatsValue treats an absent side of the diff as the zero entry,
-// as block::unpack_CreatorStats does for a null value.
-func decodeCreatorStatsValue(value *cell.Slice) (creatorStats, error) {
-	if value == nil {
-		return creatorStats{}, nil
-	}
-	return loadCreatorStats(value)
-}
-
-func creatorStatsKeyBytes(key *cell.Cell) ([32]byte, error) {
-	var creator [32]byte
-	loader, err := key.BeginParse()
-	if err != nil {
-		return creator, fmt.Errorf("parse creator statistics key: %w", err)
-	}
-	raw, err := loader.LoadSlice(creatorStatsKeyBits)
-	if err != nil || loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
-		return creator, fmt.Errorf("creator statistics key is malformed")
-	}
-	copy(creator[:], raw)
-	return creator, nil
 }
 
 func verifyDiscountedCounterUpdate(
@@ -400,7 +388,8 @@ func creatorStatsIncrements(
 // reference validator works under: DictionaryBase::validate checks the root
 // shape only, and scan_diff parses nothing else.
 func openBlockCreateStats(root *cell.Cell) (blockCreateStats, error) {
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return blockCreateStats{}, fmt.Errorf("%w: decode block creator statistics: %v", ErrInvalidInput, err)
 	}

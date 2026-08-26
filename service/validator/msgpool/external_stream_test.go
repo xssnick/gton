@@ -168,6 +168,47 @@ func TestExternalSnapshotSkipsMessagesThatExpireWhileCollatorPrepares(t *testing
 	}
 }
 
+func TestExternalSnapshotSkipsMessageQuarantinedByAnotherCandidate(t *testing.T) {
+	const quarantine = 10 * time.Second
+	env := newPoolEnv(t, func(config *Config) { config.IncludedRetryDelay = quarantine })
+	env.mustAdd(buildExtMsg(t, 0, testAddr(1), bodyWithTag(1), msgOpts{}), 0)
+
+	first, err := env.pool.OpenExternalSnapshot(allShard, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	concurrent, err := env.pool.OpenExternalSnapshot(allShard, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer concurrent.Close()
+
+	selected := first.TakeReady(1)
+	if len(selected) != 1 {
+		t.Fatalf("first candidate selected %d messages, want one", len(selected))
+	}
+	if err = env.pool.Complete([]ExternalFeedback{{
+		Ref:     selected[0].Reference(),
+		Outcome: ExternalIncluded,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if batch := concurrent.TakeReady(1); len(batch) != 0 {
+		t.Fatalf("concurrent candidate received %d quarantined messages", len(batch))
+	}
+
+	env.clock.advance(quarantine)
+	retry, err := env.pool.OpenExternalSnapshot(allShard, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer retry.Close()
+	if batch := retry.TakeReady(1); len(batch) != 1 {
+		t.Fatalf("retry candidate selected %d messages, want one", len(batch))
+	}
+}
+
 func TestExternalSnapshotSkipsMessagesDeactivatedWhileCollatorPrepares(t *testing.T) {
 	env := newPoolEnv(t)
 	env.mustAdd(buildExtMsg(t, 0, testAddr(1), bodyWithTag(1), msgOpts{}), 0)
@@ -230,8 +271,8 @@ func TestExternalStreamCloseAndPoolCloseUnblockNext(t *testing.T) {
 
 // A build that starts before its predecessor has reported what it consumed has
 // to be told directly, and the telling has to reach both halves of the stream:
-// the first fill and everything admitted afterwards. One map gates both, which
-// is why the exclusion is seeded into it rather than filtered at either.
+// the first fill and everything admitted afterwards. Raw and normalized maps
+// gate both, so equivalent encodings cannot enter through follow admission.
 //
 // Without this the successor is offered messages its predecessor already
 // included, executes them again, and has its feedback for them dropped as
@@ -239,7 +280,11 @@ func TestExternalStreamCloseAndPoolCloseUnblockNext(t *testing.T) {
 // remaining slot of the window.
 func TestExternalStreamNeverOffersAnExcludedMessage(t *testing.T) {
 	env := newPoolEnv(t)
-	consumed := env.mustAdd(buildExtMsg(t, 0, testAddr(0x11), bodyWithTag(1), msgOpts{}), ExternalPriorityBroadcast)
+	addr := testAddr(0x11)
+	body := bodyWithTag(1)
+	consumed := env.mustAdd(buildExtMsg(t, 0, addr, body, msgOpts{}), ExternalPriorityBroadcast)
+	variant := env.mustAdd(buildExtMsg(t, 0, addr, body, msgOpts{importFee: 777}), ExternalPriorityBroadcast)
+	requireEqual(t, consumed.HashNorm, variant.HashNorm, "normalized variants match")
 	kept := env.mustAdd(buildExtMsg(t, 0, testAddr(0x22), bodyWithTag(2), msgOpts{}), ExternalPriorityBroadcast)
 
 	stream, err := env.pool.OpenExternalStreamExcluding(allShard, 500, [][32]byte{consumed.Hash})
@@ -271,14 +316,19 @@ func TestExternalStreamNeverOffersAnExcludedMessage(t *testing.T) {
 		}
 		ready <- batch
 	}()
+	lateVariant := env.mustAdd(
+		buildExtMsg(t, 0, addr, body, msgOpts{importFee: 888}),
+		ExternalPriorityLocal,
+	)
+	requireEqual(t, consumed.HashNorm, lateVariant.HashNorm, "late normalized variant matches")
 	later := env.mustAdd(buildExtMsg(t, 0, testAddr(0x33), bodyWithTag(3), msgOpts{}), ExternalPriorityLocal)
 	select {
 	case nextErr := <-errs:
 		t.Fatal(nextErr)
 	case batch := <-ready:
 		for _, snapshot := range batch {
-			if snapshot.Hash == consumed.Hash {
-				t.Fatal("an excluded message was offered by follow admission")
+			if snapshot.Hash == consumed.Hash || snapshot.Hash == variant.Hash || snapshot.Hash == lateVariant.Hash {
+				t.Fatal("an excluded normalized variant was offered by follow admission")
 			}
 		}
 		requireEqual(t, batch[len(batch)-1].Hash, later.Hash, "the later message still arrives")

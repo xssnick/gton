@@ -60,23 +60,25 @@ type validatorDebugMessages struct {
 }
 
 type validatorDebugExternalMessages struct {
-	Pooled            int    `json:"pooled"`
-	PooledBytes       int64  `json:"pooled_bytes"`
-	Added             uint64 `json:"added"`
-	DedupSkipped      uint64 `json:"dedup_skipped"`
-	PriorityBumps     uint64 `json:"priority_bumps"`
-	OverflowPool      uint64 `json:"overflow_pool"`
-	OverflowBytes     uint64 `json:"overflow_bytes"`
-	OverflowAddress   uint64 `json:"overflow_address"`
-	Expired           uint64 `json:"expired"`
-	InvalidDeleted    uint64 `json:"invalid_deleted"`
-	RejectedDelayed   uint64 `json:"rejected_delayed"`
-	RejectedRetried   uint64 `json:"rejected_retried"`
-	RejectedExhausted uint64 `json:"rejected_exhausted"`
-	RejectedPressure  uint64 `json:"rejected_pressure"`
-	StaleFeedback     uint64 `json:"stale_feedback"`
-	AppliedRequested  uint64 `json:"applied_requested"`
-	AppliedDeleted    uint64 `json:"applied_deleted"`
+	Pooled              int    `json:"pooled"`
+	PooledBytes         int64  `json:"pooled_bytes"`
+	Added               uint64 `json:"added"`
+	DedupSkipped        uint64 `json:"dedup_skipped"`
+	PriorityBumps       uint64 `json:"priority_bumps"`
+	OverflowPool        uint64 `json:"overflow_pool"`
+	OverflowBytes       uint64 `json:"overflow_bytes"`
+	OverflowAddress     uint64 `json:"overflow_address"`
+	Expired             uint64 `json:"expired"`
+	InvalidDeleted      uint64 `json:"invalid_deleted"`
+	IncludedQuarantined uint64 `json:"included_quarantined"`
+	IncludedReleased    uint64 `json:"included_released"`
+	RejectedDelayed     uint64 `json:"rejected_delayed"`
+	RejectedRetried     uint64 `json:"rejected_retried"`
+	RejectedExhausted   uint64 `json:"rejected_exhausted"`
+	RejectedPressure    uint64 `json:"rejected_pressure"`
+	StaleFeedback       uint64 `json:"stale_feedback"`
+	AppliedRequested    uint64 `json:"applied_requested"`
+	AppliedDeleted      uint64 `json:"applied_deleted"`
 }
 
 type validatorDebugInternalMessages struct {
@@ -346,23 +348,25 @@ func makeValidatorDebugStatus(status StatusSnapshot) (validatorDebugStatus, erro
 
 func makeValidatorDebugExternalMessages(status msgpool.Stats) validatorDebugExternalMessages {
 	return validatorDebugExternalMessages{
-		Pooled:            status.Pooled,
-		PooledBytes:       status.PooledBytes,
-		Added:             status.Added,
-		DedupSkipped:      status.DedupSkipped,
-		PriorityBumps:     status.PriorityBumps,
-		OverflowPool:      status.OverflowMempool,
-		OverflowBytes:     status.OverflowBytes,
-		OverflowAddress:   status.OverflowAddress,
-		Expired:           status.Expired,
-		InvalidDeleted:    status.InvalidDeleted,
-		RejectedDelayed:   status.RejectedDelayed,
-		RejectedRetried:   status.RejectedRetried,
-		RejectedExhausted: status.RejectedExhausted,
-		RejectedPressure:  status.RejectedPressure,
-		StaleFeedback:     status.StaleFeedback,
-		AppliedRequested:  status.AppliedRequested,
-		AppliedDeleted:    status.AppliedDeleted,
+		Pooled:              status.Pooled,
+		PooledBytes:         status.PooledBytes,
+		Added:               status.Added,
+		DedupSkipped:        status.DedupSkipped,
+		PriorityBumps:       status.PriorityBumps,
+		OverflowPool:        status.OverflowMempool,
+		OverflowBytes:       status.OverflowBytes,
+		OverflowAddress:     status.OverflowAddress,
+		Expired:             status.Expired,
+		InvalidDeleted:      status.InvalidDeleted,
+		IncludedQuarantined: status.IncludedQuarantined,
+		IncludedReleased:    status.IncludedReleased,
+		RejectedDelayed:     status.RejectedDelayed,
+		RejectedRetried:     status.RejectedRetried,
+		RejectedExhausted:   status.RejectedExhausted,
+		RejectedPressure:    status.RejectedPressure,
+		StaleFeedback:       status.StaleFeedback,
+		AppliedRequested:    status.AppliedRequested,
+		AppliedDeleted:      status.AppliedDeleted,
 	}
 }
 

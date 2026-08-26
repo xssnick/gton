@@ -13,7 +13,8 @@ import (
 // InMsgDescr). Feeding the result into EraseApplied is the finalized-block
 // mempool cleanup.
 func AppliedNormHashesFromInMsgDescr(inMsgDescr *cell.Cell) ([][32]byte, error) {
-	loader, err := inMsgDescr.BeginParse()
+	var loader cell.Slice
+	err := inMsgDescr.BeginParseInto(&loader)
 	if err != nil {
 		return nil, fmt.Errorf("msgpool: cannot parse InMsgDescr: %w", err)
 	}
@@ -26,7 +27,7 @@ func AppliedNormHashesFromInMsgDescr(inMsgDescr *cell.Cell) ([][32]byte, error) 
 	var out [][32]byte
 	seen := map[[32]byte]struct{}{}
 	ok, err := dict.CheckForEachExtra(func(value, extra *cell.Slice, key *cell.Cell) (bool, error) {
-		v := value.Copy()
+		v := *value
 		tag, err := v.LoadUInt(3)
 		if err != nil {
 			return false, fmt.Errorf("cannot load InMsg tag: %w", err)
@@ -85,7 +86,8 @@ func AppliedNormHashesFromBlockRoot(root *cell.Cell) ([][32]byte, error) {
 // state_update:^(MERKLE_UPDATE ShardState) extra:^BlockExtra, which is why the
 // extra is reference 3.
 func blockExtra(root *cell.Cell) (*cell.Cell, error) {
-	s, err := root.BeginParse()
+	var s cell.Slice
+	err := root.BeginParseInto(&s)
 	if err != nil {
 		return nil, fmt.Errorf("msgpool: cannot parse block root: %w", err)
 	}
@@ -97,7 +99,8 @@ func blockExtra(root *cell.Cell) (*cell.Cell, error) {
 	if err != nil {
 		return nil, fmt.Errorf("msgpool: block root has no extra: %w", err)
 	}
-	es, err := extra.BeginParse()
+	var es cell.Slice
+	err = extra.BeginParseInto(&es)
 	if err != nil {
 		return nil, fmt.Errorf("msgpool: cannot parse block extra: %w", err)
 	}

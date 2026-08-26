@@ -1,7 +1,6 @@
 package validator
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
@@ -197,24 +196,7 @@ func (c *candidateCodec) encodeForBroadcast(
 // decode takes ownership of wire for the duration of the call. Returned BOCs
 // are canonical mode-31/mode-2 serializations and are independently owned.
 func (c *candidateCodec) decode(wire []byte, expected *simplex.CandidateID) (*CandidateArtifact, error) {
-	artifact, _, err := c.decodeWith(wire, expected, false)
-
-	return artifact, err
-}
-
-// decodeCanonical decodes a candidate and returns the canonical wire alongside
-// it. A received candidate is almost always re-serialized right after it is
-// decoded — its own wire may be V2-compressed or non-canonical, while storage,
-// the request path and the resolver's conflict check all compare the canonical
-// form — and rebuilding it from the returned BOCs would parse both of them
-// again and re-serialize both to prove they are canonical. Building it here
-// instead reuses the roots the decode already produced, which is what makes
-// those bytes canonical in the first place.
-func (c *candidateCodec) decodeCanonical(
-	wire []byte,
-	expected *simplex.CandidateID,
-) (*CandidateArtifact, []byte, error) {
-	return c.decodeWith(wire, expected, true)
+	return c.decodeVerified(wire, expected)
 }
 
 // decodeVerified parses, binds and signature-checks a candidate and builds no
@@ -249,14 +231,7 @@ func (c *candidateCodec) decodeBroadcast(
 	if err != nil {
 		return nil, fmt.Errorf("validator runtime: decode candidate broadcast: %w", err)
 	}
-	slot, err := candidateDataSlot(data)
-	if err != nil {
-		return nil, err
-	}
-	if slot != expectedSlot {
-		return nil, errors.New("validator runtime: candidate broadcast slot mismatch")
-	}
-	artifact, err := c.decodeData(data)
+	artifact, _, err := c.decodeData(data, &expectedSlot)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +244,7 @@ func (c *candidateCodec) decodeVerifiedData(
 	delegation *simplex.Delegation,
 	expected *simplex.CandidateID,
 ) (*CandidateArtifact, error) {
-	artifact, err := c.decodeData(data)
+	artifact, _, err := c.decodeData(data, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -305,8 +280,8 @@ func cloneDelegation(delegation *simplex.Delegation) *simplex.Delegation {
 	}
 }
 
-// decodeDeferred is decodeCanonical for the receive path. It returns the
-// decoded artifact together with a lazy wire that builds the canonical bytes
+// decodeDeferred is the lazy canonical decode for the receive path. It returns
+// the decoded artifact together with a wire that builds the canonical bytes
 // and their digest on first use, so a received candidate that is never stored
 // and never requested never pays for them. lazyCandidateWire says why the
 // deferral is sound.
@@ -371,95 +346,43 @@ func deferredCandidateWire(artifact *CandidateArtifact) (*lazyCandidateWire, err
 	return lazy, nil
 }
 
-func (c *candidateCodec) decodeWith(
-	wire []byte,
-	expected *simplex.CandidateID,
-	canonical bool,
-) (*CandidateArtifact, []byte, error) {
-	artifact, err := c.decodeVerified(wire, expected)
-	if err != nil {
-		return nil, nil, err
-	}
-	if !canonical {
-		return artifact, nil, nil
-	}
-
-	// An empty candidate has no payload to prepare; its wire is the cheap
-	// path either way. A decoded artifact never arrives with a prepared payload
-	// of its own — only local production attaches one, through Prepared() — so
-	// for a block candidate it is built here, from the roots the decode already
-	// parsed.
-	var prepared *simplex.PreparedCandidate
-	if artifact.validationRoots != nil && artifact.validationRoots.block != nil {
-		var fileHash [32]byte
-		copy(fileHash[:], artifact.Candidate.Block.FileHash)
-		prepared, err = simplex.PrepareCandidate(
-			artifact.Candidate.Block.SeqNo,
-			artifact.validationRoots.block,
-			artifact.validationRoots.collated,
-			fileHash,
-			artifact.Candidate.CollatedFileHash,
-			simplex.PayloadCellHint(artifact.BlockBOC, artifact.CollatedData),
-		)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-	var canonicalWire []byte
-	if prepared != nil {
-		canonicalWire, err = simplex.SerializeCandidatePrepared(artifact.Candidate, prepared)
-	} else {
-		canonicalWire, err = simplex.SerializeCandidate(
-			artifact.Candidate,
-			artifact.BlockBOC,
-			artifact.CollatedData,
-		)
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return artifact, canonicalWire, nil
-}
-
-func (c *candidateCodec) decodeData(data any) (*CandidateArtifact, error) {
-	if _, err := candidateDataSlot(data); err != nil {
-		return nil, err
-	}
-
-	switch candidate := data.(type) {
-	case simplex.ConsensusBlockData:
-		return c.decodeBlock(candidate)
-	case *simplex.ConsensusBlockData:
-		return c.decodeBlock(*candidate)
-	case simplex.ConsensusEmptyData:
-		return c.decodeEmpty(candidate)
-	case *simplex.ConsensusEmptyData:
-		return c.decodeEmpty(*candidate)
-	default:
-		return nil, fmt.Errorf("validator runtime: unexpected candidate data type %T", data)
-	}
-}
-
-func candidateDataSlot(data any) (uint32, error) {
+// decodeData crosses simplex candidate data's TL interface once. expectedSlot
+// is supplied by the bare broadcast path so its cheap slot policy stays ahead
+// of payload decoding; wrapped candidates have no separate transport slot.
+func (c *candidateCodec) decodeData(
+	data any,
+	expectedSlot *uint32,
+) (*CandidateArtifact, uint32, error) {
+	var block simplex.ConsensusBlockData
+	var empty simplex.ConsensusEmptyData
+	blockData := false
 	var slot int32
 	switch candidate := data.(type) {
 	case simplex.ConsensusBlockData:
-		slot = candidate.Slot
+		block, blockData, slot = candidate, true, candidate.Slot
 	case *simplex.ConsensusBlockData:
-		slot = candidate.Slot
+		block, blockData, slot = *candidate, true, candidate.Slot
 	case simplex.ConsensusEmptyData:
-		slot = candidate.Slot
+		empty, slot = candidate, candidate.Slot
 	case *simplex.ConsensusEmptyData:
-		slot = candidate.Slot
+		empty, slot = *candidate, candidate.Slot
 	default:
-		return 0, fmt.Errorf("validator runtime: unexpected candidate data type %T", data)
+		return nil, 0, fmt.Errorf("validator runtime: unexpected candidate data type %T", data)
 	}
 	if slot < 0 {
-		return 0, errors.New("validator runtime: candidate slot is negative")
+		return nil, 0, errors.New("validator runtime: candidate slot is negative")
+	}
+	decodedSlot := uint32(slot)
+	if expectedSlot != nil && decodedSlot != *expectedSlot {
+		return nil, 0, errors.New("validator runtime: candidate broadcast slot mismatch")
 	}
 
-	return uint32(slot), nil
+	if blockData {
+		artifact, err := c.decodeBlock(block)
+		return artifact, decodedSlot, err
+	}
+	artifact, err := c.decodeEmpty(empty)
+	return artifact, decodedSlot, err
 }
 
 func (c *candidateCodec) decodeBlock(
@@ -570,12 +493,13 @@ func (c *candidateCodec) decodePayload(data []byte) (decodedCandidatePayload, er
 	var round int32
 	var roots []*cell.Cell
 	// The cell count the receiver gets for free. The combined payload holds the
-	// union of the block and collated cell sets, so its declared count is an
-	// upper bound on each of the two serializations finishPayload runs — the
-	// only such number available before either of them has produced a header of
-	// its own. PayloadCellHint reads it off the buffer and clamps it; see
-	// simplex/candidate_payload_hint.go for why a count read out of an untrusted
-	// header cannot presize an unbounded table.
+	// union of the block and collated cell sets, so its declared count is a good
+	// upper bound for the large block serialization. It is deliberately not
+	// applied to collated data: on the marker-shaped masterchain candidate that
+	// would presize a one-cell bag for the whole block. PayloadCellHint reads the
+	// count off the buffer and clamps it; see simplex/candidate_payload_hint.go
+	// for why a count read out of an untrusted header cannot presize an unbounded
+	// table.
 	var combinedCellsHint int
 	switch compressed := payload.(type) {
 	case simplex.ValidatorSessionCompressedCandidate:
@@ -592,7 +516,12 @@ func (c *candidateCodec) decodePayload(data []byte) (decodedCandidatePayload, er
 			return decodedCandidatePayload{}, errors.New("validator runtime: decompressed candidate size mismatch")
 		}
 		combinedCellsHint = simplex.PayloadCellHint(decompressed, nil)
-		roots, err = cell.FromBOCMultiRoot(decompressed)
+		// The parsed DAG owns immutable views into decompressed. Cell payload
+		// slices keep that backing array alive through validationRoots, while
+		// avoiding a second copy of every payload byte before canonical rebuild.
+		roots, err = cell.FromBOCMultiRootWithOptions(decompressed, cell.BOCParseOptions{
+			NoCopyPayload: true,
+		})
 	case simplex.ValidatorSessionCompressedCandidateV2:
 		source, round, rootHash = compressed.Source, compressed.Round, compressed.RootHash
 		if uint64(len(compressed.Data)) > maxCombined {
@@ -620,12 +549,10 @@ func (c *candidateCodec) decodePayload(data []byte) (decodedCandidatePayload, er
 // of them for every one it produces — and the notarization quorum cannot form
 // until it is done.
 //
-// The two serializations are given the combined cell count and are run
-// concurrently. They are independent levers and were measured as such: on a
-// real mainnet candidate the presizing alone is worth 19% of the wall time and
-// 48% of the allocated bytes, the overlap alone 31%, and the pair takes the
-// whole call from 4.23 ms to 2.37 ms. candidate_receive_serialize_test.go holds
-// the fixture, the full table and the two shapes it was taken in.
+// The two serializations run concurrently. The block half is given the
+// combined cell count; the collated half reuses serializer scratch and grows to
+// its actual size. candidate_receive_serialize_test.go holds byte-parity,
+// allocation gates and benchmarks over both the full-proof and marker shapes.
 //
 // Both are safe over one already-parsed DAG whose two halves share cells:
 //
@@ -657,7 +584,7 @@ func (c *candidateCodec) finishPayload(
 	if len(roots) == 0 {
 		return decodedCandidatePayload{}, errors.New("validator runtime: candidate boc is empty")
 	}
-	if !bytes.Equal(roots[0].Hash(), rootHash) {
+	if !cellHashEquals(roots[0], rootHash) {
 		return decodedCandidatePayload{}, errors.New("validator runtime: candidate root hash mismatch")
 	}
 	generationTimeMS, err := candidateGenUtimeMSFromRoots(roots[1:])
@@ -679,7 +606,7 @@ func (c *candidateCodec) finishPayload(
 
 		data, err := cell.ToBOCWithOptionsErr(
 			roots[1:],
-			cell.BOCSerializeOptions{WithCRC32C: true, CellsCountHint: combinedCellsHint},
+			cell.BOCSerializeOptions{WithCRC32C: true},
 		)
 		if err != nil {
 			collatedErr = fmt.Errorf("validator runtime: serialize candidate collated data: %w", err)
@@ -882,4 +809,14 @@ func allZeroBytes(data []byte) bool {
 	}
 
 	return true
+}
+
+func cellHashEquals(root *cell.Cell, expected []byte) bool {
+	if len(expected) != 32 {
+		return false
+	}
+	var hash cell.Hash
+	copy(hash[:], expected)
+
+	return root.HashKey() == hash
 }

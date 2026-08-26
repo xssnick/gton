@@ -487,8 +487,7 @@ func parseAcceptedBlock(
 	if err != nil {
 		return nil, nil, fmt.Errorf("validator block acceptance: parse block boc: %w", err)
 	}
-	rootHash := root.HashKey()
-	if !bytes.Equal(rootHash[:], id.RootHash) {
+	if !cellHashEquals(root, id.RootHash) {
 		return nil, nil, fmt.Errorf("validator block acceptance: root hash mismatch for %s", storage.FormatBlockRef(id))
 	}
 	fileHash := sha256.Sum256(blockBOC)
@@ -496,8 +495,8 @@ func parseAcceptedBlock(
 		return nil, nil, fmt.Errorf("validator block acceptance: file hash mismatch for %s", storage.FormatBlockRef(id))
 	}
 
-	rootView, err := root.BeginParse()
-	if err != nil {
+	var rootView cell.Slice
+	if err := root.BeginParseInto(&rootView); err != nil {
 		return nil, nil, fmt.Errorf("validator block acceptance: begin block root: %w", err)
 	}
 	infoCell, err := rootView.PeekRefCellAt(0)
@@ -509,15 +508,15 @@ func parseAcceptedBlock(
 		return nil, nil, fmt.Errorf("validator block acceptance: load block extra cell: %w", err)
 	}
 
-	loader, err := root.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err = root.BeginParseInto(&loader); err != nil {
 		return nil, nil, fmt.Errorf("validator block acceptance: begin block: %w", err)
 	}
 	var parsed tlb.Block
-	if err = tlb.LoadFromCell(&parsed, loader); err != nil {
+	if err = tlb.LoadFromCell(&parsed, &loader); err != nil {
 		return nil, nil, fmt.Errorf("validator block acceptance: parse block: %w", err)
 	}
-	if err = requireAcceptedCellEmpty(loader, "block root"); err != nil {
+	if err = requireAcceptedCellEmpty(&loader, "block root"); err != nil {
 		return nil, nil, err
 	}
 	if err = storage.VerifyBlockIdentity(id, &parsed); err != nil {
@@ -532,8 +531,8 @@ func parseAcceptedBlock(
 	if parsed.StateUpdate == nil {
 		return nil, nil, fmt.Errorf("validator block acceptance: block %s has no state update", storage.FormatBlockRef(id))
 	}
-	stateUpdate, err := parsed.StateUpdate.BeginParse()
-	if err != nil {
+	var stateUpdate cell.Slice
+	if err = parsed.StateUpdate.BeginParseInto(&stateUpdate); err != nil {
 		return nil, nil, fmt.Errorf(
 			"validator block acceptance: load state update for %s: %w",
 			storage.FormatBlockRef(id),
@@ -548,8 +547,8 @@ func parseAcceptedBlock(
 			storage.FormatBlockRef(id),
 		)
 	}
-	valueFlow, err := parsed.ValueFlow.BeginParse()
-	if err != nil {
+	var valueFlow cell.Slice
+	if err = parsed.ValueFlow.BeginParseInto(&valueFlow); err != nil {
 		return nil, nil, fmt.Errorf(
 			"validator block acceptance: load value flow for %s: %w",
 			storage.FormatBlockRef(id),
@@ -559,14 +558,14 @@ func parseAcceptedBlock(
 	var flow tlb.ValueFlow
 	// AcceptBlock force-validates the TL-B shape here; the balance equation is
 	// part of candidate validation and must not change the acceptance set.
-	if err = flow.LoadFromCell(valueFlow); err != nil {
+	if err = flow.LoadFromCell(&valueFlow); err != nil {
 		return nil, nil, fmt.Errorf(
 			"validator block acceptance: decode value flow for %s: %w",
 			storage.FormatBlockRef(id),
 			err,
 		)
 	}
-	if err = requireAcceptedCellEmpty(valueFlow, "value flow"); err != nil {
+	if err = requireAcceptedCellEmpty(&valueFlow, "value flow"); err != nil {
 		return nil, nil, err
 	}
 
@@ -577,15 +576,15 @@ func validateAcceptedInfoCell(root *cell.Cell, header *tlb.BlockHeader) error {
 	if root == nil || root.IsSpecial() {
 		return errors.New("validator block acceptance: block info cell is nil or special")
 	}
-	loader, err := root.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err := root.BeginParseInto(&loader); err != nil {
 		return fmt.Errorf("validator block acceptance: begin block info: %w", err)
 	}
 	var exact tlb.BlockHeader
-	if err = tlb.LoadFromCell(&exact, loader); err != nil {
+	if err := tlb.LoadFromCell(&exact, &loader); err != nil {
 		return fmt.Errorf("validator block acceptance: parse block info: %w", err)
 	}
-	if err = requireAcceptedCellEmpty(loader, "block info"); err != nil {
+	if err := requireAcceptedCellEmpty(&loader, "block info"); err != nil {
 		return err
 	}
 
@@ -628,8 +627,8 @@ func validateAcceptedPrevRefCell(root *cell.Cell, afterMerge bool, label string)
 	if !afterMerge {
 		return validateAcceptedExtBlockRefCell(root, label)
 	}
-	loader, err := root.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err := root.BeginParseInto(&loader); err != nil {
 		return fmt.Errorf("validator block acceptance: begin %s: %w", label, err)
 	}
 	if loader.BitsLeft() != 0 || loader.RefsNum() != 2 {
@@ -652,32 +651,32 @@ func validateAcceptedExtBlockRefCell(root *cell.Cell, label string) error {
 	if root == nil || root.IsSpecial() {
 		return fmt.Errorf("validator block acceptance: %s cell is nil or special", label)
 	}
-	loader, err := root.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err := root.BeginParseInto(&loader); err != nil {
 		return fmt.Errorf("validator block acceptance: begin %s: %w", label, err)
 	}
 	var reference tlb.ExtBlkRef
-	if err = tlb.LoadFromCell(&reference, loader); err != nil {
+	if err := tlb.LoadFromCell(&reference, &loader); err != nil {
 		return fmt.Errorf("validator block acceptance: parse %s: %w", label, err)
 	}
 
-	return requireAcceptedCellEmpty(loader, label)
+	return requireAcceptedCellEmpty(&loader, label)
 }
 
 func validateAcceptedExtraCell(root *cell.Cell) error {
 	if root == nil || root.IsSpecial() {
 		return errors.New("validator block acceptance: block extra cell is nil or special")
 	}
-	loader, err := root.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err := root.BeginParseInto(&loader); err != nil {
 		return fmt.Errorf("validator block acceptance: begin block extra: %w", err)
 	}
 	var extra tlb.BlockExtra
-	if err = tlb.LoadFromCell(&extra, loader); err != nil {
+	if err := tlb.LoadFromCell(&extra, &loader); err != nil {
 		return fmt.Errorf("validator block acceptance: parse block extra: %w", err)
 	}
 
-	return requireAcceptedCellEmpty(loader, "block extra")
+	return requireAcceptedCellEmpty(&loader, "block extra")
 }
 
 func requireAcceptedCellEmpty(loader *cell.Slice, name string) error {

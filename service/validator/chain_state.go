@@ -129,7 +129,7 @@ func newChainState(request ChainStateRequest, data ChainStateData) (*ChainState,
 		// payload per loaded tip, on the path that just read those bytes from
 		// the store and parsed them, and nothing at all per candidate: the
 		// producers inside this package build their ChainState directly.
-		if !bytes.Equal(tip.Block.Hash(), tip.ID.RootHash) {
+		if !cellHashEquals(tip.Block, tip.ID.RootHash) {
 			return nil, fmt.Errorf("validator runtime: loaded chain tip %d block differs from its id", i)
 		}
 		fileHash := sha256.Sum256(tip.BlockBOC)
@@ -212,16 +212,16 @@ func (s *ChainState) apply(artifact *CandidateArtifact) (*ChainState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("validator runtime: decode applied block: %w", err)
 	}
-	if !bytes.Equal(root.Hash(), artifact.Candidate.Block.RootHash) {
+	if !cellHashEquals(root, artifact.Candidate.Block.RootHash) {
 		return nil, errors.New("validator runtime: applied block root hash mismatch")
 	}
 
-	loader, err := root.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err = root.BeginParseInto(&loader); err != nil {
 		return nil, fmt.Errorf("validator runtime: parse applied block root: %w", err)
 	}
 	var block tlb.Block
-	if err = tlb.LoadFromCell(&block, loader); err != nil {
+	if err = tlb.LoadFromCell(&block, &loader); err != nil {
 		return nil, fmt.Errorf("validator runtime: parse applied block: %w", err)
 	}
 	if loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
@@ -459,7 +459,7 @@ func (s *ChainState) validatedCandidateState(
 	if successor.StateUpdate == nil {
 		return nil, errors.New("validator runtime: validated candidate has no state update")
 	}
-	if !bytes.Equal(successor.BlockRoot.Hash(), artifact.Candidate.Block.RootHash) {
+	if !cellHashEquals(successor.BlockRoot, artifact.Candidate.Block.RootHash) {
 		return nil, errors.New("validator runtime: validated block root differs from the candidate id")
 	}
 	// The verifier ran on these exact tips, so the successor of this state is

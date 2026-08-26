@@ -1495,13 +1495,13 @@ func (b *LocalSessionBackend) readChainTip(ctx context.Context, id ton.BlockIDEx
 			return ChainTip{}, localSessionReadError("state cells", id, err)
 		}
 	}
-	if !bytes.Equal(root.Hash(), stored.StateRootHash) {
+	if !cellHashEquals(root, stored.StateRootHash) {
 		return ChainTip{}, errors.New("validator local backend: state root differs from stored metadata")
 	}
 
 	tip := ChainTip{ID: *id.Copy(), State: root}
 	if id.SeqNo == 0 {
-		if !bytes.Equal(root.Hash(), id.RootHash) {
+		if !cellHashEquals(root, id.RootHash) {
 			return ChainTip{}, errors.New("validator local backend: zerostate root differs from block id")
 		}
 		if len(stored.StateFileHash) != 0 && len(stored.StateFileHash) != sha256.Size {
@@ -1529,18 +1529,18 @@ func (b *LocalSessionBackend) readChainTip(ctx context.Context, id ton.BlockIDEx
 	if err != nil {
 		return ChainTip{}, fmt.Errorf("validator local backend: decode block data: %w", err)
 	}
-	if !bytes.Equal(blockRoot.Hash(), id.RootHash) {
+	if !cellHashEquals(blockRoot, id.RootHash) {
 		return ChainTip{}, errors.New("validator local backend: block root hash mismatch")
 	}
 	// One reflection parse: identity first, then the trailing-data check on the
 	// same loader. Going through ParseVerifiedBlockCell and re-parsing for the
 	// trailing check decoded the whole block twice per finalized parent.
-	loader, err := blockRoot.BeginParse()
-	if err != nil {
+	var loader cell.Slice
+	if err = blockRoot.BeginParseInto(&loader); err != nil {
 		return ChainTip{}, fmt.Errorf("validator local backend: parse chain tip block: %w", err)
 	}
 	var parsed tlb.Block
-	if err = tlb.LoadFromCell(&parsed, loader); err != nil {
+	if err = tlb.LoadFromCell(&parsed, &loader); err != nil {
 		return ChainTip{}, fmt.Errorf("validator local backend: parse chain tip block: %w", err)
 	}
 	if err = storage.VerifyBlockIdentity(id, &parsed); err != nil {

@@ -27,8 +27,8 @@ func walkSemanticQueuePrefix(
 	if err != nil {
 		return err
 	}
-	_, _, err = queue.TraverseExtra(func(keyPrefix *cell.Cell, extra, value *cell.Slice) (int, error) {
-		direction, prefixErr := semanticQueuePrefixDirection(keyPrefix, targetPrefix)
+	return queue.TraverseExtraBorrowed(func(keyPrefix, extra, value *cell.Slice) (int, error) {
+		direction, prefixErr := semanticQueuePrefixDirectionBorrowed(keyPrefix, targetPrefix)
 		if prefixErr != nil || direction == 0 {
 			return 0, prefixErr
 		}
@@ -41,7 +41,8 @@ func walkSemanticQueuePrefix(
 			}
 			return direction, nil
 		}
-		minimum := extra.Copy()
+		var minimum cell.Slice
+		extra.CopyInto(&minimum)
 		minimumLT, loadErr := minimum.LoadUInt(64)
 		if loadErr != nil || minimum.BitsLeft() != 0 || minimum.RefsNum() != 0 {
 			return 0, fmt.Errorf("invalid outbound queue augmentation")
@@ -52,12 +53,20 @@ func walkSemanticQueuePrefix(
 		if value == nil {
 			return 6, nil
 		}
-		entryBound, boundErr := semanticQueueLeafBound(keyPrefix, minimumLT)
-		if boundErr != nil {
-			return 0, boundErr
+
+		var keyLoader cell.Slice
+		keyPrefix.CopyInto(&keyLoader)
+		var key msgpool.QueueKey
+		if keyLoader.BitsLeft() != 352 {
+			return 0, fmt.Errorf("outbound queue leaf key has %d bits", keyLoader.BitsLeft())
 		}
-		// C++ loads every leaf node in the last equal-LT heap batch, but only
-		// unpacks EnqueuedMsg payloads through the claimed message hash.
+		if loadErr = keyLoader.LoadSliceInto(key[:], 352); loadErr != nil {
+			return 0, loadErr
+		}
+		entryBound := semanticMessageBound{lt: minimumLT}
+		copy(entryBound.hash[:], key[12:])
+		// C++ loads every leaf node in the last equal-LT batch, but only unpacks
+		// EnqueuedMsg payloads through the claimed message hash.
 		if !entryBound.lessEqual(bound) {
 			return 0, nil
 		}
@@ -68,7 +77,7 @@ func walkSemanticQueuePrefix(
 		if loadErr != nil {
 			return 0, loadErr
 		}
-		entry, parseErr := parseSemanticNeighborQueueEntryLoaded(keyPrefix, value, extra, leaf)
+		entry, parseErr := parseSemanticNeighborQueueEntryLoaded(key, value, extra, leaf)
 		if parseErr != nil {
 			return 0, semanticQueueEntryVerdict{err: parseErr}
 		}
@@ -80,8 +89,6 @@ func walkSemanticQueuePrefix(
 
 		return 0, nil
 	})
-
-	return err
 }
 
 // semanticQueueLeafCells are the cells BELOW a queue leaf that the entry parse
@@ -135,8 +142,8 @@ func materialiseSemanticQueueLeaf(value *cell.Slice) (semanticQueueLeafCells, er
 	if envelope, err = envelope.Prewarm(); err != nil {
 		return semanticQueueLeafCells{}, fmt.Errorf("load outbound queue envelope: %w", err)
 	}
-	envelopeSlice, err := envelope.BeginParse()
-	if err != nil {
+	var envelopeSlice cell.Slice
+	if err = envelope.BeginParseInto(&envelopeSlice); err != nil {
 		return semanticQueueLeafCells{}, fmt.Errorf("open outbound queue envelope: %w", err)
 	}
 	// The message is reference 0 of both envelope versions: neither emitted_lt
@@ -179,25 +186,6 @@ func (e semanticQueueEntryVerdict) Error() string { return e.err.Error() }
 
 func (e semanticQueueEntryVerdict) Unwrap() error { return e.err }
 
-func semanticQueueLeafBound(key *cell.Cell, lt uint64) (semanticMessageBound, error) {
-	if key.BitsSize() != 352 {
-		return semanticMessageBound{}, fmt.Errorf("outbound queue leaf key has %d bits", key.BitsSize())
-	}
-	loader, err := key.BeginParse()
-	if err != nil {
-		return semanticMessageBound{}, err
-	}
-	if err = loader.SkipBits(96); err != nil {
-		return semanticMessageBound{}, err
-	}
-	var hash [32]byte
-	if err = loader.LoadSliceInto(hash[:], 256); err != nil {
-		return semanticMessageBound{}, err
-	}
-
-	return semanticMessageBound{lt: lt, hash: hash}, nil
-}
-
 func semanticQueueTargetPrefix(target msgpool.ShardIdent) (*cell.Cell, error) {
 	if target.Shard == 0 {
 		return nil, fmt.Errorf("target shard is zero")
@@ -210,13 +198,15 @@ func semanticQueueTargetPrefix(target msgpool.ShardIdent) (*cell.Cell, error) {
 	return builder.EndCell(), nil
 }
 
-// semanticQueuePrefixDirection maps the current Patricia prefix to a
-// TraverseExtra directive. Before the target prefix is reached only its next
-// child is opened; once reached, both children are eligible for the LT walk.
-func semanticQueuePrefixDirection(current, target *cell.Cell) (int, error) {
-	common := min(current.BitsSize(), target.BitsSize())
-	currentLoader := current.MustBeginParse()
-	targetLoader := target.MustBeginParse()
+func semanticQueuePrefixDirectionBorrowed(current *cell.Slice, target *cell.Cell) (int, error) {
+	currentSize := current.BitsLeft()
+	targetSize := target.BitsSize()
+	common := min(currentSize, targetSize)
+	var currentLoader, targetLoader cell.Slice
+	current.CopyInto(&currentLoader)
+	if err := target.BeginParseInto(&targetLoader); err != nil {
+		return 0, err
+	}
 	for common > 0 {
 		chunk := min(common, uint(64))
 		currentBits, err := currentLoader.LoadUInt(chunk)
@@ -232,7 +222,7 @@ func semanticQueuePrefixDirection(current, target *cell.Cell) (int, error) {
 		}
 		common -= chunk
 	}
-	if current.BitsSize() >= target.BitsSize() {
+	if currentSize >= targetSize {
 		return 6, nil
 	}
 	next, err := targetLoader.LoadUInt(1)

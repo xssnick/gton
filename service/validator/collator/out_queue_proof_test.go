@@ -425,7 +425,9 @@ func TestTraceOutQueueValidationClosureLoadsDequeuedEnvelope(t *testing.T) {
 			AugmentedDictionary: previous.OutQueue.Copy(),
 		},
 	}
-	c.deferQueueDelete(message.Key, keyCell)
+	if err = c.deferQueueDelete(message.Key); err != nil {
+		t.Fatal(err)
+	}
 	if err = c.flushQueueDeletes(); err != nil {
 		t.Fatal(err)
 	}

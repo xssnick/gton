@@ -1018,6 +1018,8 @@ func (s *Service) loop() {
 				Uint64("added", st.Added).
 				Uint64("dedup", st.DedupSkipped).
 				Uint64("applied_deleted", st.AppliedDeleted).
+				Uint64("included_quarantined", st.IncludedQuarantined).
+				Uint64("included_released", st.IncludedReleased).
 				Uint64("expired", st.Expired).
 				Msg("validator message pool stats")
 			if !s.opts.DisableInternals {

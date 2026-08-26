@@ -504,15 +504,20 @@ func TestValidationRecoversTheShapeCollationReported(t *testing.T) {
 	verification := shardVerificationRequest(req, candidate)
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-	verified, err := verifyCandidate(context.Background(), verification.Masterchain.Config, verification.Candidate)
+	prepared, err := prepareVerificationCandidate(
+		context.Background(),
+		verification.Masterchain.Config,
+		verification.Candidate,
+		[]PreviousBlock{verification.Previous},
+	)
 	if err != nil {
 		t.Fatalf("decode candidate: %v", err)
 	}
-	if err = verifyPreparedShardCandidate(context.Background(), verification, &verified); err != nil {
+	if err = verifyPreparedShardCandidate(context.Background(), verification, prepared); err != nil {
 		t.Fatalf("verify candidate: %v", err)
 	}
 
-	if got, want := verified.shape, candidate.Stats.CollationShape(); got != want {
+	if got, want := prepared.verified.shape, candidate.Stats.CollationShape(); got != want {
 		t.Fatalf("validation recovered %+v, collation reported %+v", got, want)
 	}
 }

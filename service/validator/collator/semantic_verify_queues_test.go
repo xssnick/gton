@@ -220,7 +220,7 @@ func TestSemanticInDescriptorRejectsTruncatedFee(t *testing.T) {
 	if err := control.StoreBigCoins(tlb.FromNanoTONU(4).NanoRef()); err != nil {
 		t.Fatalf("store fee: %v", err)
 	}
-	if _, err := parseSemanticInDescriptor(*control.EndCell().MustBeginParse(), key); err != nil {
+	if _, err := parseSemanticInDescriptor(*control.EndCell().MustBeginParse(), key, nil); err != nil {
 		t.Fatalf("well-formed control descriptor must parse, got: %v", err)
 	}
 
@@ -232,7 +232,7 @@ func TestSemanticInDescriptorRejectsTruncatedFee(t *testing.T) {
 	if err := truncated.StoreUInt(0xFF, 8); err != nil {
 		t.Fatalf("store fee body: %v", err)
 	}
-	if _, err := parseSemanticInDescriptor(*truncated.EndCell().MustBeginParse(), key); !errors.Is(err, ErrInvalidInput) {
+	if _, err := parseSemanticInDescriptor(*truncated.EndCell().MustBeginParse(), key, nil); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("truncated fee error = %v, want invalid input", err)
 	}
 }
@@ -438,7 +438,7 @@ func TestSemanticQueueRejectionReasonIsDeterministic(t *testing.T) {
 			t.Fatalf("inbound order = %d keys, map = %d", len(validation.inOrder), len(validation.in))
 		}
 		for i := 1; i < len(validation.inOrder); i++ {
-			if bytes.Compare(validation.inOrder[i-1][:], validation.inOrder[i][:]) >= 0 {
+			if bytes.Compare(validation.inOrder[i-1].hash[:], validation.inOrder[i].hash[:]) >= 0 {
 				t.Fatalf("inbound order is not ascending at %d", i)
 			}
 		}

@@ -220,8 +220,8 @@ func (c *collation) cleanupClaimedLocalDequeues() error {
 	drained := uint32(0)
 	dequeue := func(entry semanticQueueEntry) error {
 		key := msgpool.MakeQueueKey(entry.envelope.next, entry.envelope.message.HashKey())
-		keyCell := cell.BeginCell().MustStoreSlice(key[:], 352).EndCell()
-		value, err := c.outQueue.LoadValue(keyCell)
+		var value cell.Slice
+		err := c.outQueue.LoadValueByBytesKeyInto(key[:], &value)
 		if isMissingKey(err) {
 			// An old-covered entry cannot be removed by importInternal: that
 			// path returns at its processed check before dequeueOwn. Therefore
@@ -232,7 +232,7 @@ func (c *collation) cleanupClaimedLocalDequeues() error {
 		if err != nil {
 			return fmt.Errorf("load claimed local queue entry %x: %w", key, err)
 		}
-		current, err := parseQueueEntry(value, key)
+		current, err := parseQueueEntry(&value, key)
 		if err != nil {
 			return err
 		}
@@ -530,17 +530,17 @@ type dequeueCandidate struct {
 func (c *collation) queueCandidates() ([]dequeueCandidate, error) {
 	var candidates []dequeueCandidate
 	ok, err := c.outQueue.CheckForEachExtra(func(_, extra *cell.Slice, key *cell.Cell) (bool, error) {
-		keyLoader, err := key.BeginParse()
-		if err != nil {
-			return false, err
-		}
-		keyBits, err := keyLoader.LoadSlice(352)
+		var keyLoader cell.Slice
+		err := key.BeginParseInto(&keyLoader)
 		if err != nil {
 			return false, err
 		}
 		var entryKey msgpool.QueueKey
-		copy(entryKey[:], keyBits)
-		lt, err := extra.Copy().LoadUInt(64)
+		if err = keyLoader.LoadSliceInto(entryKey[:], 352); err != nil {
+			return false, err
+		}
+		extraValue := *extra
+		lt, err := extraValue.LoadUInt(64)
 		if err != nil {
 			return false, fmt.Errorf("load queue entry %x augmentation: %w", entryKey, err)
 		}
@@ -574,13 +574,12 @@ type queueEntry struct {
 // loadQueueEntry parses one queue entry into the coverage-check view and
 // verifies that its dictionary key matches the envelope it holds.
 func (c *collation) loadQueueEntry(key msgpool.QueueKey) (queueEntry, error) {
-	keyCell := cell.BeginCell().MustStoreSlice(key[:], 352).EndCell()
-	value, err := c.outQueue.LoadValue(keyCell)
-	if err != nil {
+	var value cell.Slice
+	if err := c.outQueue.LoadValueByBytesKeyInto(key[:], &value); err != nil {
 		return queueEntry{}, fmt.Errorf("load queue entry %x: %w", key, err)
 	}
 
-	return parseQueueEntry(value, key)
+	return parseQueueEntry(&value, key)
 }
 
 // parseQueueEntry decodes one out-queue entry and re-derives its routing from
@@ -614,7 +613,8 @@ func parseQueueEntry(value *cell.Slice, key msgpool.QueueKey) (queueEntry, error
 			if root == nil {
 				continue
 			}
-			if _, err := root.BeginParse(); err != nil {
+			var content cell.Slice
+			if err := root.BeginParseInto(&content); err != nil {
 				return queueEntry{}, fmt.Errorf("%w: decode queued message StateInit %x: %v", ErrInvalidInput, key, err)
 			}
 		}
@@ -624,7 +624,8 @@ func parseQueueEntry(value *cell.Slice, key msgpool.QueueKey) (queueEntry, error
 	// Parsing InternalMessage only loads those references, so explicitly
 	// materialize their roots as part of the same validation closure.
 	// Descendants stay opaque, matching Anything.
-	if _, err := internal.Body.BeginParse(); err != nil {
+	var body cell.Slice
+	if err := internal.Body.BeginParseInto(&body); err != nil {
 		return queueEntry{}, fmt.Errorf("%w: decode queued message body %x: %v", ErrInvalidInput, key, err)
 	}
 	lt := internal.CreatedLT
@@ -711,11 +712,12 @@ func (c *collation) dequeueDelivered(entry queueEntry, importBlockLT uint64) err
 	if c.queueDeletePending(entry.key) {
 		return fmt.Errorf("dequeue delivered message %x: %w", entry.key, cell.ErrNoSuchKeyInDict)
 	}
-	keyCell := cell.BeginCell().MustStoreSlice(entry.key[:], 352).EndCell()
 	if c.queueSize == 0 {
 		return fmt.Errorf("%w: outbound queue size underflow", ErrInvalidInput)
 	}
-	c.deferQueueDelete(entry.key, keyCell)
+	if err := c.deferQueueDelete(entry.key); err != nil {
+		return err
+	}
 	c.queueSize--
 
 	out, err := descriptorDequeueShort(entry.envelope.HashKey(), entry.key, importBlockLT)

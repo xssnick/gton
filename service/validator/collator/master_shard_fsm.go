@@ -34,8 +34,8 @@ type masterShardWorkchainInfo struct {
 	enabledSince          uint32
 	basic                 bool
 	active                bool
-	zeroStateRootHash     []byte
-	zeroStateFileHash     []byte
+	zeroStateRootHash     [32]byte
+	zeroStateFileHash     [32]byte
 	minSplit              uint32
 	maxSplit              uint32
 	splitMergeDelay       uint32
@@ -86,8 +86,8 @@ func activateMasterShardWorkchains(input masterShardWorkchainActivationInput) er
 
 		fields := shardDescriptorFields{
 			regMCSeqno:         input.newBlockSeqno,
-			rootHash:           workchain.zeroStateRootHash,
-			fileHash:           workchain.zeroStateFileHash,
+			rootHash:           workchain.zeroStateRootHash[:],
+			fileHash:           workchain.zeroStateFileHash[:],
 			nextValidatorShard: shard.Root,
 			minRefMCSeqno:      math.MaxUint32,
 			splitMerge:         tlb.FutureSplitMergeNone{},
@@ -350,7 +350,8 @@ func directMasterShardSibling(shardID int64) (int64, error) {
 }
 
 func loadMasterShardDescriptorTag(descriptor *cell.Cell) (uint64, error) {
-	loader, err := descriptor.BeginParse()
+	var loader cell.Slice
+	err := descriptor.BeginParseInto(&loader)
 	if err != nil {
 		return 0, err
 	}
@@ -426,7 +427,8 @@ func loadMasterShardWorkchains(configRoot *cell.Cell) (map[int32]*masterShardWor
 		}
 		return nil, err
 	}
-	loader, err := parameter.BeginParse()
+	var loader cell.Slice
+	err = parameter.BeginParseInto(&loader)
 	if err != nil {
 		return nil, fmt.Errorf("parse config parameter 12: %w", err)
 	}
@@ -516,12 +518,12 @@ func loadMasterShardWorkchainInfo(loader *cell.Slice) (*masterShardWorkchainInfo
 	if flags != 0 {
 		return nil, fmt.Errorf("flags are %d, want 0", flags)
 	}
-	zeroStateRootHash, err := loader.LoadSlice(256)
-	if err != nil {
+	var zeroStateRootHash [32]byte
+	if err = loader.LoadSliceInto(zeroStateRootHash[:], 256); err != nil {
 		return nil, fmt.Errorf("load zero-state root hash: %w", err)
 	}
-	zeroStateFileHash, err := loader.LoadSlice(256)
-	if err != nil {
+	var zeroStateFileHash [32]byte
+	if err = loader.LoadSliceInto(zeroStateFileHash[:], 256); err != nil {
 		return nil, fmt.Errorf("load zero-state file hash: %w", err)
 	}
 	if _, err = loader.LoadUInt(32); err != nil {

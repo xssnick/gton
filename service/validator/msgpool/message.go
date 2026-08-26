@@ -42,8 +42,9 @@ type ExternalRef struct {
 type ExternalOutcome uint8
 
 const (
-	// ExternalIncluded was accepted into a candidate. It stays pooled until an
-	// applied block proves inclusion.
+	// ExternalIncluded was accepted into a candidate. It stays pooled but is
+	// quarantined until an applied block proves inclusion or its retry delay
+	// elapses.
 	ExternalIncluded ExternalOutcome = iota + 1
 	// ExternalInvalid cannot be retried and is removed immediately.
 	ExternalInvalid
@@ -121,6 +122,8 @@ type ExternalMessage struct {
 	// AddrPrefix is the first 64 bits of the destination address, used for
 	// shard routing.
 	AddrPrefix uint64
+
+	poolEntry *entry
 }
 
 // AccountDestination identifies the canonical 256-bit account address used by
@@ -223,7 +226,8 @@ func checkExtIn(parsed *tlb.ExternalMessage) error {
 // parseExtIn decodes and validates the ext_in_msg_info header of a message
 // cell.
 func parseExtIn(root *cell.Cell) (*tlb.ExternalMessage, error) {
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return nil, fmt.Errorf("msgpool: cannot parse external message: %w", err)
 	}
@@ -232,7 +236,7 @@ func parseExtIn(root *cell.Cell) (*tlb.ExternalMessage, error) {
 		return nil, errors.New("msgpool: external message must begin with ext_in_msg_info$10")
 	}
 	var parsed tlb.ExternalMessage
-	if err = tlb.LoadFromCell(&parsed, loader); err != nil {
+	if err = tlb.LoadFromCell(&parsed, &loader); err != nil {
 		return nil, fmt.Errorf("msgpool: cannot parse external message: %w", err)
 	}
 	if err = checkExtIn(&parsed); err != nil {

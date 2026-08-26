@@ -68,6 +68,7 @@ type externalPlan struct {
 // goroutine set and a join barrier per batch.
 func (c *collation) stopWaves() {
 	c.externalWaves.stop()
+	c.generatedWaves.stop()
 }
 
 // externalWaveState is the external phase's reusable state, one per collation.
@@ -340,7 +341,6 @@ func (c *collation) runExternalWave(
 			}
 			plan.wg.Wait()
 			c.stats.ExternalAttempts--
-			c.stats.InternalsDiscarded++
 			if plan.lane != nil {
 				plan.lane.tracer.discard()
 			}

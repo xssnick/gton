@@ -9,8 +9,8 @@ import (
 )
 
 func (v *semanticQueueValidation) verifyInboundMessages() error {
-	for _, hash := range v.inOrder {
-		descriptor := v.in[hash]
+	for _, entry := range v.inOrder {
+		hash, descriptor := entry.hash, entry.descriptor
 		if err := v.replay.ctx.Err(); err != nil {
 			return err
 		}
@@ -145,7 +145,7 @@ func (v *semanticQueueValidation) findImportedMessage(
 ) (semanticQueueEntry, bool, error) {
 	key := msgpool.MakeQueueKey(envelope.next, envelope.message.HashKey())
 	if v.target.ContainsPrefix(envelope.current) {
-		entry, err := loadSemanticQueueEntry(v.old.OutQueue, key)
+		entry, err := loadSemanticQueueEntry(v.old.OutQueue, key, &v.replay.envelopes)
 		if err != nil {
 			return semanticQueueEntry{}, true, fmt.Errorf("%w: local outbound queue entry is absent", ErrInvalidInput)
 		}

@@ -1,7 +1,6 @@
 package msgpool
 
 import (
-	"bytes"
 	"container/heap"
 	"errors"
 	"fmt"
@@ -249,6 +248,19 @@ func (b *Branch) AddCandidate(request CandidateRequest) error {
 	}
 
 	return nil
+}
+
+// HasCandidate reports whether this lineage already holds the candidate node.
+// It exists for the speculative first slot, whose acquisition re-derives a
+// foreign lineage on every attempt: a node that is already present must be
+// skipped rather than re-added, because the fork that installed it first may
+// have recorded a different parent shape and AddCandidate would then report a
+// conflict for content that is in fact the same block.
+func (b *Branch) HasCandidate(id [32]byte) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.candidates[id] != nil
 }
 
 // Cut merges a branch tip with exact committed neighbor snapshots. Every
@@ -636,7 +648,7 @@ func equalBranchMessages(left, right []*InternalMessage) bool {
 		a, b := left[index], right[index]
 		if a.Key != b.Key || a.EnqueuedLT != b.EnqueuedLT || a.QueueLT != b.QueueLT ||
 			a.EnvHash != b.EnvHash || a.Source != b.Source || a.SourceSeqno != b.SourceSeqno ||
-			!bytes.Equal(a.EnvelopeCell.Hash(), b.EnvelopeCell.Hash()) || !bytes.Equal(a.Root.Hash(), b.Root.Hash()) {
+			a.EnvelopeCell.HashKey() != b.EnvelopeCell.HashKey() || a.Root.HashKey() != b.Root.HashKey() {
 			return false
 		}
 	}

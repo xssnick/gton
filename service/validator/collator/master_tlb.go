@@ -30,12 +30,13 @@ func parseMasterStateInfoWithStats(root *cell.Cell) (tlb.McStateExtraBlockInfo, 
 	if root == nil {
 		return tlb.McStateExtraBlockInfo{}, blockCreateStats{}, errors.New("cell is absent")
 	}
-	loader, err := root.BeginParse()
+	var loader cell.Slice
+	err := root.BeginParseInto(&loader)
 	if err != nil {
 		return tlb.McStateExtraBlockInfo{}, blockCreateStats{}, err
 	}
 	var info tlb.McStateExtraBlockInfo
-	if err = info.LoadFromCell(loader); err != nil {
+	if err = info.LoadFromCell(&loader); err != nil {
 		return tlb.McStateExtraBlockInfo{}, blockCreateStats{}, err
 	}
 	if info.BlockCreateStats == nil {
@@ -130,7 +131,9 @@ func serializeMcBlockExtra(extra *tlb.McBlockExtra) (*cell.Cell, error) {
 	if err = b.StoreDict(extra.ShardHashes); err != nil {
 		return nil, fmt.Errorf("%w: serialize masterchain shard hashes: %v", ErrInvalidInput, err)
 	}
-	if err = b.StoreBuilder(shardFees.ToBuilder()); err != nil {
+	var shardFeesBuilder cell.Builder
+	shardFees.ToBuilderInto(&shardFeesBuilder)
+	if err = b.StoreBuilder(&shardFeesBuilder); err != nil {
 		return nil, fmt.Errorf("%w: serialize inline masterchain shard fees: %v", ErrInvalidInput, err)
 	}
 	if err = b.StoreRef(details.EndCell()); err != nil {
@@ -142,7 +145,9 @@ func serializeMcBlockExtra(extra *tlb.McBlockExtra) (*cell.Cell, error) {
 		if configErr != nil {
 			return nil, fmt.Errorf("%w: serialize masterchain configuration parameters: %v", ErrInvalidInput, configErr)
 		}
-		if err = b.StoreBuilder(config.ToBuilder()); err != nil {
+		var configBuilder cell.Builder
+		config.ToBuilderInto(&configBuilder)
+		if err = b.StoreBuilder(&configBuilder); err != nil {
 			return nil, fmt.Errorf("%w: serialize inline masterchain configuration parameters: %v",
 				ErrInvalidInput, err)
 		}

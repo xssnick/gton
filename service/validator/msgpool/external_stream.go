@@ -18,15 +18,16 @@ type ExternalStream struct {
 	seed     uint64
 	follow   bool
 
-	buffer     []ExternalSnapshot
-	head       int
-	size       int
-	seen       map[[32]byte]struct{}
-	snapshot   []externalSnapshotCandidate
-	snapshotAt int
-	dirty      bool
-	closed     bool
-	wake       chan struct{}
+	buffer      []ExternalSnapshot
+	head        int
+	size        int
+	seen        map[[32]byte]struct{}
+	excludeNorm map[[32]byte]struct{}
+	snapshot    []externalSnapshotCandidate
+	snapshotAt  int
+	dirty       bool
+	closed      bool
+	wake        chan struct{}
 }
 
 type externalSnapshotCandidate struct {
@@ -45,7 +46,8 @@ func (p *Pool) OpenExternalStream(shard ShardIdent, capacity int) (*ExternalStre
 }
 
 // OpenExternalStreamExcluding opens a stream that will never offer the named
-// messages, neither in its first fill nor in anything admitted afterwards.
+// messages or known normalized variants, neither in its first fill nor in
+// anything admitted afterwards.
 //
 // It exists for a collation that starts before its predecessor has reported what
 // it consumed. The pool learns that at the predecessor's commit; a successor
@@ -54,9 +56,10 @@ func (p *Pool) OpenExternalStream(shard ShardIdent, capacity int) (*ExternalStre
 // without a retry stamp, so the same messages come back on every remaining slot
 // of the window.
 //
-// The exclusion is seeded into the same map that gates both selection and follow
-// admission, and it is seeded before the first fill: seeding after it would let
-// the very first batch through, which is the batch a successor takes.
+// The exclusion is seeded before the first fill: seeding after it would let the
+// very first batch through, which is the batch a successor takes. Known raw
+// hashes also seed a normalized-hash set so equivalent variants admitted later
+// stay excluded.
 func (p *Pool) OpenExternalStreamExcluding(
 	shard ShardIdent,
 	capacity int,
@@ -84,8 +87,19 @@ func (p *Pool) OpenExternalStreamExcluding(
 		seen:     make(map[[32]byte]struct{}, capacity+len(exclude)),
 		wake:     make(chan struct{}, 1),
 	}
+	if len(exclude) > 0 {
+		stream.excludeNorm = make(map[[32]byte]struct{}, len(exclude))
+	}
 	for _, hash := range exclude {
 		stream.seen[hash] = struct{}{}
+		entry := p.byHash[hash]
+		if entry == nil {
+			continue
+		}
+		stream.excludeNorm[entry.msg.HashNorm] = struct{}{}
+		for _, variant := range p.byNorm[entry.msg.HashNorm] {
+			stream.seen[variant.msg.Hash] = struct{}{}
+		}
 	}
 	p.streams[stream.id] = stream
 	p.refillExternalStreamLocked(stream)
@@ -179,7 +193,7 @@ func (s *ExternalStream) TakeReady(limit int) []ExternalSnapshot {
 
 func (s *ExternalStream) takeReadyLocked(limit int) []ExternalSnapshot {
 	batch := make([]ExternalSnapshot, 0, min(limit, s.size))
-	now := s.pool.clock.Now().UnixNano()
+	now := s.pool.clock.Now()
 	for len(batch) < limit {
 		if s.size == 0 {
 			if s.dirty {
@@ -193,7 +207,9 @@ func (s *ExternalStream) takeReadyLocked(limit int) []ExternalSnapshot {
 		s.buffer[s.head] = ExternalSnapshot{}
 		s.head = (s.head + 1) % s.capacity
 		s.size--
-		if snapshot.expiresAt <= now {
+		entry := snapshot.message.poolEntry
+		if entry == nil || entry.removed || entry.generation != snapshot.generation ||
+			!entry.retryAt.IsZero() || snapshot.expiresAt <= now.UnixNano() {
 			continue
 		}
 		batch = append(batch, snapshot)
@@ -244,6 +260,9 @@ func (p *Pool) offerExternalLocked(e *entry) {
 
 func (s *ExternalStream) offerLocked(snapshot ExternalSnapshot) {
 	if s.closed {
+		return
+	}
+	if _, excluded := s.excludeNorm[snapshot.message.HashNorm]; excluded {
 		return
 	}
 	if _, exists := s.seen[snapshot.Hash]; exists {
@@ -317,6 +336,9 @@ func (p *Pool) refillExternalStreamLocked(stream *ExternalStream) {
 		for _, e := range p.slabs[priority].entries {
 			p.reactivateDueLocked(e, now)
 			if !e.retryAt.IsZero() || !stream.shard.Contains(e.msg.Workchain, e.msg.AddrPrefix) {
+				continue
+			}
+			if _, excluded := stream.excludeNorm[e.msg.HashNorm]; excluded {
 				continue
 			}
 			if _, exists := stream.seen[e.msg.Hash]; exists {

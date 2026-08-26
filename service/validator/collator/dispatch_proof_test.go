@@ -107,7 +107,7 @@ func TestAfterSplitFullCollatedProofCoversDispatchBoundary(t *testing.T) {
 		_ *cell.Cell, oldValueExtra, newValueExtra *cell.Slice,
 	) error {
 		if oldValueExtra != nil {
-			oldAccount, diffErr := dispatchDiffAccount(oldValueExtra)
+			oldAccount, diffErr := dispatchDiffAccount(*oldValueExtra)
 			if diffErr != nil {
 				return diffErr
 			}
@@ -116,7 +116,7 @@ func TestAfterSplitFullCollatedProofCoversDispatchBoundary(t *testing.T) {
 			}
 		}
 		if newValueExtra != nil {
-			newAccount, diffErr := dispatchDiffAccount(newValueExtra)
+			newAccount, diffErr := dispatchDiffAccount(*newValueExtra)
 			if diffErr != nil {
 				return diffErr
 			}

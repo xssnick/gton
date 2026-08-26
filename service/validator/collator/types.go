@@ -257,9 +257,9 @@ type ShardRequest struct {
 
 	accountPrewarmer AccountPrewarmer
 	assembly         *candidateAssemblyDurations
-	// internalWaveWorkers overrides the worker count of the inbound internal
-	// message phase; see collation.internalWaveParallelism. Tests use it to
-	// compare the sequential loop, the inline wave arm and the concurrent one.
+	// internalWaveWorkers overrides the worker count of the internal, external
+	// and generated message waves; see collation.internalWaveParallelism. Tests
+	// use it to compare the sequential loop, inline waves and concurrent waves.
 	internalWaveWorkers int
 
 	// successor is the door through which this build hands its result to the
@@ -361,8 +361,7 @@ type preparedCandidateTransition struct {
 	minimumBurned tlb.CurrencyCollection
 	// previousStats and previousInfo are the predecessor statistics and block
 	// info the masterchain structural pass already decoded. They are nil on the
-	// shard path and whenever the caller did not run that pass, so consumers
-	// must go through masterPredecessorState and keep their own fallback.
+	// shard path; a masterchain semantic transition requires both.
 	previousStats *tlb.ShardStateStats
 	previousInfo  *tlb.McStateExtraBlockInfo
 }
@@ -380,12 +379,6 @@ type ShardVerificationRequest struct {
 	NeighborShardEndLT tlb.ShardEndLTFunc
 	Semantics          CandidateTransitionVerifier
 	Candidate          *Candidate
-	// stateProven marks Candidate.State as already applied on top of the
-	// predecessor that collated data proves, which is how the acquisition
-	// pipeline builds it. Verification then skips rebuilding the same tree:
-	// that would produce a byte-identical root at the price of a second walk
-	// of the state update. Entry points handed a resident state leave it clear.
-	stateProven bool
 }
 
 // MasterVerificationRequest contains the deterministic inputs required to
@@ -403,13 +396,6 @@ type MasterVerificationRequest struct {
 	NeighborShardEndLT tlb.ShardEndLTFunc
 	Semantics          CandidateTransitionVerifier
 	Candidate          *Candidate
-	// previousState is the state verifyPredecessor already returned for this
-	// exact Previous value while the acquisition pipeline resolved the
-	// masterchain view around it. It is only ever the result of that same call,
-	// so supplying it removes a duplicate decode and accounts-prefix walk
-	// without removing a check. Entry points that did not run it leave it nil
-	// and verification performs the call itself.
-	previousState *acquiredPredecessorState
 }
 
 // acquiredPredecessorState is a predecessor state parse together with the exact
@@ -456,8 +442,8 @@ type collationRequest struct {
 	internalMsgUntil time.Time
 	accountPrewarmer AccountPrewarmer
 	assembly         *candidateAssemblyDurations
-	// internalWaveWorkers is ShardRequest's override, carried through; a
-	// masterchain build has no inbound internal phase and leaves it zero.
+	// internalWaveWorkers is ShardRequest's message-wave override, carried
+	// through. A masterchain build leaves it zero.
 	internalWaveWorkers int
 	// successor is ShardRequest's port, carried through. A masterchain build
 	// leaves it nil: its external source is a snapshot taken when the build

@@ -773,13 +773,12 @@ func (a *LocalAcquisition) validateShardCandidate(
 		NeighborShardEndLT: endLT,
 		Semantics:          a.semantics,
 		Candidate:          prepared.candidate,
-		stateProven:        verified.collated.full,
 	}
 	if len(previous) == 2 {
 		request.Previous2 = &previous[1]
 	}
 
-	return verifyPreparedShardCandidate(ctx, request, verified)
+	return verifyPreparedShardCandidate(ctx, request, prepared)
 }
 
 func (a *LocalAcquisition) validateMasterCandidate(
@@ -822,6 +821,8 @@ func (a *LocalAcquisition) validateMasterCandidate(
 		return err
 	}
 
+	prepared.masterPredecessor = previousState
+
 	return verifyPreparedMasterCandidate(ctx, MasterVerificationRequest{
 		Previous:           previous,
 		Config:             master.context.Config,
@@ -831,8 +832,7 @@ func (a *LocalAcquisition) validateMasterCandidate(
 		NeighborShardEndLT: endLT,
 		Semantics:          a.semantics,
 		Candidate:          prepared.candidate,
-		previousState:      previousState,
-	}, verified)
+	}, prepared)
 }
 
 func equalBlockHash(id ton.BlockIDExt, rootHash, fileHash []byte) bool {

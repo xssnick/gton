@@ -609,7 +609,7 @@ func (a *LocalAcquisition) readPrevious(
 			return PreviousBlock{}, tlb.ShardStateUnsplit{}, acquisitionReadError("state cells", id, err)
 		}
 	}
-	if len(stored.StateRootHash) == 32 && !bytes.Equal(root.Hash(), stored.StateRootHash) {
+	if len(stored.StateRootHash) == 32 && !equalCellHashBytes(root, stored.StateRootHash) {
 		return PreviousBlock{}, tlb.ShardStateUnsplit{}, fmt.Errorf("%w: stored state root hash differs from its metadata", ErrInvalidInput)
 	}
 
