@@ -80,10 +80,11 @@ func (n *Node) sendExternalMessage(ctx context.Context, data []byte, addrKey ext
 	}
 
 	ev := ExternalMessageEvent{
-		IsLocal: isLocal,
-		Body:    data,
-		Root:    root,
-		Message: msg,
+		IsLocal:  isLocal,
+		Priority: 0,
+		Body:     data,
+		Root:     root,
+		Message:  msg,
 	}
 
 	if checked {

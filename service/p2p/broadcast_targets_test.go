@@ -4,6 +4,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/xssnick/tonutils-go/adnl/overlay"
 )
 
 func TestBroadcastTargetsExpiredRefreshIsSingleflight(t *testing.T) {
@@ -79,6 +81,72 @@ func TestBroadcastTargetsExcludeDeferredQUICRouteOnlyFromPlumtree(t *testing.T) 
 	}
 	if !sub.PlumtreePeerReceivesBroadcasts(peerID) {
 		t.Fatal("QUIC retry delay changed Plumtree roster membership")
+	}
+}
+
+func TestBuildBroadcastTargetsSnapshotKeepsWholeCustomRoster(t *testing.T) {
+	tests := []struct {
+		name      string
+		kind      overlayKind
+		wantPeers int
+	}{
+		{
+			name:      "custom fixed keeps silent member",
+			kind:      overlayKindCustomFixed,
+			wantPeers: 2,
+		},
+		{
+			name:      "public shard keeps alive subset",
+			kind:      overlayKindPublicShard,
+			wantPeers: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Now()
+			aliveID := testPeerID(tt.name + ":alive")
+			silentID := testPeerID(tt.name + ":silent")
+			alive := &overlayPeer{
+				id:            aliveID,
+				fixedMember:   tt.kind == overlayKindCustomFixed,
+				alive:         true,
+				lastReceiveAt: now,
+				announced:     &overlay.Node{Version: int32(now.Unix())},
+			}
+			silent := &overlayPeer{
+				id:          silentID,
+				fixedMember: tt.kind == overlayKindCustomFixed,
+				announced:   &overlay.Node{Version: int32(now.Unix())},
+			}
+			sub := testOverlaySubscription(&overlaySubscription{
+				spec: overlaySpec{Kind: tt.kind},
+				peers: map[PeerID]*overlayPeer{
+					aliveID:  alive,
+					silentID: silent,
+				},
+			})
+
+			snapshot := sub.buildBroadcastTargetsSnapshot()
+			if len(snapshot.peers) != tt.wantPeers {
+				t.Fatalf("broadcast target peers = %d, want %d", len(snapshot.peers), tt.wantPeers)
+			}
+			if tt.wantPeers == 1 && snapshot.peers[0].id != aliveID {
+				t.Fatalf("public broadcast target = %s, want alive peer %s", snapshot.peers[0].id, aliveID)
+			}
+			if tt.wantPeers == 2 {
+				got := map[PeerID]struct{}{}
+				for _, peer := range snapshot.peers {
+					got[peer.id] = struct{}{}
+				}
+				if _, ok := got[aliveID]; !ok {
+					t.Fatal("custom broadcast targets omitted alive member")
+				}
+				if _, ok := got[silentID]; !ok {
+					t.Fatal("custom broadcast targets omitted silent member")
+				}
+			}
+		})
 	}
 }
 

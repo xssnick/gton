@@ -43,11 +43,11 @@ func (s *Service) AcceptExternalMessage(ctx context.Context, event p2p.ExternalM
 	if err != nil {
 		return err
 	}
-	return s.runExternalMessageHooks(ctx, event.IsLocal, result.Root, result.Message)
+	return s.runExternalMessageHooks(ctx, event, result.Root, result.Message)
 }
 
 func (s *Service) AcceptCheckedExternalMessage(ctx context.Context, event p2p.ExternalMessageEvent) error {
-	return s.runExternalMessageHooks(ctx, event.IsLocal, event.Root, event.Message)
+	return s.runExternalMessageHooks(ctx, event, event.Root, event.Message)
 }
 
 func (s *Service) checkExternalMessage(ctx context.Context, event p2p.ExternalMessageEvent) (externalmsg.CheckResult, error) {
@@ -57,12 +57,13 @@ func (s *Service) checkExternalMessage(ctx context.Context, event p2p.ExternalMe
 	return s.externalMessageChecker.CheckBOC(ctx, event.Body)
 }
 
-func (s *Service) runExternalMessageHooks(ctx context.Context, isLocal bool, root *cell.Cell, msg *tlb.ExternalMessage) error {
+func (s *Service) runExternalMessageHooks(ctx context.Context, source p2p.ExternalMessageEvent, root *cell.Cell, msg *tlb.ExternalMessage) error {
 	if s.externalMessageHooks == nil {
 		return nil
 	}
 	return s.externalMessageHooks.run(ctx, hooks.ExternalMessageEvent{
-		IsLocal:       isLocal,
+		IsLocal:       source.IsLocal,
+		Priority:      source.Priority,
 		MessageRoot:   root,
 		MessageParsed: msg,
 	})

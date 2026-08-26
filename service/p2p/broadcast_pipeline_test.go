@@ -809,6 +809,40 @@ func TestCustomOverlayRejectsUnauthorizedBlockSender(t *testing.T) {
 	}
 }
 
+func TestCustomOverlayRejectsUnauthorizedMessageSender(t *testing.T) {
+	node := newTestNode(t)
+	admission := &testExternalMessageAdmission{}
+	node.externalMessageAdmission = admission
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:       "custom.private-a",
+			Kind:       overlayKindCustomFixed,
+			ShortID:    []byte{0x02, 0x03, 0x04},
+			MsgSenders: map[PeerID]int{testPeerID("allowed"): 17},
+		},
+		log: discardLogger(),
+	})
+	msg := tonnodeapi.NewExternalMessageBroadcast{
+		Message: tonnodeapi.ExternalMessage{Data: testExternalMessageBOC(t)},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize external broadcast: %v", err)
+	}
+
+	accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, testPeerID("blocked"))
+	if accepted != nil {
+		t.Fatalf("unauthorized custom external broadcast was accepted: %+v", accepted)
+	}
+	if len(admission.events) != 0 {
+		t.Fatalf("unauthorized admission events = %d, want 0", len(admission.events))
+	}
+	if got := testBroadcastDropStatCount(node, "custom.private-a", "tonNode.externalMessageBroadcast", "unauthorized_sender"); got != 1 {
+		t.Fatalf("unauthorized drop count = %d, want 1", got)
+	}
+}
+
 func TestCustomTwoStepBroadcastSkipsSameOverlayRebroadcastButKeepsFanoutPayload(t *testing.T) {
 	node := newTestNode(t)
 	observer := &testBroadcastPipelineObserver{}
@@ -1017,6 +1051,48 @@ func TestPublicOverlayAcceptsIHRBroadcast(t *testing.T) {
 	accepted := sub.classifyBroadcast(nil, msg, payload, DeliverySimple, false, testPeerID("source"))
 	if accepted == nil || accepted.rebroadcast == nil {
 		t.Fatal("expected public IHR broadcast to be accepted")
+	}
+}
+
+func TestAcceptedPublicExternalDoesNotFanOutToCustomOverlay(t *testing.T) {
+	node := newTestNode(t)
+	publicSpec := overlaySpec{
+		Name:    "basechain",
+		Kind:    overlayKindPublicShard,
+		ShortID: bytes.Repeat([]byte{0x01}, PeerIDSize),
+	}
+	publicSub := mustGetOrCreateSubscription(t, node, publicSpec)
+
+	customSpec := overlaySpec{
+		Name:       "custom.private-a",
+		Kind:       overlayKindCustomFixed,
+		ShortID:    bytes.Repeat([]byte{0x04}, PeerIDSize),
+		MsgSenders: map[PeerID]int{node.localID: 9},
+	}
+	customSub := mustGetOrCreateSubscription(t, node, customSpec)
+	customSub.setActive(true, time.Time{})
+	customPeer := testRebroadcastQueuePeer("custom-peer")
+	customSub.peers[customPeer.id] = customPeer
+
+	msg := tonnodeapi.NewExternalMessageBroadcast{
+		Message: tonnodeapi.ExternalMessage{Data: testExternalMessageBOC(t)},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize external broadcast: %v", err)
+	}
+
+	accepted := publicSub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, testPeerID("remote"))
+	if accepted == nil {
+		t.Fatal("expected public external broadcast to be accepted")
+	}
+	node.acceptBroadcast(*accepted)
+
+	if snapshot, ok := customSub.twoStepQueueStatusSnapshot(); ok && snapshot.Items != 0 {
+		t.Fatalf("custom two-step queue items = %d, want 0", snapshot.Items)
+	}
+	if _, ok := customPeer.localRebroadcastQueue.TryPop(); ok {
+		t.Fatal("public external broadcast reached custom peer queue")
 	}
 }
 
@@ -1316,6 +1392,49 @@ func TestClassifyExternalMessageBroadcastRunsAdmission(t *testing.T) {
 	}
 	if event.IsLocal {
 		t.Fatalf("broadcast external message IsLocal = true, want false")
+	}
+	if event.Priority != 0 {
+		t.Fatalf("public external message priority = %d, want 0", event.Priority)
+	}
+}
+
+func TestCustomOverlayExternalMessageUsesSenderPriority(t *testing.T) {
+	node := newTestNode(t)
+	admission := &testExternalMessageAdmission{}
+	node.externalMessageAdmission = admission
+	sourceID := testPeerID("custom-message-source")
+	sub := testOverlaySubscription(&overlaySubscription{
+		node: node,
+		spec: overlaySpec{
+			Name:       "custom.private-a",
+			Kind:       overlayKindCustomFixed,
+			ShortID:    []byte{0x02, 0x03, 0x04},
+			MsgSenders: map[PeerID]int{sourceID: 17},
+		},
+		log: discardLogger(),
+	})
+	data := testExternalMessageBOC(t)
+	msg := tonnodeapi.NewExternalMessageBroadcast{
+		Message: tonnodeapi.ExternalMessage{Data: data},
+	}
+	payload, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize external broadcast: %v", err)
+	}
+
+	accepted := sub.classifyBroadcast(nil, msg, payload, DeliveryFEC, false, sourceID)
+	if accepted == nil {
+		t.Fatal("expected custom external broadcast to be accepted")
+	}
+	if len(admission.events) != 1 {
+		t.Fatalf("admission events = %d, want 1", len(admission.events))
+	}
+	event := admission.events[0]
+	if event.IsLocal {
+		t.Fatal("custom external message IsLocal = true, want false")
+	}
+	if event.Priority != 17 {
+		t.Fatalf("custom external message priority = %d, want 17", event.Priority)
 	}
 }
 

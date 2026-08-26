@@ -280,6 +280,9 @@ type SyncLagProvider interface {
 type ExternalMessageEvent struct {
 	// IsLocal is true when the message originated from the local API path.
 	IsLocal bool
+	// Priority is the configured custom-overlay message sender priority.
+	// Local and public-overlay messages use priority zero.
+	Priority int
 	// Body is the raw external message BOC.
 	Body []byte
 	// Root is the parsed external message root when already available.

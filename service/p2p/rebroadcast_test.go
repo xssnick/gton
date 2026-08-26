@@ -394,17 +394,17 @@ func TestSendCustomTwoStepRebroadcastUsesRLDP2(t *testing.T) {
 		overlay:       overlayA,
 		rldpOverlay:   overlay.CreateExtendedRLDP(rldpA).CreateOverlay(overlayID[:]),
 		announced:     &overlay.Node{Version: now},
+		fixedMember:   true,
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}
 	peerB := &overlayPeer{
-		id:            testPeerID("peer-b"),
-		addr:          "peer-b",
-		overlay:       overlayB,
-		rldpOverlay:   overlay.CreateExtendedRLDP(rldpB).CreateOverlay(overlayID[:]),
-		announced:     &overlay.Node{Version: now},
-		alive:         true,
-		lastReceiveAt: time.Now(),
+		id:          testPeerID("peer-b"),
+		addr:        "peer-b",
+		overlay:     overlayB,
+		rldpOverlay: overlay.CreateExtendedRLDP(rldpB).CreateOverlay(overlayID[:]),
+		announced:   &overlay.Node{Version: now},
+		fixedMember: true,
 	}
 	sub := testOverlaySubscription(&overlaySubscription{
 		node: node,

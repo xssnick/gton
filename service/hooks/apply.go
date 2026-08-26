@@ -60,6 +60,9 @@ type ExternalMessageEvent struct {
 	// IsLocal is true when the message came from this node's local API path,
 	// not from an overlay broadcast.
 	IsLocal bool
+	// Priority is the configured custom-overlay message sender priority.
+	// Local and public-overlay messages use priority zero.
+	Priority int
 	// MessageRoot is the parsed root cell of the external message.
 	MessageRoot *cell.Cell
 	// MessageParsed is the decoded external message when it was already

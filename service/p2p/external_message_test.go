@@ -127,6 +127,9 @@ func TestSendExternalMessageRunsAdmissionBeforeQueue(t *testing.T) {
 	if !event.IsLocal {
 		t.Fatalf("send external message IsLocal = false, want true")
 	}
+	if event.Priority != 0 {
+		t.Fatalf("local external message priority = %d, want 0", event.Priority)
+	}
 	if _, ok := peer.localRebroadcastQueue.TryPop(); !ok {
 		t.Fatalf("expected queued local rebroadcast after admission")
 	}
@@ -180,6 +183,9 @@ func TestSendCheckedExternalMessageRunsCheckedAdmission(t *testing.T) {
 	if !event.IsLocal {
 		t.Fatalf("checked external message IsLocal = false, want true")
 	}
+	if event.Priority != 0 {
+		t.Fatalf("checked local external message priority = %d, want 0", event.Priority)
+	}
 	if event.Root != nil || event.Message != nil {
 		t.Fatalf("checked external message parsed data = (%v, %v), want nil", event.Root, event.Message)
 	}
@@ -217,6 +223,38 @@ func TestSendCheckedExternalMessageMarksAdmissionLocal(t *testing.T) {
 	}
 	if _, ok := peer.localRebroadcastQueue.TryPop(); !ok {
 		t.Fatalf("expected checked external message to be queued")
+	}
+}
+
+func TestSendExternalMessageCustomOverlayAlsoSendsPublicByDefault(t *testing.T) {
+	node, publicSub := newSendExternalMessageTestNode(t)
+	publicPeer := testRebroadcastQueuePeer("public-peer")
+	publicSub.peers[publicPeer.id] = publicPeer
+
+	customSpec := overlaySpec{
+		Name:       "custom.private-a",
+		Kind:       overlayKindCustomFixed,
+		ShortID:    bytes.Repeat([]byte{0x22}, 32),
+		MsgSenders: map[PeerID]int{node.localID: 3},
+	}
+	customSub := mustGetOrCreateSubscription(t, node, customSpec)
+	customSub.setActive(true, time.Time{})
+	customPeer := testRebroadcastQueuePeer("custom-peer")
+	customSub.peers[customPeer.id] = customPeer
+
+	body := testExternalMessageBOC(t)
+	if err := sendTestExternalMessage(t, node, body); err != nil {
+		t.Fatalf("send external message failed: %v", err)
+	}
+	if got, ok := customSub.twoStepQueueStatusSnapshot(); !ok {
+		t.Fatal("expected custom two-step rebroadcast queue")
+	} else if got.Items != 1 {
+		t.Fatalf("custom two-step queued items = %d, want 1", got.Items)
+	}
+	if got, ok := publicPeer.localRebroadcastQueue.TryPop(); !ok {
+		t.Fatal("expected public rebroadcast")
+	} else if got.kind != "tonNode.externalMessageBroadcast" || !got.local {
+		t.Fatalf("unexpected public rebroadcast: %#v", got)
 	}
 }
 

@@ -11,6 +11,7 @@ require (
 	github.com/rs/zerolog v1.35.1
 	github.com/xssnick/raptorq v1.5.1
 	github.com/xssnick/tonutils-go v1.18.1-0.20260801052814-fc795b3d6ca7
+	golang.org/x/crypto v0.54.0
 	golang.org/x/sys v0.47.0
 )
 
@@ -46,7 +47,6 @@ require (
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/rogpeppe/go-internal v1.12.0 // indirect
 	github.com/xssnick/quic-go-ton v0.0.0-20260707110703-14f3237f97b9 // indirect
-	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20260508232706-74f9aab9d74a // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
