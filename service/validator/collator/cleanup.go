@@ -218,8 +218,10 @@ func (c *collation) cleanupClaimedLocalDequeues() error {
 	}
 
 	drained := uint32(0)
-	dequeue := func(entry semanticQueueEntry) error {
-		key := msgpool.MakeQueueKey(entry.envelope.next, entry.envelope.message.HashKey())
+	dequeue := func(entry claimedQueueEntry) error {
+		// entry.key is the dictionary key the walk visited, already checked
+		// against the routing the envelope itself derives.
+		key := entry.key
 		var value cell.Slice
 		err := c.outQueue.LoadValueByBytesKeyInto(key[:], &value)
 		if isMissingKey(err) {
@@ -236,7 +238,7 @@ func (c *collation) cleanupClaimedLocalDequeues() error {
 		if err != nil {
 			return err
 		}
-		if current.envelope.HashKey() != entry.enqueued.Msg.HashKey() {
+		if current.envelope.HashKey() != entry.envelopeHash {
 			return fmt.Errorf("%w: claimed local queue entry %x changed envelope", ErrInvalidInput, key)
 		}
 		if err = c.dequeueDelivered(current, c.localCleanup.endLT); err != nil {
@@ -293,7 +295,7 @@ func (c *collation) cleanupClaimedLocalDequeues() error {
 		defer c.usage.SetIgnoredObserver(nil)
 	}
 
-	err := walkSemanticQueuePrefix(c.oldOutQueue, c.shard, c.processedClaim, func(entry semanticQueueEntry) error {
+	err := walkClaimedQueuePrefix(c.oldOutQueue, c.shard, c.processedClaim, func(entry claimedQueueEntry) error {
 		// Everything below is cleanup's own work and the closure's walk does
 		// none of it, so its reads are not part of the set the closure records.
 		c.claimedPrefix.suspend()
@@ -302,7 +304,7 @@ func (c *collation) cleanupClaimedLocalDequeues() error {
 		if err := c.ctx.Err(); err != nil {
 			return err
 		}
-		if !c.shard.ContainsPrefix(entry.envelope.current) {
+		if !c.shard.ContainsPrefix(entry.current) {
 			return nil
 		}
 		processed, err := c.shardEndLT.alreadyProcessed(

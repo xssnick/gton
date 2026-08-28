@@ -64,8 +64,8 @@ func TestGeneratedWavesProduceTheSequentialBlockMultiSource(t *testing.T) {
 				}
 
 				got, want := candidate.Stats, reference.Stats
-				got.InternalsSpeculated, got.InternalsDiscarded = 0, 0
-				want.InternalsSpeculated, want.InternalsDiscarded = 0, 0
+				got.InternalsSpeculated, got.InternalsDiscarded, got.InternalsChained = 0, 0, 0
+				want.InternalsSpeculated, want.InternalsDiscarded, want.InternalsChained = 0, 0, 0
 				if got != want {
 					t.Fatalf("%s produced different stats:\n got  %+v\n want %+v", arm.name, got, want)
 				}

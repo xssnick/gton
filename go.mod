@@ -11,7 +11,7 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/rs/zerolog v1.35.1
 	github.com/xssnick/raptorq v1.5.2
-	github.com/xssnick/tonutils-go v1.18.1-0.20260826121847-289d6710f3c1
+	github.com/xssnick/tonutils-go v1.18.1-0.20260828071555-40d36afb7f16
 	golang.org/x/crypto v0.55.0
 	golang.org/x/sys v0.47.0
 )

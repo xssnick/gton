@@ -946,6 +946,57 @@ func BenchmarkMainnetLazyPredecessorParse(b *testing.B) {
 	b.ReportMetric(float64(len(predecessorBOC)), "predecessorB")
 }
 
+// The store-shaped row: the same workload with its predecessor served through
+// cell records and CreateWithLazyRefsUnsafe, which is the shape production
+// hands a collation out of celldb. The BOC row above prices the FIXTURE's
+// parser (FromBOCWithOptions{Lazy}), whose per-cell materialization cost is
+// its own and not production's; comparing this row to the resident one is what
+// prices the lazy PARENT SHAPE the way the node actually pays for it. The
+// predecessor is rebuilt per iteration for the same reason the BOC row
+// rebuilds its parse — a store-shaped tree materializes as it is read, so a
+// shared one is lazy only for the first collation — but here the rebuild is
+// one root-record decode over a prebuilt record map, cheap enough to stay
+// inside the timer instead of paying StopTimer's memstats round-trip.
+func BenchmarkCollateMainnetHeavyStoreShaped(b *testing.B) {
+	req, _, _ := benchMainnetFixtureRequest(b, benchMainnetExportRepeat())
+	// Same subject split as the row above: the parent's shape, not the proof
+	// building capFullCollatedData adds on top of it.
+	req.Masterchain.Config.capabilities &^= capFullCollatedData
+	resident := req.Previous.State
+	store := newLazyPredecessorStore(b, resident)
+	req.Previous.State = store.root(b, resident)
+
+	builder := testBuilder()
+	ctx := context.Background()
+	candidate, err := builder.BuildShard(ctx, req)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(candidate.CollatedData) != benchMainnetCollatedMarkerBytes {
+		b.Fatalf("collated data is %d bytes, want the %d-byte marker: this row is meant to run "+
+			"WITHOUT capFullCollatedData", len(candidate.CollatedData), benchMainnetCollatedMarkerBytes)
+	}
+	blockBytes := len(candidate.BlockBOC)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		req.Previous.State = store.root(b, resident)
+		built, err := builder.BuildShard(ctx, req)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(built.BlockBOC) != blockBytes {
+			b.Fatalf("iteration produced a %d-byte block against the %d-byte first one: "+
+				"the predecessor is not being rebuilt", len(built.BlockBOC), blockBytes)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(candidate.Stats.Transactions), "tx/block")
+	b.ReportMetric(float64(candidate.Stats.GasUsed), "gas/block")
+	b.ReportMetric(float64(blockBytes), "blockB")
+}
+
 func BenchmarkVerifyMainnetHeavyFixture(b *testing.B) {
 	req, _, _ := benchMainnetFixtureRequest(b, benchMainnetExportRepeat())
 	candidate, err := testBuilder().BuildShard(context.Background(), req)

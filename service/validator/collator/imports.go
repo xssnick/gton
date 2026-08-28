@@ -236,12 +236,27 @@ type internalPlan struct {
 	started   bool
 	dependsOn *internalPlan
 	follows   *internalPlan
+	// chained marks a successor the worker started itself, straight off its
+	// predecessor's emulated post-state, without waiting for the predecessor
+	// to retire. The worker sets it — together with started and the wg count —
+	// strictly before releasing the predecessor's wg, so the main goroutine,
+	// which always waits on the predecessor first, observes a settled decision
+	// and never dispatches such a plan a second time.
+	chained bool
 
 	// Set by speculateInternal, read by retireInternal.
 	lane    *accountLane
 	fresh   bool
 	result  *tvm.TransactionExecutionResult
 	execErr error
+	// events is the plan's own segment of its lane tracer's buffer: every read
+	// its emulation made, detached by the goroutine that emulated it the moment
+	// the emulation finished. A chained successor speculates through the same
+	// tracer while its predecessor is still unretired, so the buffer cannot be
+	// read out of the tracer at retirement — replay must forward exactly the
+	// retired plan's own reads, and this is where they live. The slice is kept
+	// across arena reuse for its capacity.
+	events []laneTraceEvent
 	// wg is one worker's completion, not a wave's. A WaitGroup rather than a
 	// channel because a plan is reused across the waves of one collation and a
 	// closed channel cannot be: at a thousand inbound messages a block that is a
@@ -442,9 +457,17 @@ func (c *collation) retireInternal(plan *internalPlan) error {
 
 // commitSpeculated takes a plan whose transaction already ran off the main
 // goroutine and makes it part of the collation: the lane is registered if it
-// is new, its buffered reads are replayed into the shared recorders, and the
+// is new, its detached reads are replayed into the shared recorders, and the
 // result is committed. After this the collation is in the state a sequential
 // executePrepared would have left it in.
+//
+// The tracer returns to pass-through only when this plan's successor was not
+// chained: a chained successor is still buffering — or already holds its own
+// detached segment — and dropping to pass-through under it would leak the
+// reads the retire path itself makes into the shared record out of order.
+// That successor is real only off the masterchain (see chainInternal), and off
+// the masterchain the retire path parses no lane-traced cell, so nothing fires
+// the tracer between this replay and the successor's own.
 func (c *collation) commitSpeculated(plan *internalPlan) (*tvm.TransactionExecutionResult, *accountLane, error) {
 	plan.wg.Wait()
 	if plan.execErr != nil {
@@ -454,11 +477,23 @@ func (c *collation) commitSpeculated(plan *internalPlan) (*tvm.TransactionExecut
 	if plan.fresh {
 		c.registerLane(lane)
 	}
-	lane.tracer.replay()
+	lane.tracer.replaySegment(plan.events)
+	plan.releaseEvents()
+	if next := plan.follows; next == nil || !next.chained {
+		lane.tracer.discard()
+	}
 	if err := c.commitExecution(plan.result, lane, true); err != nil {
 		return nil, nil, err
 	}
 	return plan.result, lane, nil
+}
+
+// releaseEvents empties the plan's replayed or discarded segment. The cells go
+// now — a retained segment would keep predecessor subtrees alive for as long
+// as the arena does — while the slice stays for its capacity.
+func (p *internalPlan) releaseEvents() {
+	clear(p.events)
+	p.events = p.events[:0]
 }
 
 func (c *collation) relayInternal(

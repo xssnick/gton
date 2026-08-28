@@ -402,7 +402,7 @@ func semanticEnvelopeFromInternal(
 	}
 	current := semanticIntermediatePrefix(source, destination, envelope.CurAddr)
 	next := semanticIntermediatePrefix(source, destination, envelope.NextAddr)
-	if envelope.FwdFeeRemaining.Nano().Cmp(internal.FwdFee.Nano()) > 0 {
+	if envelope.FwdFeeRemaining.NanoRef().Cmp(internal.FwdFee.NanoRef()) > 0 {
 		return nil, fmt.Errorf("remaining forwarding fee exceeds the original fee")
 	}
 	lt := internal.CreatedLT

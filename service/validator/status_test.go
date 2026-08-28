@@ -158,11 +158,16 @@ func TestValidatorStatusMergesRuntimeAndDurableSession(t *testing.T) {
 	node.Commands = commands
 
 	extension, err := New(validatorTestOptions(Options{
-		Keys:           keys,
-		Storage:        store,
-		StatsInterval:  -1,
-		EnableGroups:   true,
-		PrepareSession: preparer.prepare,
+		Keys:          keys,
+		Storage:       store,
+		StatsInterval: -1,
+		EnableGroups:  true,
+		// The replayed masterchain head is historical, so the startup catch-up
+		// gate would keep the supervisor stopped until the settled-head escape
+		// hatch; this test reconciles the supervisor directly and needs it
+		// started at Start.
+		ConsensusCatchupThreshold: -1,
+		PrepareSession:            preparer.prepare,
 	}))(node)
 	if err != nil {
 		t.Fatal(err)

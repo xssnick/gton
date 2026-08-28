@@ -219,7 +219,7 @@ func TestClaimedPrefixCollectionIsSuspendedInsideCleanupsCallback(t *testing.T) 
 				return true
 			}
 			name, isIdent := call.Fun.(*ast.Ident)
-			if !isIdent || name.Name != "walkSemanticQueuePrefix" || len(call.Args) == 0 {
+			if !isIdent || name.Name != "walkClaimedQueuePrefix" || len(call.Args) == 0 {
 				return true
 			}
 			if lit, isLit := call.Args[len(call.Args)-1].(*ast.FuncLit); isLit {
@@ -229,7 +229,7 @@ func TestClaimedPrefixCollectionIsSuspendedInsideCleanupsCallback(t *testing.T) 
 		})
 	}
 	if callback == nil {
-		t.Fatal("cleanupClaimedLocalDequeues no longer passes a literal callback to walkSemanticQueuePrefix")
+		t.Fatal("cleanupClaimedLocalDequeues no longer passes a literal callback to walkClaimedQueuePrefix")
 	}
 	if len(callback.Body.List) < 2 {
 		t.Fatal("the callback is too short to open with the suspend bracket")

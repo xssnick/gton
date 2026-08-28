@@ -23,6 +23,34 @@ func walkSemanticQueuePrefix(
 	bound semanticMessageBound,
 	visit func(semanticQueueEntry) error,
 ) error {
+	return walkSemanticQueuePrefixLeaves(queue, target, bound,
+		func(key msgpool.QueueKey, value, extra *cell.Slice, leaf semanticQueueLeafCells) error {
+			entry, parseErr := parseSemanticNeighborQueueEntryLoaded(key, value, extra, leaf)
+			if parseErr != nil {
+				return semanticQueueEntryVerdict{err: parseErr}
+			}
+			if visit != nil {
+				return visit(entry)
+			}
+			return nil
+		})
+}
+
+// walkSemanticQueuePrefixLeaves is the traversal half of walkSemanticQueuePrefix,
+// shared with the claimed-prefix cleanup's narrower reader (walkClaimedQueuePrefix).
+// The descent — which nodes are opened, in which order, which leaves are
+// materialised and which failures stop the walk — has to be single-source: the
+// cells cleanup's walk touches are handed to the validation closure as the
+// validator's own read set, so two independently maintained descents could
+// drift apart in exactly the way that ships a short proof. Only the leaf PARSE
+// may differ between callers, and the parity tests over claimedPrefixCells pin
+// that the narrow parse opens the same cells the full one does.
+func walkSemanticQueuePrefixLeaves(
+	queue *tlb.OutMsgQueueAugDict,
+	target msgpool.ShardIdent,
+	bound semanticMessageBound,
+	visit func(key msgpool.QueueKey, value, extra *cell.Slice, leaf semanticQueueLeafCells) error,
+) error {
 	targetPrefix, err := semanticQueueTargetPrefix(target)
 	if err != nil {
 		return err
@@ -77,14 +105,8 @@ func walkSemanticQueuePrefix(
 		if loadErr != nil {
 			return 0, loadErr
 		}
-		entry, parseErr := parseSemanticNeighborQueueEntryLoaded(key, value, extra, leaf)
-		if parseErr != nil {
-			return 0, semanticQueueEntryVerdict{err: parseErr}
-		}
-		if visit != nil {
-			if visitErr := visit(entry); visitErr != nil {
-				return 0, visitErr
-			}
+		if visitErr := visit(key, value, extra, leaf); visitErr != nil {
+			return 0, visitErr
 		}
 
 		return 0, nil

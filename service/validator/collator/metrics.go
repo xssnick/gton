@@ -3,6 +3,7 @@ package collator
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -382,6 +383,11 @@ var candidateAssemblyStages = [...]CollationStage{
 type candidateAssemblyDurations struct {
 	stages  [collationStageCount]time.Duration
 	entered [collationStageCount]bool
+	// substageMu serializes substages appends. The validation closure now runs
+	// on its own goroutine, overlapped with the state update, and reports its
+	// task spans from there while the main goroutine keeps reporting stage
+	// spans of its own; the slice is the one thing both sides append to.
+	substageMu sync.Mutex
 	// substages are spans nested inside a stage, reported beside it when the
 	// build's durations are flushed. See CollationStageObservation.Substage.
 	substages []candidateAssemblySubstage
@@ -400,6 +406,8 @@ func (d *candidateAssemblyDurations) substage(stage CollationStage, name string,
 	if d == nil {
 		return
 	}
+	d.substageMu.Lock()
+	defer d.substageMu.Unlock()
 	d.substages = append(d.substages, candidateAssemblySubstage{stage: stage, name: name, duration: duration})
 }
 

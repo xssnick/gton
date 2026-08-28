@@ -195,8 +195,17 @@ func (t *laneTracer) speculate() {
 // pass-through. It runs on the main goroutine after the worker has finished,
 // which orders it after every append.
 func (t *laneTracer) replay() {
+	t.replaySegment(t.events)
+	t.discard()
+}
+
+// replaySegment forwards one detached segment in order. Unlike replay it
+// leaves the tracer's buffer and mode alone: the events belong to the caller,
+// and the lane may still be buffering for a chained successor whose reads are
+// not part of this segment.
+func (t *laneTracer) replaySegment(events []laneTraceEvent) {
 	c := t.c.Load()
-	for _, event := range t.events {
+	for _, event := range events {
 		switch event.kind {
 		case laneTraceTree:
 			t.usage.OnLoad(event.cell)
@@ -208,7 +217,22 @@ func (t *laneTracer) replay() {
 			t.forwardStat(event.cell)
 		}
 	}
-	t.discard()
+}
+
+// detachEvents hands the buffered events to the caller and installs recycle,
+// emptied, as the new buffer. It exists for chained speculation: two
+// emulations of one lane may be in flight against the tracer before the first
+// retires, and the buffer they share would otherwise mix their reads — replay
+// at retirement must forward exactly the retired plan's own prefix. It runs on
+// the goroutine that produced the events, between two emulations, so no append
+// is concurrent with the swap; the segment it returns is immutable from that
+// point on, which is what lets the main goroutine replay it while the same
+// goroutine buffers the successor.
+func (t *laneTracer) detachEvents(recycle []laneTraceEvent) []laneTraceEvent {
+	events := t.events
+	t.events = recycle[:0]
+
+	return events
 }
 
 // discard drops the buffered events unreplayed and returns the tracer to

@@ -752,13 +752,31 @@ func (c *collation) importAfterLT(lane *accountLane) uint64 {
 // collation has not yet admitted. afterLT must already carry every floor the
 // caller applies; see executePrepared.
 func (c *collation) emulate(lane *accountLane, message *tvm.PreparedMessage, afterLT uint64) (*tvm.TransactionExecutionResult, error) {
+	return c.emulateFrom(lane, lane.current, lane.storageStat, message, afterLT)
+}
+
+// emulateFrom is emulate against an explicit account state: current and
+// storageStat stand where the lane's committed fields would. It exists for
+// chained speculation, where a successor is emulated from its predecessor's
+// emulated post-state before that predecessor has retired — the lane fields
+// still hold the pre-chain state, and the main goroutine is the one that will
+// move them, so a worker must not read them. Committing the predecessor sets
+// the lane fields to exactly the values passed here, which is what keeps a
+// chained emulation byte-identical to one run after the commit.
+func (c *collation) emulateFrom(
+	lane *accountLane,
+	current *tvm.PreparedAccount,
+	storageStat *cell.Cell,
+	message *tvm.PreparedMessage,
+	afterLT uint64,
+) (*tvm.TransactionExecutionResult, error) {
 	minLT := max(c.header.StartLt, afterLT)
 	if minLT >= math.MaxInt64 {
 		return nil, fmt.Errorf("%w: transaction lt overflow", ErrInvalidInput)
 	}
-	result, err := c.builder.machine.EmulateTransaction(c.blockCtx, lane.current, message, tvm.TransactionOptions{
+	result, err := c.builder.machine.EmulateTransaction(c.blockCtx, current, message, tvm.TransactionOptions{
 		LogicalTime:        int64(minLT + 1),
-		AccountStorageStat: lane.storageStat,
+		AccountStorageStat: storageStat,
 		OnCellLoad:         lane.tracer.onExecutionRead,
 	})
 	if err != nil {

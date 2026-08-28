@@ -12,7 +12,9 @@ import (
 // traceProcessedQueueValidationClosure.
 //
 // The two passes walk the identical region — same dictionary, same target
-// shard, same claimed bound, the same walkSemanticQueuePrefix call — and differ
+// shard, same claimed bound, the same walkSemanticQueuePrefixLeaves traversal
+// (cleanup reads the leaves through the narrower claimed-prefix parse, which
+// opens the same cells; the parity tests below pin that) — and differ
 // only in what may become of the reads. Cleanup runs before the Merkle update
 // and must not record: a read taken there lands in the update's OLD side, which
 // cost 697 block bytes on the mainnet fixture and 9175 on the three-times arm.

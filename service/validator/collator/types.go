@@ -557,6 +557,11 @@ type Stats struct {
 	// produces the same block.
 	InternalsSpeculated uint32
 	InternalsDiscarded  uint32
+	// InternalsChained counts the speculated transactions a worker started
+	// straight off their in-wave predecessor's emulated post-state instead of
+	// waiting for that predecessor to retire. Like the two above it describes
+	// scheduling, not the block.
+	InternalsChained uint32
 	// CollationAttempts is how many passes through the collator this block took,
 	// counting the one that produced it: 1 for a block that fit at once, more
 	// for one rebuilt after ErrSizeLimit under retryUnderSizeLimit's escalating

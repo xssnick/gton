@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/rs/zerolog v1.35.1
 	github.com/xssnick/gton v0.0.0
-	github.com/xssnick/tonutils-go v1.18.1-0.20260819105223-d100262c898f
+	github.com/xssnick/tonutils-go v1.18.1-0.20260826121847-289d6710f3c1
 )
 
 require (
@@ -44,7 +44,7 @@ require (
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/rogpeppe/go-internal v1.12.0 // indirect
 	github.com/xssnick/quic-go-ton v0.0.0-20260707110703-14f3237f97b9 // indirect
-	github.com/xssnick/raptorq v1.5.1 // indirect
+	github.com/xssnick/raptorq v1.5.2 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/exp v0.0.0-20260508232706-74f9aab9d74a // indirect
 	golang.org/x/net v0.58.0 // indirect

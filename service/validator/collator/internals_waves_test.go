@@ -102,18 +102,27 @@ func TestInternalWavesProduceTheSequentialBlock(t *testing.T) {
 				// The speculation counters describe the scheduling, not the block,
 				// and are the one thing allowed to differ between arms.
 				got, want := candidate.Stats, reference.Stats
-				got.InternalsSpeculated, got.InternalsDiscarded = 0, 0
-				want.InternalsSpeculated, want.InternalsDiscarded = 0, 0
+				got.InternalsSpeculated, got.InternalsDiscarded, got.InternalsChained = 0, 0, 0
+				want.InternalsSpeculated, want.InternalsDiscarded, want.InternalsChained = 0, 0, 0
 				if got != want {
 					t.Fatalf("%s produced different stats: %+v against %+v", arm.name, got, want)
 				}
 				if arm.workers > 0 {
-					t.Logf("%s: speculated %d, discarded %d", arm.name,
-						candidate.Stats.InternalsSpeculated, candidate.Stats.InternalsDiscarded)
+					t.Logf("%s: speculated %d, discarded %d, chained %d", arm.name,
+						candidate.Stats.InternalsSpeculated, candidate.Stats.InternalsDiscarded,
+						candidate.Stats.InternalsChained)
 					if fixture.fills && candidate.Stats.InternalsDiscarded == 0 {
 						t.Fatalf("%s: the block filled but no speculated plan was discarded — the stopping point "+
 							"landed on a wave boundary and the discard path went untested", arm.name)
 					}
+					if arm.workers > 1 && candidate.Stats.InternalsChained == 0 {
+						t.Fatalf("%s: no in-wave successor was chained — the fixture carries account chains "+
+							"in every wave, so the worker handoff went untested", arm.name)
+					}
+				}
+				if arm.workers == 1 && candidate.Stats.InternalsChained != 0 {
+					t.Fatalf("%s: the inline arm chained %d successors; chaining belongs to workers only",
+						arm.name, candidate.Stats.InternalsChained)
 				}
 			}
 		})

@@ -963,6 +963,52 @@ func (c *collation) finish() (*Candidate, error) {
 		return nil, fmt.Errorf("%w: block exceeds the logical time limit", ErrInvalidInput)
 	}
 	timer.stop()
+	// The validation closure overlaps the state update from here. The closure
+	// is pure reading — its five tasks replay checks against cells the block
+	// has already fixed — and the update's source graph is the one consumer
+	// that must not see those reads: a read recorded before the graph is built
+	// widens the update's old side with cells the reference collator never
+	// puts there. The deferred-recording window is what reconciles the two:
+	// the closure's reads land in a buffer while the table stays frozen for
+	// the graph, and the flush after the join puts them where they always
+	// went — the collated-proof selection, which runs strictly later. The
+	// estimators fed by the first-read callback see each cell exactly once,
+	// at read time, same as before.
+	//
+	// The reference stays sequential here (prepare_proofs after
+	// create_shard_state, collator.cpp:6297 vs :5806); the overlap changes
+	// when the same reads happen, not what they record, and byte identity of
+	// block and proof across the reorder is pinned by the full-collated
+	// goldens on both predecessor shapes.
+	c.usage.BeginDeferredRecording()
+	closureSpan := time.Duration(0)
+	closureDone := make(chan error, 1)
+	go func() {
+		closureStart := time.Now()
+		err := c.traceValidationClosure()
+		closureSpan = time.Since(closureStart)
+		closureDone <- err
+	}()
+	closureJoined := false
+	joinClosure := func() error {
+		if closureJoined {
+			return nil
+		}
+		closureJoined = true
+		err := <-closureDone
+		c.usage.FlushDeferredRecording()
+		return err
+	}
+	// A failure between here and the explicit join must still drain the
+	// closure goroutine and close the window before the collation returns.
+	defer func() {
+		if !closureJoined {
+			<-closureDone
+			c.usage.FlushDeferredRecording()
+			closureJoined = true
+		}
+	}()
+
 	timer = c.req.assembly.start(CollationStageBuildStateUpdate)
 
 	parts, err := c.buildStateAndBlockParts()
@@ -1093,21 +1139,14 @@ func (c *collation) finish() (*Candidate, error) {
 	}()
 
 	timer = c.req.assembly.start(CollationStageValidationClosure)
-	// The validation-closure shims run here, after the state update exists, and
-	// the position is the whole point. The update's source graph descends only
-	// through cells the read set recorded, so a read taken before this line ends
-	// up inside the block: it widens the update's old side with cells the
-	// reference collator never puts there, costing block bytes and breaking
-	// bit-parity with it. Taken after, the same read still reaches the collated
-	// proof — that one is selected from collatedProofEstimate, a separate hash
-	// set the record callback keeps filling — and reaches nothing else.
-	//
-	// This is the split Collator has: prepare_proofs is called from
-	// create_collated_data (collator.cpp:6297), after create_shard_state has
-	// generated the update at :5806 and after create_block.
-	if err = c.traceValidationClosure(); err != nil {
+	// The join with the overlapped closure: from here on the stage span
+	// measures only what the closure failed to hide behind the state update
+	// and the block BOC; the closure's own wall time is reported as the
+	// overlapped_run substage.
+	if err = joinClosure(); err != nil {
 		return nil, err
 	}
+	c.req.assembly.substage(CollationStageValidationClosure, "overlapped_run", closureSpan)
 	if err = c.ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1362,20 +1401,30 @@ func (c *collation) serializeCollatedData(
 	// the tightest
 	// deadline, which is the worst moment to hand a core to a full candidate
 	// compression for a block that no longer exists.
-	var (
+	// The verdict is waited for on its own goroutine rather than polled here.
+	// This used to be a non-blocking select: the verdict normally landed while
+	// the validation closure still ran sequentially between the block branch
+	// and this call, so a single probe at this point caught it. The closure
+	// overlaps the state update now and that gap is gone — the roots above are
+	// ready several milliseconds sooner, the probe raced a verdict that had
+	// not landed yet, and the capsule lost its head start (the capsule-ahead
+	// test is what catches this drift). Waiting on a goroutine keeps both
+	// properties at once: the collated serialization below never stands behind
+	// the block one, and the payload starts at the instant the verdict lands
+	// instead of at whichever fixed probe point happens to come after it.
+	type payloadStart struct {
 		prepared     *simplex.PreparedCandidate
 		blockVerdict bool
-		verdictTaken bool
-	)
-	select {
-	case blockVerdict = <-blockFits:
-		verdictTaken = true
-	default:
 	}
-	if verdictTaken && blockVerdict && c.ctx.Err() == nil &&
-		c.limits.collatedData <= uint64(c.config.maxCollatedBytes) {
-		prepared = startPayload()
-	}
+	started := make(chan payloadStart, 1)
+	go func() {
+		start := payloadStart{blockVerdict: <-blockFits}
+		if start.blockVerdict && c.ctx.Err() == nil &&
+			c.limits.collatedData <= uint64(c.config.maxCollatedBytes) {
+			start.prepared = startPayload()
+		}
+		started <- start
+	}()
 
 	collatedData, err := cell.ToBOCWithOptionsErr(collatedRoots, cell.BOCSerializeOptions{
 		WithCRC32C:     true,
@@ -1396,17 +1445,16 @@ func (c *collation) serializeCollatedData(
 		}
 	}
 
-	// Both limits are settled now, so a payload held back above starts here,
-	// still ahead of the two file hashes, the candidate assembly, the signature
-	// and the commit. The verdict is waited for this time: there is nothing
-	// left on this branch for it to delay.
-	if prepared == nil {
-		if !verdictTaken {
-			blockVerdict = <-blockFits
-		}
-		if blockVerdict {
-			prepared = startPayload()
-		}
+	// Both limits are settled now, so a payload the goroutine held back on the
+	// estimate starts here, still ahead of the two file hashes, the candidate
+	// assembly, the signature and the commit. The estimate stands above the
+	// bytes a collation actually produces, so this late start only ever fires
+	// when the estimate was over the limit while the written bytes are not —
+	// the verdict itself was already waited for above.
+	start := <-started
+	prepared := start.prepared
+	if prepared == nil && start.blockVerdict {
+		prepared = startPayload()
 	}
 
 	return collatedData, collatedRoots, prepared, nil
@@ -1471,9 +1519,16 @@ func (c *collation) buildCollatedRoots(consensusExtra, stateUpdate *cell.Cell) (
 		// doubling from sixteen entries allocates nearly three times what the
 		// table ends up holding and discards the rest. Capacity only: the hash
 		// predicate above is what decides the bytes.
-		previousStateProof, err := c.oldRoot.WithoutTrace().CreateHashUsageProofResolvedSized(func(hash cell.Hash) bool {
+		// Parallel like the state update's own two proofs: the walk clones and
+		// hashes an already-resident selection (the read set holds the loaded
+		// form of everything the predicate keeps), so branch workers split real
+		// work — measured 2.9 → 1.35 ms on the mainnet block, which is most of
+		// the serialize-candidate stage this call sits inside. Byte identity
+		// across worker counts and both predecessor shapes is pinned by the
+		// full-collated goldens and the payload-hint fixtures.
+		previousStateProof, err := c.oldRoot.WithoutTrace().CreateHashUsageProofResolvedSizedParallel(func(hash cell.Hash) bool {
 			return loaded.loaded(hash) || updateSource.emitted(hash)
-		}, c.usage.RecordedCell, c.usage.Size())
+		}, c.usage.RecordedCell, c.usage.Size(), collationParallelism)
 		if err != nil {
 			return nil, fmt.Errorf("build previous state proof: %w", err)
 		}
