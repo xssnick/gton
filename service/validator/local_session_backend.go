@@ -98,7 +98,15 @@ type localConsensusProgressCollator interface {
 
 type localSelfWindowCollator interface {
 	ActivateSelfWindow(context.Context, collator.SelfWindowRequest) error
-	SpeculateSelfWindow(context.Context, collator.SpeculativeWindowRequest) error
+	SpeculateWindow(context.Context, collator.SpeculativeWindowRequest) error
+	SpeculateSessionStart(context.Context, collator.SpeculativeSessionStartRequest) error
+}
+
+// localNotarizationPaceCollator is the optional half of an in-process collator
+// that sizes its blocks to the committee's pace, measured from the
+// certificates on its own candidates; see collator/committee_pace.go.
+type localNotarizationPaceCollator interface {
+	ObserveConsensusNotarized(groups.ShardID, simplex.CandidateID, time.Time)
 }
 
 type localWindowRoute struct {
@@ -131,6 +139,7 @@ type LocalSessionBackend struct {
 	productionMode collator.ProductionMode
 	progress       localConsensusProgressCollator
 	self           localSelfWindowCollator
+	pace           localNotarizationPaceCollator
 	finalized      func(context.Context, ton.BlockIDExt) error
 	accepter       *BlockAccepter
 	metrics        ValidationObserver
@@ -319,6 +328,9 @@ func PrepareLocalSessionBackend(
 		}
 		backend.progress = progress
 		backend.self = self
+		if pace, ok := options.Collator.(localNotarizationPaceCollator); ok {
+			backend.pace = pace
+		}
 		backend.finalized = func(ctx context.Context, block ton.BlockIDExt) error {
 			return progress.ObserveConsensusFinalized(ctx, options.Config.SessionID, block)
 		}
@@ -453,6 +465,7 @@ func (b *LocalSessionBackend) ActivateSession(ctx context.Context, start Session
 
 		return collator.ErrSessionConflict
 	}
+	activated := false
 	if b.validator != nil && !b.collatorDeferred.Load() && !b.collatorUnavailable {
 		if err := b.collator.ActivateSession(ctx, activation); err != nil {
 			if !errors.Is(err, collator.ErrSessionUnavailable) {
@@ -460,12 +473,67 @@ func (b *LocalSessionBackend) ActivateSession(ctx context.Context, start Session
 			}
 
 			b.quarantineCollator(&b.update)
+		} else {
+			activated = true
 		}
 	}
 
 	b.activation = &activation
 	b.publishValidationView()
+	if activated {
+		b.speculateSessionStart(ctx, time.Now())
+	}
 	return nil
+}
+
+// speculateSessionStart bets on window zero of a session this node leads under
+// the round-robin schedule: the first slot starts building now, at activation,
+// while the consensus engine is still starting, and the producer that opens
+// window zero adopts it. On the stand, at a shard split, the committee's
+// first-block timeout for window zero ran out in the very instant our first
+// candidate — collated only after the engine had started — was notarized, and
+// the whole window was skipped. The bet lives for that timeout plus two target
+// rates: a window zero nobody has opened by then is lost regardless.
+func (b *LocalSessionBackend) speculateSessionStart(ctx context.Context, now time.Time) {
+	if b.self == nil || b.validator == nil || b.productionMode != collator.ProductionModeSelf {
+		return
+	}
+	if b.config.Shard.IsMasterchain() {
+		return
+	}
+	windowSize := b.config.Protocol.SlotsPerLeaderWindow
+	validators := uint32(len(b.config.Validators))
+	// Window zero is led by validator 0 / windowSize % validators, that is 0.
+	if windowSize == 0 || validators == 0 || b.validator.Index != 0 {
+		return
+	}
+	params := b.state.Params
+	if params == (simplex.Params{}) {
+		params = simplex.DefaultParams()
+	}
+	targetRate := b.update.TargetRate
+	if targetRate <= 0 {
+		targetRate = params.TargetRate
+	}
+	if targetRate <= 0 {
+		return
+	}
+	deadline := now.Add(params.FirstBlockTimeout + 2*targetRate)
+	request := collator.SpeculativeSessionStartRequest{
+		SessionID: b.config.SessionID,
+		Leader:    b.validator.Index,
+		StartAt:   now,
+		Deadline:  deadline,
+	}
+	specCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	go func() {
+		defer cancel()
+		if err := b.self.SpeculateSessionStart(specCtx, request); err != nil {
+			b.log.Debug().
+				Err(err).
+				Msg("speculative session start was not placed")
+		}
+	}()
 }
 
 func (b *LocalSessionBackend) UpdateSession(ctx context.Context, state SessionState) error {
@@ -511,13 +579,19 @@ func (b *LocalSessionBackend) UpdateSession(ctx context.Context, state SessionSt
 
 			return nil
 		}
-		if err := b.collator.UpdateSession(ctx, next); err != nil {
-			if !errors.Is(err, collator.ErrSessionUnavailable) {
-				return fmt.Errorf("validator local backend: update collator session: %w", err)
-			}
-
+		updateErr := b.collator.UpdateSession(ctx, next)
+		// Deferred means the producer accepted this exact routine refresh and owns
+		// its later pipeline commit. SessionBackend errors promise that no state was
+		// accepted, so translate that producer-only outcome to success here.
+		switch {
+		case updateErr == nil:
+		case errors.Is(updateErr, collator.ErrSessionUnavailable):
 			b.quarantineCollator(&next)
-		} else if b.collatorDeferred.Load() && b.activation != nil {
+		case errors.Is(updateErr, collator.ErrSessionUpdateDeferred):
+		default:
+			return fmt.Errorf("validator local backend: update collator session: %w", updateErr)
+		}
+		if !b.collatorUnavailable && b.collatorDeferred.Load() && b.activation != nil {
 			if err := b.collator.ActivateSession(ctx, *b.activation); err != nil {
 				if !errors.Is(err, collator.ErrSessionUnavailable) {
 					return fmt.Errorf("validator local backend: activate recovered collator session: %w", err)
@@ -811,7 +885,7 @@ func (b *LocalSessionBackend) speculateNextWindow(
 
 			return
 		}
-		if err = b.self.SpeculateSelfWindow(specCtx, collator.SpeculativeWindowRequest{
+		if err = b.self.SpeculateWindow(specCtx, collator.SpeculativeWindowRequest{
 			SessionID: session,
 			StartSlot: bet.startSlot,
 			Leader:    b.validator.Index,
@@ -837,14 +911,27 @@ type speculativeWindowBet struct {
 	deadline  time.Time
 }
 
-// nextWindowBet reports whether the candidate validated at slot is the one whose
-// notarization opens a window this node leads, and on what schedule its first
-// block should be stamped.
+// speculationTailSlots is how many of the last slots of the window before ours
+// place a bet. The window opens on the last candidate of that window the
+// network notarizes: the last slot when the window completes, an earlier one
+// when the committee skips the tail — which on the stand it does to 28% of the
+// reference leaders' windows, and every one of ours that opened after such a
+// skip started its first block from scratch, at the window, with no head start
+// at all. Each of these slots bets on itself; a later bet supersedes an
+// earlier one (Service.SpeculateWindow), so at most one build runs at a time
+// and the parked bet is always on the newest candidate this node has seen.
+const speculationTailSlots = 3
+
+// nextWindowBet reports whether the candidate validated at slot may be the one
+// whose notarization opens a window this node leads, and on what schedule its
+// first block should be stamped.
 //
-// Only the last slot of the current window qualifies. It is the candidate whose
-// certificate opens the next window and therefore the base that window will
-// carry unless the network skips it — the 21% of the time it does, the producer
-// falls back to collating on the base consensus really selected.
+// The last speculationTailSlots slots of the current window qualify. Each is a
+// candidate whose certificate opens the next window if the network notarizes
+// nothing after it, and therefore the base that window will carry unless a
+// later slot lands — in which case the later slot's bet takes over — or the
+// network skips this one too, in which case the producer falls back to
+// collating on the base consensus really selected.
 func (b *LocalSessionBackend) nextWindowBet(
 	view *localValidationView,
 	slot uint32,
@@ -862,8 +949,8 @@ func (b *LocalSessionBackend) nextWindowBet(
 	if windowSize == 0 || validators == 0 || slot == math.MaxUint32 {
 		return speculativeWindowBet{}, false
 	}
-	nextStart := slot + 1
-	if nextStart%windowSize != 0 {
+	nextStart := (slot/windowSize + 1) * windowSize
+	if nextStart-slot > speculationTailSlots {
 		return speculativeWindowBet{}, false
 	}
 	if nextStart/windowSize%validators != b.validator.Index {
@@ -891,17 +978,58 @@ func (b *LocalSessionBackend) nextWindowBet(
 		}
 	}
 
-	// Three target rates bounds a bet nobody comes to collect: longer than any
-	// observed gap between this estimate and the window it predicts, and short
-	// enough that a bet lost to a stalled session dies within a window.
+	// The bet lives for the slots still to come plus two target rates: longer
+	// than any observed gap between this estimate and the window it predicts —
+	// for the last slot, three rates, as before; for an earlier one, the slots
+	// the committee may still notarize or skip on top — and short enough that a
+	// bet lost to a stalled session dies within a window.
 	return speculativeWindowBet{
 		startSlot: nextStart,
 		startAt:   startAt,
-		deadline:  startAt.Add(3 * targetRate),
+		deadline:  startAt.Add(time.Duration(nextStart-slot+2) * targetRate),
 	}, true
 }
 
-func (b *LocalSessionBackend) AcceptBlock(ctx context.Context, acceptance BlockAcceptance) error {
+// ObserveConsensusNotarized hands the committee's certificate on a candidate to
+// the in-process collator, which paces its blocks by the certificates on its
+// own. It runs on the consensus hook and blocks on nothing.
+func (b *LocalSessionBackend) ObserveConsensusNotarized(id simplex.CandidateID, at time.Time) {
+	if b.pace != nil {
+		b.pace.ObserveConsensusNotarized(b.config.Shard, id, at)
+	}
+}
+
+type localBlockAcceptance struct {
+	backend  *LocalSessionBackend
+	prepared *preparedBlockAcceptance
+}
+
+func (b *LocalSessionBackend) PrepareBlockAcceptance(
+	ctx context.Context,
+	acceptance BlockAcceptance,
+) (PreparedBlockAcceptance, error) {
+	b.controlMu.Lock()
+	closed := b.closed
+	b.controlMu.Unlock()
+	if closed {
+		return nil, ErrLocalSessionBackendClosed
+	}
+
+	// Resolve the current registry only from Describe, after local ingress and
+	// publication. A missing snapshot must not hold the finalization chain.
+	resolveView := func() (BlockAcceptanceView, error) {
+		return currentBlockAcceptanceView(b.groups, b.config.Shard)
+	}
+	prepared, err := b.accepter.Prepare(ctx, acceptance, resolveView)
+	if err != nil {
+		return nil, err
+	}
+
+	return &localBlockAcceptance{backend: b, prepared: prepared}, nil
+}
+
+func (p *localBlockAcceptance) Submit(ctx context.Context) error {
+	b := p.backend
 	b.controlMu.Lock()
 	if b.closed {
 		b.controlMu.Unlock()
@@ -910,29 +1038,30 @@ func (b *LocalSessionBackend) AcceptBlock(ctx context.Context, acceptance BlockA
 	observeFinalized := b.finalized != nil && !b.collatorDeferred.Load() && !b.collatorUnavailable
 	b.controlMu.Unlock()
 
-	// The registry view is resolved inside acceptance, after the block reached
-	// local ingress and the network. Resolving it here would abort the whole
-	// acceptance while the group tracker has no snapshot yet, and every retry of
-	// that acceptance carries Retry, so the block would never be published.
-	// Acceptance calls this only for a finalized shard block.
-	resolveView := func() (BlockAcceptanceView, error) {
-		return currentBlockAcceptanceView(b.groups, b.config.Shard)
-	}
-	if err := b.accepter.Accept(ctx, acceptance, resolveView); err != nil {
+	if err := p.prepared.Submit(ctx); err != nil {
 		return err
 	}
 	// A deferred collator was recovered ahead of the node database and already
-	// persisted this consensus progress. Replaying it before UpdateSession
-	// reaches that durable view would address an intentionally inactive
-	// collator and make crash recovery retry forever.
-	if observeFinalized && !acceptance.Certificate.IsZero() &&
-		acceptance.Certificate.Vote().Kind == simplex.VoteFinalize {
-		if err := b.finalized(ctx, acceptance.Candidate.Candidate.Block); err != nil {
+	// persisted this progress. Replaying it before UpdateSession activates the
+	// collator would make crash recovery retry forever.
+	if observeFinalized && p.prepared.final {
+		if err := b.finalized(ctx, p.prepared.link.block); err != nil {
 			return fmt.Errorf("validator local backend: observe consensus finalization: %w", err)
 		}
 	}
 
 	return nil
+}
+
+func (p *localBlockAcceptance) Describe(ctx context.Context) error {
+	p.backend.controlMu.Lock()
+	closed := p.backend.closed
+	p.backend.controlMu.Unlock()
+	if closed {
+		return ErrLocalSessionBackendClosed
+	}
+
+	return p.prepared.Describe(ctx)
 }
 
 func (b *LocalSessionBackend) HandleLeaderWindow(ctx context.Context, window LeaderWindow) error {
@@ -1009,17 +1138,19 @@ func (b *LocalSessionBackend) HandleLeaderWindow(ctx context.Context, window Lea
 	next.CurrentWindowObservedSlot = window.Window.ObservedSlot
 	next.CurrentWindowStartAt = window.StartAt
 	next.CurrentBase = window.Window.Base
-	if err := b.collator.UpdateSession(ctx, next); err != nil {
-		if errors.Is(err, collator.ErrSessionUnavailable) {
-			b.quarantineCollator(&next)
-			b.update = next
-			b.publishValidationView()
+	updateErr := b.collator.UpdateSession(ctx, next)
+	switch {
+	case updateErr == nil:
+	case errors.Is(updateErr, collator.ErrSessionUnavailable):
+		b.quarantineCollator(&next)
+		b.update = next
+		b.publishValidationView()
 
-			return nil
-		}
-
+		return nil
+	case errors.Is(updateErr, collator.ErrSessionUpdateDeferred):
+	default:
 		b.clearWindowRoute(window.Window.StartSlot)
-		return fmt.Errorf("validator local backend: update collator leader window: %w", err)
+		return fmt.Errorf("validator local backend: update collator leader window: %w", updateErr)
 	}
 	b.update = next
 	b.publishValidationView()
@@ -1809,7 +1940,7 @@ func prepareLocalCollatorSession(
 			err,
 		)
 	}
-	if err = producer.UpdateSession(ctx, latest); err != nil {
+	if err = producer.UpdateSession(ctx, latest); err != nil && !errors.Is(err, collator.ErrSessionUpdateDeferred) {
 		return localCollatorPreparation{}, fmt.Errorf(
 			"validator local backend: reconcile recovered collator session: %w",
 			err,

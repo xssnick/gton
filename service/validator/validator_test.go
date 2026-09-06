@@ -434,12 +434,18 @@ func newValidatorTestRuntime() *Runtime {
 
 func newTestService(t *testing.T, opts Options) *Service {
 	t.Helper()
+
+	return newTestServiceWithNode(t, opts, validatorTestNode())
+}
+
+func newTestServiceWithNode(t *testing.T, opts Options, node hooks.Node) *Service {
+	t.Helper()
 	if opts.StatsInterval == 0 {
 		opts.StatsInterval = -1
 	}
 
 	factory := New(validatorTestOptions(opts))
-	ext, err := factory(validatorTestNode())
+	ext, err := factory(node)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -906,26 +912,69 @@ func TestCloseRetriesLocalCollatorCleanup(t *testing.T) {
 	options.Runtime.Close()
 }
 
+// blockingAccountPrewarmer parks the first warming hint until release is
+// closed. It is how a test holds an applied-block hook open inside the pool
+// feed without a seam that exists only for tests.
+type blockingAccountPrewarmer struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (w *blockingAccountPrewarmer) block() {
+	w.once.Do(func() {
+		close(w.entered)
+		<-w.release
+	})
+}
+
+func (w *blockingAccountPrewarmer) EnqueueRoot(cell.Hash) bool {
+	w.block()
+
+	return true
+}
+
+func (w *blockingAccountPrewarmer) EnqueueAccount(int32, [32]byte) bool {
+	w.block()
+
+	return true
+}
+
+func (*blockingAccountPrewarmer) PrewarmAccountNow(int32, [32]byte) bool {
+	return true
+}
+
 func TestCloseWaitsForShardHookAndRejectsLaterHooks(t *testing.T) {
-	s := newTestService(t, Options{})
+	// The hook is parked inside the pool feed, on the prewarm the reseed path
+	// issues for every message it installs. Any point inside the applied-block
+	// hook would do; this one is reached by an ordinary first-sight reseed and
+	// needs no test-only seam in the feed itself.
+	warmer := &blockingAccountPrewarmer{entered: make(chan struct{}), release: make(chan struct{})}
+	s := newTestServiceWithNode(t, Options{}, hooks.Node{
+		Store:            validatorTestStore{err: storage.ErrNotFound},
+		Logger:           zerolog.Nop(),
+		AccountPrewarmer: warmer,
+	})
 	internals := s.pool.Internals()
 
-	processing := s.sourceProcessing(allShard)
-	processing.mu.Lock()
-	locked := true
+	released := false
 	defer func() {
-		if locked {
-			processing.mu.Unlock()
+		if !released {
+			close(warmer.release)
 		}
 	}()
 
+	queued := feedInternalMsg(t, 0x22, 1000)
 	first := appliedEvent(feedBlockRoot(t, nil))
-	first.CurrentState = feedStateRoot(t, nil)
+	first.CurrentState = feedStateRoot(t, map[msgpool.QueueKey]tlb.EnqueuedMsg{
+		feedQueueKey(t, queued, 0x22): {EnqueuedLT: 1000, Msg: feedEnvelope(t, queued)},
+	})
 	hookResult := make(chan error, 1)
 	go func() {
 		hookResult <- s.OnBlockApplied(context.Background(), first)
 	}()
 
+	<-warmer.entered
 	waitFor(t, func() bool {
 		s.lifecycleMu.Lock()
 		defer s.lifecycleMu.Unlock()
@@ -953,8 +1002,8 @@ func TestCloseWaitsForShardHookAndRejectsLaterHooks(t *testing.T) {
 	default:
 	}
 
-	processing.mu.Unlock()
-	locked = false
+	close(warmer.release)
+	released = true
 	if err := <-hookResult; err != nil {
 		t.Fatal(err)
 	}
@@ -1404,9 +1453,12 @@ func feedRef(root *cell.Cell, seqno uint32) msgpool.SourceRef {
 }
 
 func TestInternalsFeedSeedsAppliesAndHealsGaps(t *testing.T) {
-	s := newTestService(t, Options{})
 	warmer := &recordedServiceAccountPrewarmer{}
-	s.accountPrewarmer = warmer
+	s := newTestServiceWithNode(t, Options{}, hooks.Node{
+		Store:            validatorTestStore{err: storage.ErrNotFound},
+		Logger:           zerolog.Nop(),
+		AccountPrewarmer: warmer,
+	})
 	internals := s.pool.Internals()
 
 	// Block 1 arrives with its post-state: the source is unseen, the run
@@ -1494,7 +1546,7 @@ func TestInternalsFeedSeedsAppliesAndHealsGaps(t *testing.T) {
 	}
 	warmed := warmer.snapshot()
 	for index, fill := range []byte{0x22, 0x44, 0x55} {
-		want := pooledAccountPrewarmKey{account: testAddr(fill)}
+		want := prewarmedAccount{account: testAddr(fill)}
 		if warmed[index] != want {
 			t.Fatalf("prewarmed account %d = %+v, want %+v", index, warmed[index], want)
 		}
@@ -1527,7 +1579,7 @@ func TestInternalsTopologyPrunesObsoleteSources(t *testing.T) {
 			Shard: groups.ShardID{Workchain: allShard.Workchain, Shard: int64(allShard.Shard)},
 		}},
 	}}}
-	if err := s.reconcileInternals(current); err != nil {
+	if err := s.feed.Reconcile(msgpool.NewTopology(current)); err != nil {
 		t.Fatal(err)
 	}
 	for index, source := range []msgpool.ShardIdent{allShard, left, right, master} {
@@ -1545,13 +1597,11 @@ func TestInternalsTopologyPrunesObsoleteSources(t *testing.T) {
 	}}, Future: []groups.Session{{
 		Shard: groups.ShardID{Workchain: right.Workchain, Shard: int64(right.Shard)},
 	}}}
-	if err := s.reconcileInternals(next); err != nil {
+	topology := msgpool.NewTopology(next)
+	if err := s.feed.Reconcile(topology); err != nil {
 		t.Fatal(err)
 	}
-	s.internalsTopologyMu.RLock()
-	futureIsSource := s.internalsTopology.ContainsSource(right)
-	s.internalsTopologyMu.RUnlock()
-	if futureIsSource {
+	if topology.ContainsSource(right) {
 		t.Fatal("future destination became an internal-message source before activation")
 	}
 	for _, source := range []msgpool.ShardIdent{allShard, right} {
@@ -1568,13 +1618,13 @@ func TestInternalsTopologyPrunesObsoleteSources(t *testing.T) {
 	obsolete := appliedEvent(cell.BeginCell().MustStoreUInt(0xbad, 32).EndCell())
 	obsolete.Meta.ID.Shard = int64(allShard.Shard)
 	obsolete.Meta.ID.SeqNo = 2
-	s.feedInternals(&sourceProcessing{}, obsolete)
+	s.feed.Observe(appliedBlock(obsolete))
 	if _, err := internals.SourceTop(left, allShard); !errors.Is(err, msgpool.ErrNotFound) {
 		t.Fatalf("obsolete source was restored by a late block: %v", err)
 	}
 }
 
-// reconcileInternals runs synchronously on every masterchain apply, while the
+// Feed.Reconcile runs synchronously on every masterchain apply, while the
 // projection it computes only moves on a split, a merge or a session rotation.
 // The guard that keeps the sweep off the apply path has to be exact in both
 // directions: an unchanged shard configuration must skip it, and a change that
@@ -1594,7 +1644,7 @@ func TestInternalsTopologySkipsOnlyUnchangedProjections(t *testing.T) {
 		}}}
 	}
 
-	if err := s.reconcileInternals(snapshot(allShard)); err != nil {
+	if err := s.feed.Reconcile(msgpool.NewTopology(snapshot(allShard))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1605,7 +1655,7 @@ func TestInternalsTopologySkipsOnlyUnchangedProjections(t *testing.T) {
 	if err := internals.Seed(left, right, ref, nil, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.reconcileInternals(snapshot(allShard)); err != nil {
+	if err := s.feed.Reconcile(msgpool.NewTopology(snapshot(allShard))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := internals.SourceTop(left, right); err != nil {
@@ -1615,7 +1665,7 @@ func TestInternalsTopologySkipsOnlyUnchangedProjections(t *testing.T) {
 	// Same destination list, different registered set. Comparing destinations
 	// alone would call this unchanged and leave a rotated-away neighbor feeding
 	// the pool.
-	if err := s.reconcileInternals(snapshot(left)); err != nil {
+	if err := s.feed.Reconcile(msgpool.NewTopology(snapshot(left))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := internals.SourceTop(left, right); !errors.Is(err, msgpool.ErrNotFound) {
@@ -1927,7 +1977,7 @@ func TestFeedInternalsRecoveryBranches(t *testing.T) {
 			if tt.state != nil {
 				event.CurrentState = tt.state(t)
 			}
-			s.feedInternals(&sourceProcessing{}, event)
+			s.feed.Observe(appliedBlock(event))
 
 			top, err := internals.SourceTop(allShard, allShard)
 			if tt.wantDropped {
@@ -1971,7 +2021,7 @@ func TestFeedInternalsReplacesSameHeightForkFromAppliedState(t *testing.T) {
 	event := appliedEvent(feedBlockRoot(t, nil))
 	event.Meta.ID.SeqNo = 1
 	event.CurrentState = feedStateRoot(t, nil)
-	s.feedInternals(&sourceProcessing{}, event)
+	s.feed.Observe(appliedBlock(event))
 
 	want := feedRef(event.BlockRoot, 1)
 	top, err := internals.SourceTop(allShard, allShard)
@@ -2008,9 +2058,7 @@ func TestSettledStaleHeadCannotRunAfterFreshBlock(t *testing.T) {
 
 	stale := appliedEvent(buildAppliedBlockRoot(t, []*cell.Cell{pooled}))
 	stale.CurrentState = nil
-	if processed := s.processSourceBlock(allShard, stale); processed {
-		t.Fatal("settled stale head ran after a newer block")
-	}
+	s.feed.Observe(appliedBlock(stale))
 	if got := s.pool.Stats().Pooled; got != 1 {
 		t.Fatalf("stale head cleaned %d pooled externals", 1-got)
 	}

@@ -448,7 +448,35 @@ func (s *overlaySubscription) classifyFullBlockBroadcast(
 	if err != nil {
 		return broadcastResult{}, err
 	}
+	if s.node.alreadyHeldBlockBroadcast(block) {
+		return s.acceptedHeldBlockBroadcast(fingerprint, delivery, kind, block, payload, peer)
+	}
 	return s.acceptedFullBlockBroadcast(fingerprint, delivery, trusted, kind, block, sourcePeerID, msg, payload, peer)
+}
+
+// acceptedHeldBlockBroadcast is the outcome for a full block broadcast whose
+// block this node already holds (see alreadyHeldBlockBroadcast): the header
+// alone decides it, so neither the validator-signature pass nor the payload
+// decode runs, and the skipped local processing is accounted as an
+// already_applied drop. The payload is still deduplicated and relayed exactly
+// like a processed block — the overlay forwards the raw bytes, the custom and
+// FastSync fanout stay deduped per block — which is what the reference node
+// does as well: it distributes FEC parts independently of the validator's
+// verdict on the block.
+func (s *overlaySubscription) acceptedHeldBlockBroadcast(fingerprint string, delivery Delivery, kind string, block ton.BlockIDExt, payload *broadcastPayload, peer *overlayPeer) (broadcastResult, error) {
+	if !s.node.deduper.Mark(fingerprint, time.Now()) {
+		s.node.noteBroadcastDrop(s.spec.Name, kind, "seen")
+		return ignoredBroadcastResult(), nil
+	}
+	s.node.noteBroadcastDrop(s.spec.Name, kind, "already_applied")
+
+	result, err := s.acceptedProcessedBlockBroadcast(fingerprint, delivery, kind, block, payload, peer)
+	if err != nil {
+		return broadcastResult{}, err
+	}
+	// the drop above is the only bookkeeping for this delivery
+	result.accepted.skipAcceptedMetric = true
+	return result, nil
 }
 
 func (s *overlaySubscription) classifyBlockCandidateBroadcast(
@@ -614,6 +642,7 @@ func (s *overlaySubscription) inboundRebroadcast(kind string, payload []byte, pe
 		sourcePeerID: sourcePeerID,
 		skipOverlayRebroadcast: delivery == DeliveryTwoStep ||
 			delivery == DeliveryPlumtree ||
+			(delivery == DeliverySimple && s.spec.relaysSimpleBroadcasts()) ||
 			(delivery == DeliveryFEC && s.spec.relaysFECBroadcasts()),
 	}
 }

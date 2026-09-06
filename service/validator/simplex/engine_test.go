@@ -20,6 +20,7 @@ func TestStartAnnouncesFirstWindow(t *testing.T) {
 	requireEqual(t, w.Leader, uint32(0), "window leader")
 	requireEqual(t, w.LocalLeader, true, "local leader")
 	requireEqual(t, w.ObservedAt.Equal(env.clock.Now()), true, "window observation time")
+	requireEqual(t, w.FirstBlockTimeout, env.params.FirstBlockTimeout, "window timeout")
 	requireEqual(t, w.Base.Exists, false, "window base is genesis")
 	env.requireNoFatal()
 
@@ -60,6 +61,7 @@ func TestRecoveryObservesAlignedWindowFromMidWindow(t *testing.T) {
 	requireEqual(t, w.Leader, uint32(1), "window leader")
 	requireEqual(t, w.LocalLeader, true, "local leader")
 	requireEqual(t, w.Base, Parent(last), "base for first unsettled slot")
+	requireEqual(t, w.FirstBlockTimeout, env.eng.voter.firstBlockTimeout, "recovered timeout")
 	env.requireNoFatal()
 }
 
@@ -192,6 +194,30 @@ func TestSkipTimeoutsAndAdaptiveTimeout(t *testing.T) {
 	v := env.eng.voter
 	scaled := time.Duration(float64(env.params.FirstBlockTimeout) * env.params.FirstBlockTimeoutMultiplier)
 	requireEqual(t, v.firstBlockTimeout, scaled, "adaptive first block timeout")
+	requireEqual(t, env.hooks.windows[1].FirstBlockTimeout, scaled, "producer adaptive grace")
+	requireEqual(t, env.hooks.windows[0].FirstBlockTimeout, env.params.FirstBlockTimeout, "earlier observation retains its grace")
+	env.requireNoFatal()
+}
+
+func TestWindowCarriesCappedAdaptiveTimeout(t *testing.T) {
+	params := DefaultParams()
+	params.FirstBlockTimeout = 100 * time.Millisecond
+	params.FirstBlockTimeoutMultiplier = 2
+	params.FirstBlockTimeoutCap = 300 * time.Millisecond
+	env := newTestEnv(t, withLocal(1), withParams(params))
+	env.start()
+
+	for window, want := range []time.Duration{200 * time.Millisecond, 300 * time.Millisecond, 300 * time.Millisecond} {
+		env.clock.set(env.eng.NextWakeup())
+		env.eng.Advance()
+		start := uint32(window) * env.spw
+		for slot := start; slot < start+env.spw; slot++ {
+			env.deliverVote(2, SkipVote(slot))
+			env.deliverVote(3, SkipVote(slot))
+		}
+		requireEqual(t, len(env.hooks.windows), window+2, "next window delivered")
+		requireEqual(t, env.hooks.windows[window+1].FirstBlockTimeout, want, "capped producer grace")
+	}
 	env.requireNoFatal()
 }
 
@@ -442,6 +468,7 @@ func TestObserverFollowsFinality(t *testing.T) {
 	requireEqual(t, env.trans.countVotes(VoteNotarize)+env.trans.countVotes(VoteFinalize)+env.trans.countVotes(VoteSkip), 0, "observer never votes")
 	requireEqual(t, len(env.hooks.windows), 1, "observer sees window")
 	requireEqual(t, env.hooks.windows[0].LocalLeader, false, "observer is not leader")
+	requireEqual(t, env.hooks.windows[0].FirstBlockTimeout, env.params.FirstBlockTimeout, "observer baseline grace")
 	env.requireNoFatal()
 }
 

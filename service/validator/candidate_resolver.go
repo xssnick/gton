@@ -14,6 +14,7 @@ import (
 
 	corestorage "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/gton/service/validator/simplex"
+	"github.com/xssnick/tonutils-go/ton"
 )
 
 var (
@@ -126,9 +127,13 @@ type candidateEntry struct {
 	// asks this field and nothing else.
 	durable   bool
 	candidate *CandidateArtifact
+	// lineage keeps only the authenticated parent/block identity after payload
+	// eviction. Fixed-size hashes cannot retain a decoded wire backing array.
+	// It is installed with the admitted artifact and never changed or released.
+	lineage *candidateLineage
 	// validationRoots is an at-most-once handoff from network decode to the
-	// semantic validator. It is kept outside candidate so every other resolver
-	// consumer sees and retains only the canonical bytes.
+	// semantic validator or observer successor preparation. It is kept outside
+	// candidate so retained resolutions hold only the canonical bytes.
 	validationRoots *candidateValidationRoots
 	wire            []byte
 	// wireHash is the canonical wire identity, kept after the payload itself is
@@ -150,6 +155,7 @@ type candidateEntry struct {
 	// release, which drops the payload it would have produced.
 	lazyWire     *lazyCandidateWire
 	notarization simplex.VerifiedCertificate
+	notarized    chan struct{}
 	load         *resolverFlight
 	resolve      *resolverFlight
 	store        *resolverFlight
@@ -159,6 +165,41 @@ type candidateEntry struct {
 	// store owners and leave the payload in place.
 	storeBuilds int
 	serve       *resolverFlight
+}
+
+// candidateLineage is the part of a verified candidate needed to prove an
+// applied block is an ancestor. The owning entry's exact CandidateID binds it;
+// neither a payload nor its parsed cell trees are retained here.
+type candidateLineage struct {
+	parent    simplex.ParentID
+	workchain int32
+	shard     int64
+	seqno     uint32
+	rootHash  [32]byte
+	fileHash  [32]byte
+}
+
+func (l *candidateLineage) matches(block ton.BlockIDExt) bool {
+	return l.workchain == block.Workchain && l.shard == block.Shard &&
+		l.seqno == block.SeqNo && bytes.Equal(l.rootHash[:], block.RootHash) &&
+		bytes.Equal(l.fileHash[:], block.FileHash)
+}
+
+// retainLineage runs only after candidate admission verified the artifact's
+// signed identity (or durable loading decoded it against the exact entry ID).
+// The metadata is deliberately separate from notarization: ancestry must still
+// obtain that certificate before trusting these links.
+func (e *candidateEntry) retainLineage(artifact *CandidateArtifact) {
+	if e.lineage != nil {
+		return
+	}
+	candidate := artifact.Candidate
+	e.lineage = &candidateLineage{
+		parent: candidate.Parent, workchain: candidate.Block.Workchain,
+		shard: candidate.Block.Shard, seqno: candidate.Block.SeqNo,
+	}
+	copy(e.lineage.rootHash[:], candidate.Block.RootHash)
+	copy(e.lineage.fileHash[:], candidate.Block.FileHash)
 }
 
 // releasable reports whether the payload of an already finalized candidate can
@@ -174,8 +215,8 @@ type candidateEntry struct {
 // they are ever needed again is answered by durable rather than by this
 // predicate.
 //
-// An empty candidate carries no BOCs, so releasing one frees nothing measurable
-// and only costs a lineage walk one storage read per step.
+// An empty candidate carries no BOCs, so releasing one frees nothing measurable.
+// Ordinary candidates retain their compact lineage even when the BOCs go away.
 //
 // A load, store flight or store-side lazy build is left to itself: each is
 // bounded by one storage operation or one serialization and is installing or
@@ -315,6 +356,53 @@ func (r *candidateResolver) entry(id simplex.CandidateID) *candidateEntry {
 	return entry
 }
 
+// localHalves reports which halves of a resolve this node already holds: the
+// certificate, and a payload that is either resident or durable. They are the
+// two conditions localResolution completes on, read without starting a flight.
+//
+// It deliberately does not create an entry: a caller polling for a certificate
+// must not populate the cache with the ids it asks about.
+func (r *candidateResolver) localHalves(id simplex.CandidateID) (notarized, available bool) {
+	r.mu.Lock()
+	if entry := r.entries[id]; entry != nil {
+		notarized = !entry.notarization.IsZero()
+		available = entry.candidate != nil || entry.durable
+	}
+	r.mu.Unlock()
+
+	return notarized, available
+}
+
+// awaitNotarization waits only for locally observed evidence. The payload is
+// already resident, so asking peers while they assemble the quorum adds work
+// without making this state's certification happen any earlier.
+func (r *candidateResolver) awaitNotarization(ctx context.Context, id simplex.CandidateID) error {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return ErrResolverClosed
+	}
+	entry := r.entry(id)
+	if !entry.notarization.IsZero() {
+		r.mu.Unlock()
+		return nil
+	}
+	if entry.notarized == nil {
+		entry.notarized = make(chan struct{})
+	}
+	done := entry.notarized
+	r.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.ctx.Done():
+		return ErrResolverClosed
+	case <-done:
+		return nil
+	}
+}
+
 func (r *candidateResolver) updateParams(params simplex.Params) {
 	r.mu.Lock()
 	if r.params.CandidateResolveRateLimit != params.CandidateResolveRateLimit {
@@ -327,9 +415,17 @@ func (r *candidateResolver) updateParams(params simplex.Params) {
 }
 
 func (r *candidateResolver) observeNotarization(id simplex.CandidateID, certificate simplex.VerifiedCertificate) {
+	if certificate.IsZero() {
+		return
+	}
+
 	r.mu.Lock()
 	entry := r.entry(id)
 	entry.notarization = certificate
+	if entry.notarized != nil {
+		close(entry.notarized)
+		entry.notarized = nil
+	}
 	r.completeResolveLocked(id, entry)
 	r.mu.Unlock()
 }
@@ -445,9 +541,10 @@ func (r *candidateResolver) attachPayloadLocked(
 	hash [32]byte,
 ) {
 	// Both capsules retain parsed DAGs. Resolver state needs only the canonical
-	// bytes, so every retention route strips them in one place. A voting runtime
-	// keeps the validation capsule separately until the first validation claims
-	// it; an observer discards it immediately.
+	// bytes, so every retention route strips them in one place. The runtime
+	// keeps the capsule separately until validation or observer preparation
+	// claims it. Observers drop the collated proof roots immediately.
+	entry.retainLineage(artifact)
 	entry.candidate = artifact
 	if artifact.preparedBlock != nil || artifact.validationRoots != nil {
 		retained := *artifact
@@ -455,8 +552,14 @@ func (r *candidateResolver) attachPayloadLocked(
 		retained.validationRoots = nil
 		entry.candidate = &retained
 	}
-	if r.validateCandidates {
-		entry.validationRoots = artifact.validationRoots
+	entry.validationRoots = artifact.validationRoots
+	if !r.validateCandidates && entry.validationRoots != nil {
+		// An observer only applies the block update. It never needs the full
+		// collated proof set while waiting for notarization.
+		entry.validationRoots = &candidateValidationRoots{
+			block:          artifact.validationRoots.block,
+			builtSuccessor: artifact.validationRoots.builtSuccessor,
+		}
 	}
 	entry.wire = wire
 	entry.wireHash = hash
@@ -486,6 +589,7 @@ func (r *candidateResolver) attachDeferredPayloadLocked(
 		return
 	}
 
+	entry.retainLineage(artifact)
 	entry.candidate = artifact
 	if artifact.preparedBlock != nil || artifact.validationRoots != nil {
 		retained := *artifact
@@ -493,8 +597,14 @@ func (r *candidateResolver) attachDeferredPayloadLocked(
 		retained.validationRoots = nil
 		entry.candidate = &retained
 	}
-	if r.validateCandidates {
-		entry.validationRoots = artifact.validationRoots
+	entry.validationRoots = artifact.validationRoots
+	if !r.validateCandidates && entry.validationRoots != nil {
+		// An observer only applies the block update. It never needs the full
+		// collated proof set while waiting for notarization.
+		entry.validationRoots = &candidateValidationRoots{
+			block:          artifact.validationRoots.block,
+			builtSuccessor: artifact.validationRoots.builtSuccessor,
+		}
 	}
 	entry.lazyWire = lazy
 	r.cache.Candidates++
@@ -840,12 +950,10 @@ func (r *candidateResolver) retainedSlots() uint32 {
 	return candidateRetainedSlots(r.params.TargetRate)
 }
 
-// payloadResidency reports where resolving id will have to get its payload:
-// out of memory, out of the candidate store, or off the network. It is what
-// turns a lineage walk from a duration into an explanation — a walk that is
-// suddenly reading storage is the retention floor having given up, and that
-// distinction was previously only inferable from the log.
-func (r *candidateResolver) payloadResidency(id simplex.CandidateID) LineageStepSource {
+// lineageResidency reports where the ancestry guard must obtain the candidate
+// identity. Certificates are still required for memory hits, just as for a
+// resident payload, but an evicted payload no longer makes this a storage step.
+func (r *candidateResolver) lineageResidency(id simplex.CandidateID) LineageStepSource {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -853,13 +961,59 @@ func (r *candidateResolver) payloadResidency(id simplex.CandidateID) LineageStep
 	switch {
 	case entry == nil:
 		return LineageStepPeer
-	case entry.candidate != nil:
+	case entry.lineage != nil:
 		return LineageStepMemory
 	case entry.durable:
 		return LineageStepStorage
 	default:
 		return LineageStepPeer
 	}
+}
+
+// lineage resolves a certified parent/block identity. Restarted entries have
+// only a durable index and certificate, so they use normal candidate resolution
+// once to authenticate the stored bytes. Subsequent walks retain no dependency
+// on those bytes or on their continued availability in storage.
+func (r *candidateResolver) lineage(ctx context.Context, id simplex.CandidateID) (*candidateLineage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+
+		return nil, ErrResolverClosed
+	}
+	entry := r.entries[id]
+	if entry != nil && entry.lineage != nil && !entry.notarization.IsZero() {
+		lineage, vote := entry.lineage, entry.notarization.Vote()
+		r.mu.Unlock()
+		if vote != simplex.NotarizeVote(id) {
+			return nil, errors.New("validator runtime: ancestry notarization differs from its id")
+		}
+
+		return lineage, nil
+	}
+	r.mu.Unlock()
+
+	resolution, err := r.resolve(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if resolution.Candidate.Candidate.ID != id || resolution.Notarization.Vote() != simplex.NotarizeVote(id) {
+		return nil, errors.New("validator runtime: resolved ancestry candidate differs from its id")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, ErrResolverClosed
+	}
+	// A successful resolve passed an attach function, which installs lineage
+	// before completing the flight. Neither eviction nor close removes entries
+	// or their lineage, even if they release the result's payload meanwhile.
+	return r.entries[id].lineage, nil
 }
 
 // retentionBudgetBytes is the payload budget this session's floor is derived
@@ -885,17 +1039,18 @@ func (r *candidateResolver) retentionBudgetBytes() int64 {
 // payloads themselves. Empty candidates and already-released ones carry no
 // bytes and appear nowhere in it.
 //
-// It runs on the Simplex engine goroutine for every finalization, and its cost
-// is the number of payload-carrying retained entries, which the budget bounds:
-// once the budget is exhausted the floor rises and the sweep releases the rest.
+// It runs on the Simplex engine goroutine for every finalization. Under budget
+// the exact counters answer in constant time. Otherwise it sorts the retained
+// payloads; once the budget is exhausted the floor rises and the sweep releases
+// the rest.
 //
 // Crossing the budget is a degradation point and not an allocation limit.
 // Nothing here refuses a candidate, allocates a smaller one or fails a
 // validation: the floor rises, notifyFinalized releases the payloads below it,
 // and the next consumer that needs one reads it back through loadCandidate —
 // out of the candidate store if consensus accepted it, off the network if it
-// did not. The visible cost is a lineage walk paying storage reads, which the
-// walk's own step-source metric reports.
+// did not. Compact authenticated ancestry stays in memory; only consumers of
+// the actual block bytes pay this read.
 //
 // What the budget bounds is therefore narrower than "this session's payload
 // memory", and the honest ceiling has five terms, only the first of which
@@ -946,6 +1101,13 @@ func (r *candidateResolver) retentionCapFloor(tip uint32) uint32 {
 		floor = tip - backstop
 	}
 
+	// The complete resident population is an upper bound on every subset the
+	// sorted walk below can select. When it fits, only the age backstop can
+	// constrain the floor; future slots and empty candidates cannot weaken it.
+	if r.cache.Bytes <= r.budget.Bytes && r.cache.Candidates <= r.budget.Payloads {
+		return floor
+	}
+
 	payloads := r.retentionScratch[:0]
 	for id, entry := range r.retained {
 		if id.Slot > tip || id.Slot < floor || entry.candidate == nil {
@@ -990,9 +1152,10 @@ func (r *candidateResolver) retentionCapFloor(tip uint32) uint32 {
 // margin above is a distance below the finalized slot, and the lineage walk
 // that consumes these payloads is not: it stops at the applied anchor, which
 // falls arbitrarily far behind finalization when the node's apply pipeline
-// lags. Releasing on the margin alone therefore drops exactly the payloads the
-// next leader window is about to walk, and reloads them from storage once per
-// window forever. The sweep releases below whichever of the two is lower.
+// lags. This same floor protects the state resolver's applied successors; keep
+// the payload budget aligned with those states even though the ancestry guard
+// now follows compact metadata. The sweep releases below whichever bound is
+// lower.
 //
 // This runs on the Simplex engine goroutine for every finalization, so it costs
 // what it retains and not what it remembers: only entries still holding a
@@ -1001,7 +1164,7 @@ func (r *candidateResolver) retentionCapFloor(tip uint32) uint32 {
 // reconsidered at the next finalization.
 //
 // A released entry stays in the map. Its durability claim, notarization
-// certificate and wire identity are the whole point of keeping it, and dropping
+// certificate, compact lineage and wire identity survive release. Dropping
 // it would make a pruned candidate indistinguishable from an unknown one. A
 // released entry that is durable is read back through loadCandidate before any
 // consumer asks the network; one that is not durable was never accepted by
@@ -1735,6 +1898,10 @@ func (r *candidateResolver) mergeVerifiedResponse(
 	}
 	if !notarization.IsZero() && entry.notarization.IsZero() {
 		entry.notarization = notarization
+		if entry.notarized != nil {
+			close(entry.notarized)
+			entry.notarized = nil
+		}
 	}
 	r.completeResolveLocked(id, entry)
 	r.mu.Unlock()

@@ -399,24 +399,38 @@ func (o *PrivateOverlay) QueryRaw(
 	return peer.queryTransport.QueryRaw(ctx, maxAnswerSize, tl.Raw(boxed))
 }
 
+// privateTwoStepQuorumMargin is how many peers past the FEC symbol count this
+// node waits for before it considers its own candidate away. The payload is
+// recoverable from k symbols and every recipient relays the one it took, so
+// k+3 of a fifteen-peer committee holding theirs is the point where waiting
+// longer only measures the worst link: on the stand the fan-out's median was
+// tens of milliseconds against a p90 of 809 ms and a p99 of 2.2 s, and the
+// stragglers finish on their own goroutines either way. Zero would restore the
+// wait for every peer.
+const privateTwoStepQuorumMargin = 3
+
 func (o *PrivateOverlay) BroadcastTwoStep(
 	ctx context.Context,
 	signer overlay.BroadcastSigner,
 	payload []byte,
 	extra tl.Raw,
 	flags int32,
-) (overlay.BroadcastTwoStepSendResult, error) {
+) (TwoStepSendOutcome, error) {
 	if !o.sub.spec.PrivateTwoStep {
-		return overlay.BroadcastTwoStepSendResult{}, errors.New("private overlay two-step broadcast is disabled")
+		return TwoStepSendOutcome{}, errors.New("private overlay two-step broadcast is disabled")
 	}
 	if !o.sub.isActive() {
-		return overlay.BroadcastTwoStepSendResult{}, ErrPrivateOverlayClosed
+		return TwoStepSendOutcome{}, ErrPrivateOverlayClosed
 	}
 	if signer == nil {
 		signer = o.signer
 	}
 
-	peerSet, resolveFailed := o.sub.resolveTwoStepPeerSet(ctx, PeerID{})
+	// No per-peer send budget. C++ pushes every recipient into the transport
+	// actor and returns, with no deadline on the source side at all
+	// (cppnode/ton/overlay/broadcast-twostep.cpp:263-265). The caller's context
+	// is the only bound, and it belongs to a background sender rather than to
+	// the slot that produced the candidate.
 	result, err := overlay.SendBroadcastTwoStep(ctx, overlay.BroadcastTwoStepSendRequest{
 		Signer:      signer,
 		Certificate: overlay.CertificateEmpty{},
@@ -424,12 +438,22 @@ func (o *PrivateOverlay) BroadcastTwoStep(
 		Payload:     payload,
 		Extra:       []byte(extra),
 		Flags:       flags,
-		PeerSet:     peerSet,
-	}, overlay.WithBroadcastTwoStepPeerSendTimeout(twoStepPeerSendTimeout))
-	result.Attempted += len(resolveFailed)
-	result.Failed = append(result.Failed, resolveFailed...)
-	o.sub.markTwoStepPeerFailures(result.Failed)
-	return result, err
+		PeerSet:     o.twoStepPeerSet(),
+	}, overlay.WithBroadcastTwoStepQuorumMargin(privateTwoStepQuorumMargin))
+
+	return o.sub.twoStepSendOutcome(result), err
+}
+
+// twoStepPeerSet is the fan-out of this node's own broadcast, and the only
+// place priority-marked peers are handed out: the private overlay is the
+// candidate transport, and its BroadcastTwoStep has exactly one caller, the
+// collator's candidate sender. Stand, 2026-09-03: the candidate's ~200 kB
+// symbol queued behind up to 14 relayed symbols on the same per-peer
+// connection, p90 1.84 s against a p50 of 0.10 s (see quicPrioritySendLatch).
+// Forwarding of received symbols and queued rebroadcasts resolve the plain set
+// and defer to these writes.
+func (o *PrivateOverlay) twoStepPeerSet() overlay.StaticBroadcastPeerSet {
+	return prioritizeTwoStepPeerSet(o.sub.resolveTwoStepPeerSet(PeerID{}))
 }
 
 func (o *PrivateOverlay) peer(id PeerID) (*overlayPeer, error) {

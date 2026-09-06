@@ -54,6 +54,11 @@ type Options struct {
 	Controller Controller
 	ShardTops  ShardTopDescriptionSink
 	Messages   *msgpool.Pool
+	// Feed advances the message pool by applied blocks. It is the same
+	// component a validator drives from its own hook: without it the collator's
+	// out-queue runs are never at the head and every leader window pays a full
+	// queue walk out of state before it can collate.
+	Feed *msgpool.Feed
 }
 
 // New returns the lifecycle and console adapter for an already composed
@@ -70,6 +75,9 @@ func New(options Options) hooks.ExtensionFactory {
 		if options.Messages == nil {
 			return nil, errors.New("collator extension: message pool is required")
 		}
+		if options.Feed == nil {
+			return nil, errors.New("collator extension: message pool feed is required")
+		}
 		if node.Store == nil {
 			return nil, errors.New("collator extension: node store is required")
 		}
@@ -80,6 +88,7 @@ func New(options Options) hooks.ExtensionFactory {
 			history:          node.Store,
 			shardTops:        options.ShardTops,
 			messages:         options.Messages,
+			feed:             options.Feed,
 			accountPrewarmer: node.AccountPrewarmer,
 			log:              node.Logger.With().Str("component", "collator").Logger(),
 			state:            extensionNew,
@@ -118,9 +127,11 @@ type Extension struct {
 	history          groups.MasterchainHistory
 	shardTops        ShardTopDescriptionSink
 	messages         *msgpool.Pool
+	feed             *msgpool.Feed
 	accountPrewarmer hooks.AccountPrewarmer
 	log              zerolog.Logger
 
+	sweep    sync.WaitGroup
 	mu       sync.Mutex
 	state    extensionState
 	cancel   context.CancelFunc
@@ -175,6 +186,14 @@ func (e *Extension) Start(ctx context.Context) error {
 	e.done = done
 	e.startErr = nil
 	e.mu.Unlock()
+
+	// The deferred-head sweep, which a validator drives from its own service
+	// loop. It runs for the whole lifetime rather than only after a successful
+	// bootstrap: blocks are already being observed while the controller is
+	// still waiting for its first masterchain snapshot, and their heads are
+	// exactly what arms the pool on a chain that is not producing.
+	e.sweep.Add(1)
+	go e.sweepSettledHeads(lifetime)
 
 	err := e.controller.BootstrapMasterchain(lifetime, e.history, buffered, time.Now())
 	if errors.Is(err, groups.ErrNoSnapshot) {
@@ -279,6 +298,25 @@ func (e *Extension) finishStart(cancel context.CancelFunc, done chan struct{}, e
 	return err
 }
 
+// sweepSettledHeads arms the pool from a chain head that stopped moving. The
+// interval is a fraction of the settle delay for the same reason the validator
+// service uses one: the delay bounds how long a settled head waits, and a
+// ticker at the delay itself would double it.
+func (e *Extension) sweepSettledHeads(lifetime context.Context) {
+	defer e.sweep.Done()
+
+	ticker := time.NewTicker(max(e.feed.SettleDelay()/3, 10*time.Millisecond))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-lifetime.Done():
+			return
+		case <-ticker.C:
+			e.feed.SweepSettled()
+		}
+	}
+}
+
 func (e *Extension) Close(ctx context.Context) error {
 	// Every field below is already under e.mu, and Controller.Close is
 	// idempotent under its own lock. A second mutex here would only serialize
@@ -310,6 +348,9 @@ func (e *Extension) Close(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	// Joined after the cancel above and before the controller goes away: the
+	// sweep touches the pool the controller's sessions read.
+	e.sweep.Wait()
 
 	if err := e.controller.Close(ctx); err != nil {
 		return err
@@ -331,7 +372,7 @@ func (e *Extension) OnBlockApplied(ctx context.Context, event hooks.BlockApplied
 		return errors.New("collator extension: applied block metadata is absent")
 	}
 	if event.Meta.ID.Workchain != masterchainWorkchain || event.Meta.ID.Shard != masterchainShard {
-		e.cleanAppliedExternals(event)
+		e.feed.Observe(appliedBlock(event))
 
 		return nil
 	}
@@ -351,14 +392,14 @@ func (e *Extension) OnBlockApplied(ctx context.Context, event hooks.BlockApplied
 		case extensionNew:
 			e.bufferStateLocked(event)
 			e.mu.Unlock()
-			e.cleanAppliedExternals(event)
+			e.feed.Observe(appliedBlock(event))
 
 			return nil
 		case extensionStarting:
 			if e.waiting {
 				e.bufferStateLocked(event)
 				e.mu.Unlock()
-				e.cleanAppliedExternals(event)
+				e.feed.Observe(appliedBlock(event))
 
 				return nil
 			}
@@ -380,7 +421,7 @@ func (e *Extension) OnBlockApplied(ctx context.Context, event hooks.BlockApplied
 				AsOf:      time.Now(),
 			})
 			if err == nil {
-				e.cleanAppliedExternals(event)
+				e.feed.Observe(appliedBlock(event))
 			}
 
 			return err
@@ -428,19 +469,18 @@ func (e *Extension) OnShardTopBlockDescription(
 	return e.shardTops.StoreShardTopDescription(ctx, description, root)
 }
 
-func (e *Extension) cleanAppliedExternals(event hooks.BlockAppliedEvent) {
-	hashes, err := msgpool.AppliedNormHashesFromBlockRoot(event.BlockRoot)
-	if err != nil {
-		e.log.Warn().Err(err).Str("block", storage.FormatBlockRef(event.Meta.ID)).
-			Msg("cannot extract applied external messages")
-
-		return
+// appliedBlock is the node's applied-block event as the message pool reads it.
+// The same conversion exists on the validator side; the pool is deliberately
+// not given the node's hook type, so each deployment names the fields the feed
+// reads at its own boundary.
+func appliedBlock(event hooks.BlockAppliedEvent) msgpool.AppliedBlock {
+	return msgpool.AppliedBlock{
+		ID:        event.Meta.ID,
+		BlockRoot: event.BlockRoot,
+		StateRoot: event.CurrentState,
+		StartLT:   event.Meta.StartLT,
+		GenUTime:  event.Meta.GenUTime,
 	}
-	if len(hashes) == 0 {
-		return
-	}
-
-	e.messages.EraseApplied(hashes)
 }
 
 func (e *Extension) handleStatus(ctx context.Context, args []string) (string, error) {

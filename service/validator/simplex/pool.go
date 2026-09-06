@@ -310,6 +310,7 @@ func (e *Engine) applyVote(idx uint32, v Vote, sig []byte, tolerateConflicts boo
 	if !applied {
 		return false
 	}
+	e.noteOwnCandidateVote(idx, v)
 	e.onVoteApplied(idx, v, slot)
 	return true
 }
@@ -437,6 +438,7 @@ func (e *Engine) storeSavedCertificate(slot *poolSlot, vc VerifiedCertificate) {
 		}
 	}
 	e.log.Info().Msgf("obtained certificate for %s: %s", cert.Vote, voters)
+	e.reportOwnCandidateNotarized(cert)
 
 	if !e.suppressCertBroadcast {
 		e.transport.BroadcastToRandom(e.params.CertificateGossipNeighbors, cert.Serialize())
@@ -612,21 +614,24 @@ func (e *Engine) advancePresent() {
 }
 
 func (e *Engine) windowObserved(startSlot uint32, base ParentID) {
+	firstBlockTimeout := e.params.FirstBlockTimeout
 	if e.voter != nil {
 		e.voterWindowObserved(startSlot)
+		firstBlockTimeout = e.voter.firstBlockTimeout
 	}
 
 	windowStart := startSlot - startSlot%e.spw
 	windowEnd := windowStart + e.spw
 	leader := e.schedule.ExpectedLeader(windowStart)
 	window := Window{
-		Base:         base,
-		ObservedSlot: startSlot,
-		StartSlot:    windowStart,
-		EndSlot:      windowEnd,
-		Leader:       leader,
-		LocalLeader:  e.localIndex >= 0 && leader == uint32(e.localIndex),
-		ObservedAt:   e.clock.Now(),
+		Base:              base,
+		ObservedSlot:      startSlot,
+		StartSlot:         windowStart,
+		EndSlot:           windowEnd,
+		Leader:            leader,
+		LocalLeader:       e.localIndex >= 0 && leader == uint32(e.localIndex),
+		ObservedAt:        e.clock.Now(),
+		FirstBlockTimeout: firstBlockTimeout,
 	}
 	e.enqueue(func() { e.hooks.HandleWindow(window) })
 }

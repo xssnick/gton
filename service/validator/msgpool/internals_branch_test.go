@@ -134,6 +134,152 @@ func TestBranchMergeBaseAndCandidateRetry(t *testing.T) {
 	requireLts(t, cut, 200, 250, 300)
 }
 
+func TestBranchReusesLinearParentAfterItsPromotion(t *testing.T) {
+	pool, branch, base := branchFixture(t, 2)
+	defer pool.Close()
+	defer branch.Close()
+
+	parent := sref(11, 0xc1).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID:    parent,
+		Seqno: 11,
+		Base:  []CandidateSource{{Source: baseSource, Visible: base}},
+		Delta: &InternalsDelta{RemovedKeys: []QueueKey{imsg(1_000, 0).Key}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	added := imsg(1_200, 12)
+	bindTestMessages(testOwner, 12, []*InternalMessage{added})
+	delta := &InternalsDelta{
+		Added:       []*InternalMessage{added},
+		RemovedKeys: []QueueKey{imsg(1_001, 1).Key},
+	}
+	candidate := sref(12, 0xc2).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID: candidate, Parent: &parent, Seqno: 12, Delta: delta,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	promoted := CandidateRequest{
+		ID: candidate,
+		Base: []CandidateSource{{
+			Source:  testOwner,
+			Visible: SourceRef{Seqno: 11, RootHash: parent},
+		}},
+		Seqno: 12,
+		Delta: delta,
+	}
+	if err := branch.ReusePromotedCandidate(promoted); err != nil {
+		t.Fatalf("verify Parent=P as Base=P without a new snapshot: %v", err)
+	}
+	if ownership, err := branch.AddOrReusePromotedCandidate(promoted); err != nil {
+		t.Fatalf("reuse Parent=P as Base=P: %v", err)
+	} else if ownership != CandidateInstallReused {
+		t.Fatalf("promoted candidate ownership = %d, want reused", ownership)
+	}
+	if err := branch.AddCandidate(promoted); !errors.Is(err, ErrCutStale) {
+		t.Fatalf("strict AddCandidate accepted the representation change: %v", err)
+	}
+
+	conflictingDelta := promoted
+	conflictingDelta.Delta = &InternalsDelta{}
+	if _, err := branch.AddOrReusePromotedCandidate(conflictingDelta); !errors.Is(err, ErrCutStale) {
+		t.Fatalf("reuse with another delta = %v, want ErrCutStale", err)
+	}
+	conflictingBase := promoted
+	conflictingBase.Base = []CandidateSource{{
+		Source:  testOwner,
+		Visible: SourceRef{Seqno: 11, RootHash: [32]byte{0xdd}},
+	}}
+	if _, err := branch.AddOrReusePromotedCandidate(conflictingBase); !errors.Is(err, ErrCutStale) {
+		t.Fatalf("reuse with another applied base = %v, want ErrCutStale", err)
+	}
+	mergeBase := promoted
+	mergeBase.Base = append(mergeBase.Base, CandidateSource{Source: leftShard, Visible: base})
+	if _, err := branch.AddOrReusePromotedCandidate(mergeBase); !errors.Is(err, ErrCutStale) {
+		t.Fatalf("reuse with a merge base = %v, want ErrCutStale", err)
+	}
+	missing := promoted
+	missing.ID = [32]byte{0xee}
+	if err := branch.ReusePromotedCandidate(missing); !errors.Is(err, ErrCandidateNotFound) {
+		t.Fatalf("reuse of missing candidate = %v, want ErrCandidateNotFound", err)
+	}
+
+	cut, err := branch.Cut(CutRequest{
+		Sources:      map[ShardIdent]CutSource{baseSource: {Visible: base}},
+		CandidateTip: &candidate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLts(t, cut, 1_200)
+}
+
+func TestBranchReusesLinearBaseAsItsCandidateParent(t *testing.T) {
+	pool, branch, base := branchFixture(t, 2)
+	defer pool.Close()
+	defer branch.Close()
+
+	parent := sref(11, 0xd1).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID:    parent,
+		Seqno: 11,
+		Base:  []CandidateSource{{Source: baseSource, Visible: base}},
+		Delta: &InternalsDelta{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Internals().ApplyBlock(
+		testOwner,
+		baseSource,
+		SourceRef{Seqno: 11, RootHash: parent},
+		&InternalsDelta{},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	added := imsg(1_200, 13)
+	bindTestMessages(testOwner, 12, []*InternalMessage{added})
+	delta := &InternalsDelta{
+		Added:       []*InternalMessage{added},
+		RemovedKeys: []QueueKey{imsg(1_001, 1).Key},
+	}
+	candidate := sref(12, 0xd2).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID: candidate,
+		Base: []CandidateSource{{
+			Source:  testOwner,
+			Visible: SourceRef{Seqno: 11, RootHash: parent},
+		}},
+		Seqno: 12,
+		Delta: delta,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	retry := CandidateRequest{
+		ID: candidate, Parent: &parent, Seqno: 12, Delta: delta,
+	}
+	if err := branch.ReusePromotedCandidate(retry); err != nil {
+		t.Fatalf("verify Base=P as Parent=P: %v", err)
+	}
+	if ownership, err := branch.AddOrReusePromotedCandidate(retry); err != nil {
+		t.Fatalf("reuse Base=P as Parent=P: %v", err)
+	} else if ownership != CandidateInstallReused {
+		t.Fatalf("continued candidate ownership = %d, want reused", ownership)
+	}
+
+	cut, err := branch.Cut(CutRequest{
+		Sources:      map[ShardIdent]CutSource{baseSource: {Visible: base}},
+		CandidateTip: &candidate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLts(t, cut, 1_000, 1_200)
+}
+
 func TestBranchAllowsRemoveAndReaddAcrossCandidateLineage(t *testing.T) {
 	pool, branch, base := branchFixture(t, 1)
 	defer pool.Close()
@@ -539,6 +685,43 @@ func TestBranchRetainDropAndClose(t *testing.T) {
 	}
 }
 
+func TestBranchRetainPreservesSelectedDescendants(t *testing.T) {
+	pool, branch, base := branchFixture(t, 0)
+	defer pool.Close()
+
+	root := sref(11, 0xc1).RootHash
+	selected := sref(12, 0xc2).RootHash
+	diverged := sref(12, 0xd2).RootHash
+	descendant := sref(13, 0xc3).RootHash
+	requests := []CandidateRequest{
+		{ID: root, Seqno: 11, Base: []CandidateSource{{Source: baseSource, Visible: base}}, Delta: &InternalsDelta{}},
+		{ID: selected, Parent: &root, Seqno: 12, Delta: &InternalsDelta{}},
+		{ID: diverged, Parent: &root, Seqno: 12, Delta: &InternalsDelta{}},
+		{ID: descendant, Parent: &selected, Seqno: 13, Delta: &InternalsDelta{}},
+	}
+	for _, request := range requests {
+		if err := branch.AddCandidate(request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := branch.Retain(&selected); err != nil {
+		t.Fatal(err)
+	}
+	if !branch.HasCandidate(root) || !branch.HasCandidate(selected) || !branch.HasCandidate(descendant) {
+		t.Fatal("selected lineage or its live descendant was discarded")
+	}
+	if branch.HasCandidate(diverged) {
+		t.Fatal("fork which diverged before the selected tip was retained")
+	}
+
+	next := sref(14, 0xc4).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID: next, Parent: &descendant, Seqno: 14, Delta: &InternalsDelta{},
+	}); err != nil {
+		t.Fatalf("append after retaining selected lineage: %v", err)
+	}
+}
+
 func TestBranchConcurrentFeedCutRetainAndClose(t *testing.T) {
 	pool, branch, base := branchFixture(t, 1)
 	defer pool.Close()
@@ -619,4 +802,106 @@ func branchFixture(t testing.TB, count int) (*Pool, *Branch, SourceRef) {
 func cellForNewExport(envelope *cell.Cell) *cell.Cell {
 	return cell.BeginCell().MustStoreUInt(0b001, 3).MustStoreRef(envelope).
 		MustStoreRef(cell.BeginCell().MustStoreUInt(1, 1).EndCell()).EndCell()
+}
+
+// TestBranchSourcePinnableMatchesPinSource pins the probe to the operation it
+// predicts. The per-slot masterchain view pick asks SourcePinnable of every
+// neighbour top a candidate view registers before it commits to that view, and
+// only a probe that answers exactly what PinSource would answer keeps the pick
+// honest: a stricter probe rejects views whose tops are in fact already
+// committed and walks the node back to a stale masterchain view — the frozen
+// view that starves a leader window of imported internals; a looser one lets
+// the slot discover the miss inside the build, where it costs the from-state
+// seed walk or, on a build that may not seed, the slot itself.
+//
+// The pinned-run tail pins the other half: once a run is pinned into the
+// branch it stays pinnable for the whole session, even after the committed
+// history that produced it is gone, so a window that pinned a top early does
+// not lose it mid-window to a trim.
+func TestBranchSourcePinnableMatchesPinSource(t *testing.T) {
+	cases := []struct {
+		name    string
+		source  ShardIdent
+		visible func(base SourceRef) SourceRef
+		want    bool
+	}{
+		{
+			name:    "untracked source",
+			source:  leftShard,
+			visible: func(base SourceRef) SourceRef { return base },
+		},
+		{
+			name:    "ahead of the committed top",
+			source:  baseSource,
+			visible: func(base SourceRef) SourceRef { return SourceRef{Seqno: base.Seqno + 1, RootHash: base.RootHash} },
+		},
+		{
+			name:    "below the seed floor",
+			source:  baseSource,
+			visible: func(base SourceRef) SourceRef { return SourceRef{Seqno: base.Seqno - 1, RootHash: base.RootHash} },
+		},
+		{
+			name:    "root hash mismatch at the position",
+			source:  baseSource,
+			visible: func(base SourceRef) SourceRef { return sref(base.Seqno, 0xbb) },
+		},
+		{
+			name:    "exact committed top",
+			source:  baseSource,
+			visible: func(base SourceRef) SourceRef { return base },
+			want:    true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// A fresh branch per case: PinSource caches what it pins, so a
+			// shared branch would answer a later probe from that cache
+			// instead of from committed state, and the disagreement this
+			// test looks for could not appear.
+			pool, branch, base := branchFixture(t, 3)
+			defer pool.Close()
+			defer branch.Close()
+
+			visible := tc.visible(base)
+			probe := branch.SourcePinnable(tc.source, visible)
+			err := branch.PinSource(tc.source, visible)
+			if probe != (err == nil) {
+				t.Fatalf("SourcePinnable = %v, PinSource = %v", probe, err)
+			}
+			if probe != tc.want {
+				t.Fatalf("SourcePinnable = %v, want %v (PinSource = %v)", probe, tc.want, err)
+			}
+		})
+	}
+
+	t.Run("pinned run outlives its committed history", func(t *testing.T) {
+		pool, branch, base := branchFixture(t, 3)
+		defer pool.Close()
+		defer branch.Close()
+
+		if err := branch.PinSource(baseSource, base); err != nil {
+			t.Fatal(err)
+		}
+		// Applying past the retained history window moves the run's floor
+		// beyond the pinned position, the same way a neighbour that keeps
+		// producing does to a top pinned at the start of a leader window.
+		for seqno := base.Seqno + 1; seqno <= base.Seqno+maxSourceRefHistory; seqno++ {
+			if err := pool.Internals().ApplyBlock(
+				testOwner, baseSource, sref(seqno, byte(seqno)), &InternalsDelta{},
+			); err != nil {
+				t.Fatalf("apply %d: %v", seqno, err)
+			}
+		}
+		if err := pool.Internals().ValidateSourceRef(testOwner, baseSource, base); !errors.Is(err, ErrCutStale) {
+			t.Fatalf("committed state still holds the pinned position: %v", err)
+		}
+
+		if !branch.SourcePinnable(baseSource, base) {
+			t.Fatal("probe lost a run this branch already holds")
+		}
+		if err := branch.PinSource(baseSource, base); err != nil {
+			t.Fatalf("PinSource disagrees with the probe on a held run: %v", err)
+		}
+	})
 }

@@ -2,6 +2,8 @@ package collator
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -63,6 +65,15 @@ type blockCreateStatsInput struct {
 	now                uint32
 	shardBlockCreators map[[32]byte]uint32
 	masterchainCreator [32]byte
+	// scanStart is where the stale-entry sweep begins. The reference draws it
+	// from a real PRNG; ours has to be a function of the candidate, because a
+	// re-collation of the same slot — the size-limit retry, the speculative
+	// self-window handoff, the goldens — must reproduce the block byte for
+	// byte. See creatorStatsScanStart.
+	scanStart [32]byte
+	// scanKeys is how many consecutive entries the sweep visits. Zero disables
+	// it, which is what every path other than a masterchain block build wants.
+	scanKeys int
 }
 
 type creatorStatsIncrement struct {
@@ -142,6 +153,10 @@ func updateBlockCreateStats(input blockCreateStatsInput) (*cell.Cell, error) {
 		if err = dict.SetBuilderByBytesKey(creator[:], value); err != nil {
 			return nil, fmt.Errorf("%w: store creator statistics %x: %v", ErrInvalidInput, creator, err)
 		}
+	}
+
+	if _, err := sweepStaleCreatorStats(dict, input.scanStart, input.now, input.scanKeys); err != nil {
+		return nil, err
 	}
 
 	builder := cell.BeginCell()
@@ -556,6 +571,98 @@ func (c *discountedCounter) increaseBy(count, now uint32) error {
 		count65536:  count65536 + scaled,
 	}
 	return nil
+}
+
+// creatorStatsScanKeys is how many consecutive dictionary entries one
+// masterchain block sweeps for stale creators. Taken verbatim from the
+// reference collator (cppnode/ton/validator/impl/collator.cpp: the partial-scan
+// loop bounded at 100), because the width is what decides how much of the
+// predecessor dictionary the block's state update has to expose: the scanned
+// range stops being one pruned branch and becomes its real cells.
+const creatorStatsScanKeys = 100
+
+// creatorStatsScanStart is the deterministic replacement for the reference's
+// prng::rand_gen().rand_bytes start key.
+//
+// The sweep is producer-local — a validator accepts a block whether or not it
+// deletes anything — but the block BYTES are not: a re-collation of the same
+// slot must reproduce them exactly, or the size-limit retry, the speculative
+// self-window handoff and the full-collated goldens all start comparing blocks
+// that legitimately differ. So the entropy comes from data that is fixed for
+// the slot before collation starts and travels inside the block itself: the
+// candidate's random seed, its sequence number and its generation time.
+func creatorStatsScanStart(seed [32]byte, seqno, now uint32) [32]byte {
+	var buf [len("gton block_create_stats gc v1") + 32 + 8]byte
+	n := copy(buf[:], "gton block_create_stats gc v1")
+	n += copy(buf[n:], seed[:])
+	binary.BigEndian.PutUint32(buf[n:], seqno)
+	binary.BigEndian.PutUint32(buf[n+4:], now)
+
+	return sha256.Sum256(buf[:])
+}
+
+// sweepStaleCreatorStats deletes the entries whose counters have decayed to
+// nothing, walking at most budget consecutive keys from start.
+//
+// This is the reference's partial scan: a full filter over a dictionary that
+// holds one entry per validator that produced a block in the last few weeks
+// would read the whole thing into the block's state update, so the reference
+// samples a window per block instead and lets consecutive blocks cover the
+// dictionary between them. The deletion predicate is the reference's
+// creator_count_outdated: amortize both counters to now and delete when both
+// 65536-second counters have reached exactly zero — not almostZero, which is
+// the validator's tolerance for a counter it did not compute itself.
+//
+// Deletions are collected before they are applied: the iterator walks the
+// dictionary being mutated.
+func sweepStaleCreatorStats(dict *cell.Dictionary, start [32]byte, now uint32, budget int) (int, error) {
+	if dict == nil || budget <= 0 {
+		return 0, nil
+	}
+
+	startKey := cell.BeginCell().MustStoreSlice(start[:], creatorStatsKeyBits).EndCell()
+	iterator, err := dict.IteratorAt(startKey, false, false, true)
+	if err != nil {
+		return 0, fmt.Errorf("%w: scan creator statistics: %v", ErrInvalidInput, err)
+	}
+
+	var stale [][]byte
+	for scanned := 0; scanned < budget && iterator.Next(); scanned++ {
+		item := iterator.Item()
+		keySlice, err := item.Key.BeginParse()
+		if err != nil {
+			return 0, fmt.Errorf("%w: parse scanned creator key: %v", ErrInvalidInput, err)
+		}
+		key, err := keySlice.LoadSlice(creatorStatsKeyBits)
+		if err != nil {
+			return 0, fmt.Errorf("%w: decode scanned creator key: %v", ErrInvalidInput, err)
+		}
+		entry, err := loadCreatorStats(item.Value)
+		if err != nil {
+			return 0, fmt.Errorf("%w: decode scanned creator statistics %x: %v", ErrInvalidInput, key, err)
+		}
+		if err = entry.masterchain.increaseBy(0, now); err != nil {
+			return 0, fmt.Errorf("%w: amortize masterchain counter %x: %v", ErrInvalidInput, key, err)
+		}
+		if err = entry.shardchain.increaseBy(0, now); err != nil {
+			return 0, fmt.Errorf("%w: amortize shardchain counter %x: %v", ErrInvalidInput, key, err)
+		}
+		if entry.masterchain.count65536|entry.shardchain.count65536 == 0 {
+			stale = append(stale, key)
+		}
+	}
+	if err = iterator.Err(); err != nil {
+		return 0, fmt.Errorf("%w: scan creator statistics: %v", ErrInvalidInput, err)
+	}
+
+	for _, key := range stale {
+		keyCell := cell.BeginCell().MustStoreSlice(key, creatorStatsKeyBits).EndCell()
+		if err = dict.Delete(keyCell); err != nil {
+			return 0, fmt.Errorf("%w: delete stale creator statistics %x: %v", ErrInvalidInput, key, err)
+		}
+	}
+
+	return len(stale), nil
 }
 
 func (c discountedCounter) almostZero() bool {

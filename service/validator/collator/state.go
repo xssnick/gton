@@ -46,6 +46,21 @@ func (c *collation) buildStateAndBlockParts() (blockParts, error) {
 		return c.buildMasterStateAndBlockParts()
 	}
 
+	// Everything below runs inside the deferred-recording window opened in
+	// finish(): the validation closure overlaps this build, and the window is a
+	// property of the whole read set rather than of the closure's goroutine. So
+	// a structure FIRST read here never reaches the read table, the state
+	// update's source graph cannot descend into it, and every untouched subtree
+	// under it is copied into the update instead of pruned. That is exactly how
+	// the masterchain block create statistics turned our masterchain blocks into
+	// 816 kB against the reference's 12.7 kB.
+	//
+	// What follows is safe because it reads nothing new: the queue and the
+	// accounts were traversed by execution, the history and statistics come off
+	// the predecessor state parsed in prepare. Anything added here that walks a
+	// predecessor dictionary for the first time has to be hoisted above the
+	// window in finish() instead — the full-collated goldens will fail on it,
+	// but they will only report that the bytes moved.
 	queueInfo, err := c.buildQueueInfo()
 	if err != nil {
 		return blockParts{}, err

@@ -110,14 +110,14 @@ func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
 			}
 			if isArchiveCatchUpRetryError(err) {
 				if err = r.restartPipeline(err); err != nil {
-					return nil, err
+					return nil, r.returnWithProgress(err)
 				}
 				continue
 			}
 			return nil, r.returnWithProgress(err)
 		}
 		if window.startSeqno != r.current.ShardClientSeqno+1 {
-			return nil, fmt.Errorf("archive pipeline returned window #%d after current seqno %d", window.startSeqno, r.current.ShardClientSeqno)
+			return nil, r.returnWithProgress(fmt.Errorf("archive pipeline returned window #%d after current seqno %d", window.startSeqno, r.current.ShardClientSeqno))
 		}
 		if len(window.masterStates) == 0 {
 			if window.syncUntilReached {
@@ -126,7 +126,7 @@ func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
 				break
 			}
 			window.releaseImportedData()
-			return nil, fmt.Errorf("archive window #%d did not provide next masterchain blocks", window.startSeqno)
+			return nil, r.returnWithProgress(fmt.Errorf("archive window #%d did not provide next masterchain blocks", window.startSeqno))
 		}
 
 		applyStarted := time.Now()
@@ -136,7 +136,7 @@ func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
 			window.releaseImportedData()
 			if isArchiveCatchUpRetryError(err) {
 				if err = r.restartPipeline(err); err != nil {
-					return nil, err
+					return nil, r.returnWithProgress(err)
 				}
 				continue
 			}
@@ -166,10 +166,13 @@ func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
 				a.syncUntilTransitions.enterSyncUntilOffline(r.current, PreparedBlock{})
 				break
 			}
-			return nil, fmt.Errorf("archive window #%d did not advance shard client seqno %d", window.startSeqno, before)
+			return nil, r.returnWithProgress(fmt.Errorf("archive window #%d did not advance shard client seqno %d", window.startSeqno, before))
 		}
-		r.current = next
-		a.currentTransitions.archiveCurrentAdvanced(r.current)
+		if err = r.commitAcceptedArchiveWindow(window, next); err != nil {
+			r.dropArchiveWindowShardImportCache(window)
+			window.releaseImportedData()
+			return nil, r.returnWithProgress(err)
+		}
 		r.importCache.dropBefore(r.current.ShardClientSeqno + 1)
 		r.shardBlocksApplied += uint64(window.shardBlocksApplied)
 		r.shardBlocksReused += uint64(window.shardBlocksReused)
@@ -178,12 +181,12 @@ func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
 		window.releaseImportedData()
 
 		if _, err = r.finishCheckpoint(false); err != nil {
-			return nil, err
+			return nil, r.returnWithProgress(err)
 		}
 		if window.syncUntilReached {
 			if r.checkpointDone != nil || r.current.ShardClientSeqno > r.lastCheckpointSeqno {
 				if _, err = r.persistCheckpoint("sync_until"); err != nil {
-					return nil, err
+					return nil, r.returnWithProgress(err)
 				}
 			}
 			a.syncUntilTransitions.enterSyncUntilOffline(r.current, PreparedBlock{})
@@ -202,7 +205,7 @@ func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
 					Bool("checkpoint_in_flight", r.checkpointDone != nil).
 					Msg("persisting archive shard-client checkpoint before cell generation switch")
 				if _, err = r.persistCheckpoint("cell_generation_switch"); err != nil {
-					return nil, err
+					return nil, r.returnWithProgress(err)
 				}
 			}
 			yieldToCellGenerationSwitch = true
@@ -229,7 +232,7 @@ func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
 					Msg("persisting archive shard-client checkpoint before next-block handoff")
 				handoffCheckpointBlocks, err = r.persistCheckpoint("handoff")
 				if err != nil {
-					return nil, err
+					return nil, r.returnWithProgress(err)
 				}
 			}
 			handoffToNext = true
@@ -245,7 +248,7 @@ func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
 		}
 		if r.checkpointDone == nil && a.shouldPersistArchiveCatchUpCheckpoint(r.current.ShardClientSeqno, r.target.SeqNo, r.lastCheckpointSeqno, r.lastCheckpoint, r.checkpointBlocksTarget, r.pendingArchiveCheckpointBytes()) {
 			if err = r.startCheckpoint("interval"); err != nil {
-				return nil, err
+				return nil, r.returnWithProgress(err)
 			}
 		}
 		if r.shouldWaitArchiveCheckpointBackpressure() {
@@ -266,13 +269,13 @@ func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
 			resumeDownloads := r.pauseArchiveDownloadsForCheckpointBackpressure()
 			if _, err = r.finishCheckpoint(true); err != nil {
 				resumeDownloads()
-				return nil, err
+				return nil, r.returnWithProgress(err)
 			}
 			resumeDownloads()
 		}
 
 		if err = r.logProgress(); err != nil {
-			return nil, err
+			return nil, r.returnWithProgress(err)
 		}
 	}
 
@@ -290,7 +293,7 @@ func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
 			Bool("checkpoint_in_flight", r.checkpointDone != nil).
 			Msg("persisting final archive shard-client checkpoint")
 		if _, err := r.persistCheckpoint("final"); err != nil {
-			return nil, err
+			return nil, r.returnWithProgress(err)
 		}
 	}
 
@@ -309,6 +312,21 @@ func (r *archiveCatchUpRun) run() (result *storage.CurrentState, runErr error) {
 	return r.current, nil
 }
 
+func (r *archiveCatchUpRun) commitAcceptedArchiveWindow(window *shardClientArchiveWindow, next *storage.CurrentState) error {
+	if err := r.dispatchArchiveWindowBlockApplied(window, r.current, next); err != nil {
+		return err
+	}
+
+	// Event dispatch retries against the outer run context and cannot be
+	// interrupted by a pipeline restart or live-tail handoff. Once every
+	// processor accepted the window, advance and publish the in-process head
+	// before returning to any later operation that can fail, so this run cannot
+	// replay accepted hooks.
+	r.current = next
+	r.archive.currentTransitions.archiveCurrentAdvanced(r.current)
+	return nil
+}
+
 func (r *archiveCatchUpRun) shouldHandoffToNextBlock() bool {
 	latest, err := r.archive.network.ObservedMasterchainBlock()
 	return err == nil && shouldPreferNextBlockTarget(r.current.Masterchain.Block.SeqNo, latest.SeqNo)
@@ -319,6 +337,9 @@ func (r *archiveCatchUpRun) shutdown() error {
 		r.pipeline.stop()
 	}
 	_, checkpointErr := r.finishCheckpoint(true)
+	if checkpointErr != nil {
+		checkpointErr = r.returnWithProgress(checkpointErr)
+	}
 	if r.archiveSession != nil {
 		r.archiveSession.Close()
 	}

@@ -59,9 +59,19 @@ func TestParseAcceptedBlockRejectsTrailingReferencedData(t *testing.T) {
 			block.RootHash = rootHash[:]
 			block.FileHash = fileHash[:]
 
-			_, _, err = parseAcceptedBlock(block, boc)
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("parse block with trailing %s error = %v", test.name, err)
+			for _, resident := range []bool{false, true} {
+				name := "decode wire"
+				var readyRoot *cell.Cell
+				if resident {
+					name = "resident root"
+					readyRoot = poisoned
+				}
+				t.Run(name, func(t *testing.T) {
+					_, _, err := parseAcceptedBlock(block, boc, readyRoot)
+					if err == nil || !strings.Contains(err.Error(), test.want) {
+						t.Fatalf("parse block with trailing %s error = %v", test.name, err)
+					}
+				})
 			}
 		})
 	}
@@ -77,7 +87,7 @@ func TestBlockAccepterRejectsMalformedCandidateBeforeSerialization(t *testing.T)
 		t.Fatal(err)
 	}
 
-	err = accepter.Accept(t.Context(), acceptance, acceptanceTestViewResolver(BlockAcceptanceView{}))
+	err = accepter.acceptForTest(t.Context(), acceptance, acceptanceTestViewResolver(BlockAcceptanceView{}))
 	if err == nil || !strings.Contains(err.Error(), "candidate block hashes must be 32 bytes") {
 		t.Fatalf("malformed candidate error = %v", err)
 	}

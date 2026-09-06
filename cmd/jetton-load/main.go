@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -28,7 +31,8 @@ import (
 )
 
 const (
-	stateFormatVersion    = 4
+	stateFormatVersion    = 5
+	unprofiledStateFormat = 4
 	previousStateFormat   = 3
 	legacyStateFormat     = 2
 	highloadKeyDomain     = "gton-jetton-load/highload/v2"
@@ -40,7 +44,10 @@ const (
 	previousHighloadTTL   = 120
 	highloadInitPoll      = time.Second
 	highloadInitResubmit  = 10 * time.Second
+	highloadTimeRefresh   = 5 * time.Minute
 	defaultSetupTimeout   = 3 * time.Minute
+	defaultInspectTimeout = 30 * time.Second
+	maximumInspectTimeout = defaultSetupTimeout
 	accountPollPeriod     = 200 * time.Millisecond
 	batchPeriod           = time.Second
 	submissionRetryPeriod = 500 * time.Millisecond
@@ -56,11 +63,12 @@ var logger = zerolog.New(zerolog.ConsoleWriter{
 var errHighloadInitializationTimeout = errors.New("highload wallet initialization timeout")
 
 type commonOptions struct {
-	nodeConfig  string
-	liteAddr    string
-	statePath   string
-	fundingKey  string
-	senderIndex uint64
+	nodeConfig      string
+	liteAddr        string
+	statePath       string
+	fundingKey      string
+	senderIndex     uint64
+	contractProfile string
 }
 
 type setupOptions struct {
@@ -82,9 +90,19 @@ type runOptions struct {
 	jettons    string
 }
 
+type inspectOptions struct {
+	commonOptions
+	timeout    time.Duration
+	runEpoch   *loadRunEpoch
+	recipients int
+}
+
 type loadState struct {
 	FormatVersion             int    `json:"format_version"`
 	SenderIndex               uint64 `json:"sender_index"`
+	ContractProfile           string `json:"contract_profile"`
+	MinterCodeHash            string `json:"minter_code_hash"`
+	WalletCodeHash            string `json:"wallet_code_hash"`
 	Minter                    string `json:"minter"`
 	HighloadWallet            string `json:"highload_wallet"`
 	SourceJettonWallet        string `json:"source_jetton_wallet"`
@@ -100,6 +118,11 @@ type networkClient struct {
 	seed    []byte
 }
 
+type readOnlyClient struct {
+	pool *liteclient.ConnectionPool
+	api  ton.APIClientWrapped
+}
+
 type fundingWallet struct {
 	api  ton.APIClientWrapped
 	addr *address.Address
@@ -110,6 +133,17 @@ type highloadTimeAPI interface {
 	CurrentMasterchainInfo(context.Context) (*ton.BlockIDExt, error)
 	GetBlockShardsInfo(context.Context, *ton.BlockIDExt) ([]*ton.BlockIDExt, error)
 	GetBlockHeader(context.Context, *ton.BlockIDExt) (*tlb.BlockHeader, error)
+}
+
+type loadRunEpoch [16]byte
+
+type highloadCreatedAtProvider struct {
+	mu           sync.Mutex
+	api          highloadTimeAPI
+	addr         *address.Address
+	createdAt    int64
+	refreshedAt  time.Time
+	refreshEvery time.Duration
 }
 
 func main() {
@@ -125,24 +159,39 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: gton-jetton-load <setup|run> [flags]")
+		return finishCommand(newCommandResult("", 0), errors.New("usage: gton-jetton-load <setup|run|inspect> [flags]"))
 	}
 
 	switch args[0] {
 	case "setup":
 		opts, err := parseSetupOptions(args[1:])
 		if err != nil {
-			return err
+			return finishCommand(newCommandResult("setup", opts.senderIndex), err)
 		}
-		return setup(opts)
+		result := newCommandResult("setup", opts.senderIndex)
+		err = setup(opts, &result)
+		return finishCommand(result, err)
 	case "run":
 		opts, err := parseRunOptions(args[1:])
 		if err != nil {
-			return err
+			return finishCommand(newCommandResult("run", opts.senderIndex), err)
 		}
-		return runLoad(opts)
+		result := newCommandResult("run", opts.senderIndex)
+		err = runLoad(opts, &result)
+		return finishCommand(result, err)
+	case "inspect":
+		opts, err := parseInspectOptions(args[1:])
+		if err != nil {
+			return finishCommand(newCommandResult("inspect", opts.senderIndex), err)
+		}
+		result := newCommandResult("inspect", opts.senderIndex)
+		err = inspectLoad(opts, &result)
+		return finishCommand(result, err)
 	default:
-		return fmt.Errorf("unknown command %q; expected setup or run", args[0])
+		return finishCommand(
+			newCommandResult(args[0], 0),
+			fmt.Errorf("unknown command %q; expected setup, run, or inspect", args[0]),
+		)
 	}
 }
 
@@ -150,19 +199,19 @@ func parseSetupOptions(args []string) (setupOptions, error) {
 	var opts setupOptions
 	set := flag.NewFlagSet("setup", flag.ContinueOnError)
 	addCommonFlags(set, &opts.commonOptions)
-	set.StringVar(&opts.minterCode, "minter-code", "cppnode/ton/benchmark/contracts/jetton-minter.code.boc", "jetton minter code BOC")
-	set.StringVar(&opts.walletCode, "wallet-code", "cppnode/ton/benchmark/contracts/jetton-wallet.code.boc", "jetton wallet code BOC")
+	set.StringVar(&opts.minterCode, "minter-code", "", "optional minter BOC override; root hash must match the contract profile")
+	set.StringVar(&opts.walletCode, "wallet-code", "", "optional wallet BOC override; root hash must match the contract profile")
 	set.StringVar(&opts.fundTON, "fund-ton", "10000", "TON transferred to the load wallet")
-	set.StringVar(&opts.mintJetton, "mint-jetton", "1000000000", "jettons minted to the load wallet")
+	set.StringVar(&opts.mintJetton, "mint-jetton", "1000000000000000000", "raw jetton units minted to the load wallet")
 	set.DurationVar(&opts.timeout, "timeout", defaultSetupTimeout, "maximum duration for one sender setup")
 	if err := set.Parse(args); err != nil {
-		return setupOptions{}, err
+		return opts, err
 	}
 	if set.NArg() != 0 {
-		return setupOptions{}, fmt.Errorf("unexpected setup arguments: %v", set.Args())
+		return opts, fmt.Errorf("unexpected setup arguments: %v", set.Args())
 	}
 	if opts.timeout <= 0 {
-		return setupOptions{}, errors.New("setup timeout must be positive")
+		return opts, errors.New("setup timeout must be positive")
 	}
 	return opts, nil
 }
@@ -173,28 +222,64 @@ func parseRunOptions(args []string) (runOptions, error) {
 	addCommonFlags(set, &opts.commonOptions)
 	set.IntVar(&opts.rate, "rate", 30, "jetton transfers per second")
 	set.DurationVar(&opts.duration, "duration", 30*time.Second, "load duration")
-	set.DurationVar(&opts.drain, "drain", 30*time.Second, "maximum wait for submitted transfers")
+	set.DurationVar(&opts.drain, "drain", 30*time.Second, "settlement wait before the destination balance snapshot")
 	set.IntVar(&opts.recipients, "recipients", 256, "deterministic recipient owner addresses")
 	set.StringVar(&opts.msgTON, "message-ton", "0.05", "TON attached to each jetton transfer")
-	set.StringVar(&opts.jettons, "jettons", "1", "jettons sent by each transfer")
+	set.StringVar(&opts.jettons, "jettons", "1000000", "raw jetton units sent by each transfer")
 	if err := set.Parse(args); err != nil {
-		return runOptions{}, err
+		return opts, err
 	}
 	if set.NArg() != 0 {
-		return runOptions{}, fmt.Errorf("unexpected run arguments: %v", set.Args())
+		return opts, fmt.Errorf("unexpected run arguments: %v", set.Args())
 	}
 	if opts.rate <= 0 || opts.rate > 254*254 {
-		return runOptions{}, fmt.Errorf("rate must be between 1 and %d", 254*254)
+		return opts, fmt.Errorf("rate must be between 1 and %d", 254*254)
 	}
 	if opts.duration <= 0 || opts.duration%batchPeriod != 0 {
-		return runOptions{}, errors.New("duration must be a positive whole number of seconds")
+		return opts, errors.New("duration must be a positive whole number of seconds")
 	}
-	if opts.drain < 0 {
-		return runOptions{}, errors.New("drain cannot be negative")
+	if opts.drain <= 0 {
+		return opts, errors.New("drain must be positive for destination confirmation")
 	}
 	if opts.recipients <= 0 {
-		return runOptions{}, errors.New("recipients must be positive")
+		return opts, errors.New("recipients must be positive")
 	}
+	return opts, nil
+}
+
+func parseInspectOptions(args []string) (inspectOptions, error) {
+	var opts inspectOptions
+	var runEpoch string
+	set := flag.NewFlagSet("inspect", flag.ContinueOnError)
+	addCommonFlags(set, &opts.commonOptions)
+	set.DurationVar(&opts.timeout, "timeout", defaultInspectTimeout, "maximum duration for the read-only inspection")
+	set.StringVar(&runEpoch, "run-epoch", "", "optional 16-byte hex run epoch for recipient inspection")
+	set.IntVar(&opts.recipients, "recipients", 0, "recipient hotset size; requires --run-epoch")
+	if err := set.Parse(args); err != nil {
+		return opts, err
+	}
+	if set.NArg() != 0 {
+		return opts, fmt.Errorf("unexpected inspect arguments: %v", set.Args())
+	}
+	if opts.timeout <= 0 || opts.timeout > maximumInspectTimeout {
+		return opts, fmt.Errorf("inspect timeout must be between 1ns and %s", maximumInspectTimeout)
+	}
+	if runEpoch == "" {
+		if opts.recipients != 0 {
+			return opts, errors.New("recipients requires run-epoch")
+		}
+
+		return opts, nil
+	}
+	if opts.recipients <= 0 {
+		return opts, errors.New("recipients must be positive when run-epoch is set")
+	}
+	epoch, err := parseLoadRunEpoch(runEpoch)
+	if err != nil {
+		return opts, err
+	}
+	opts.runEpoch = &epoch
+
 	return opts, nil
 }
 
@@ -204,6 +289,7 @@ func addCommonFlags(set *flag.FlagSet, opts *commonOptions) {
 	set.StringVar(&opts.statePath, "state", "jetton-load.state.json", "load state file")
 	set.StringVar(&opts.fundingKey, "funding-key", "", "base64 Ed25519 seed controlling the genesis funding wallet")
 	set.Uint64Var(&opts.senderIndex, "sender-index", 0, "independent load sender index")
+	set.StringVar(&opts.contractProfile, "contract-profile", defaultContractProfile, "pinned jetton contract profile")
 }
 
 func connect(ctx context.Context, opts commonOptions) (*networkClient, error) {
@@ -267,8 +353,34 @@ func connect(ctx context.Context, opts commonOptions) (*networkClient, error) {
 	return client, nil
 }
 
+func connectReadOnly(ctx context.Context, opts commonOptions) (*readOnlyClient, error) {
+	cfg, err := config.Load(opts.nodeConfig)
+	if err != nil {
+		return nil, fmt.Errorf("load node config: %w", err)
+	}
+	if len(cfg.Lite.Key) != ed25519.SeedSize {
+		return nil, fmt.Errorf("liteserver key has %d bytes, expected %d", len(cfg.Lite.Key), ed25519.SeedSize)
+	}
+
+	pool := liteclient.NewConnectionPool()
+	liteKey := ed25519.NewKeyFromSeed(cfg.Lite.Key).Public().(ed25519.PublicKey)
+	if err = pool.AddConnection(ctx, opts.liteAddr, base64.StdEncoding.EncodeToString(liteKey)); err != nil {
+		pool.Stop()
+		return nil, fmt.Errorf("connect to liteserver: %w", err)
+	}
+
+	return &readOnlyClient{
+		pool: pool,
+		api:  ton.NewAPIClient(pool).WithRetryTimeout(2, 3*time.Second),
+	}, nil
+}
+
 func (c *networkClient) close() {
 	clear(c.seed)
+	c.pool.Stop()
+}
+
+func (c *readOnlyClient) close() {
 	c.pool.Stop()
 }
 
@@ -325,12 +437,23 @@ func (s *fundingWallet) buildMessage(ctx context.Context, messages []*wallet.Mes
 		EndCell(), nil
 }
 
-func setup(opts setupOptions) error {
+func setup(opts setupOptions, result *commandResult) error {
+	profile, err := resolveContractProfile(opts.contractProfile, opts.minterCode, opts.walletCode)
+	if err != nil {
+		return err
+	}
+	setResultProfile(result, profile)
+
 	var previous *loadState
 	stored, err := readState(opts.statePath)
 	if err == nil {
 		if err = validateStateSender(stored, opts.senderIndex); err != nil {
 			return err
+		}
+		if stored.ContractProfile != "" {
+			if err = validateStateContract(stored, profile); err != nil {
+				return err
+			}
 		}
 		previous = &stored
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -346,14 +469,8 @@ func setup(opts setupOptions) error {
 	}
 	defer client.close()
 
-	minterCode, err := loadBOC(opts.minterCode)
-	if err != nil {
-		return fmt.Errorf("load minter code: %w", err)
-	}
-	jettonWalletCode, err := loadBOC(opts.walletCode)
-	if err != nil {
-		return fmt.Errorf("load jetton wallet code: %w", err)
-	}
+	minterCode := profile.minterCode
+	jettonWalletCode := profile.walletCode
 
 	highloadKey := deriveHighloadKey(client.seed, opts.senderIndex)
 	highload, err := newHighloadWallet(client.api, highloadKey, nil)
@@ -418,6 +535,9 @@ func setup(opts setupOptions) error {
 		if err = waitContractMethod(ctx, client.api, minter, "get_jetton_data"); err != nil {
 			return fmt.Errorf("wait for minter deployment: %w", err)
 		}
+	}
+	if err = validateJettonMasterProfile(ctx, client.api, minter, profile); err != nil {
+		return err
 	}
 
 	fundAmount, err := tlb.FromTON(opts.fundTON)
@@ -495,7 +615,7 @@ func setup(opts setupOptions) error {
 	if previous != nil && previous.SourceJettonWallet != displayAddress(sourceJetton.Address()) && !reprovisionHighload {
 		return errors.New("source jetton wallet differs from existing state file")
 	}
-	mintAmount, err := tlb.FromTON(opts.mintJetton)
+	mintAmount, err := parseJettonUnits(opts.mintJetton)
 	if err != nil {
 		return fmt.Errorf("parse mint-jetton: %w", err)
 	}
@@ -514,7 +634,7 @@ func setup(opts setupOptions) error {
 		mintDelta := new(big.Int).Sub(mintAmount.Nano(), jettonBalance)
 		logger.Info().
 			Str("wallet", displayAddress(sourceJetton.Address())).
-			Str("amount", tlb.FromNanoTON(mintDelta).String()).
+			Str("amount_units", mintDelta.String()).
 			Msg("minting test jettons")
 		body, buildErr := buildMintPayload(highload.WalletAddress(), client.funding.addr, tlb.FromNanoTON(mintDelta))
 		if buildErr != nil {
@@ -531,6 +651,9 @@ func setup(opts setupOptions) error {
 	state := loadState{
 		FormatVersion:             stateFormatVersion,
 		SenderIndex:               opts.senderIndex,
+		ContractProfile:           profile.name,
+		MinterCodeHash:            profile.minterCodeHash,
+		WalletCodeHash:            profile.walletCodeHash,
 		Minter:                    displayAddress(minter),
 		HighloadWallet:            displayAddress(highload.WalletAddress()),
 		SourceJettonWallet:        displayAddress(sourceJetton.Address()),
@@ -556,6 +679,9 @@ func setup(opts setupOptions) error {
 	if err = writeState(opts.statePath, state); err != nil {
 		return err
 	}
+	result.Minter = state.Minter
+	result.HighloadWallet = state.HighloadWallet
+	result.SourceJettonWallet = state.SourceJettonWallet
 
 	logger.Info().
 		Uint64("sender_index", state.SenderIndex).
@@ -574,16 +700,13 @@ func loadWalletTopUp(minimum, balance *big.Int) *big.Int {
 	return amount.Add(amount, big.NewInt(fundingFeeReserveNano))
 }
 
-func runLoad(opts runOptions) error {
-	state, err := readState(opts.statePath)
+func runLoad(opts runOptions, result *commandResult) error {
+	state, profile, err := loadExistingState(opts.commonOptions, result)
 	if err != nil {
 		return err
 	}
-	if err = validateStateSender(state, opts.senderIndex); err != nil {
-		return err
-	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), opts.duration+opts.drain+defaultSetupTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), runLoadTimeout(opts))
 	defer cancel()
 	client, err := connect(ctx, opts.commonOptions)
 	if err != nil {
@@ -594,14 +717,19 @@ func runLoad(opts runOptions) error {
 	highloadKey := deriveHighloadKey(client.seed, opts.senderIndex)
 	defer clear(highloadKey)
 	batches64 := uint64(opts.duration / batchPeriod)
-	if batches64 > highloadValidQueries {
-		return fmt.Errorf("load requires %d highload query IDs, maximum is %d", batches64, highloadValidQueries)
+	if batches64+1 > highloadValidQueries {
+		return fmt.Errorf("load and canary require %d highload query IDs, maximum is %d", batches64+1, highloadValidQueries)
 	}
 	if state.NextHighloadQueryID >= highloadQueryLimit {
 		return fmt.Errorf("stored highload query id %d is outside the 23-bit range", state.NextHighloadQueryID)
 	}
 	batches := uint32(batches64)
 	runNow := time.Now()
+	runEpoch, err := newLoadRunEpoch()
+	if err != nil {
+		return err
+	}
+	result.RunEpoch = formatLoadRunEpoch(runEpoch)
 	queryID, rebased := nextHighloadQueryID(state, runNow)
 	if rebased {
 		logger.Info().
@@ -611,7 +739,7 @@ func runLoad(opts runOptions) error {
 			Msg("rebasing expired highload query IDs")
 	}
 	reservedNext := queryID
-	for range batches {
+	for range batches + 1 {
 		reservedNext = advanceHighloadQueryID(reservedNext)
 	}
 	highload, err := newHighloadWallet(client.api, highloadKey, nil)
@@ -621,14 +749,20 @@ func runLoad(opts runOptions) error {
 	if displayAddress(highload.WalletAddress()) != state.HighloadWallet {
 		return errors.New("load wallet derived from node config differs from state file")
 	}
-	createdAt, err := highloadCreatedAt(ctx, client.api, highload.WalletAddress())
-	if err != nil {
-		return fmt.Errorf("resolve load wallet shard time: %w", err)
+	createdAt := highloadCreatedAtProvider{
+		api:          client.api,
+		addr:         highload.WalletAddress(),
+		refreshEvery: highloadTimeRefresh,
 	}
-	highload, err = newHighloadWallet(client.api, highloadKey, func(context.Context, uint32) (uint32, int64, error) {
+	highload, err = newHighloadWallet(client.api, highloadKey, func(messageCtx context.Context, _ uint32) (uint32, int64, error) {
+		created, createdErr := createdAt.current(messageCtx, time.Now())
+		if createdErr != nil {
+			return 0, 0, createdErr
+		}
+
 		id := queryID
 		queryID = advanceHighloadQueryID(queryID)
-		return id, createdAt, nil
+		return id, created, nil
 	})
 	if err != nil {
 		return err
@@ -643,6 +777,11 @@ func runLoad(opts runOptions) error {
 		return fmt.Errorf("parse minter: %w", err)
 	}
 	jettonClient := jetton.NewJettonMasterClient(client.api, minterAddr)
+	if err = validateJettonMasterProfile(ctx, client.api, minterAddr, profile); err != nil {
+		result.Outcome = resultOutcomeWorkloadInvalid
+		result.FailureStage = "contract_profile"
+		return err
+	}
 	sourceWallet, err := jettonClient.GetJettonWallet(ctx, highload.WalletAddress())
 	if err != nil {
 		return fmt.Errorf("resolve source jetton wallet: %w", err)
@@ -654,7 +793,7 @@ func runLoad(opts runOptions) error {
 	if err != nil {
 		return fmt.Errorf("get initial jetton balance: %w", err)
 	}
-	jettonAmount, err := tlb.FromTON(opts.jettons)
+	jettonAmount, err := parseJettonUnits(opts.jettons)
 	if err != nil {
 		return fmt.Errorf("parse jettons: %w", err)
 	}
@@ -662,15 +801,76 @@ func runLoad(opts runOptions) error {
 	if err != nil {
 		return fmt.Errorf("parse message-ton: %w", err)
 	}
-	expected := new(big.Int).Mul(jettonAmount.Nano(), new(big.Int).SetUint64(uint64(opts.rate)*uint64(batches)))
+	expectedTransfers := uint64(opts.rate)*uint64(batches) + 1
+	expected := new(big.Int).Mul(jettonAmount.Nano(), new(big.Int).SetUint64(expectedTransfers))
 	if before.Cmp(expected) < 0 {
-		return fmt.Errorf("source has %s jettons, need at least %s", tlb.FromNanoTON(before).String(), tlb.FromNanoTON(expected).String())
+		return fmt.Errorf("source has %s raw jetton units, need at least %s", before, expected)
 	}
 	state.NextHighloadQueryID = reservedNext
 	state.HighloadQueryIDReservedAt = runNow.Unix()
 	if err = writeState(opts.statePath, state); err != nil {
 		return fmt.Errorf("reserve highload query IDs: %w", err)
 	}
+	result.SourceBalanceBefore = before.String()
+	result.ExternalBatches = int(batches)
+
+	canaryOwner := canaryRecipientAddress(opts.senderIndex, runEpoch)
+	canaryWallet, err := deriveJettonWalletAddress(profile.walletCode, minterAddr, canaryOwner)
+	if err != nil {
+		return fmt.Errorf("derive canary jetton wallet: %w", err)
+	}
+	resolvedCanary, err := jettonClient.GetJettonWallet(ctx, canaryOwner)
+	if err != nil {
+		return fmt.Errorf("resolve canary jetton wallet: %w", err)
+	}
+	if !resolvedCanary.Address().Equals(canaryWallet) {
+		return errors.New("locally derived canary jetton wallet differs from minter result")
+	}
+	canaryBefore, err := jettonWalletBalance(ctx, client.api, canaryWallet, profile.walletCode)
+	if err != nil {
+		return fmt.Errorf("get canary balance: %w", err)
+	}
+	canaryMessage, err := buildTransferMessage(sourceAddr, canaryOwner, jettonAmount, messageAmount)
+	if err != nil {
+		return fmt.Errorf("build canary transfer: %w", err)
+	}
+	canaryAttempts, err := sendHighloadExternal(ctx, client.api, highload, []*wallet.Message{canaryMessage}, false)
+	if err != nil {
+		result.Outcome = resultOutcomeSubmissionFailed
+		result.FailureStage = "canary_submission"
+		return fmt.Errorf("submit canary transfer after %d attempts: %w", canaryAttempts, err)
+	}
+	result.CanarySubmitted = 1
+	if err = waitJettonWalletIncrease(
+		ctx,
+		client.api,
+		canaryWallet,
+		profile.walletCode,
+		canaryBefore,
+		jettonAmount.Nano(),
+		opts.drain,
+	); err != nil {
+		result.Outcome = resultOutcomeExecutionFailed
+		result.FailureStage = "canary_delivery"
+		return fmt.Errorf("canary destination confirmation: %w", err)
+	}
+	result.CanaryAccepted = 1
+
+	recipientWallets, err := deriveRecipientJettonWallets(
+		profile.walletCode,
+		minterAddr,
+		opts.senderIndex,
+		runEpoch,
+		opts.recipients,
+	)
+	if err != nil {
+		return err
+	}
+	recipientBefore, err := sumJettonWalletBalances(ctx, client.api, recipientWallets, profile.walletCode)
+	if err != nil {
+		return fmt.Errorf("snapshot recipient balances before load: %w", err)
+	}
+	result.RecipientBalanceBefore = recipientBefore.String()
 
 	logger.Info().
 		Uint64("sender_index", opts.senderIndex).
@@ -684,19 +884,27 @@ func runLoad(opts runOptions) error {
 	defer ticker.Stop()
 	start := time.Now()
 	sent := 0
-	failedBatches := 0
 	for batch := uint32(0); batch < batches; batch++ {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case scheduled := <-ticker.C:
-			messages, buildErr := buildTransferBatch(sourceAddr, opts.rate, opts.recipients, uint64(batch)*uint64(opts.rate), jettonAmount, messageAmount)
+			messages, buildErr := buildTransferBatch(
+				sourceAddr,
+				opts.senderIndex,
+				runEpoch,
+				opts.rate,
+				opts.recipients,
+				uint64(batch)*uint64(opts.rate),
+				jettonAmount,
+				messageAmount,
+			)
 			if buildErr != nil {
 				return buildErr
 			}
 			attempts, sendErr := sendHighloadExternal(ctx, client.api, highload, messages, false)
 			if sendErr != nil {
-				failedBatches++
+				result.FailedBatches++
 				logger.Error().
 					Err(sendErr).
 					Uint32("batch", batch).
@@ -711,29 +919,165 @@ func runLoad(opts runOptions) error {
 					Msg("batch accepted after retry")
 			}
 			sent += len(messages)
+			result.Submitted = sent
+			result.RPCAcceptedBatches++
 			if lag := time.Since(scheduled); lag > 100*time.Millisecond {
 				logger.Warn().Dur("lag", lag).Uint32("batch", batch).Msg("load sender missed schedule")
 			}
 		}
 	}
 	submissionElapsed := time.Since(start)
+	result.Submitted = sent
+	result.SubmittedTPS = float64(sent) / submissionElapsed.Seconds()
 
-	accepted, after, waitErr := waitTransferred(ctx, sourceWallet, before, jettonAmount.Nano(), sent, opts.drain)
+	recipientAfter, err := waitRecipientsSettled(
+		ctx,
+		func(snapshotCtx context.Context) (*big.Int, error) {
+			return sumJettonWalletBalances(snapshotCtx, client.api, recipientWallets, profile.walletCode)
+		},
+		recipientBefore,
+		jettonAmount.Nano(),
+		sent,
+		opts.drain,
+		settlementPollPeriod,
+	)
+	if err != nil {
+		return fmt.Errorf("snapshot recipient balances after load: %w", err)
+	}
+	accepted, err := deliveredTransfers(recipientBefore, recipientAfter, jettonAmount.Nano(), sent)
+	if err != nil {
+		return err
+	}
+	result.Accepted = accepted
+	result.Undelivered = sent - accepted
+	result.RecipientBalanceAfter = recipientAfter.String()
+
+	after, err := sourceWallet.GetBalance(ctx)
+	if err != nil {
+		return fmt.Errorf("get final source jetton balance: %w", err)
+	}
+	result.SourceBalanceAfter = after.String()
 	logger.Info().
 		Int("submitted", sent).
 		Int("accepted", accepted).
-		Int("failed_batches", failedBatches).
-		Float64("submitted_tps", float64(sent)/submissionElapsed.Seconds()).
-		Str("balance_before", tlb.FromNanoTON(before).String()).
-		Str("balance_after", tlb.FromNanoTON(after).String()).
+		Int("failed_batches", result.FailedBatches).
+		Float64("submitted_tps", result.SubmittedTPS).
+		Str("source_balance_before_units", before.String()).
+		Str("source_balance_after_units", after.String()).
+		Str("recipient_balance_before_units", recipientBefore.String()).
+		Str("recipient_balance_after_units", recipientAfter.String()).
 		Msg("jetton load completed")
-	if waitErr != nil {
-		return waitErr
+	if result.FailedBatches != 0 {
+		result.Outcome = resultOutcomeSubmissionFailed
+		result.FailureStage = "batch_submission"
+		return fmt.Errorf("%d of %d external batches failed RPC submission", result.FailedBatches, result.ExternalBatches)
 	}
-	if failedBatches != 0 || accepted != sent {
-		return fmt.Errorf("only %d of %d submitted transfers were observed", accepted, sent)
+	if accepted != sent {
+		result.Outcome = resultOutcomeDeliveryIncomplete
+		result.FailureStage = "destination_delivery"
+		return fmt.Errorf("only %d of %d submitted transfers reached destination wallets", accepted, sent)
 	}
 	return nil
+}
+
+func inspectLoad(opts inspectOptions, result *commandResult) error {
+	state, profile, err := loadExistingState(opts.commonOptions, result)
+	if err != nil {
+		return err
+	}
+	if opts.runEpoch != nil {
+		result.RunEpoch = formatLoadRunEpoch(*opts.runEpoch)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
+	defer cancel()
+	client, err := connectReadOnly(ctx, opts.commonOptions)
+	if err != nil {
+		return err
+	}
+	defer client.close()
+
+	highloadAddr, err := address.ParseAddr(state.HighloadWallet)
+	if err != nil {
+		return fmt.Errorf("parse load wallet: %w", err)
+	}
+
+	sourceAddr, err := address.ParseAddr(state.SourceJettonWallet)
+	if err != nil {
+		return fmt.Errorf("parse source jetton wallet: %w", err)
+	}
+	minterAddr, err := address.ParseAddr(state.Minter)
+	if err != nil {
+		return fmt.Errorf("parse minter: %w", err)
+	}
+	if err = validateJettonMasterProfile(ctx, client.api, minterAddr, profile); err != nil {
+		result.Outcome = resultOutcomeWorkloadInvalid
+		result.FailureStage = "contract_profile"
+		return err
+	}
+
+	jettonClient := jetton.NewJettonMasterClient(client.api, minterAddr)
+	sourceWallet, err := jettonClient.GetJettonWallet(ctx, highloadAddr)
+	if err != nil {
+		return fmt.Errorf("resolve source jetton wallet: %w", err)
+	}
+	if !sourceWallet.Address().Equals(sourceAddr) {
+		return errors.New("source jetton wallet from contract differs from state file")
+	}
+	current, err := sourceWallet.GetBalance(ctx)
+	if err != nil {
+		return fmt.Errorf("get current source jetton balance: %w", err)
+	}
+	result.SourceBalanceCurrent = current.String()
+
+	if opts.runEpoch == nil {
+		return nil
+	}
+	recipientWallets, err := deriveRecipientJettonWallets(
+		profile.walletCode,
+		minterAddr,
+		opts.senderIndex,
+		*opts.runEpoch,
+		opts.recipients,
+	)
+	if err != nil {
+		return err
+	}
+	recipientBalance, err := sumJettonWalletBalances(ctx, client.api, recipientWallets, profile.walletCode)
+	if err != nil {
+		return fmt.Errorf("snapshot current recipient balances: %w", err)
+	}
+	result.RecipientBalanceCurrent = recipientBalance.String()
+
+	return nil
+}
+
+func loadExistingState(
+	opts commonOptions,
+	result *commandResult,
+) (loadState, resolvedContractProfile, error) {
+	state, err := readState(opts.statePath)
+	if err != nil {
+		return loadState{}, resolvedContractProfile{}, err
+	}
+	if err = validateStateSender(state, opts.senderIndex); err != nil {
+		return loadState{}, resolvedContractProfile{}, err
+	}
+	profile, err := resolveContractProfile(opts.contractProfile, "", "")
+	if err != nil {
+		return loadState{}, resolvedContractProfile{}, err
+	}
+	setResultProfile(result, profile)
+	if err = validateStateContract(state, profile); err != nil {
+		result.Outcome = resultOutcomeWorkloadInvalid
+		result.FailureStage = "contract_profile"
+		return loadState{}, resolvedContractProfile{}, err
+	}
+	result.Minter = state.Minter
+	result.HighloadWallet = state.HighloadWallet
+	result.SourceJettonWallet = state.SourceJettonWallet
+
+	return state, profile, nil
 }
 
 func newHighloadWallet(api ton.APIClientWrapped, key ed25519.PrivateKey, builder func(context.Context, uint32) (uint32, int64, error)) (*wallet.Wallet, error) {
@@ -777,6 +1121,10 @@ func nextHighloadQueryID(state loadState, now time.Time) (uint32, bool) {
 	return normalizeHighloadQueryID(state.NextHighloadQueryID), false
 }
 
+func runLoadTimeout(opts runOptions) time.Duration {
+	return defaultSetupTimeout + opts.duration + 2*opts.drain
+}
+
 func advanceHighloadQueryID(id uint32) uint32 {
 	id = (id + 1) % highloadQueryLimit
 	if id&highloadQueryLowMask == highloadQueryLowMask {
@@ -817,6 +1165,24 @@ func highloadCreatedAt(ctx context.Context, api highloadTimeAPI, addr *address.A
 	}
 
 	return 0, errors.New("wallet shard is absent from the masterchain view")
+}
+
+func (p *highloadCreatedAtProvider) current(ctx context.Context, now time.Time) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.refreshedAt.IsZero() && !now.Before(p.refreshedAt) && now.Sub(p.refreshedAt) < p.refreshEvery {
+		return p.createdAt, nil
+	}
+
+	createdAt, err := highloadCreatedAt(ctx, p.api, p.addr)
+	if err != nil {
+		return 0, fmt.Errorf("refresh load wallet shard time: %w", err)
+	}
+
+	p.createdAt = createdAt
+	p.refreshedAt = now
+	return createdAt, nil
 }
 
 func sendFundingAndWait(ctx context.Context, api ton.APIClientWrapped, source *fundingWallet, message *wallet.Message) error {
@@ -1079,31 +1445,105 @@ func buildMintPayload(owner, admin *address.Address, amount tlb.Coins) (*cell.Ce
 	return payload, nil
 }
 
-func buildTransferBatch(source *address.Address, count, recipients int, offset uint64, jettons, messageTON tlb.Coins) ([]*wallet.Message, error) {
+func parseJettonUnits(value string) (tlb.Coins, error) {
+	units, ok := new(big.Int).SetString(value, 10)
+	if !ok || units.Sign() <= 0 {
+		return tlb.Coins{}, fmt.Errorf("raw jetton units must be a positive base-10 integer, got %q", value)
+	}
+
+	return tlb.FromNanoTON(units), nil
+}
+
+func buildTransferBatch(
+	source *address.Address,
+	senderIndex uint64,
+	runEpoch loadRunEpoch,
+	count int,
+	recipients int,
+	offset uint64,
+	jettons tlb.Coins,
+	messageTON tlb.Coins,
+) ([]*wallet.Message, error) {
 	messages := make([]*wallet.Message, count)
 	for i := range messages {
-		recipient := recipientAddress((offset + uint64(i)) % uint64(recipients))
-		body, err := jetton.BuildTransferPayload(
-			recipient,
-			address.NewAddressNone(),
-			jettons,
-			tlb.ZeroCoins,
-			nil,
-			nil,
-		)
+		recipient := recipientAddress(senderIndex, runEpoch, (offset+uint64(i))%uint64(recipients))
+		message, err := buildTransferMessage(source, recipient, jettons, messageTON)
 		if err != nil {
 			return nil, fmt.Errorf("build transfer %d: %w", i, err)
 		}
-		messages[i] = wallet.SimpleMessage(source, messageTON, body)
+		messages[i] = message
 	}
 	return messages, nil
 }
 
-func recipientAddress(index uint64) *address.Address {
-	var encoded [8]byte
-	binary.LittleEndian.PutUint64(encoded[:], index)
+func buildTransferMessage(
+	source *address.Address,
+	recipient *address.Address,
+	jettons tlb.Coins,
+	messageTON tlb.Coins,
+) (*wallet.Message, error) {
+	body, err := jetton.BuildTransferPayload(
+		recipient,
+		address.NewAddressNone(),
+		jettons,
+		tlb.ZeroCoins,
+		nil,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return wallet.SimpleMessage(source, messageTON, body), nil
+}
+
+func newLoadRunEpoch() (loadRunEpoch, error) {
+	var epoch loadRunEpoch
+	if _, err := rand.Read(epoch[:]); err != nil {
+		return loadRunEpoch{}, fmt.Errorf("generate load run epoch: %w", err)
+	}
+
+	return epoch, nil
+}
+
+func parseLoadRunEpoch(value string) (loadRunEpoch, error) {
+	encoded, err := hex.DecodeString(value)
+	if err != nil {
+		return loadRunEpoch{}, fmt.Errorf("parse run-epoch: %w", err)
+	}
+	var epoch loadRunEpoch
+	if len(encoded) != len(epoch) {
+		return loadRunEpoch{}, fmt.Errorf("run-epoch has %d bytes, expected %d", len(encoded), len(epoch))
+	}
+	copy(epoch[:], encoded)
+
+	return epoch, nil
+}
+
+func formatLoadRunEpoch(epoch loadRunEpoch) string {
+	return hex.EncodeToString(epoch[:])
+}
+
+func recipientAddress(senderIndex uint64, runEpoch loadRunEpoch, index uint64) *address.Address {
+	return deterministicRecipientAddress("gton-jetton-load/recipient/v3", senderIndex, runEpoch, index)
+}
+
+func canaryRecipientAddress(senderIndex uint64, runEpoch loadRunEpoch) *address.Address {
+	return deterministicRecipientAddress("gton-jetton-load/canary/v2", senderIndex, runEpoch, 0)
+}
+
+func deterministicRecipientAddress(
+	domain string,
+	senderIndex uint64,
+	runEpoch loadRunEpoch,
+	index uint64,
+) *address.Address {
+	var encoded [16]byte
+	binary.LittleEndian.PutUint64(encoded[:8], senderIndex)
+	binary.LittleEndian.PutUint64(encoded[8:], index)
 	hash := sha256.New()
-	_, _ = hash.Write([]byte("gton-jetton-load/recipient/v1"))
+	_, _ = hash.Write([]byte(domain))
+	_, _ = hash.Write(runEpoch[:])
 	_, _ = hash.Write(encoded[:])
 	return address.NewAddress(0, 0, hash.Sum(nil))
 }
@@ -1136,18 +1576,6 @@ func contractAddress(code, data *cell.Cell, workchain byte) (*address.Address, e
 		return nil, fmt.Errorf("serialize state init: %w", err)
 	}
 	return address.NewAddress(0, workchain, state.Hash()), nil
-}
-
-func loadBOC(path string) (*cell.Cell, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	root, err := cell.FromBOC(data)
-	if err != nil {
-		return nil, err
-	}
-	return root, nil
 }
 
 func contractMethodReady(ctx context.Context, api ton.APIClientWrapped, addr *address.Address, method string) bool {
@@ -1220,34 +1648,6 @@ func waitJettonBalance(ctx context.Context, wallet *jetton.WalletClient, minimum
 	}
 }
 
-func waitTransferred(ctx context.Context, source *jetton.WalletClient, before, amount *big.Int, submitted int, timeout time.Duration) (int, *big.Int, error) {
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(accountPollPeriod)
-	defer ticker.Stop()
-	after := new(big.Int).Set(before)
-	for {
-		balance, err := source.GetBalance(ctx)
-		if err == nil {
-			after = balance
-			spent := new(big.Int).Sub(before, after)
-			accepted := int(new(big.Int).Quo(spent, amount).Int64())
-			if accepted >= submitted {
-				return accepted, after, nil
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return 0, after, ctx.Err()
-		case <-deadline.C:
-			spent := new(big.Int).Sub(before, after)
-			accepted := int(new(big.Int).Quo(spent, amount).Int64())
-			return accepted, after, fmt.Errorf("drain timeout after observing %d of %d transfers", accepted, submitted)
-		case <-ticker.C:
-		}
-	}
-}
-
 func readState(path string) (loadState, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -1265,6 +1665,8 @@ func readState(path string) (loadState, error) {
 	case previousStateFormat:
 		state.FormatVersion = stateFormatVersion
 		state.HighloadMessageTTL = previousHighloadTTL
+	case unprofiledStateFormat:
+		state.FormatVersion = stateFormatVersion
 	}
 	return state, nil
 }

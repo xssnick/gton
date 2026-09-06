@@ -188,6 +188,9 @@ func TestGeneratedMasterStateIsAcceptedByValidatorTracker(t *testing.T) {
 	if len(config.ActiveValidators.Validators) != len(spec.Validators) {
 		t.Fatalf("active validators = %d, want %d", len(config.ActiveValidators.Validators), len(spec.Validators))
 	}
+	if config.ActiveValidators.Main != uint16(len(spec.Validators)) {
+		t.Fatalf("masterchain validators = %d, want %d", config.ActiveValidators.Main, len(spec.Validators))
+	}
 	if config.NewConsensus.Masterchain == nil || config.NewConsensus.Shard == nil {
 		t.Fatal("Simplex config is absent")
 	}
@@ -221,6 +224,109 @@ func TestGeneratedMasterStateIsAcceptedByValidatorTracker(t *testing.T) {
 	}
 	if _, err = collator.PrepareConfig(executionConfig); err != nil {
 		t.Fatalf("prepare generated collator config: %v", err)
+	}
+}
+
+func TestGeneratedValidatorSetCanRestrictMasterchainMembership(t *testing.T) {
+	t.Parallel()
+
+	spec := validTestSpec(t)
+	spec.Consensus.MasterchainValidators = 1
+	validated, err := validateSpec(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	built, err := buildStates(validated, spec.GenesisTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := groups.ParseState(groups.StateInput{Block: built.master.block, Root: built.master.root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := groups.ParseConfig(state.ConfigRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ActiveValidators.Main != 1 {
+		t.Fatalf("masterchain validators = %d, want 1", config.ActiveValidators.Main)
+	}
+	if len(config.ActiveValidators.Validators) != len(spec.Validators) {
+		t.Fatalf("total validators = %d, want %d", len(config.ActiveValidators.Validators), len(spec.Validators))
+	}
+}
+
+func TestGeneratedValidatorRegistryIsUsableByValidatorTracker(t *testing.T) {
+	t.Parallel()
+
+	spec := validTestSpec(t)
+	spec.ValidatorRegistry = &ValidatorRegistry{MaxCollatorsPerValidator: 8}
+	validated, err := validateSpec(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	built, err := buildStates(validated, spec.GenesisTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built.validatorRegistry == nil {
+		t.Fatal("validator registry address is absent")
+	}
+
+	state, err := groups.ParseState(groups.StateInput{Block: built.master.block, Root: built.master.root})
+	if err != nil {
+		t.Fatalf("parse generated master state: %v", err)
+	}
+	rawConfig := tlb.BlockchainConfig{Root: state.ConfigRoot}
+	parameter, err := rawConfig.GetParam(configParamValidatorRegistry)
+	if err != nil {
+		t.Fatalf("load validator registry config: %v", err)
+	}
+	loader := parameter.MustBeginParse()
+	constructor := loader.MustLoadUInt(32)
+	registryAddress := loader.MustLoadSlice(256)
+	maxCollators := loader.MustLoadUInt(32)
+	hasNewCodeHash := loader.MustLoadBoolBit()
+	if constructor != validatorRegistryConfigConstructor ||
+		!bytes.Equal(registryAddress, built.validatorRegistry.Data()) ||
+		maxCollators != 8 || hasNewCodeHash || loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
+		t.Fatalf("unexpected validator registry config")
+	}
+	fundamental, err := rawConfig.GetFundamentalSmartContractAddresses()
+	if err != nil {
+		t.Fatalf("load fundamental addresses: %v", err)
+	}
+	if _, err = fundamental.Addresses.LoadValueByBytesKey(built.validatorRegistry.Data()); err != nil {
+		t.Fatalf("validator registry is not a special contract: %v", err)
+	}
+
+	tracker, err := groups.NewTracker(groups.TrackerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := tracker.Apply(groups.ApplyInput{
+		Block: built.master.block,
+		Root:  built.master.root,
+		AsOf:  time.Unix(int64(spec.GenesisTime), 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CollatorRegistryIssue != nil {
+		t.Fatalf("validator registry is unusable: %v", result.CollatorRegistryIssue)
+	}
+	if len(result.Snapshot.CollatorsByValidator) != 0 {
+		t.Fatalf("new validator registry is not empty: %#v", result.Snapshot.CollatorsByValidator)
+	}
+}
+
+func TestValidatorRegistryRequiresPositiveLimit(t *testing.T) {
+	t.Parallel()
+
+	spec := validTestSpec(t)
+	spec.ValidatorRegistry = &ValidatorRegistry{}
+	if _, err := validateSpec(spec); err == nil || !strings.Contains(err.Error(), "must be positive") {
+		t.Fatalf("validator registry validation error = %v", err)
 	}
 }
 

@@ -520,6 +520,10 @@ type masterBuildFixtureOptions struct {
 	// genUtime pins the predecessor generation time; the candidate is built at
 	// genUtime+1. Zero picks masterBuildSafeTime.
 	genUtime uint32
+	// creatorStats seeds the predecessor's block_create_stats#17 cell. Nil
+	// leaves the capability flag clear, which is the empty creator dictionary
+	// every other fixture builds over.
+	creatorStats *cell.Cell
 }
 
 func newMasterBuildFixture(t testing.TB, malformedConfigAccount bool) masterBuildFixture {
@@ -592,8 +596,9 @@ func newMasterBuildFixtureWith(t testing.TB, options masterBuildFixtureOptions) 
 			CatchainSeqno:          catchainSeqno,
 			NextCCUpdated:          true,
 		},
-		PrevBlocks:    &tlb.OldMcBlocksInfoAugDict{AugmentedDictionary: history},
-		AfterKeyBlock: true,
+		PrevBlocks:       &tlb.OldMcBlocksInfoAugDict{AugmentedDictionary: history},
+		AfterKeyBlock:    true,
+		BlockCreateStats: options.creatorStats,
 	}
 	infoRoot, err := oldInfo.ToCell()
 	if err != nil {

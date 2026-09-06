@@ -31,7 +31,8 @@ type testPrivateOverlay struct {
 	broadcastSigner adnloverlay.BroadcastSigner
 	broadcastExtra  []byte
 	broadcastErr    error
-	broadcast       func(context.Context) error
+	broadcast       func(context.Context) (p2p.TwoStepSendOutcome, error)
+	broadcastOut    p2p.TwoStepSendOutcome
 	broadcasts      int
 	send            func(context.Context, p2p.PeerID, []byte) error
 }
@@ -42,6 +43,7 @@ type testCandidateTransportObserver struct {
 	queueAges  []time.Duration
 	drops      [candidateOutboundDropReasonCount]int
 	sends      []CandidateTransportSendObservation
+	peerSends  [candidateTransportPeerOutcomeCount]int
 }
 
 func (o *testCandidateTransportObserver) AddCandidateOutboundQueue(
@@ -77,6 +79,23 @@ func (o *testCandidateTransportObserver) ObserveCandidateTransportSend(
 	o.mu.Lock()
 	o.sends = append(o.sends, observation)
 	o.mu.Unlock()
+}
+
+func (o *testCandidateTransportObserver) AddCandidateTransportPeerSends(
+	_ collator.MetricChain,
+	outcome CandidateTransportPeerOutcome,
+	count int,
+) {
+	o.mu.Lock()
+	o.peerSends[outcome] += count
+	o.mu.Unlock()
+}
+
+func (o *testCandidateTransportObserver) peerSendSnapshot() [candidateTransportPeerOutcomeCount]int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return o.peerSends
 }
 
 func (o *testCandidateTransportObserver) snapshot() (
@@ -129,18 +148,19 @@ func (o *testPrivateOverlay) BroadcastTwoStep(
 	_ []byte,
 	extra tl.Raw,
 	_ int32,
-) (adnloverlay.BroadcastTwoStepSendResult, error) {
+) (p2p.TwoStepSendOutcome, error) {
 	o.mu.Lock()
 	o.broadcastSigner = signer
 	o.broadcastExtra = append([]byte(nil), extra...)
 	o.broadcasts++
 	broadcast := o.broadcast
+	outcome := o.broadcastOut
 	err := o.broadcastErr
 	o.mu.Unlock()
 	if broadcast != nil {
-		err = broadcast(ctx)
+		return broadcast(ctx)
 	}
-	return adnloverlay.BroadcastTwoStepSendResult{}, err
+	return outcome, err
 }
 
 func (o *testPrivateOverlay) broadcastSnapshot() (int, adnloverlay.BroadcastSigner) {
@@ -666,6 +686,23 @@ func TestAcceptedBlockPublicationResolvesValidatorCertificateSigner(t *testing.T
 	}
 }
 
+func TestAcceptedBlockPublicationSkipsObserverSession(t *testing.T) {
+	manager, _, _, observerSpec := testSessionManager(t)
+	if _, err := manager.prepare(context.Background(), observerSpec); err != nil {
+		t.Fatal(err)
+	}
+
+	manager.PublishAcceptedBlock(validator.AcceptedBlockPublication{
+		SessionID: observerSpec.id,
+	})
+	publisher := manager.broadcasts.(*testBlockPublisher)
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	if len(publisher.accepted) != 0 {
+		t.Fatalf("observer accepted publications = %d, want 0", len(publisher.accepted))
+	}
+}
+
 func TestProtocolOneUsesLegacyRoutesAndCachesInboundCandidate(t *testing.T) {
 	manager, opener, validatorSpec, _ := testProtocolV1SharedManager(t)
 	endpoint, err := manager.prepare(context.Background(), validatorSpec)
@@ -810,12 +847,12 @@ func TestCandidateRelayDoesNotWaitForPrivateWorkerAndRetireCancels(t *testing.T)
 	started := make(chan struct{}, candidateSenderWorkerCount)
 	stopped := make(chan struct{}, candidateSenderWorkerCount)
 	handle.mu.Lock()
-	handle.broadcast = func(ctx context.Context) error {
+	handle.broadcast = func(ctx context.Context) (p2p.TwoStepSendOutcome, error) {
 		started <- struct{}{}
 		<-ctx.Done()
 		stopped <- struct{}{}
 
-		return ctx.Err()
+		return p2p.TwoStepSendOutcome{}, ctx.Err()
 	}
 	handle.mu.Unlock()
 	extra, err := (&simplex.BroadcastExtra{Slot: 1}).Serialize()
@@ -897,7 +934,10 @@ func TestCandidateRelayDoesNotWaitForPrivateWorkerAndRetireCancels(t *testing.T)
 	}
 }
 
-func TestCandidatePrivateSendDeadlineReleasesWorkerAndObservesQueueAge(t *testing.T) {
+// A fan-out that lost one recipient of fifteen is not a failed broadcast:
+// two-step FEC reconstructs from (n-1)/2 parts. The observer must therefore
+// report coverage, and per recipient it must report whose fault a miss was.
+func TestCandidatePrivateSendReportsCoverageAndPerRecipientFaults(t *testing.T) {
 	manager, opener, validatorSpec, _ := testSessionManager(t)
 	observer := &testCandidateTransportObserver{}
 	manager.candidateMetrics = observer
@@ -912,15 +952,12 @@ func TestCandidatePrivateSendDeadlineReleasesWorkerAndObservesQueueAge(t *testin
 	}()
 	startTestEndpoint(t, endpoint, &testSessionReceiver{})
 
-	started := make(chan struct{}, 1)
+	partial := p2p.TwoStepSendOutcome{Attempted: 15, Sent: 14}
+	partial.Faults[p2p.TwoStepSendFaultOffline] = 1
 	handle := opener.latest()
 	handle.mu.Lock()
-	handle.broadcast = func(ctx context.Context) error {
-		started <- struct{}{}
-		<-ctx.Done()
-
-		return ctx.Err()
-	}
+	handle.broadcastOut = partial
+	handle.broadcastErr = errors.New("one recipient was offline")
 	handle.mu.Unlock()
 
 	extra, err := (&simplex.BroadcastExtra{Slot: 1}).Serialize()
@@ -933,11 +970,6 @@ func TestCandidatePrivateSendDeadlineReleasesWorkerAndObservesQueueAge(t *testin
 		validator.CandidateArtifact{BlockBOC: []byte{2}},
 	); err != nil {
 		t.Fatal(err)
-	}
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("private candidate send did not start")
 	}
 
 	waitForCondition(t, func() bool {
@@ -954,11 +986,123 @@ func TestCandidatePrivateSendDeadlineReleasesWorkerAndObservesQueueAge(t *testin
 	if drops[CandidateOutboundDropQueueFull] != 0 || drops[CandidateOutboundDropUnavailable] != 0 {
 		t.Fatalf("candidate queue drops = %v, want none", drops)
 	}
-	if sends[0].Result != CandidateTransportSendDeadline {
-		t.Fatalf("candidate send result = %d, want deadline", sends[0].Result)
+	if sends[0].Result != CandidateTransportSendPartial {
+		t.Fatalf("candidate send result = %d, want partial", sends[0].Result)
 	}
-	if sends[0].Duration < candidateTransportSendTimeout/2 || sends[0].Duration > 2*candidateTransportSendTimeout {
-		t.Fatalf("candidate send duration = %s, want bounded near %s", sends[0].Duration, candidateTransportSendTimeout)
+	peerSends := observer.peerSendSnapshot()
+	if peerSends[CandidateTransportPeerSent] != 14 {
+		t.Fatalf("delivered recipients = %d, want 14", peerSends[CandidateTransportPeerSent])
+	}
+	if peerSends[CandidateTransportPeerOffline] != 1 {
+		t.Fatalf("offline recipients = %d, want 1", peerSends[CandidateTransportPeerOffline])
+	}
+}
+
+// The send budget exists only so a wedged connection cannot own a worker
+// forever. It must never reach the producing slot: the handoff returns while
+// the send is still in flight, and cancelling the session releases the worker.
+func TestCandidatePrivateSendBudgetBoundsWorkerNotProducer(t *testing.T) {
+	manager, opener, validatorSpec, _ := testSessionManager(t)
+	observer := &testCandidateTransportObserver{}
+	manager.candidateMetrics = observer
+	endpoint, err := manager.prepare(context.Background(), validatorSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestEndpoint(t, endpoint, &testSessionReceiver{})
+
+	if candidateTransportSendBudget <= 750*time.Millisecond {
+		t.Fatalf("candidate send budget = %s, want a wedge guard rather than a latency policy",
+			candidateTransportSendBudget)
+	}
+
+	started := make(chan struct{}, 1)
+	handle := opener.latest()
+	handle.mu.Lock()
+	handle.broadcast = func(ctx context.Context) (p2p.TwoStepSendOutcome, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+
+		return p2p.TwoStepSendOutcome{Attempted: 3}, ctx.Err()
+	}
+	handle.mu.Unlock()
+
+	extra, err := (&simplex.BroadcastExtra{Slot: 1}).Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handoff := make(chan error, 1)
+	go func() {
+		handoff <- endpoint.BroadcastCandidate(
+			context.Background(),
+			simplex.CandidateBroadcast{Data: []byte{1}, Extra: extra},
+			validator.CandidateArtifact{BlockBOC: []byte{2}},
+		)
+	}()
+	select {
+	case handoffErr := <-handoff:
+		if handoffErr != nil {
+			t.Fatalf("candidate handoff: %v", handoffErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("candidate handoff blocked on the peer send")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("private candidate send did not start")
+	}
+
+	if err = manager.RetireValidatorSession(context.Background(), validatorSpec.id); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, func() bool {
+		_, _, _, sends := observer.snapshot()
+		return len(sends) == 1
+	})
+	_, queueAges, _, sends := observer.snapshot()
+	if len(queueAges) != 1 {
+		t.Fatalf("candidate queue age samples = %d, want 1", len(queueAges))
+	}
+	if sends[0].Result != CandidateTransportSendFailed {
+		t.Fatalf("candidate send result = %d, want failed", sends[0].Result)
+	}
+	if sends[0].Duration >= candidateTransportSendBudget {
+		t.Fatalf("cancelled send waited %s, want release well inside %s",
+			sends[0].Duration, candidateTransportSendBudget)
+	}
+}
+
+// Bounded memory must not cost the freshest block: when the outbound queue is
+// full, the candidate that can still be notarized is the newest one.
+func TestCandidateQueueOverflowEvictsOldestNotNewest(t *testing.T) {
+	endpoint := newSessionEndpoint(&session{manager: &Manager{}}, sessionKindValidator)
+	endpoint.running = true
+
+	for candidate := range candidateOutboundQueueSize {
+		if err := endpoint.enqueueCandidate(outboundCandidateMessage{
+			data: []byte{byte(candidate)},
+		}); err != nil {
+			t.Fatalf("enqueue candidate %d: %v", candidate, err)
+		}
+	}
+	if err := endpoint.enqueueCandidate(outboundCandidateMessage{data: []byte{0xff}}); err != nil {
+		t.Fatalf("full queue refused the newest candidate: %v", err)
+	}
+	if got := len(endpoint.candidateOutbound); got != candidateOutboundQueueSize {
+		t.Fatalf("candidate queue depth = %d, want bounded depth %d", got, candidateOutboundQueueSize)
+	}
+
+	head := <-endpoint.candidateOutbound
+	if head.data[0] != 1 {
+		t.Fatalf("queue head = %d, want the oldest candidate evicted", head.data[0])
+	}
+	tail := head
+	for len(endpoint.candidateOutbound) > 0 {
+		tail = <-endpoint.candidateOutbound
+	}
+	if tail.data[0] != 0xff {
+		t.Fatalf("queue tail = %d, want the newest candidate retained", tail.data[0])
 	}
 }
 
@@ -976,24 +1120,25 @@ func TestCandidatePrivateWorkersDoNotSerializeBehindOneSlowSend(t *testing.T) {
 	var callsMu sync.Mutex
 	calls := 0
 	handle.mu.Lock()
-	handle.broadcast = func(ctx context.Context) error {
+	handle.broadcast = func(ctx context.Context) (p2p.TwoStepSendOutcome, error) {
 		callsMu.Lock()
 		calls++
 		call := calls
 		callsMu.Unlock()
+		delivered := p2p.TwoStepSendOutcome{Attempted: 1, Sent: 1}
 		if call == 1 {
 			close(firstStarted)
 			select {
 			case <-releaseFirst:
 			case <-ctx.Done():
-				return ctx.Err()
+				return p2p.TwoStepSendOutcome{}, ctx.Err()
 			}
 
-			return nil
+			return delivered, nil
 		}
 		laterCompleted <- struct{}{}
 
-		return nil
+		return delivered, nil
 	}
 	handle.mu.Unlock()
 	extra, err := (&simplex.BroadcastExtra{Slot: 1}).Serialize()

@@ -98,3 +98,18 @@ type Store interface {
 	// published"; the caller's own read stays the predicate.
 	BlockArtifactsSignal() <-chan struct{}
 }
+
+// AcceptedBlockStatePublisher is an optional Store capability: it tells an
+// extension about every PublishAcceptedBlockState publication, with the
+// artifacts as published, once the store can answer for them. The live view
+// provides it (liveview.Store.ObserveAcceptedBlockStates); an extension that
+// finds it absent keeps following the applied-block hook alone.
+//
+// The validator uses it to advance its internal-message pool from the states
+// of the blocks it accepted in consensus, which are resident about a second
+// before the same blocks reach OnBlockApplied under load. The observer runs
+// synchronously on the acceptance path, so it must be as cheap as the applied
+// hook's own bookkeeping.
+type AcceptedBlockStatePublisher interface {
+	ObserveAcceptedBlockStates(observe func(storage.LiveBlockArtifacts)) (stop func())
+}

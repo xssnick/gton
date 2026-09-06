@@ -6,21 +6,24 @@ import (
 	"math/big"
 
 	"github.com/xssnick/gton/service/blockproof"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const (
-	capCreateStats         = uint64(2)
-	capBounceMsgBody       = uint64(4)
-	capReportVersion       = uint64(8)
-	capShortDequeue        = uint64(32)
-	capStoreOutQueueSize   = uint64(64)
-	capMessageMetadata     = uint64(128)
-	capDeferMessages       = uint64(256)
-	capFullCollatedData    = uint64(512)
-	defaultGlobalVersion   = uint32(14)
-	maxValidatorValidUntil = ^uint32(0)
+	capCreateStats                     = uint64(2)
+	capBounceMsgBody                   = uint64(4)
+	capReportVersion                   = uint64(8)
+	capShortDequeue                    = uint64(32)
+	capStoreOutQueueSize               = uint64(64)
+	capMessageMetadata                 = uint64(128)
+	capDeferMessages                   = uint64(256)
+	capFullCollatedData                = uint64(512)
+	defaultGlobalVersion               = uint32(14)
+	maxValidatorValidUntil             = ^uint32(0)
+	configParamValidatorRegistry       = uint32(46)
+	validatorRegistryConfigConstructor = uint64(0x3601163e)
 )
 
 var (
@@ -29,7 +32,13 @@ var (
 	walletAddress  = [32]byte{}
 )
 
-func buildConfigRoot(spec validatedSpec, genesisTime uint32, baseRootHash, baseFileHash []byte) (*cell.Dictionary, uint32, error) {
+func buildConfigRoot(
+	spec validatedSpec,
+	genesisTime uint32,
+	baseRootHash,
+	baseFileHash []byte,
+	registryAddress *address.Address,
+) (*cell.Dictionary, uint32, error) {
 	params := cell.NewDict(32)
 	put := func(id uint32, value any) error {
 		param, err := tlb.ToCell(value)
@@ -200,16 +209,38 @@ func buildConfigRoot(spec validatedSpec, genesisTime uint32, baseRootHash, baseF
 	if err = putConfigParam(params, tlb.ConfigParamNewConsensusConfig, newConsensus); err != nil {
 		return nil, 0, err
 	}
+	if registryAddress != nil {
+		registryConfig := cell.BeginCell().
+			MustStoreUInt(validatorRegistryConfigConstructor, 32).
+			MustStoreSlice(registryAddress.Data(), 256).
+			MustStoreUInt(uint64(spec.spec.ValidatorRegistry.MaxCollatorsPerValidator), 32).
+			MustStoreBoolBit(false).
+			EndCell()
+		if err = putConfigParam(params, configParamValidatorRegistry, registryConfig); err != nil {
+			return nil, 0, err
+		}
+	}
 
 	fundamental, err := unitDictionary(256, []int64{0})
 	if err != nil {
 		return nil, 0, err
 	}
+	if registryAddress != nil {
+		if err = fundamental.SetIntKey(new(big.Int).SetBytes(registryAddress.Data()), cell.BeginCell().EndCell()); err != nil {
+			return nil, 0, err
+		}
+	}
 	if err = put(tlb.ConfigParamFundamentalSMCAddresses, &tlb.FundamentalSmartContractAddresses{Addresses: fundamental}); err != nil {
 		return nil, 0, err
 	}
 
-	validators, validatorHash, err := buildValidatorSet(spec.validators, genesisTime)
+	mainValidators := spec.spec.Consensus.MasterchainValidators
+	// Specs written before masterchain_validators existed used every validator
+	// for the masterchain. Preserve that canonical interpretation when omitted.
+	if mainValidators == 0 {
+		mainValidators = uint32(len(spec.validators))
+	}
+	validators, validatorHash, err := buildValidatorSet(spec.validators, uint16(mainValidators), genesisTime)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -220,7 +251,7 @@ func buildConfigRoot(spec validatedSpec, genesisTime uint32, baseRootHash, baseF
 	return params, validatorHash, nil
 }
 
-func buildValidatorSet(validators []validatorIdentity, genesisTime uint32) (*cell.Cell, uint32, error) {
+func buildValidatorSet(validators []validatorIdentity, main uint16, genesisTime uint32) (*cell.Cell, uint32, error) {
 	list := cell.NewDict(16)
 	addresses := make([]*tlb.ValidatorAddr, len(validators))
 	var totalWeight uint64
@@ -245,7 +276,7 @@ func buildValidatorSet(validators []validatorIdentity, genesisTime uint32) (*cel
 		UTimeSince:  genesisTime,
 		UTimeUntil:  maxValidatorValidUntil,
 		Total:       uint16(len(validators)),
-		Main:        uint16(len(validators)),
+		Main:        main,
 		TotalWeight: totalWeight,
 		List:        list,
 	}}

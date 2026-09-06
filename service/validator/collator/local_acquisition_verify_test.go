@@ -221,7 +221,7 @@ func TestFullCollatedProofsSkipPredecessorNeighbors(t *testing.T) {
 	}
 
 	provider := &localFullProofProvider{proofViews: views}
-	proofs, err := provider.BuildFullCollatedProofs(context.Background(), FullCollatedProofRequest{
+	built, err := provider.BuildFullCollatedProofs(context.Background(), FullCollatedProofRequest{
 		Previous:  first,
 		Previous2: &second,
 		Neighbors: neighbors,
@@ -229,6 +229,7 @@ func TestFullCollatedProofsSkipPredecessorNeighbors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build proofs for a neighbor set of predecessors only: %v", err)
 	}
+	proofs := built.Roots
 	if len(proofs) != 0 {
 		t.Fatalf("emitted %d proofs for neighbors that are all collation predecessors", len(proofs))
 	}

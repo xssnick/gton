@@ -132,29 +132,32 @@ func (v *SemanticVerifier) VerifyCandidateTransition(ctx context.Context, transi
 // long past its validation — live-set growth, which is the one memory currency
 // this tree treats as expensive.
 type semanticEnvelopeCache struct {
-	entries sync.Map
+	entries map[cell.Hash]*semanticEnvelope
 }
 
 // parse returns the cached envelope for the cell's content or parses and
-// caches it. Safe from the concurrent account lanes; on a race both sides
-// parse the same content and either result is correct, so LoadOrStore just
-// keeps the first. The nil receiver parses without caching — the neighbor
-// and masterchain paths use it.
+// caches it. Queue preparation fills the cache before the account lanes start;
+// lanes read only the parsed descriptor bindings. Queue checks resume after
+// the lanes join, so cache access is sequential. A nil receiver parses without
+// caching for callers outside the replay.
 func (c *semanticEnvelopeCache) parse(root *cell.Cell) (*semanticEnvelope, error) {
 	if c == nil {
 		return parseSemanticEnvelope(root)
 	}
 	key := root.HashKey()
-	if cached, ok := c.entries.Load(key); ok {
-		return cached.(*semanticEnvelope), nil
+	if cached := c.entries[key]; cached != nil {
+		return cached, nil
 	}
 	envelope, err := parseSemanticEnvelope(root)
 	if err != nil {
 		return nil, err
 	}
-	cached, _ := c.entries.LoadOrStore(key, envelope)
+	if c.entries == nil {
+		c.entries = make(map[cell.Hash]*semanticEnvelope)
+	}
+	c.entries[key] = envelope
 
-	return cached.(*semanticEnvelope), nil
+	return envelope, nil
 }
 
 type semanticReplay struct {

@@ -354,6 +354,10 @@ type Window struct {
 	Leader       uint32
 	LocalLeader  bool
 	ObservedAt   time.Time
+	// FirstBlockTimeout is this observation's local grace, including the
+	// voter's adaptation after skipped windows. Carry it with the event so an
+	// asynchronous producer cannot read the timeout of a later window.
+	FirstBlockTimeout time.Duration
 }
 
 // Misbehavior kinds, mirroring simplex/misbehavior.h.

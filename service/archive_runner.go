@@ -56,11 +56,13 @@ type ArchiveStore interface {
 // coordinator's individual caches and publishers.
 type archiveMasterTransitions interface {
 	masterchainValidatorsForConsensus(*storage.BlockState, ton.BlockIDExt, masterchainValidatorCacheKey) (*blockproof.PreparedValidatorSet, error)
-	applyArchiveMasterBlock(context.Context, *storage.BlockState, *PreparedBlock, *masterchainConsensusProof, stateUpdateApplier) (*storage.BlockState, masterchainApplyTiming, time.Duration, error)
+	applyArchiveMasterBlock(context.Context, *storage.BlockState, *PreparedBlock, *masterchainConsensusProof, stateUpdateApplier, *blockAppliedObserverMeta) (*storage.BlockState, masterchainApplyTiming, time.Duration, error)
+	archiveBlockAppliedEnabled() bool
+	processArchiveBlockApplied(context.Context, BlockAppliedEvent) error
 }
 
 type archiveShardTransitions interface {
-	applyArchiveShardBlock(context.Context, ton.BlockIDExt, []*storage.BlockState, PreparedBlock, stateUpdateApplier, *storage.BlockState) (*storage.BlockState, error)
+	applyArchiveShardBlock(context.Context, ton.BlockIDExt, []*storage.BlockState, PreparedBlock, stateUpdateApplier, *blockAppliedObserverMeta) (*storage.BlockState, error)
 }
 
 type archiveCurrentTransitions interface {
@@ -268,7 +270,7 @@ func (a *ArchiveRunner) loadBlockStateForApply(ctx context.Context, state storag
 	return a.storage.BlockState(ctx, state.Block)
 }
 
-func (s *SyncCoordinator) applyArchiveMasterBlock(ctx context.Context, current *storage.BlockState, block *PreparedBlock, proof *masterchainConsensusProof, applier stateUpdateApplier) (*storage.BlockState, masterchainApplyTiming, time.Duration, error) {
+func (s *SyncCoordinator) applyArchiveMasterBlock(ctx context.Context, current *storage.BlockState, block *PreparedBlock, proof *masterchainConsensusProof, applier stateUpdateApplier, observerMeta *blockAppliedObserverMeta) (*storage.BlockState, masterchainApplyTiming, time.Duration, error) {
 	block.consensus = proof
 
 	consensusStarted := time.Now()
@@ -279,7 +281,7 @@ func (s *SyncCoordinator) applyArchiveMasterBlock(ctx context.Context, current *
 	}
 	block.consensusChecked = checked
 
-	next, timing, err := s.applyMasterchainTransition(ctx, current, *block, checked, applier, &blockAppliedObserverMeta{})
+	next, timing, err := s.applyMasterchainTransition(ctx, current, *block, checked, applier, observerMeta)
 	if err != nil {
 		return nil, timing, consensusElapsed, err
 	}
@@ -297,17 +299,26 @@ func (s *SyncCoordinator) applyArchiveMasterBlock(ctx context.Context, current *
 	return next, timing, consensusElapsed, nil
 }
 
-func (s *SyncCoordinator) applyArchiveShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, block PreparedBlock, applier stateUpdateApplier, master *storage.BlockState) (*storage.BlockState, error) {
-	next, err := s.applyResolvedShardBlock(ctx, target, previous, block, applier, &blockAppliedObserverMeta{
-		InclusionMasterRef:   &master.Block,
-		InclusionMasterState: master.Cell,
-	})
+func (s *SyncCoordinator) applyArchiveShardBlock(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, block PreparedBlock, applier stateUpdateApplier, observerMeta *blockAppliedObserverMeta) (*storage.BlockState, error) {
+	next, err := s.applyResolvedShardBlock(ctx, target, previous, block, applier, observerMeta)
 	if err != nil {
 		return nil, err
 	}
 
 	s.publishLiveBlockArtifacts(block, next, liveBlockPublishOptions{availabilityOnly: true})
 	return next, nil
+}
+
+func (s *SyncCoordinator) processArchiveBlockApplied(ctx context.Context, event BlockAppliedEvent) error {
+	if s.blockAppliedProcessor == nil {
+		return nil
+	}
+
+	return s.blockAppliedProcessor.run(ctx, event)
+}
+
+func (s *SyncCoordinator) archiveBlockAppliedEnabled() bool {
+	return s.blockAppliedProcessor != nil
 }
 
 func (s *SyncCoordinator) archiveCurrentAdvanced(current *storage.CurrentState) {

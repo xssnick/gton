@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"fmt"
+	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/xssnick/gton/service/p2p"
@@ -17,11 +19,30 @@ const (
 	shardDescriptionHintLimit = 4096
 )
 
+// shardDescriptionHintSeq numbers hints in the order they enter a table
+// (taken under that table's shardDescriptionMu), so a table's newest hint
+// always carries its highest sequence number; see
+// shardDescriptionHintGeneration.
+var shardDescriptionHintSeq atomic.Uint64
+
 type shardDescriptionHint struct {
 	Description p2p.ShardBlockDescription
 	Overlay     string
 	Kind        string
 	ReceivedAt  time.Time
+	// seq is the hint's position in the remember order; re-remembering a
+	// block hands its hint a fresh one.
+	seq uint64
+}
+
+// shardDescriptionHintGeneration summarises which hints a table holds without
+// enumerating them. Every insertion or replacement raises maxSeq above every
+// sequence number the table has held so far, and any removal not accompanied
+// by one lowers count, so two generations compare equal exactly when the
+// table holds the same hints.
+type shardDescriptionHintGeneration struct {
+	count  int
+	maxSeq uint64
 }
 
 func (s *SyncCoordinator) runShardDescriptionProcessor(ctx context.Context) {
@@ -73,15 +94,7 @@ func (s *SyncCoordinator) rememberShardDescriptionHint(ev p2p.BroadcastEvent) bo
 		ReceivedAt:  receivedAt,
 	}
 
-	key := storage.BlockKey(ev.Block)
-
-	s.shardDescriptionMu.Lock()
-	if _, ok := s.shardDescriptionHints[key]; !ok {
-		s.shardDescriptionOrder = append(s.shardDescriptionOrder, key)
-	}
-	s.shardDescriptionHints[key] = hint
-	s.pruneShardDescriptionHintsLocked(time.Now())
-	s.shardDescriptionMu.Unlock()
+	s.storeShardDescriptionHint(hint)
 
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(ev.Block)).
@@ -94,6 +107,23 @@ func (s *SyncCoordinator) rememberShardDescriptionHint(ev p2p.BroadcastEvent) bo
 	s.signalShardDescriptionWake()
 	s.wakeCurrentStateSync()
 	return true
+}
+
+// storeShardDescriptionHint files hint under its block, replacing an earlier
+// description of the same block, and prunes the table.
+func (s *SyncCoordinator) storeShardDescriptionHint(hint shardDescriptionHint) {
+	key := storage.BlockKey(hint.Description.Block)
+
+	s.shardDescriptionMu.Lock()
+	// Numbered under the lock: the sequence must rise with the table's own
+	// insertion order for the generation to track its contents.
+	hint.seq = shardDescriptionHintSeq.Add(1)
+	if _, ok := s.shardDescriptionHints[key]; !ok {
+		s.shardDescriptionOrder = append(s.shardDescriptionOrder, key)
+	}
+	s.shardDescriptionHints[key] = hint
+	s.pruneShardDescriptionHintsLocked(time.Now())
+	s.shardDescriptionMu.Unlock()
 }
 
 func (s *SyncCoordinator) observeShardTopBlockDescription(ctx context.Context, ev p2p.BroadcastEvent) {
@@ -189,15 +219,23 @@ func cloneServiceBlockIDs(blocks []ton.BlockIDExt) []ton.BlockIDExt {
 	return cloned
 }
 
-func (s *SyncCoordinator) shardDescriptionHintSnapshot(now time.Time) []shardDescriptionHint {
+// shardDescriptionHintSnapshot copies the live hints into dst, reusing its
+// backing array, and reports the table generation they came from. A caller
+// that passes back the slice and generation of its previous snapshot gets
+// both returned untouched with changed=false while the table still holds the
+// same hints: that snapshot already equals the table.
+func (s *SyncCoordinator) shardDescriptionHintSnapshot(now time.Time, dst []shardDescriptionHint, seen shardDescriptionHintGeneration) (hints []shardDescriptionHint, gen shardDescriptionHintGeneration, changed bool) {
 	s.shardDescriptionMu.Lock()
 	defer s.shardDescriptionMu.Unlock()
 
-	s.pruneShardDescriptionHintsLocked(now)
+	gen = s.pruneShardDescriptionHintsLocked(now)
+	if gen == seen {
+		return dst, gen, false
+	}
 
 	// Hints are cloned privately at remember time and never mutated afterwards,
 	// so the snapshot shares them instead of deep-cloning every Chain again.
-	hints := make([]shardDescriptionHint, 0, len(s.shardDescriptionOrder))
+	hints = slices.Grow(dst[:0], len(s.shardDescriptionOrder))
 	for _, key := range s.shardDescriptionOrder {
 		hint, ok := s.shardDescriptionHints[key]
 		if !ok {
@@ -205,7 +243,10 @@ func (s *SyncCoordinator) shardDescriptionHintSnapshot(now time.Time) []shardDes
 		}
 		hints = append(hints, hint)
 	}
-	return hints
+	// Whatever an earlier snapshot left past the new length would pin hints
+	// the table has since evicted.
+	clear(hints[len(hints):cap(hints)])
+	return hints, gen, true
 }
 
 func (s *SyncCoordinator) dropShardDescriptionHint(block ton.BlockIDExt) {
@@ -216,14 +257,18 @@ func (s *SyncCoordinator) dropShardDescriptionHint(block ton.BlockIDExt) {
 	s.shardDescriptionMu.Unlock()
 }
 
-func (s *SyncCoordinator) pruneShardDescriptionHintsLocked(now time.Time) {
+// pruneShardDescriptionHintsLocked drops expired hints and the oldest ones
+// beyond the table limit, and returns the generation of what remains.
+func (s *SyncCoordinator) pruneShardDescriptionHintsLocked(now time.Time) shardDescriptionHintGeneration {
 	if len(s.shardDescriptionHints) == 0 {
 		s.shardDescriptionOrder = nil
-		return
+		return shardDescriptionHintGeneration{}
 	}
 
 	cutoff := now.Add(-shardDescriptionHintTTL)
 	write := 0
+	var maxSeq uint64
+	maxAt := -1
 	for _, key := range s.shardDescriptionOrder {
 		hint, ok := s.shardDescriptionHints[key]
 		if !ok {
@@ -232,6 +277,9 @@ func (s *SyncCoordinator) pruneShardDescriptionHintsLocked(now time.Time) {
 		if hint.ReceivedAt.Before(cutoff) {
 			delete(s.shardDescriptionHints, key)
 			continue
+		}
+		if maxAt < 0 || hint.seq > maxSeq {
+			maxSeq, maxAt = hint.seq, write
 		}
 		s.shardDescriptionOrder[write] = key
 		write++
@@ -247,7 +295,16 @@ func (s *SyncCoordinator) pruneShardDescriptionHintsLocked(now time.Time) {
 			s.shardDescriptionOrder[i] = storage.BlockRootHash{}
 		}
 		s.shardDescriptionOrder = s.shardDescriptionOrder[:len(s.shardDescriptionOrder)-overflow]
+		if maxAt < overflow {
+			// The newest hint re-described one of the evicted blocks; the
+			// survivors' newest is whichever of them remains.
+			maxSeq = 0
+			for _, key := range s.shardDescriptionOrder {
+				maxSeq = max(maxSeq, s.shardDescriptionHints[key].seq)
+			}
+		}
 	}
+	return shardDescriptionHintGeneration{count: len(s.shardDescriptionOrder), maxSeq: maxSeq}
 }
 
 func (s *SyncCoordinator) signalShardDescriptionWake() {

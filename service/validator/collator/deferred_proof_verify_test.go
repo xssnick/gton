@@ -23,7 +23,7 @@ import (
 // proves that key absent — for a deferred message it builds its queue lookup
 // out of a next_prefix it deliberately does not compute — so a reference
 // collator has no reason to carry that path, and demanding it rejects blocks
-// the rest of the network accepts. The comment in applyOutQueueChanges has the
+// the rest of the network accepts. The comment in verifyOutQueueChanges has the
 // line references.
 //
 // What this test does and does not establish is worth stating plainly. It runs

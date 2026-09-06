@@ -16,6 +16,7 @@ import (
 	"github.com/xssnick/gton/service/validator/blockstats"
 	core "github.com/xssnick/gton/service/validator/collator"
 	"github.com/xssnick/gton/service/validator/keyring"
+	"github.com/xssnick/gton/service/validator/msgpool"
 	validatornet "github.com/xssnick/gton/service/validator/network"
 
 	"github.com/xssnick/tonutils-go/ton"
@@ -767,13 +768,22 @@ func newStandaloneCollatorFactory(
 		if err != nil {
 			return nil, fmt.Errorf("collator composition: create backend: %w", err)
 		}
+		// One feed per pool: the controller owns its destination projection and
+		// the extension drives it per applied block. A standalone collator that
+		// skipped this reads its neighbours' out-queues out of state on every
+		// window entry instead of off runs kept at the head.
+		feed := msgpool.NewFeed(msgpool.FeedOptions{
+			Pool:      composition.runtime.Messages,
+			Logger:    log,
+			Prewarmer: node.AccountPrewarmer,
+		})
 		controller, err := core.NewController(core.ControllerOptions{
 			Backend:     backend,
 			Storage:     composition.collatorStorage,
 			Observer:    observer,
 			Tracker:     composition.runtime.Groups,
 			Acquisition: acquisition,
-			Messages:    composition.runtime.Messages,
+			Feed:        feed,
 			Logger:      log,
 		})
 		if err != nil {
@@ -784,6 +794,7 @@ func newStandaloneCollatorFactory(
 			Controller: controller,
 			ShardTops:  shardTops,
 			Messages:   composition.runtime.Messages,
+			Feed:       feed,
 		})(node)
 	}
 }

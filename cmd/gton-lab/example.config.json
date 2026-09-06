@@ -4,6 +4,7 @@
     {
       "name": "go-0",
       "kind": "go",
+      "roles": ["producer", "validator"],
       "log_path": "/srv/localnet/node-0/lab.jsonl",
       "tmux_session": "localnet-go-0",
       "start_command": [
@@ -15,6 +16,7 @@
     {
       "name": "go-1",
       "kind": "go",
+      "roles": ["producer"],
       "log_path": "/srv/localnet/node-1/lab.jsonl",
       "tmux_session": "localnet-go-1",
       "start_command": [
@@ -26,6 +28,7 @@
     {
       "name": "cpp-0",
       "kind": "cpp",
+      "roles": ["validator", "finalizer"],
       "log_path": "/srv/localnet/cpp/validator-engine.log",
       "tmux_session": "localnet-cpp-0"
     }
@@ -46,7 +49,7 @@
     "topology_timeout": "10m",
     "recipients": 256,
     "message_ton": "0.05",
-    "jettons": "1"
+    "jettons": "1000000"
   },
   "deploy": {
     "target_binary": "/srv/localnet/bin/gton-node",
@@ -59,6 +62,13 @@
     "max_hard_errors": 0,
     "require_split": true,
     "require_merge": true,
+    "candidate_flows": [
+      {
+        "producer": "go-1",
+        "validators": ["cpp-0"],
+        "finalizers": ["cpp-0"]
+      }
+    ],
     "allow_error_patterns": []
   }
 }

@@ -67,6 +67,8 @@ type builtCandidate struct {
 	// bind refuses a chain that is not those parents, so the reused successor
 	// can never belong to a different predecessor than the one being committed.
 	parents []cell.Hash
+	// live binds the built successor to the exact resident predecessor trees.
+	live LiveSuccessorState
 	// state and stateUpdate bind the successor handed to CommitCandidate to the
 	// transition finish() actually built. Both are cached level-0 hashes, so the
 	// check is O(1) and does not retain another tree.
@@ -238,14 +240,22 @@ func newBuiltCandidate(
 	}
 
 	parents := make([]cell.Hash, 0, len(previous))
+	liveParents := make([]*cell.Cell, 0, len(previous))
 	for _, parent := range previous {
 		if parent == nil || parent.State == nil {
 			return nil
 		}
 		parents = append(parents, parent.State.HashKeyAt(0))
+		liveParents = append(liveParents, parent.State)
+	}
+
+	source, err := stateUpdate.PeekRef(0)
+	if err != nil {
+		return nil
 	}
 
 	built := &builtCandidate{
+		live:        LiveSuccessorState{root: state, parents: liveParents, source: source.HashKeyAt(0)},
 		root:        root,
 		collated:    collated,
 		startLT:     startLT,

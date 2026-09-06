@@ -24,9 +24,9 @@ type staticFullCollatedProofProvider struct {
 func (p *staticFullCollatedProofProvider) BuildFullCollatedProofs(
 	_ context.Context,
 	_ FullCollatedProofRequest,
-) ([]*cell.Cell, error) {
+) (FullCollatedProofs, error) {
 	p.called++
-	return p.roots, p.err
+	return FullCollatedProofs{Roots: p.roots, ScanExhausted: true}, p.err
 }
 
 type recordingCandidateTransitionVerifier struct {

@@ -700,6 +700,29 @@ var processedInfinityHash = func() (hash [32]byte) {
 // prepare-time
 // minimum came from. Without an insert the parent dictionary passes through
 // byte-identical.
+// prospectiveProcessedBound is the bound this block will claim, computed before
+// it is written. The collated proof has to be built against exactly this bound
+// — the validator opens the queue prefix below the claim and nothing else — so
+// the claim and the proof read it from one place.
+//
+// The second result says whether there is a claim at all.
+func (c *collation) prospectiveProcessedBound() (semanticMessageBound, bool) {
+	if c.lastProcLT != 0 {
+		return semanticMessageBound{lt: c.lastProcLT, hash: c.lastProcHash}, true
+	}
+	// The drained claim: nothing was imported, and the block says everything
+	// below the reference lt is already processed.
+	if len(c.req.internalMessages()) != 0 || c.req.internalsIncomplete() {
+		return semanticMessageBound{}, false
+	}
+	_, referenceEndLT := c.processedReference()
+	if referenceEndLT == 0 {
+		return semanticMessageBound{}, false
+	}
+
+	return semanticMessageBound{lt: referenceEndLT - 1, hash: processedInfinityHash}, true
+}
+
 func (c *collation) updateProcessedInfo() error {
 	boundLT, boundHash := c.lastProcLT, c.lastProcHash
 	if boundLT == 0 {
@@ -707,6 +730,18 @@ func (c *collation) updateProcessedInfo() error {
 		// empty. The infinity bound sits just below the reference masterchain
 		// state lt.
 		if len(c.req.internalMessages()) != 0 || c.req.internalsIncomplete() {
+			return nil
+		}
+		if !c.drainedClaimProvable {
+			// The prefix under this bound is deeper than the budget the collated
+			// proof can carry for it, so the claim would cost more than it is
+			// worth: measured on the stand at 3.4 MB of proof on a block with
+			// 2.3 kB of content, which puts the block over the collated limit
+			// before a message can be admitted and keeps it there. Leaving
+			// ProcessedInfo unmoved owes the validator nothing —
+			// verifyProcessedInfo returns before its source loop when the
+			// dictionary did not move — and any block that actually imports
+			// something advances the bound the ordinary way.
 			return nil
 		}
 		_, referenceEndLT := c.processedReference()

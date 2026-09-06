@@ -17,7 +17,10 @@ import (
 
 const (
 	loadOutcomeComplete           = "complete"
-	loadOutcomeDeliveryIncomplete = "load_delivery_incomplete"
+	loadOutcomeDeliveryIncomplete = "delivery_incomplete"
+	loadOutcomeExecutionFailed    = "execution_failed"
+	loadOutcomeSubmissionFailed   = "submission_failed"
+	loadOutcomeWorkloadInvalid    = "workload_incompatible"
 	loadOutcomeFailed             = "failed"
 )
 
@@ -43,16 +46,18 @@ func BuildReport(runDirectory string) (Summary, error) {
 			return Summary{}, err
 		}
 		events = append(events, nodeEvents...)
+		hardErrors, errorCategories := allowedHardErrorStats(nodeEvents, manifest.Config.Conditions.AllowErrorPatterns)
 		deltas = append(deltas, NodeDelta{
 			Name: node.Name, StartOffset: baseline.Log.Offset, EndOffset: end.Offset,
 			MasterchainStart: baseline.MasterchainSeqno, MasterchainEnd: stats.MasterchainSeqno,
 			FinalizedBlocks: stats.Finalized, CollatedBlocks: stats.Collated,
-			ValidatedBlocks: stats.Validated, HardErrors: allowedHardErrors(nodeEvents, manifest.Config.Conditions.AllowErrorPatterns),
-			AdvisoryWarnings: stats.AdvisoryWarnings,
+			EmittedCandidates: stats.Emitted, ValidatedBlocks: stats.Validated, HardErrors: hardErrors,
+			AdvisoryWarnings: stats.AdvisoryWarnings, ErrorCategories: errorCategories,
+			WarningCategories: stats.WarningCategories,
 		})
 	}
 
-	coverage := evaluateTopology(events, manifest.Config.Nodes)
+	coverage := evaluateTopology(events, manifest.Config)
 	checks := evaluateChecks(manifest, deltas, coverage)
 	consensusVerdict := "passed"
 	for _, check := range checks {
@@ -64,7 +69,7 @@ func BuildReport(runDirectory string) (Summary, error) {
 	if observesTopology(manifest.Scenario) && consensusVerdict == "passed" && !coverage.Complete {
 		consensusVerdict = "inconclusive"
 	}
-	verdict := scenarioVerdict(manifest.Scenario, consensusVerdict, manifest.Load)
+	verdict := scenarioVerdict(consensusVerdict, manifest.Load)
 
 	finished := manifest.FinishedAt
 	if finished.IsZero() {
@@ -82,6 +87,7 @@ func BuildReport(runDirectory string) (Summary, error) {
 		Nodes:              deltas,
 		Checks:             checks,
 		Topology:           coverage,
+		Phases:             manifest.Phases,
 		Events:             len(events),
 	}
 	if err = writeEvents(filepath.Join(runDirectory, "events.ndjson"), events); err != nil {
@@ -93,14 +99,11 @@ func BuildReport(runDirectory string) (Summary, error) {
 	return summary, nil
 }
 
-func scenarioVerdict(scenario, consensus string, load LoadResult) string {
-	if load.HardFailure || load.Outcome == loadOutcomeFailed {
+func scenarioVerdict(consensus string, load LoadResult) string {
+	if load.HardFailure || load.Outcome != "" && load.Outcome != loadOutcomeComplete {
 		return "failed"
 	}
 	if load.Outcome == "" && (load.ExitCode != 0 || load.Error != "") {
-		return "failed"
-	}
-	if load.Outcome == loadOutcomeDeliveryIncomplete && scenario != "topology-cycle" {
 		return "failed"
 	}
 	return consensus
@@ -108,7 +111,7 @@ func scenarioVerdict(scenario, consensus string, load LoadResult) string {
 
 func evaluateChecks(manifest RunManifest, deltas []NodeDelta, coverage TopologyCoverage) []Check {
 	conditions := manifest.Config.Conditions
-	checks := make([]Check, 0, 6)
+	checks := make([]Check, 0, 7+len(coverage.CandidateFlows))
 	if conditions.MinMasterchainAdvance > 0 {
 		minimum := ^uint32(0)
 		found := false
@@ -147,6 +150,37 @@ func evaluateChecks(manifest RunManifest, deltas []NodeDelta, coverage TopologyC
 		checks = append(checks, Check{Name: "finalized_blocks", Passed: finalized >= conditions.MinFinalizedBlocks, Actual: strconv.FormatUint(finalized, 10), Wanted: ">=" + strconv.FormatUint(conditions.MinFinalizedBlocks, 10)})
 	}
 	checks = append(checks, Check{Name: "hard_errors", Passed: hardErrors <= uint64(conditions.MaxHardErrors), Actual: strconv.FormatUint(hardErrors, 10), Wanted: "<=" + strconv.Itoa(conditions.MaxHardErrors)})
+	checks = append(checks, Check{
+		Name:   "required_role_coverage",
+		Passed: coverage.RequiredRoleCoverage,
+		Actual: fmt.Sprintf(
+			"producers=%v validators=%v finalizers=%v",
+			coverage.ProducerNodes,
+			coverage.ValidationNodes,
+			coverage.FinalizationNodes,
+		),
+		Wanted: "all configured non-optional node roles observed",
+	})
+	for index, flow := range coverage.CandidateFlows {
+		checks = append(checks, Check{
+			Name:   "candidate_flow_" + strconv.Itoa(index),
+			Passed: flow.Complete,
+			Actual: fmt.Sprintf(
+				"producer=%s validated_by=%v finalized_by=%v missing_evidence=%v complete=%t",
+				flow.Producer,
+				flow.ValidatedBy,
+				flow.FinalizedBy,
+				flow.MissingEvidence,
+				flow.Complete,
+			),
+			Wanted: fmt.Sprintf(
+				"producer=%s validators=%v finalizers=%v complete=true",
+				flow.Producer,
+				flow.Validators,
+				flow.Finalizers,
+			),
+		})
+	}
 	if conditions.RequireSplit {
 		checks = append(checks, Check{Name: "split", Passed: coverage.Split, Actual: strconv.FormatBool(coverage.Split), Wanted: "true"})
 	}
@@ -172,14 +206,12 @@ type splitGeneration struct {
 	rotated  bool
 }
 
-func evaluateTopology(events []Event, nodes []NodeConfig) TopologyCoverage {
+func evaluateTopology(events []Event, cfg Config) TopologyCoverage {
+	events = deduplicateCandidateEmissions(events)
 	states := make(map[string]*topologyState)
 	producers := make(map[string]struct{})
 	validators := make(map[string]struct{})
-	cppCandidates := make(map[string]struct{})
-	goValidated := make(map[string]struct{})
-	cppBlocks := make(map[string]struct{})
-	goValidatedBlocks := make(map[string]struct{})
+	finalizers := make(map[string]struct{})
 	var combined TopologyCoverage
 	for _, event := range events {
 		state := states[event.Node]
@@ -190,30 +222,14 @@ func evaluateTopology(events []Event, nodes []NodeConfig) TopologyCoverage {
 			states[event.Node] = state
 		}
 		state.observe(event)
-		if event.Kind == "block_collated" {
+		if event.Kind == "candidate_emitted" {
 			producers[event.Node] = struct{}{}
 		}
 		if event.Kind == "block_validated" {
 			validators[event.Node] = struct{}{}
 		}
-		if event.CandidateHash != "" {
-			kind := nodeKind(nodes, event.Node)
-			if kind == "cpp" && event.Kind == "block_collated" {
-				cppCandidates[event.CandidateHash] = struct{}{}
-			}
-			if kind == "go" && event.Kind == "block_validated" {
-				goValidated[event.CandidateHash] = struct{}{}
-			}
-		}
-		blockID := eventBlockID(event)
-		if blockID != "" {
-			kind := nodeKind(nodes, event.Node)
-			if kind == "cpp" && event.Kind == "block_collated" {
-				cppBlocks[blockID] = struct{}{}
-			}
-			if kind == "go" && event.Kind == "block_validated" {
-				goValidatedBlocks[blockID] = struct{}{}
-			}
+		if event.Kind == "block_finalized" {
+			finalizers[event.Node] = struct{}{}
 		}
 	}
 	for _, state := range states {
@@ -235,36 +251,232 @@ func evaluateTopology(events []Event, nodes []NodeConfig) TopologyCoverage {
 		combined.ValidationNodes = append(combined.ValidationNodes, node)
 	}
 	slices.Sort(combined.ValidationNodes)
-	combined.RequiredNodeCoverage = true
-	for _, node := range nodes {
+	combined.FinalizationNodes = make([]string, 0, len(finalizers))
+	for node := range finalizers {
+		combined.FinalizationNodes = append(combined.FinalizationNodes, node)
+	}
+	slices.Sort(combined.FinalizationNodes)
+	combined.RequiredRoleCoverage = true
+	for _, node := range cfg.Nodes {
 		if node.Optional {
 			continue
 		}
 		_, collated := producers[node.Name]
 		_, validated := validators[node.Name]
-		if !collated || node.Kind == "go" && !validated {
-			combined.RequiredNodeCoverage = false
+		_, finalized := finalizers[node.Name]
+		if nodeHasRole(node, nodeRoleProducer) && !collated ||
+			nodeHasRole(node, nodeRoleValidator) && !validated ||
+			nodeHasRole(node, nodeRoleFinalizer) && !finalized {
+			combined.RequiredRoleCoverage = false
 		}
 	}
-	for candidate := range cppCandidates {
-		if _, exists := goValidated[candidate]; exists {
-			combined.CppToGoValidated = true
-			break
-		}
-	}
-	if !combined.CppToGoValidated {
-		for blockID := range cppBlocks {
-			if _, exists := goValidatedBlocks[blockID]; exists {
-				combined.CppToGoValidated = true
-				break
-			}
-		}
+	combined.CandidateFlows = make([]CandidateFlowCoverage, 0, len(cfg.Conditions.CandidateFlows))
+	flowsComplete := true
+	for _, flow := range cfg.Conditions.CandidateFlows {
+		coverage := evaluateCandidateFlow(events, flow)
+		combined.CandidateFlows = append(combined.CandidateFlows, coverage)
+		flowsComplete = flowsComplete && coverage.Complete
 	}
 	topologyComplete := combined.LinearProof && combined.Split && combined.ChildrenProduced &&
 		combined.Rotation && combined.Merge && combined.AfterMergeProduced && combined.ReturnedToLinear
-	parityComplete := combined.RequiredNodeCoverage && combined.CppToGoValidated
+	parityComplete := combined.RequiredRoleCoverage && flowsComplete
 	combined.Complete = topologyComplete && parityComplete
 	return combined
+}
+
+// evaluateCandidateFlow is re-run from scratch every second by the topology
+// loop, against an event slice that only grows, so every question it asks of
+// the observed events is asked through an index built once per node rather than
+// by scanning them again per produced candidate.
+func evaluateCandidateFlow(events []Event, flow CandidateFlowConfig) CandidateFlowCoverage {
+	coverage := CandidateFlowCoverage{
+		Producer:   flow.Producer,
+		Validators: slices.Clone(flow.Validators),
+		Finalizers: slices.Clone(flow.Finalizers),
+	}
+	// Only candidate emissions carry a duplicate identity — a build and its
+	// replay name one emission — so the deduplication belongs on the producer's
+	// own events and not on a fresh copy of everything the run has ever logged.
+	// It stays here rather than being left to the caller so this function is
+	// still correct when it is called on its own.
+	produced := deduplicateCandidateEmissions(
+		selectBlockEvents(events, flow.Producer, "candidate_emitted"),
+	)
+	validated := make(map[string]candidateHashIndex, len(flow.Validators))
+	for _, node := range flow.Validators {
+		observed := selectBlockEvents(events, node, "block_validated")
+		if !eventsHaveCandidateHash(observed) {
+			coverage.MissingEvidence = append(coverage.MissingEvidence, "validator_candidate_hash:"+node)
+		}
+		index := newCandidateHashIndex(observed)
+		validated[node] = index
+		if slices.ContainsFunc(produced, index.matches) {
+			coverage.ValidatedBy = append(coverage.ValidatedBy, node)
+		}
+	}
+	finalized := make(map[string]blockIDIndex, len(flow.Finalizers))
+	for _, node := range flow.Finalizers {
+		observed := selectBlockEvents(events, node, "block_finalized")
+		if !eventsHaveBlockID(observed) {
+			coverage.MissingEvidence = append(coverage.MissingEvidence, "finalizer_block_id:"+node)
+		}
+		index := newBlockIDIndex(observed)
+		finalized[node] = index
+		if slices.ContainsFunc(produced, index.matches) {
+			coverage.FinalizedBy = append(coverage.FinalizedBy, node)
+		}
+	}
+	for _, candidate := range produced {
+		if candidate.CandidateHash == "" || eventBlockID(candidate) == "" {
+			continue
+		}
+		complete := true
+		for _, node := range flow.Validators {
+			complete = complete && validated[node].matches(candidate)
+		}
+		for _, node := range flow.Finalizers {
+			complete = complete && finalized[node].matches(candidate)
+		}
+		if complete {
+			coverage.Complete = true
+			break
+		}
+	}
+	if !eventsHaveCandidateHash(produced) {
+		coverage.MissingEvidence = append(coverage.MissingEvidence, "producer_candidate_hash")
+	}
+	if !eventsHaveBlockID(produced) {
+		coverage.MissingEvidence = append(coverage.MissingEvidence, "producer_block_id")
+	}
+	slices.Sort(coverage.ValidatedBy)
+	slices.Sort(coverage.FinalizedBy)
+	slices.Sort(coverage.MissingEvidence)
+	return coverage
+}
+
+func selectBlockEvents(events []Event, node, kind string) []Event {
+	selected := make([]Event, 0)
+	for _, event := range events {
+		if event.Node == node && event.Kind == kind {
+			selected = append(selected, event)
+		}
+	}
+	return selected
+}
+
+// candidateHashIndex answers "did this node observe that candidate" without
+// walking its events again. The slot rule it encodes is the one the linear
+// match used: an unknown slot on either side falls back to the hash alone, and
+// two known slots have to agree.
+type candidateHashIndex struct {
+	present map[string]struct{}
+	anySlot map[string]struct{}
+	slots   map[candidateSlotKey]struct{}
+}
+
+type candidateSlotKey struct {
+	hash string
+	slot uint32
+}
+
+func newCandidateHashIndex(events []Event) candidateHashIndex {
+	index := candidateHashIndex{
+		present: make(map[string]struct{}, len(events)),
+		anySlot: make(map[string]struct{}),
+		slots:   make(map[candidateSlotKey]struct{}, len(events)),
+	}
+	for _, event := range events {
+		if event.CandidateHash == "" {
+			continue
+		}
+		index.present[event.CandidateHash] = struct{}{}
+		if event.Slot == nil {
+			index.anySlot[event.CandidateHash] = struct{}{}
+
+			continue
+		}
+		index.slots[candidateSlotKey{hash: event.CandidateHash, slot: *event.Slot}] = struct{}{}
+	}
+
+	return index
+}
+
+func (i candidateHashIndex) matches(candidate Event) bool {
+	if candidate.CandidateHash == "" {
+		return false
+	}
+	if candidate.Slot == nil {
+		_, exists := i.present[candidate.CandidateHash]
+
+		return exists
+	}
+	if _, exists := i.anySlot[candidate.CandidateHash]; exists {
+		return true
+	}
+	_, exists := i.slots[candidateSlotKey{hash: candidate.CandidateHash, slot: *candidate.Slot}]
+
+	return exists
+}
+
+// blockIDIndex is the same idea for finalization evidence, which matches on the
+// block identity alone. It also spares the per-pair concatenation eventBlockID
+// used to do once for every produced candidate against every observed event.
+type blockIDIndex map[string]struct{}
+
+func newBlockIDIndex(events []Event) blockIDIndex {
+	index := make(blockIDIndex, len(events))
+	for _, event := range events {
+		if id := eventBlockID(event); id != "" {
+			index[id] = struct{}{}
+		}
+	}
+
+	return index
+}
+
+func (i blockIDIndex) matches(candidate Event) bool {
+	blockID := eventBlockID(candidate)
+	if blockID == "" {
+		return false
+	}
+	_, exists := i[blockID]
+
+	return exists
+}
+
+func deduplicateCandidateEmissions(events []Event) []Event {
+	seen := make(map[candidateEmissionKey]struct{})
+	deduplicated := make([]Event, 0, len(events))
+	for _, event := range events {
+		key, identified := candidateEmissionIdentity(event)
+		if identified {
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+		}
+		deduplicated = append(deduplicated, event)
+	}
+
+	return deduplicated
+}
+
+func eventsHaveCandidateHash(events []Event) bool {
+	for _, event := range events {
+		if event.CandidateHash != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func eventsHaveBlockID(events []Event) bool {
+	for _, event := range events {
+		if eventBlockID(event) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func eventBlockID(event Event) string {
@@ -272,15 +484,6 @@ func eventBlockID(event Event) string {
 		return ""
 	}
 	return event.BlockRootHash + ":" + event.BlockFileHash
-}
-
-func nodeKind(nodes []NodeConfig, name string) string {
-	for _, node := range nodes {
-		if node.Name == name {
-			return node.Kind
-		}
-	}
-	return ""
 }
 
 func (s *topologyState) observe(event Event) {
@@ -343,7 +546,7 @@ func (s *topologyState) observe(event Event) {
 				s.split.sessions[event.Shard] = event.SessionID
 			}
 		}
-	case "block_collated", "block_validated", "block_finalized":
+	case "candidate_emitted":
 		if !s.coverage.Split && event.Shard == shard.Root {
 			s.coverage.LinearProof = true
 		}
@@ -366,11 +569,17 @@ func (s *topologyState) observe(event Event) {
 }
 
 func allowedHardErrors(events []Event, allowed []string) uint64 {
+	count, _ := allowedHardErrorStats(events, allowed)
+	return count
+}
+
+func allowedHardErrorStats(events []Event, allowed []string) (uint64, map[string]uint64) {
 	patterns := make([]*regexp.Regexp, len(allowed))
 	for i := range allowed {
 		patterns[i] = regexp.MustCompile(allowed[i])
 	}
 	var count uint64
+	categories := make(map[string]uint64)
 	for _, event := range events {
 		if event.Kind != "hard_error" {
 			continue
@@ -384,9 +593,17 @@ func allowedHardErrors(events []Event, allowed []string) uint64 {
 		}
 		if !ignored {
 			count++
+			category := event.Category
+			if category == "" {
+				category = "uncategorized"
+			}
+			categories[category]++
 		}
 	}
-	return count
+	if len(categories) == 0 {
+		categories = nil
+	}
+	return count, categories
 }
 
 func isRunScenario(scenario string) bool {
@@ -398,14 +615,8 @@ func observesTopology(scenario string) bool {
 	return scenario == "all" || scenario == "full-cycle" || scenario == "topology-cycle"
 }
 
-func loadStopsScenario(scenario string, load LoadResult) bool {
-	if load.HardFailure || load.Outcome == loadOutcomeFailed {
-		return true
-	}
-	if load.Outcome == loadOutcomeDeliveryIncomplete {
-		return scenario != "topology-cycle"
-	}
-	return load.ExitCode != 0
+func loadStopsScenario(load LoadResult) bool {
+	return load.HardFailure || load.Outcome != loadOutcomeComplete || load.ExitCode != 0
 }
 
 func findBaseline(baseline Baseline, name string) (NodeBaseline, error) {

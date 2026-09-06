@@ -44,3 +44,39 @@ func collatorConsensusProgress(
 
 	return converted, nil
 }
+
+// collatorSpeculativeWindow binds one observer bet to the exact block and state
+// the collator will build on. Like the progress conversion above, the roots stay
+// resolver-owned and the collator receives a candidate-bound capability rather
+// than raw cells.
+func collatorSpeculativeWindow(
+	sessionID [32]byte,
+	window sessionSpeculativeWindow,
+) (collator.SpeculativeWindowRequest, error) {
+	if window.BaseState == nil || len(window.BaseState.tips) != 1 {
+		return collator.SpeculativeWindowRequest{}, errors.New(
+			"validator runtime: speculative base is not a normal state",
+		)
+	}
+	tip := window.BaseState.tips[0]
+	base, err := collator.NewSelectedBaseState(
+		sessionID,
+		window.Base,
+		tip.ID,
+		tip.BlockBOC,
+		tip.Block,
+		tip.State,
+	)
+	if err != nil {
+		return collator.SpeculativeWindowRequest{}, err
+	}
+
+	return collator.SpeculativeWindowRequest{
+		SessionID: sessionID,
+		StartSlot: window.StartSlot,
+		Leader:    window.Leader,
+		Base:      base,
+		StartAt:   window.StartAt,
+		Deadline:  window.Deadline,
+	}, nil
+}

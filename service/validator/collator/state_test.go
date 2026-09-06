@@ -397,7 +397,18 @@ func TestBuildCollatedRootsIncludesOnlyUsedStorageStats(t *testing.T) {
 	estimator := newProofSizeEstimator(0)
 	usage.SetRecordCallback(estimator.addLoadedCell)
 	tracedRoot := usage.Root()
-	if _, err := tracedRoot.BeginParse(); err != nil {
+	// Read what prepare always reads: parsePredecessorParts decodes the state
+	// and its outbound queue info, and the verifier of the constructed roots
+	// decodes the queue info out of the previous-state proof. An unread leaf is
+	// a pruned branch in that proof, so a collation assembled by hand has to make
+	// the same reads or the verifier meets a boundary where prepare never leaves
+	// one.
+	var tracedState tlb.ShardStateUnsplit
+	if err := parseExact(&tracedState, tracedRoot); err != nil {
+		t.Fatal(err)
+	}
+	var tracedQueue tlb.OutMsgQueueInfo
+	if err := parseExact(&tracedQueue, tracedState.OutMsgQueueInfo); err != nil {
 		t.Fatal(err)
 	}
 	used := storageStatTestDict(t)

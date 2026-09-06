@@ -100,7 +100,7 @@ func BenchmarkHookStaleSkip(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		s.processAppliedBlock(ev)
+		s.feed.Observe(appliedBlock(ev))
 	}
 }
 
@@ -124,7 +124,7 @@ func BenchmarkHookProcessBlock250(b *testing.B) {
 			b.Fatal(err)
 		}
 		b.StartTimer()
-		s.processAppliedBlock(ev)
+		s.feed.Observe(appliedBlock(ev))
 	}
 }
 

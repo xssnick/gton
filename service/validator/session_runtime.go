@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -88,8 +89,35 @@ type sessionConsensusProgress struct {
 
 type consensusProgressObserver func(context.Context, sessionConsensusProgress) error
 
+// sessionSpeculativeWindow is one session's bet that the window about to open
+// will open on a candidate it already holds, offered to whatever produces
+// blocks for this session.
+//
+// It exists on the observer path only. A validator collating for itself makes
+// the same bet from its own validation, where the successor state is already in
+// hand; an observer has to resolve that state first, which is what the goroutine
+// that fills this in does.
+type sessionSpeculativeWindow struct {
+	StartSlot uint32
+	Leader    uint32
+	Base      simplex.CandidateID
+	BaseState *ChainState
+	StartAt   time.Time
+	Deadline  time.Time
+}
+
+type speculativeWindowObserver func(context.Context, sessionSpeculativeWindow) error
+
 type consensusProgressObserverBackend interface {
 	ObserveConsensusProgress(context.Context, sessionConsensusProgress) error
+}
+
+// consensusNotarizationObserverBackend is the optional half a backend
+// implements to learn when the committee certified a candidate. The in-process
+// collator sizes its blocks by the certificates on its own; see
+// collator/committee_pace.go.
+type consensusNotarizationObserverBackend interface {
+	ObserveConsensusNotarized(simplex.CandidateID, time.Time)
 }
 
 // RuntimeOptions are already-bound dependencies for exactly one session.
@@ -110,6 +138,8 @@ type RuntimeOptions struct {
 	CaptureDir string
 
 	observeConsensusProgress consensusProgressObserver
+	observeSpeculation       speculativeWindowObserver
+	observeNotarization      func(simplex.CandidateID, time.Time)
 }
 
 // newSessionFailedCandidateCapturer builds the refused-candidate capturer for a
@@ -139,14 +169,25 @@ const (
 )
 
 type sessionRuntime struct {
-	config  SessionConfig
-	storage ValidatorStorage
-	network SessionNetwork
-	backend SessionBackend
-	codec   *candidateCodec
-	observe consensusProgressObserver
-	metrics ValidationObserver
-	log     *zerolog.Logger
+	config    SessionConfig
+	storage   ValidatorStorage
+	network   SessionNetwork
+	backend   SessionBackend
+	codec     *candidateCodec
+	observe   consensusProgressObserver
+	speculate speculativeWindowObserver
+	notarized func(simplex.CandidateID, time.Time)
+	metrics   ValidationObserver
+	log       *zerolog.Logger
+
+	// ownSlots holds, for every slot this node published a candidate for, when
+	// it went out — until consensus says what became of it. It is the only
+	// place the two facts meet: the producer knows when it published and
+	// nothing else does, and the consensus hooks know the outcome and not the
+	// instant. Without it the panel that matters most to a leader — did my
+	// block make it, and how long did the committee take — cannot be drawn.
+	ownSlotsMu sync.Mutex
+	ownSlots   map[uint32]ownSlotState
 
 	candidates *candidateResolver
 	states     *stateResolver
@@ -176,6 +217,12 @@ type sessionRuntime struct {
 	workActive bool
 	workCtx    context.Context
 	workWG     sync.WaitGroup
+
+	// warming holds the candidates whose successor state a background resolve
+	// is already computing. It exists only on an observer session: see
+	// warmCandidateState.
+	warmingMu sync.Mutex
+	warming   map[simplex.CandidateID]struct{}
 
 	fatal chan error
 
@@ -326,6 +373,8 @@ func prepareSessionRuntime(
 		backend:                options.Backend,
 		codec:                  codec,
 		observe:                options.observeConsensusProgress,
+		speculate:              options.observeSpeculation,
+		notarized:              options.observeNotarization,
 		metrics:                options.Observer,
 		log:                    options.Logger,
 		candidates:             resolver,
@@ -335,10 +384,18 @@ func prepareSessionRuntime(
 		phase:                  sessionRuntimePrepared,
 		windowEventsWake:       make(chan struct{}, 1),
 		leaderWindowRecordWake: make(chan struct{}, 1),
+		warming:                make(map[simplex.CandidateID]struct{}),
 	}
 	if runtime.observe == nil {
 		if observer, ok := options.Backend.(consensusProgressObserverBackend); ok {
 			runtime.observe = observer.ObserveConsensusProgress
+		}
+	}
+	if runtime.notarized == nil {
+		// Voting runtimes report to their producer-owning backend. Standalone
+		// observers supply the controller's collator callback explicitly above.
+		if observer, ok := options.Backend.(consensusNotarizationObserverBackend); ok {
+			runtime.notarized = observer.ObserveConsensusNotarized
 		}
 	}
 	runtime.states = newStateResolver(
@@ -352,6 +409,18 @@ func prepareSessionRuntime(
 		params,
 		config.Protocol.SlotsPerLeaderWindow,
 	)
+	runtime.states.describeFailed = func(id simplex.CandidateID, err error) {
+		// The same shape OnFinalized gives an acceptance error: the block is
+		// accepted and consensus continues, only the shard-top description that
+		// helps masterchain collators include it sooner is missing.
+		if runtime.log != nil {
+			runtime.log.Warn().
+				Err(err).
+				Hex("session_id", config.SessionID[:]).
+				Uint32("slot", id.Slot).
+				Msg("shard-top description of an accepted block failed; consensus continues")
+		}
+	}
 
 	localIndex := simplex.ObserverIndex
 	var signer simplex.Signer
@@ -611,6 +680,9 @@ func (r *sessionRuntime) run(
 		r.lifecycleMu.Unlock()
 	}()
 
+	// Timed per phase: the session's first window is due against the
+	// committee's first-block timeout, and every phase here is on that path.
+	runStarted := time.Now()
 	if err := r.backend.ActivateSession(runCtx, start); err != nil {
 		if runCtx.Err() != nil {
 			cleanCancellation = true
@@ -619,6 +691,8 @@ func (r *sessionRuntime) run(
 		}
 		return fmt.Errorf("validator runtime: activate session backend: %w", err)
 	}
+	activated := time.Since(runStarted)
+	statesAt := time.Now()
 	if err := r.states.start(runCtx, start); err != nil {
 		if runCtx.Err() != nil {
 			cleanCancellation = true
@@ -627,6 +701,7 @@ func (r *sessionRuntime) run(
 		}
 		return err
 	}
+	statesReady := time.Since(statesAt)
 	r.startWork(runCtx)
 	if !r.spawn(r.runLeaderWindowRecords) {
 		return errors.New("validator runtime: start leader window recorder")
@@ -634,6 +709,7 @@ func (r *sessionRuntime) run(
 	if !r.spawn(r.runWindowEvents) {
 		return errors.New("validator runtime: start consensus window dispatcher")
 	}
+	networkAt := time.Now()
 	if err := r.network.Start(runCtx, r); err != nil {
 		if runCtx.Err() != nil {
 			cleanCancellation = true
@@ -642,6 +718,8 @@ func (r *sessionRuntime) run(
 		}
 		return fmt.Errorf("validator runtime: start network: %w", err)
 	}
+	networkStarted := time.Since(networkAt)
+	simplexAt := time.Now()
 	results := make(chan runtimeComponentResult, 2)
 	runnerStartup := make(chan error, 1)
 	r.lifecycleMu.Lock()
@@ -665,6 +743,20 @@ func (r *sessionRuntime) run(
 				break
 			}
 			started = true
+			// The logger is optional on this runtime, as every other use of it
+			// in this file assumes; the in-process test runtimes run without one.
+			if r.log != nil {
+				r.log.Info().
+					Hex("session_id", r.config.SessionID[:]).
+					Int32("workchain", r.config.Shard.Workchain).
+					Int64("shard", r.config.Shard.Shard).
+					Dur("activate", activated).
+					Dur("states", statesReady).
+					Dur("network", networkStarted).
+					Dur("simplex", time.Since(simplexAt)).
+					Dur("total", time.Since(runStarted)).
+					Msg("validator session started")
+			}
 		case err := <-r.fatal:
 			resultErr = err
 		case result := <-results:
@@ -998,6 +1090,12 @@ func (r *sessionRuntime) ReceiveCandidate(
 		if err = r.runner.SubmitCandidate(&artifact.Candidate); err != nil {
 			return err
 		}
+		// The earliest instant a candidate's successor state can be computed,
+		// and the one a validator gets for free by validating it. On an observer
+		// this is what keeps the window that opens on this candidate from paying
+		// the apply itself — and, for the last slot of a window, what makes the
+		// bet on the next one possible at all.
+		r.warmCandidateState(artifact.Candidate.ID)
 		received = *artifact
 
 		return nil
@@ -1591,6 +1689,10 @@ func (r *sessionRuntime) beginWindowProgress(
 	}
 }
 
+// windowProgressDeadline includes the grace the voter selected for this
+// observation, which can exceed the configured baseline after skipped windows.
+// Reading the current first-block timeout here would lose that association
+// when window dispatch lags behind consensus.
 func windowProgressDeadline(window simplex.Window, targetRate time.Duration) time.Time {
 	if window.ObservedAt.IsZero() || targetRate <= 0 || window.EndSlot <= window.ObservedSlot {
 		return time.Time{}
@@ -1600,8 +1702,7 @@ func windowProgressDeadline(window simplex.Window, targetRate time.Duration) tim
 	if remainingSlots > uint64(time.Duration(1<<63-1)/targetRate) {
 		return time.Time{}
 	}
-
-	return window.ObservedAt.Add(time.Duration(remainingSlots) * targetRate)
+	return window.ObservedAt.Add(time.Duration(remainingSlots) * targetRate).Add(window.FirstBlockTimeout)
 }
 
 func (r *sessionRuntime) observeWindowProgress(
@@ -1627,7 +1728,7 @@ func (r *sessionRuntime) observeWindowProgress(
 			return err
 		}
 		r.markWindowProgressRetrying(progress.Window.StartSlot)
-		if err = waitDuration(ctx, consensusProgressRetryInterval); err != nil {
+		if err = waitConsensusProgress(ctx, err); err != nil {
 			return err
 		}
 	}
@@ -1685,7 +1786,26 @@ func (r *sessionRuntime) markWindowProgressRetrying(startSlot uint32) {
 }
 
 func isTransientProgressError(err error) bool {
-	return errors.Is(err, ErrBlockNotReady) || errors.Is(err, collator.ErrAcquisitionNotReady)
+	return errors.Is(err, ErrBlockNotReady) || errors.Is(err, collator.ErrAcquisitionNotReady) ||
+		errors.Is(err, collator.ErrSessionUpdateDeferred)
+}
+
+// consensusProgressReadiness is supplied by a transient refusal whose owner
+// can signal when another attempt is useful. Waiting must happen outside the
+// runtime lifecycle lock: controller reconciliation may need that lock itself.
+type consensusProgressReadiness interface {
+	WaitReady(context.Context) error
+}
+
+func waitConsensusProgress(ctx context.Context, cause error) error {
+	var readiness consensusProgressReadiness
+	if errors.As(cause, &readiness) {
+		return readiness.WaitReady(ctx)
+	}
+
+	// Incomplete state/acquisition and deferred production updates have no
+	// readiness signal. Their existing bounded retry remains necessary.
+	return waitDuration(ctx, consensusProgressRetryInterval)
 }
 
 func (r *sessionRuntime) verifyWindowAncestry(
@@ -1759,8 +1879,355 @@ func (r *sessionRuntime) observeLineageWalk(
 	})
 }
 
+// ownSlotState is one published candidate of ours awaiting its verdict.
+type ownSlotState struct {
+	publishedAt time.Time
+	// slotStartAt is the instant the committee's ladder gives this slot:
+	// window observation plus one target rate per slot of offset. Every voter
+	// arms its skip alarm off exactly this anchor (voterWindowObserved), so a
+	// notarization measured from here is the share of the slot's real budget
+	// this block consumed — the one number that says whether we fit. Zero when
+	// the window was not readable at publication, and then only the
+	// publish-relative measurement is reported.
+	slotStartAt time.Time
+	notarized   bool
+}
+
+// ownSlotsRetained bounds the map against a session that publishes far ahead of
+// finalization. The sweep below normally keeps it at a window's worth; this is
+// the backstop for the case where finalization stops entirely, and it drops the
+// oldest entries because those are the ones consensus has already left behind.
+const ownSlotsRetained = 256
+
+// noteOwnCandidatePublished stamps the instant one of our candidates went out.
+func (r *sessionRuntime) noteOwnCandidatePublished(slot uint32, at time.Time) {
+	r.ownSlotsMu.Lock()
+	defer r.ownSlotsMu.Unlock()
+
+	if r.ownSlots == nil {
+		r.ownSlots = make(map[uint32]ownSlotState)
+	}
+	if len(r.ownSlots) >= ownSlotsRetained {
+		oldest := slot
+		for candidate := range r.ownSlots {
+			if candidate < oldest {
+				oldest = candidate
+			}
+		}
+		delete(r.ownSlots, oldest)
+	}
+	r.ownSlots[slot] = ownSlotState{publishedAt: at, slotStartAt: r.slotLadderStart(slot)}
+}
+
+// slotLadderStart is where the committee's clock puts this slot: the instant
+// the leader window was observed, plus one target rate per slot into it. It is
+// the same arithmetic the voter does, and it is deliberately anchored on the
+// window observation rather than on the producer's own schedule, because the
+// deadline this is measured against is the voters' and not ours.
+func (r *sessionRuntime) slotLadderStart(slot uint32) time.Time {
+	r.windowMu.Lock()
+	submitter := r.window
+	r.windowMu.Unlock()
+	if submitter == nil {
+		return time.Time{}
+	}
+	// Read without s.mu: this runs inside publishCandidate, which submit calls
+	// with s.mu already held by this very goroutine, and Go mutexes are not
+	// reentrant — taking it here deadlocks the session outright, and with it
+	// the engine goroutine that later wants ownSlotsMu to report the
+	// notarization. Observed on the test stand: every inbound candidate piled
+	// up behind the stalled engine (929 goroutines in PrecheckCandidateBroadcast)
+	// and the node stopped validating a minute after start.
+	//
+	// The field is safe to read: a submitter's window is assigned once, before
+	// the submitter is installed under windowMu, and submit and close only ever
+	// write nextSlot, parent, accepted, runtime and err.
+	window := submitter.window
+	if window.ObservedAt.IsZero() || slot < window.StartSlot {
+		return time.Time{}
+	}
+	r.stateMu.RLock()
+	targetRate := r.state.Params.TargetRate
+	r.stateMu.RUnlock()
+	if targetRate <= 0 {
+		return time.Time{}
+	}
+
+	return window.ObservedAt.Add(time.Duration(slot-window.StartSlot) * targetRate)
+}
+
+// observeOwnNotarization reports the round trip for one of our own slots and
+// marks it as having made it. A candidate that is not ours is a map miss.
+func (r *sessionRuntime) observeOwnNotarization(slot uint32, at time.Time) {
+	if r.metrics == nil {
+		return
+	}
+	r.ownSlotsMu.Lock()
+	state, ours := r.ownSlots[slot]
+	if ours && !state.notarized {
+		state.notarized = true
+		r.ownSlots[slot] = state
+	}
+	r.ownSlotsMu.Unlock()
+	if !ours || state.publishedAt.IsZero() {
+		return
+	}
+	chain := r.metricChain()
+	r.metrics.ObserveOwnSlot(chain, OwnSlotNotarized)
+	r.metrics.ObserveOwnNotarization(chain, at.Sub(state.publishedAt))
+	if !state.slotStartAt.IsZero() {
+		r.metrics.ObserveOwnSlotNotarization(chain, at.Sub(state.slotStartAt))
+	}
+}
+
+// observeOwnFinalization reports the finalization round trip for one of our
+// slots and retires every earlier slot of ours the chain has now passed. A
+// slot consensus moved past without notarizing is one this node built,
+// delivered and lost.
+func (r *sessionRuntime) observeOwnFinalization(slot uint32, at time.Time) {
+	if r.metrics == nil {
+		return
+	}
+	r.ownSlotsMu.Lock()
+	state, ours := r.ownSlots[slot]
+	delete(r.ownSlots, slot)
+	lost := 0
+	for candidate, passed := range r.ownSlots {
+		if candidate >= slot {
+			continue
+		}
+		delete(r.ownSlots, candidate)
+		if !passed.notarized {
+			lost++
+		}
+	}
+	r.ownSlotsMu.Unlock()
+
+	chain := r.metricChain()
+	for range lost {
+		r.metrics.ObserveOwnSlot(chain, OwnSlotLost)
+	}
+	if ours && !state.publishedAt.IsZero() {
+		r.metrics.ObserveOwnFinalization(chain, at.Sub(state.publishedAt))
+	}
+}
+
+func (r *sessionRuntime) metricChain() collator.MetricChain {
+	if r.config.Shard.IsMasterchain() {
+		return collator.MetricChainMasterchain
+	}
+
+	return collator.MetricChainShardchain
+}
+
 func (r *sessionRuntime) OnNotarized(id simplex.CandidateID, certificate simplex.VerifiedCertificate) {
 	r.candidates.observeNotarization(id, certificate)
+	r.observeOwnNotarization(id.Slot, time.Now())
+	if r.notarized != nil {
+		// A map update on the collator's side; nothing here waits on it.
+		r.notarized(id, time.Now())
+	}
+	// The backstop, and deliberately not the main path. For the candidate a
+	// window opens ON this buys nothing: the certificate that notarizes it
+	// announces that window in the same engine turn, so this resolve and the
+	// window's own join one single flight. What it does warm is every earlier
+	// slot of the window — notarized while the window still runs — which is what
+	// leaves one apply at the window boundary instead of the whole chain, and a
+	// candidate whose payload never reached this node at all, which the resolver
+	// then fetches from a peer instead of at the window start.
+	r.warmCandidateState(id)
+}
+
+// warmCandidateState resolves, in the background, the state a candidate
+// produces — the state a leader window opening on that candidate needs.
+//
+// It exists because an observer session never validates. A validator resolves
+// and applies every candidate it votes on, so by the time a window opens on one
+// its state is already resident and resolveWindowBase is a cache hit. An
+// observer — which is what a standalone collator runs — reaches the window with
+// nothing resolved and pays the whole chain of applies from the last finalized
+// block on the critical path, at the exact instant its first block is due.
+//
+// It is deliberately not done on a validator. stateResolver.resolve is
+// single-flight, and rememberValidatedState does not replace a flight that has
+// already finished; a background resolve that won that race would leave the
+// session holding a different materialization of the state validation just
+// built, and chain_state.go compares tip states by pointer, so every later
+// candidate would silently pay a full re-apply.
+//
+// The context is the session's own, never a caller's: the last waiter to leave
+// an unfinished flight cancels it, so a warm-up bounded by a shorter lifetime
+// could take down work a foreground resolve is about to join. The flight's own
+// TTL and session shutdown bound it instead.
+func (r *sessionRuntime) warmCandidateState(id simplex.CandidateID) {
+	r.warmState(id, true)
+}
+
+// warmPublishedCandidateState warms the state of a block this node produced
+// itself, without betting on it.
+//
+// A standalone collator's own candidate never reaches the receive path — it is
+// broadcast from here — so without this the one window entry that matters most
+// is the coldest: the collator that leads two windows in a row would resolve and
+// apply its own last block at the instant the next window's first block is due,
+// which is exactly the block the cross-window handoff already built and parked.
+//
+// It places no bet, and that is not an omission. The producer that built this
+// block has already parked a successor for the next window under this very
+// candidate (promoteNextWindowBet); a second bet would either be refused as a
+// duplicate or race the first one out of the slot.
+func (r *sessionRuntime) warmPublishedCandidateState(id simplex.CandidateID) {
+	r.warmState(id, false)
+}
+
+func (r *sessionRuntime) warmState(id simplex.CandidateID, offerBet bool) {
+	if r.config.Identity.Validator != nil {
+		return
+	}
+
+	r.warmingMu.Lock()
+	if _, warming := r.warming[id]; warming {
+		r.warmingMu.Unlock()
+
+		return
+	}
+	r.warming[id] = struct{}{}
+	r.warmingMu.Unlock()
+
+	if !r.spawn(func(ctx context.Context) {
+		defer func() {
+			r.warmingMu.Lock()
+			delete(r.warming, id)
+			r.warmingMu.Unlock()
+		}()
+
+		// What this call leaves behind is the resolver's own cached flight,
+		// which is what the window start then finds; an error here is one the
+		// window start reports for itself.
+		resolved, err := r.states.resolve(ctx, simplex.Parent(id))
+		if err == nil && offerBet {
+			r.offerSpeculativeWindow(ctx, id, resolved)
+		}
+		// Last, and deliberately: everything above is what a window opening in
+		// the next few hundred milliseconds waits for, and this is not.
+		r.persistNotarizedCandidate(id)
+	}) {
+		r.warmingMu.Lock()
+		delete(r.warming, id)
+		r.warmingMu.Unlock()
+	}
+}
+
+// persistNotarizedCandidate submits the durable write of a notarized candidate
+// on an observer session.
+//
+// A validator has already written it: its voter stores every candidate before
+// voting, so the write finalization asks for is long done and joins a finished
+// flight. An observer never votes and never runs that hook, so nothing wrote
+// it, and the whole serialize-compress-submit lands inside finalizeInner —
+// between a finalization and the block acceptance that follows it. Submitting
+// it here keeps the same durability, which a peerless restart depends on, with
+// the cost on a background goroutine instead.
+//
+// It is submitted, not joined. A failed write has no voter to report to, so it
+// is logged and the finalization's own store reports it for real.
+func (r *sessionRuntime) persistNotarizedCandidate(id simplex.CandidateID) {
+	if r.config.Identity.Validator != nil {
+		return
+	}
+	// A candidate that never gathers a quorum never finalizes, so nothing will
+	// ever ask for it durably. The warm-up reaches here on that path too, when
+	// it resolved a candidate whose payload had to come from a peer and the
+	// resolve failed.
+	if notarized, _ := r.candidates.localHalves(id); !notarized {
+		return
+	}
+	if _, err := r.candidates.storeAsync(id, func(storeErr error) {
+		if storeErr == nil {
+			return
+		}
+		r.log.Debug().Err(storeErr).Uint32("slot", id.Slot).
+			Msg("notarized candidate was not persisted ahead of finalization")
+	}); err != nil {
+		r.log.Debug().Err(err).Uint32("slot", id.Slot).
+			Msg("notarized candidate was not submitted for persistence")
+	}
+}
+
+// offerSpeculativeWindow bets that the window about to open will open on the
+// candidate whose state was just resolved, and offers that bet to whatever
+// produces blocks for this session.
+//
+// Only the last slot of a window qualifies: it is the candidate whose
+// certificate opens the next window and therefore the base that window carries
+// unless the network skips it. Everything else this needs is derived here
+// rather than asked for — the leader from the session's own round-robin
+// schedule, the schedule of the window to come from the base's generation time
+// — because an observer has no window of its own to read them from.
+//
+// Whether the bet may be taken at all is not decided here. The producer knows:
+// a standalone collator holds a delegation for that window or it does not, and
+// it refuses the offer when it does not.
+func (r *sessionRuntime) offerSpeculativeWindow(
+	ctx context.Context,
+	id simplex.CandidateID,
+	resolved ResolvedState,
+) {
+	if r.speculate == nil || r.config.Shard.IsMasterchain() {
+		return
+	}
+	if resolved.State == nil || len(resolved.State.tips) != 1 {
+		return
+	}
+	windowSize := r.config.Protocol.SlotsPerLeaderWindow
+	validators := uint32(len(r.config.Validators))
+	if windowSize == 0 || validators == 0 || id.Slot == math.MaxUint32 {
+		return
+	}
+	nextStart := id.Slot + 1
+	if nextStart%windowSize != 0 {
+		return
+	}
+	r.stateMu.RLock()
+	targetRate := r.state.Params.TargetRate
+	r.stateMu.RUnlock()
+	if targetRate <= 0 {
+		return
+	}
+
+	// The instant the observed window would compute, by the rule handleWindow
+	// uses: the parent's generation time plus one target rate, never earlier
+	// than now and never more than one rate ahead. It stamps the block's header
+	// and nothing else; the producer's schedule still comes from the window when
+	// it is really observed.
+	now := time.Now()
+	startAt := now
+	if !resolved.GenUtime.IsZero() {
+		if earliest := resolved.GenUtime.Add(targetRate); earliest.After(startAt) {
+			startAt = earliest
+		}
+		if latest := now.Add(targetRate); startAt.After(latest) {
+			startAt = latest
+		}
+	}
+
+	if err := r.speculate(ctx, sessionSpeculativeWindow{
+		StartSlot: nextStart,
+		Leader:    r.codec.schedule.ExpectedLeader(nextStart),
+		Base:      id,
+		BaseState: resolved.State,
+		StartAt:   startAt,
+		// Three target rates bounds a bet nobody comes to collect: longer than
+		// any observed gap between this estimate and the window it predicts, and
+		// short enough that a bet lost to a stalled session dies within a window.
+		Deadline: startAt.Add(3 * targetRate),
+	}); err != nil && r.log != nil {
+		r.log.Debug().
+			Err(err).
+			Hex("session_id", r.config.SessionID[:]).
+			Uint32("window_start", nextStart).
+			Msg("speculative window was not started")
+	}
 }
 
 func (r *sessionRuntime) OnFinalized(id simplex.CandidateID, certificate simplex.VerifiedCertificate) {
@@ -1779,6 +2246,7 @@ func (r *sessionRuntime) OnFinalized(id simplex.CandidateID, certificate simplex
 	// own retained payloads, and handed to the state resolver: the two never
 	// nest their locks, and the bound is a memory budget rather than a slot
 	// distance.
+	r.observeOwnFinalization(id.Slot, time.Now())
 	budgetFloor := r.candidates.retentionCapFloor(id.Slot)
 	floor := r.states.notifyFinalized(id.Slot, budgetFloor)
 	candidates := r.candidates.notifyFinalized(id.Slot, floor.Slot)
@@ -2130,6 +2598,9 @@ func (r *sessionRuntime) publishCandidate(ctx context.Context, artifact *Candida
 		if err = r.candidates.stage(artifact, wire); err != nil {
 			return err
 		}
+		// Staged, so the resolve below reads it from this session rather than
+		// asking a peer for a block this node just made.
+		r.warmPublishedCandidateState(artifact.Candidate.ID)
 		slot := artifact.Candidate.ID.Slot
 		if _, err = r.candidates.storeAsync(artifact.Candidate.ID, func(storeErr error) {
 			if storeErr == nil {
@@ -2139,6 +2610,8 @@ func (r *sessionRuntime) publishCandidate(ctx context.Context, artifact *Candida
 		}); err != nil {
 			return err
 		}
+
+		r.noteOwnCandidatePublished(artifact.Candidate.ID.Slot, time.Now())
 
 		return r.runner.SubmitCandidate(&artifact.Candidate)
 	})

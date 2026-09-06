@@ -47,7 +47,7 @@ func TestBlockAccepterPublishesAndInstallsFinalShardTop(t *testing.T) {
 	}
 
 	acceptance := fixture.acceptance(simplex.VoteFinalize, true)
-	if err = accepter.Accept(t.Context(), acceptance, acceptanceTestViewResolver(fixture.view(t))); err != nil {
+	if err = accepter.acceptForTest(t.Context(), acceptance, acceptanceTestViewResolver(fixture.view(t))); err != nil {
 		t.Fatal(err)
 	}
 	if len(node.blocks) != 1 || len(publisher.blocks) != 1 {
@@ -86,7 +86,7 @@ func TestBlockAccepterReplaysOnlyToLocalIngress(t *testing.T) {
 
 	acceptance := fixture.acceptance(simplex.VoteFinalize, false)
 	acceptance.Replay = true
-	if err = accepter.Accept(t.Context(), acceptance, acceptanceTestViewResolver(BlockAcceptanceView{})); err != nil {
+	if err = accepter.acceptForTest(t.Context(), acceptance, acceptanceTestViewResolver(BlockAcceptanceView{})); err != nil {
 		t.Fatal(err)
 	}
 	if len(node.blocks) != 1 {
@@ -126,7 +126,7 @@ func TestBlockAccepterBuildsShardTopWithHistoricalMasterchainAnchor(t *testing.T
 		t.Fatal(err)
 	}
 
-	if err = accepter.Accept(
+	if err = accepter.acceptForTest(
 		t.Context(),
 		fixture.acceptance(simplex.VoteFinalize, false),
 		acceptanceTestViewResolver(view),
@@ -158,7 +158,7 @@ func TestBlockAccepterRejectsWrongShardTopMasterchainAnchor(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		err = accepter.Accept(t.Context(), fixture.acceptance(simplex.VoteFinalize, false), acceptanceTestViewResolver(view))
+		err = accepter.acceptForTest(t.Context(), fixture.acceptance(simplex.VoteFinalize, false), acceptanceTestViewResolver(view))
 		if err == nil || !strings.Contains(err.Error(), "reference differs from masterchain view") {
 			t.Fatalf("same-height masterchain anchor error = %v", err)
 		}
@@ -194,7 +194,7 @@ func TestBlockAccepterRejectsWrongShardTopMasterchainAnchor(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		err = accepter.Accept(t.Context(), fixture.acceptance(simplex.VoteFinalize, false), acceptanceTestViewResolver(view))
+		err = accepter.acceptForTest(t.Context(), fixture.acceptance(simplex.VoteFinalize, false), acceptanceTestViewResolver(view))
 		if err == nil || !strings.Contains(err.Error(), "masterchain history contains another block") {
 			t.Fatalf("historical masterchain anchor error = %v", err)
 		}
@@ -223,19 +223,19 @@ func TestBlockAccepterBuildsShardTopFromNodeStoredPredecessor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = accepter.Accept(
+	if err = accepter.acceptForTest(
 		t.Context(),
 		first.acceptance(simplex.VoteNotarize, false),
 		acceptanceTestViewResolver(BlockAcceptanceView{}),
 	); err != nil {
 		t.Fatalf("accept notarized predecessor: %v", err)
 	}
-	predecessor, err := accepter.prepare(first.acceptance(simplex.VoteNotarize, false))
+	predecessor, err := accepter.Prepare(t.Context(), first.acceptance(simplex.VoteNotarize, false), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	node.proofs[storage.FormatBlockRef(first.candidate.Candidate.Block)] = predecessor.block.ProofBOC
-	prepared, err := accepter.prepare(second.acceptance(simplex.VoteFinalize, false))
+	prepared, err := accepter.Prepare(t.Context(), second.acceptance(simplex.VoteFinalize, false), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestBlockAccepterBuildsShardTopFromNodeStoredPredecessor(t *testing.T) {
 		t.Fatalf("proof chain = %+v", links)
 	}
 
-	if err = accepter.Accept(
+	if err = accepter.acceptForTest(
 		t.Context(),
 		second.acceptance(simplex.VoteFinalize, false),
 		acceptanceTestViewResolver(first.view(t)),
@@ -293,7 +293,14 @@ func TestBlockAccepterRetriesMissingProofWithoutRepublishing(t *testing.T) {
 	}
 	acceptance := second.acceptance(simplex.VoteFinalize, false)
 
-	err = accepter.Accept(t.Context(), acceptance, acceptanceTestViewResolver(first.view(t)))
+	pending, err := accepter.Prepare(t.Context(), acceptance, acceptanceTestViewResolver(first.view(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = pending.Submit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	err = pending.Describe(t.Context())
 	if !errors.Is(err, ErrBlockNotReady) {
 		t.Fatalf("missing predecessor error = %v, want ErrBlockNotReady", err)
 	}
@@ -305,18 +312,17 @@ func TestBlockAccepterRetriesMissingProofWithoutRepublishing(t *testing.T) {
 			inbox.Len(),
 		)
 	}
-	prepared, err := accepter.prepare(first.acceptance(simplex.VoteNotarize, false))
+	prepared, err := accepter.Prepare(t.Context(), first.acceptance(simplex.VoteNotarize, false), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	node.proofs[storage.FormatBlockRef(first.candidate.Candidate.Block)] = prepared.block.ProofBOC
-	acceptance.Retry = true
-	if err = accepter.Accept(t.Context(), acceptance, acceptanceTestViewResolver(first.view(t))); err != nil {
+	if err = pending.Describe(t.Context()); err != nil {
 		t.Fatalf("retry acceptance: %v", err)
 	}
-	if len(node.blocks) != 2 || len(publisher.blocks) != 1 || inbox.Len() != 1 {
+	if len(node.blocks) != 1 || len(publisher.blocks) != 1 || inbox.Len() != 1 {
 		t.Fatalf(
-			"retry local/published/top counts = %d/%d/%d, want 2/1/1",
+			"retry local/published/top counts = %d/%d/%d, want 1/1/1",
 			len(node.blocks),
 			len(publisher.blocks),
 			inbox.Len(),
@@ -355,7 +361,14 @@ func TestBlockAccepterPublishesWhenFirstAcceptanceViewIsNotReady(t *testing.T) {
 	}
 
 	acceptance := fixture.acceptance(simplex.VoteFinalize, false)
-	err = accepter.Accept(t.Context(), acceptance, resolveView)
+	pending, err := accepter.Prepare(t.Context(), acceptance, resolveView)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = pending.Submit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	err = pending.Describe(t.Context())
 	if !errors.Is(err, ErrBlockNotReady) {
 		t.Fatalf("unresolved acceptance view error = %v, want ErrBlockNotReady", err)
 	}
@@ -369,13 +382,12 @@ func TestBlockAccepterPublishesWhenFirstAcceptanceViewIsNotReady(t *testing.T) {
 	}
 
 	ready = true
-	acceptance.Retry = true
-	if err = accepter.Accept(t.Context(), acceptance, resolveView); err != nil {
+	if err = pending.Describe(t.Context()); err != nil {
 		t.Fatalf("retry acceptance: %v", err)
 	}
-	if len(node.blocks) != 2 || len(publisher.blocks) != 1 || inbox.Len() != 1 {
+	if len(node.blocks) != 1 || len(publisher.blocks) != 1 || inbox.Len() != 1 {
 		t.Fatalf(
-			"retry local/published/top counts = %d/%d/%d, want 2/1/1",
+			"retry local/published/top counts = %d/%d/%d, want 1/1/1",
 			len(node.blocks),
 			len(publisher.blocks),
 			inbox.Len(),
@@ -401,7 +413,7 @@ func TestBlockAccepterRejectsShardTopLongerThanEightProofs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = accepter.Accept(t.Context(), long.acceptance(simplex.VoteFinalize, false), acceptanceTestViewResolver(anchor))
+	err = accepter.acceptForTest(t.Context(), long.acceptance(simplex.VoteFinalize, false), acceptanceTestViewResolver(anchor))
 	if err == nil || !strings.Contains(err.Error(), "more than eight") {
 		t.Fatalf("long shard proof chain error = %v", err)
 	}
@@ -475,7 +487,7 @@ func requireAcceptanceTestTop(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = accepter.Accept(t.Context(), fixture.acceptance(simplex.VoteFinalize, false), acceptanceTestViewResolver(view)); err != nil {
+	if err = accepter.acceptForTest(t.Context(), fixture.acceptance(simplex.VoteFinalize, false), acceptanceTestViewResolver(view)); err != nil {
 		t.Fatal(err)
 	}
 	if inbox.Len() != 1 {

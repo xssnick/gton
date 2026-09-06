@@ -305,6 +305,18 @@ func (spec *overlaySpec) relaysFECBroadcasts() bool {
 	return spec.Kind != overlayKindCustomFixed
 }
 
+// relaysSimpleBroadcasts reports that the transport forwards the original
+// simple broadcast envelope after application acceptance. Public overlays use
+// this path to preserve the source, signature, and broadcast id exactly as the
+// C++ overlay does. The application layer must not additionally rebuild and
+// enqueue the payload, or the new local source turns it into another broadcast.
+func (spec *overlaySpec) relaysSimpleBroadcasts() bool {
+	if spec.Kind == overlayKindPrivate {
+		return spec.PrivateAllowLegacyBroadcasts
+	}
+	return spec.Kind == overlayKindPublicShard
+}
+
 // usesPlumtree reports whether a Plumtree runtime is built for this overlay.
 // Public overlays always support Plumtree. FastSync keeps its config-controlled
 // transport switch because it also changes overlay membership flags and legacy

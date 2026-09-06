@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
@@ -104,18 +105,23 @@ func (s *observerTestStorage) deletes() int {
 type observerTestSessionNetwork struct {
 	mu sync.Mutex
 
-	receiver      SessionReceiver
-	startErrors   []error
-	startCalls    int
-	runCalls      int
-	runFailures   chan error
-	broadcasts    []simplex.CandidateBroadcast
-	consensusAll  int
-	consensusSome int
+	receiver       SessionReceiver
+	startErrors    []error
+	startCalls     int
+	runCalls       int
+	runStarted     chan struct{}
+	runStartedOnce sync.Once
+	runFailures    chan error
+	broadcasts     []simplex.CandidateBroadcast
+	consensusAll   int
+	consensusSome  int
 }
 
 func newObserverTestSessionNetwork() *observerTestSessionNetwork {
-	return &observerTestSessionNetwork{runFailures: make(chan error, 4)}
+	return &observerTestSessionNetwork{
+		runStarted:  make(chan struct{}),
+		runFailures: make(chan error, 4),
+	}
 }
 
 func (n *observerTestSessionNetwork) BroadcastToAll([]byte) {
@@ -183,6 +189,7 @@ func (n *observerTestSessionNetwork) Run(ctx context.Context) error {
 	n.mu.Lock()
 	n.runCalls++
 	n.mu.Unlock()
+	n.runStartedOnce.Do(func() { close(n.runStarted) })
 
 	select {
 	case <-ctx.Done():
@@ -316,6 +323,7 @@ type observerFixture struct {
 	network      *observerTestNetwork
 	sessionNet   *observerTestSessionNetwork
 	storage      *observerTestStorage
+	node         *localBackendTestNode
 	descriptor   collator.ConsensusObserverSession
 	activation   collator.SessionActivation
 	validatorKey ed25519.PrivateKey
@@ -491,6 +499,8 @@ func newObserverFixture(
 	}, collator.ConsensusObserverEvents{
 		Progressed: progressed,
 		Finalized:  func(context.Context, collator.ConsensusFinalization) error { return nil },
+		Speculated: func(context.Context, collator.SpeculativeWindowRequest) error { return nil },
+		Notarized:  func(groups.ShardID, simplex.CandidateID, time.Time) {},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -500,6 +510,7 @@ func newObserverFixture(
 		network:      network,
 		sessionNet:   sessionNet,
 		storage:      storage,
+		node:         node,
 		descriptor:   descriptor,
 		activation:   activation,
 		validatorKey: validatorKey,
@@ -1003,6 +1014,97 @@ func TestConsensusObserverRetriesSynchronousStartupFailures(t *testing.T) {
 	})
 }
 
+func TestConsensusObserverClassifiesUnavailableGenesisAsRetryable(t *testing.T) {
+	fixture := newObserverFixture(t, nil, nil)
+	t.Cleanup(func() {
+		if err := fixture.observer.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+
+	genesis := fixture.activation.Genesis[0]
+	key := localBackendTestBlockKey(genesis)
+	fixture.node.mu.Lock()
+	genesisState := fixture.node.states[key]
+	delete(fixture.node.states, key)
+	fixture.node.mu.Unlock()
+
+	if err := fixture.observer.PrepareSession(context.Background(), fixture.descriptor); err != nil {
+		t.Fatal(err)
+	}
+	err := fixture.observer.ActivateSession(context.Background(), fixture.activation)
+	if !errors.Is(err, ErrBlockNotReady) || !errors.Is(err, collator.ErrAcquisitionNotReady) {
+		t.Fatalf("activation error = %v, want ErrBlockNotReady and ErrAcquisitionNotReady", err)
+	}
+
+	session, err := fixture.observer.session(fixture.activation.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	phase := session.phase
+	runtime := session.runtime
+	session.mu.Unlock()
+	if phase != observerSessionPrepared || runtime != nil {
+		t.Fatalf("session after unavailable genesis = phase:%d runtime:%T, want prepared/nil", phase, runtime)
+	}
+
+	if err = fixture.node.PublishAcceptedBlockState(corestorage.LiveBlockArtifacts{
+		Block: genesis,
+		State: genesisState,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.observer.ActivateSession(context.Background(), fixture.activation); err != nil {
+		t.Fatalf("activation after genesis publication: %v", err)
+	}
+}
+
+func TestConsensusObserverClassifiesUnavailableCandidateAsRetryable(t *testing.T) {
+	fixture := newObserverFixture(t, nil, nil)
+	t.Cleanup(func() {
+		if err := fixture.observer.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	fixture.sessionNet.startErrors = []error{
+		fmt.Errorf("request recovery candidate: %w", ErrCandidateUnavailable),
+	}
+
+	if err := fixture.observer.PrepareSession(context.Background(), fixture.descriptor); err != nil {
+		t.Fatal(err)
+	}
+	err := fixture.observer.ActivateSession(context.Background(), fixture.activation)
+	if !errors.Is(err, ErrCandidateUnavailable) || !errors.Is(err, collator.ErrAcquisitionNotReady) {
+		t.Fatalf("activation error = %v, want ErrCandidateUnavailable and ErrAcquisitionNotReady", err)
+	}
+
+	session, err := fixture.observer.session(fixture.activation.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	phase := session.phase
+	runtime := session.runtime
+	session.mu.Unlock()
+	if phase != observerSessionPrepared || runtime != nil {
+		t.Fatalf("session after unavailable candidate = phase:%d runtime:%T, want prepared/nil", phase, runtime)
+	}
+
+	if err = fixture.observer.ActivateSession(context.Background(), fixture.activation); err != nil {
+		t.Fatalf("activation after candidate became available: %v", err)
+	}
+	select {
+	case <-fixture.sessionNet.runStarted:
+	case <-time.After(time.Second):
+		t.Fatal("session network did not enter Run after activation retry")
+	}
+	start, run, _ := fixture.sessionNet.counts()
+	if start != 2 || run != 1 {
+		t.Fatalf("activation retry counts = start:%d run:%d, want 2/1", start, run)
+	}
+}
+
 func TestConsensusObserverRunFailureAfterReadinessIsTerminal(t *testing.T) {
 	runErr := errors.New("private overlay receiver failed")
 	fixture := newObserverFixture(t, nil, nil)
@@ -1203,6 +1305,8 @@ func TestConsensusObserverStartCleanupCanRetry(t *testing.T) {
 	}, collator.ConsensusObserverEvents{
 		Progressed: func(context.Context, collator.ConsensusProgress) error { return nil },
 		Finalized:  func(context.Context, collator.ConsensusFinalization) error { return nil },
+		Speculated: func(context.Context, collator.SpeculativeWindowRequest) error { return nil },
+		Notarized:  func(groups.ShardID, simplex.CandidateID, time.Time) {},
 	})
 	if !errors.Is(err, startErr) || !errors.Is(err, cleanupErr) {
 		t.Fatalf("start error = %v, want joined start and cleanup errors", err)
@@ -1281,4 +1385,57 @@ func waitObserverPhase(
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("observer session did not reach phase %d", want)
+}
+
+// TestObserverStartupFlushRetriesTransientRefusals pins the failure this
+// replaced. ActivateSession spawns the startup flush and returns while the
+// controller reconcile that called it still holds the session lock the collator
+// needs; the collator answers that with a typed transient refusal rather than
+// waiting, because waiting would invert the two locks. The flush used to fail
+// the whole session runtime on any error at all, which took a live observer
+// down for a condition that clears in microseconds.
+func TestObserverStartupFlushRetriesTransientRefusals(t *testing.T) {
+	observer := &ConsensusObserver{}
+
+	attempts := 0
+	if err := observer.deliverRetrying(context.Background(), func() error {
+		attempts++
+		if attempts < 3 {
+			return fmt.Errorf("deliver progress: %w", collator.ErrSessionUpdateDeferred)
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("transient refusals were not retried to success: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("delivery attempts = %d, want 3", attempts)
+	}
+
+	// A real failure is still one: retrying it would hide a session that has to
+	// come down.
+	permanent := errors.New("collator runtime: session retired")
+	attempts = 0
+	err := observer.deliverRetrying(context.Background(), func() error {
+		attempts++
+
+		return permanent
+	})
+	if !errors.Is(err, permanent) || attempts != 1 {
+		t.Fatalf("permanent failure: err = %v after %d attempts, want it returned on the first", err, attempts)
+	}
+
+	// And a refusal that never clears ends with the flush's own context rather
+	// than spinning for the life of the process.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	attempts = 0
+	err = observer.deliverRetrying(ctx, func() error {
+		attempts++
+
+		return collator.ErrAcquisitionNotReady
+	})
+	if !errors.Is(err, context.Canceled) || attempts != 1 {
+		t.Fatalf("cancelled flush: err = %v after %d attempts", err, attempts)
+	}
 }

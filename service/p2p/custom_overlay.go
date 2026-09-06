@@ -92,9 +92,8 @@ func (s *overlaySubscription) twoStepIntermediateCandidates() []*overlayPeer {
 }
 
 func (s *overlaySubscription) resolveTwoStepPeerSet(
-	_ context.Context,
 	sourcePeerID PeerID,
-) (overlay.StaticBroadcastPeerSet, []overlay.BroadcastTwoStepPeerError) {
+) overlay.StaticBroadcastPeerSet {
 	candidates := s.twoStepIntermediateCandidates()
 	peers := make(overlay.StaticBroadcastPeerSet, 0, len(candidates))
 
@@ -103,7 +102,7 @@ func (s *overlaySubscription) resolveTwoStepPeerSet(
 			continue
 		}
 		if s.spec.UseQUIC {
-			peers = append(peers, quicTwoStepSendPeer{
+			peers = append(peers, quicRouteBroadcastPeer{
 				peer:     peer,
 				envelope: s.quicEnvelope,
 			})
@@ -114,7 +113,7 @@ func (s *overlaySubscription) resolveTwoStepPeerSet(
 			transport: peer.rldpOverlay,
 		})
 	}
-	return peers, nil
+	return peers
 }
 
 func planCustomRebroadcast(kind string, payloadLen int) rebroadcastPlan {
@@ -249,11 +248,11 @@ func (s *overlaySubscription) sendTwoStepRebroadcast(ctx context.Context, req re
 		return false
 	}
 
+	// The queue worker is already off every producer's path, so its own budget
+	// is the only bound the fan-out needs; a second per-peer deadline only
+	// truncated deliveries that were still making progress.
 	sendCtx, cancel := context.WithTimeout(ctx, peerRebroadcastTimeout)
 	defer cancel()
-
-	peerSet, resolveFailed := s.resolveTwoStepPeerSet(sendCtx, req.sourcePeerID)
-	s.markTwoStepPeerFailures(resolveFailed)
 
 	res, err := overlay.SendBroadcastTwoStep(sendCtx, overlay.BroadcastTwoStepSendRequest{
 		Key:         s.node.privKey,
@@ -261,16 +260,16 @@ func (s *overlaySubscription) sendTwoStepRebroadcast(ctx context.Context, req re
 		LocalADNLID: s.node.localID.Bytes(),
 		Payload:     req.payload,
 		Flags:       plan.flags,
-		PeerSet:     peerSet,
-	}, overlay.WithBroadcastTwoStepPeerSendTimeout(twoStepPeerSendTimeout))
-	s.markTwoStepPeerFailures(res.Failed)
+		PeerSet:     s.resolveTwoStepPeerSet(req.sourcePeerID),
+	})
+	outcome := s.twoStepSendOutcome(res)
 
-	if err != nil && res.Sent == 0 {
+	if err != nil && outcome.Sent == 0 {
 		s.log.Debug().
 			Err(err).
 			Str("kind", req.kind).
-			Int("attempted", res.Attempted+len(resolveFailed)).
-			Int("failed", len(res.Failed)+len(resolveFailed)).
+			Int("attempted", outcome.Attempted).
+			Int("failed", outcome.Failed()).
 			Msg("failed to send custom two-step broadcast")
 		return false
 	}
@@ -278,25 +277,11 @@ func (s *overlaySubscription) sendTwoStepRebroadcast(ctx context.Context, req re
 		s.log.Debug().
 			Err(err).
 			Str("kind", req.kind).
-			Int("sent", res.Sent).
-			Int("failed", len(res.Failed)+len(resolveFailed)).
+			Int("sent", outcome.Sent).
+			Int("failed", outcome.Failed()).
 			Msg("partially sent custom two-step broadcast")
 	}
-	return res.Sent > 0
-}
-
-func (s *overlaySubscription) markTwoStepPeerFailures(failed []overlay.BroadcastTwoStepPeerError) {
-	for _, peerErr := range failed {
-		id, err := NewPeerID(peerErr.PeerID)
-		if err != nil {
-			continue
-		}
-		peer := s.peerByID(id)
-		if peer == nil {
-			continue
-		}
-		s.handlePeerQueryFailure(peer, peerErr.Err)
-	}
+	return outcome.Sent > 0
 }
 
 func (s *overlaySubscription) peerByID(id PeerID) *overlayPeer {

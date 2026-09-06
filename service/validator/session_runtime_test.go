@@ -309,8 +309,10 @@ type runtimeTestBackend struct {
 	load       func(context.Context, ChainStateRequest) (ChainStateData, error)
 	validation func(context.Context, *ChainState, *CandidateArtifact) (CandidateValidation, error)
 	// requests observes the internal parent-bound successor handle.
-	requests   func(CandidateValidationRequest)
-	acceptance func(context.Context, BlockAcceptance) error
+	requests          func(CandidateValidationRequest)
+	acceptance        func(context.Context, BlockAcceptance) error
+	description       func(context.Context, BlockAcceptance) error
+	prepareAcceptance func(context.Context, BlockAcceptance) (PreparedBlockAcceptance, error)
 }
 
 func (*runtimeTestBackend) ActivateSession(context.Context, SessionStart) error {
@@ -379,9 +381,33 @@ func (b *runtimeTestBackend) ValidateCandidate(
 	return testCandidateValidation(request.Parent, request.Artifact)
 }
 
-func (b *runtimeTestBackend) AcceptBlock(ctx context.Context, acceptance BlockAcceptance) error {
-	if b.acceptance != nil {
-		return b.acceptance(ctx, acceptance)
+type runtimeTestBlockAcceptance struct {
+	backend    *runtimeTestBackend
+	acceptance BlockAcceptance
+}
+
+func (b *runtimeTestBackend) PrepareBlockAcceptance(
+	ctx context.Context,
+	acceptance BlockAcceptance,
+) (PreparedBlockAcceptance, error) {
+	if b.prepareAcceptance != nil {
+		return b.prepareAcceptance(ctx, acceptance)
+	}
+
+	return &runtimeTestBlockAcceptance{backend: b, acceptance: acceptance}, nil
+}
+
+func (p *runtimeTestBlockAcceptance) Submit(ctx context.Context) error {
+	if p.backend.acceptance != nil {
+		return p.backend.acceptance(ctx, p.acceptance)
+	}
+
+	return nil
+}
+
+func (p *runtimeTestBlockAcceptance) Describe(ctx context.Context) error {
+	if p.backend.description != nil {
+		return p.backend.description(ctx, p.acceptance)
 	}
 
 	return nil
@@ -1216,12 +1242,13 @@ func TestSessionRuntimeLeaderWindowTelemetryDoesNotDelayCurrentWindow(t *testing
 		t.Fatal("initial consensus window was not delivered")
 	}
 	current := simplex.Window{
-		Base:         simplex.Genesis(),
-		StartSlot:    100,
-		EndSlot:      104,
-		ObservedSlot: 100,
-		ObservedAt:   time.Now(),
-		LocalLeader:  true,
+		Base:              simplex.Genesis(),
+		StartSlot:         100,
+		EndSlot:           104,
+		ObservedSlot:      100,
+		ObservedAt:        time.Now(),
+		FirstBlockTimeout: simplex.DefaultParams().FirstBlockTimeout,
+		LocalLeader:       true,
 	}
 	runtime.HandleWindow(current)
 	var telemetryDone func(error)
@@ -1393,11 +1420,12 @@ func TestSessionRuntimeProgressFailureSkipsOnlyCurrentWindow(t *testing.T) {
 				t.Fatalf("update after producer progress failure: %v", err)
 			}
 			next := simplex.Window{
-				Base:         simplex.Genesis(),
-				StartSlot:    100,
-				EndSlot:      104,
-				ObservedSlot: 100,
-				ObservedAt:   time.Now(),
+				Base:              simplex.Genesis(),
+				StartSlot:         100,
+				EndSlot:           104,
+				ObservedSlot:      100,
+				ObservedAt:        time.Now(),
+				FirstBlockTimeout: simplex.DefaultParams().FirstBlockTimeout,
 			}
 			runtime.HandleWindow(next)
 			select {
@@ -1436,6 +1464,10 @@ func TestSessionRuntimeRetriesTransientConsensusProgress(t *testing.T) {
 		{
 			name: "local acquisition not ready",
 			err:  fmt.Errorf("seed predecessor queue: %w", collator.ErrAcquisitionNotReady),
+		},
+		{
+			name: "session update deferred",
+			err:  fmt.Errorf("routine refresh: %w", collator.ErrSessionUpdateDeferred),
 		},
 	}
 
@@ -1526,11 +1558,12 @@ func TestSessionRuntimeCancelsTransientProgressAtNewerWindow(t *testing.T) {
 	}
 
 	first := simplex.Window{
-		Base:         simplex.Genesis(),
-		StartSlot:    100,
-		EndSlot:      104,
-		ObservedSlot: 100,
-		ObservedAt:   time.Now(),
+		Base:              simplex.Genesis(),
+		StartSlot:         100,
+		EndSlot:           104,
+		ObservedSlot:      100,
+		ObservedAt:        time.Now(),
+		FirstBlockTimeout: simplex.DefaultParams().FirstBlockTimeout,
 	}
 	runtime.HandleWindow(first)
 	select {
@@ -1606,11 +1639,12 @@ func TestSessionRuntimeDoesNotRetryProgressPastWindowDeadline(t *testing.T) {
 	}
 
 	stale := simplex.Window{
-		Base:         simplex.Genesis(),
-		StartSlot:    100,
-		EndSlot:      104,
-		ObservedSlot: 100,
-		ObservedAt:   time.Now().Add(-time.Hour),
+		Base:              simplex.Genesis(),
+		StartSlot:         100,
+		EndSlot:           104,
+		ObservedSlot:      100,
+		ObservedAt:        time.Now().Add(-time.Hour),
+		FirstBlockTimeout: simplex.DefaultParams().FirstBlockTimeout,
 	}
 	runtime.HandleWindow(stale)
 	select {
@@ -1821,12 +1855,13 @@ func TestSessionRuntimeLeaderWindowFailureSkipsOnlyCurrentWindow(t *testing.T) {
 		t.Fatalf("update after leader-window producer failure: %v", err)
 	}
 	next := simplex.Window{
-		Base:         simplex.Genesis(),
-		StartSlot:    100,
-		EndSlot:      104,
-		ObservedSlot: 100,
-		ObservedAt:   time.Now(),
-		LocalLeader:  true,
+		Base:              simplex.Genesis(),
+		StartSlot:         100,
+		EndSlot:           104,
+		ObservedSlot:      100,
+		ObservedAt:        time.Now(),
+		FirstBlockTimeout: simplex.DefaultParams().FirstBlockTimeout,
+		LocalLeader:       true,
 	}
 	runtime.HandleWindow(next)
 	select {
@@ -2178,6 +2213,9 @@ func TestSessionRuntimeRetriesUnavailableAncestryAndCancels(t *testing.T) {
 
 		candidates.mu.Lock()
 		candidates.releasePayloadLocked(tip.Candidate.ID, candidates.entries[tip.Candidate.ID])
+		// A restarted resolver has only the durable index. Known compact
+		// ancestry survives ordinary eviction and would not read this store.
+		candidates.entries[tip.Candidate.ID].lineage = nil
 		candidates.mu.Unlock()
 
 		return resolver, candidates, artifacts, storage
@@ -2307,10 +2345,11 @@ func TestSessionRuntimeSkipsWindowBehindLocallyFinalizedState(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime.HandleWindow(simplex.Window{
-		StartSlot:    100,
-		EndSlot:      101,
-		ObservedSlot: 100,
-		ObservedAt:   time.Now(),
+		StartSlot:         100,
+		EndSlot:           101,
+		ObservedSlot:      100,
+		ObservedAt:        time.Now(),
+		FirstBlockTimeout: simplex.DefaultParams().FirstBlockTimeout,
 	})
 	select {
 	case progress := <-backend.progresses:
@@ -2331,10 +2370,11 @@ func TestSessionRuntimeSkipsWindowBehindLocallyFinalizedState(t *testing.T) {
 		t.Fatalf("older masterchain anchor regressed finalized block to %v, want %v", finalized, ahead)
 	}
 	runtime.HandleWindow(simplex.Window{
-		StartSlot:    101,
-		EndSlot:      102,
-		ObservedSlot: 101,
-		ObservedAt:   time.Now(),
+		StartSlot:         101,
+		EndSlot:           102,
+		ObservedSlot:      101,
+		ObservedAt:        time.Now(),
+		FirstBlockTimeout: simplex.DefaultParams().FirstBlockTimeout,
 	})
 	select {
 	case progress := <-backend.progresses:

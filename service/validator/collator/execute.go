@@ -462,6 +462,15 @@ func (c *collation) processExternalBatch(
 // until the normal limit class fills up; everything else — and the remainder
 // after the cutoff — is enqueued.
 func (c *collation) processNewMessages(enqueueOnly bool) error {
+	// Once a pass went enqueue-only, every later pass of this block is too —
+	// the reference never lowers the flag, and lowering it here would deliver
+	// immediately after an enqueue and carry the claim past that enqueue's lt.
+	enqueueOnly = enqueueOnly || c.enqueueOnlyLatched
+	defer func() {
+		if enqueueOnly {
+			c.enqueueOnlyLatched = true
+		}
+	}()
 	if workers := c.generatedWaveParallelism(enqueueOnly); workers > 0 {
 		if err := c.processNewMessagesInWaves(enqueueOnly, workers); err != nil {
 			return err
@@ -577,6 +586,7 @@ func (c *collation) completeGeneratedImmediate(
 		}).ToCell()
 		if err == nil {
 			in, err = descriptorFee(0b011, 3, envelopeCell, result.TransactionCell, plan.internal.FwdFee) // msg_import_imm$011
+			c.stats.ImmediateMessages++
 		}
 	}
 	if err != nil {

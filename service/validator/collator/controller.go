@@ -24,6 +24,12 @@ import (
 type ConsensusObserverEvents struct {
 	Progressed func(context.Context, ConsensusProgress) error
 	Finalized  func(context.Context, ConsensusFinalization) error
+	Notarized  func(groups.ShardID, simplex.CandidateID, time.Time)
+	// Speculated offers a first slot for a window that has not opened yet,
+	// built on a candidate the observer already holds. It is the standalone
+	// collator's counterpart to the bet a validator places from its own
+	// validation, and the backend refuses it unless it is delegated that window.
+	Speculated func(context.Context, SpeculativeWindowRequest) error
 }
 
 // ConsensusFinalization is the ordinary block named by a final certificate.
@@ -73,6 +79,8 @@ type ControllerBackend interface {
 	Collator
 	ApplyConsensusProgress(context.Context, ConsensusProgress) error
 	ObserveConsensusFinalized(context.Context, [32]byte, ton.BlockIDExt) error
+	ObserveConsensusNotarized(groups.ShardID, simplex.CandidateID, time.Time)
+	SpeculateWindow(context.Context, SpeculativeWindowRequest) error
 }
 
 // MasterchainViewPublisher installs one coherent resident masterchain view
@@ -115,8 +123,11 @@ type ControllerOptions struct {
 	Observer    ConsensusObserver
 	Tracker     GroupTracker
 	Acquisition MasterchainViewPublisher
-	Messages    *msgpool.Pool
-	Logger      zerolog.Logger
+	// Feed advances the shared message pool by applied blocks. The controller
+	// owns only the destination projection half of it; the extension drives the
+	// per-block half from the node's applied-block hook.
+	Feed   *msgpool.Feed
+	Logger zerolog.Logger
 }
 
 // ControllerStatus combines controller lifecycle/session counts with the
@@ -139,6 +150,14 @@ const (
 	controllerRunning
 	controllerClosing
 	controllerClosed
+
+	// A recovered observer may reference a finalization whose candidate payload
+	// was not persisted by an older binary and is no longer served by the old
+	// private overlay. Bound that historical repair attempt so a synchronous
+	// applied-block hook cannot pin archive publication indefinitely. Ordinary
+	// (fresh) session activation is deliberately not time-bounded here.
+	recoveredObserverActivationProbeTimeout = 10 * time.Second
+	recoveredObserverActivationRetryDelay   = 30 * time.Second
 )
 
 // Controller derives standalone collator and observer sessions from applied
@@ -151,15 +170,23 @@ type Controller struct {
 	observer    ConsensusObserver
 	tracker     GroupTracker
 	acquisition MasterchainViewPublisher
-	messages    *msgpool.Internals
+	feed        *msgpool.Feed
 	policy      sessionProjectionPolicy
-	topology    *msgpool.Topology
 	log         zerolog.Logger
 
 	applyMu ctxMutex
 	mu      sync.RWMutex
 	state   controllerState
 	managed map[[32]byte]*controlledSession
+
+	// recoveryFloor is the newest masterchain view already committed by the
+	// collator store when the process starts. The node's own checkpoint may lag
+	// that child-store commit because applied-block hooks run before publication.
+	// applyMu protects the floor and keeps recovered lifecycle closed until the
+	// authoritative node view catches up instead of rolling an active session
+	// back into its older tentative projection.
+	recoveryFloor      *ton.BlockIDExt
+	recoveryWaitLogged bool
 }
 
 type controlledSession struct {
@@ -170,6 +197,12 @@ type controlledSession struct {
 	reconciled    bool
 	hasBackend    bool
 	hasObserver   bool
+
+	// recoveredObserver stays set until the recovered runtime has activated
+	// successfully. A failed bounded probe leaves ingress closed and backs off
+	// retries while newer masterchain projections continue to advance.
+	recoveredObserver         bool
+	observerActivationRetryAt time.Time
 }
 
 // newControlledSession is the only way to build a managed controller session.
@@ -180,6 +213,35 @@ func newControlledSession() *controlledSession {
 	return &controlledSession{mu: newCtxMutex()}
 }
 
+// controllerProgressDeferred lets the observer wait for the session semaphore
+// after releasing its runtime lifecycle lock. Using the same semaphore avoids
+// lost wakeups and a separate notification channel on every session unlock.
+type controllerProgressDeferred struct {
+	session *controlledSession
+}
+
+func (e *controllerProgressDeferred) Error() string {
+	return ErrSessionUpdateDeferred.Error()
+}
+
+func (e *controllerProgressDeferred) Unwrap() error {
+	return ErrSessionUpdateDeferred
+}
+
+func (e *controllerProgressDeferred) WaitReady(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := e.session.mu.LockCtx(ctx); err != nil {
+		return err
+	}
+	e.session.mu.Unlock()
+
+	// Readiness permits a retry; that retry must check whether reconciliation
+	// changed or retired the projection before delivering progress.
+	return ctx.Err()
+}
+
 type controllerReconcileTask struct {
 	id      [32]byte
 	current *controlledSession
@@ -187,8 +249,9 @@ type controllerReconcileTask struct {
 }
 
 type controllerReconcileResult struct {
-	retired bool
-	err     error
+	retired  bool
+	complete bool
+	err      error
 }
 
 // NewController validates fixed operator policy and binds the group tracker
@@ -210,8 +273,8 @@ func NewController(options ControllerOptions) (*Controller, error) {
 	if options.Acquisition == nil {
 		return nil, errors.New("collator controller: local acquisition is required")
 	}
-	if options.Messages == nil {
-		return nil, errors.New("collator controller: message pool is required")
+	if options.Feed == nil {
+		return nil, errors.New("collator controller: message pool feed is required")
 	}
 	if options.Backend.CollatorID() == ([32]byte{}) {
 		return nil, errors.New("collator controller: backend collator id is zero")
@@ -231,7 +294,7 @@ func NewController(options ControllerOptions) (*Controller, error) {
 		observer:    options.Observer,
 		tracker:     options.Tracker,
 		acquisition: options.Acquisition,
-		messages:    options.Messages.Internals(),
+		feed:        options.Feed,
 		policy:      policy,
 		log:         options.Logger,
 		managed:     make(map[[32]byte]*controlledSession),
@@ -306,8 +369,8 @@ func (c *Controller) Start(ctx context.Context) error {
 		// Recovered sessions prepare their acquisition pipeline during backend
 		// startup. Publish current destinations first so that preparation never
 		// observes an uninitialized internal-message topology.
-		if err := c.reconcileMessageTopology(snapshot); err != nil {
-			return err
+		if err := c.feed.Reconcile(msgpool.NewTopology(snapshot)); err != nil {
+			return fmt.Errorf("collator controller: reconcile message topology: %w", err)
 		}
 	}
 
@@ -331,9 +394,16 @@ func (c *Controller) Start(ctx context.Context) error {
 		managed.hasBackend = true
 		recovered[record.Session.ID] = managed
 	}
+	recoveryFloor, err := recoveredSessionFloor(records)
+	if err != nil {
+		return c.failStart(ctx, fmt.Errorf("collator controller: recover session floor: %w", err), false)
+	}
+	c.recoveryFloor = recoveryFloor
 	if err = c.observer.Start(ctx, c.remoteHandlers(), ConsensusObserverEvents{
 		Progressed: c.handleConsensusProgress,
 		Finalized:  c.handleConsensusFinalization,
+		Notarized:  c.backend.ObserveConsensusNotarized,
+		Speculated: c.handleConsensusSpeculation,
 	}); err != nil {
 		return c.failStart(ctx, fmt.Errorf("collator controller: start consensus observer: %w", err), true)
 	}
@@ -359,6 +429,7 @@ func (c *Controller) Start(ctx context.Context) error {
 			recovered[id] = managed
 		}
 		managed.hasObserver = true
+		managed.recoveredObserver = true
 	}
 
 	c.mu.Lock()
@@ -448,6 +519,13 @@ func (c *Controller) ApplyMasterchainState(ctx context.Context, input AppliedMas
 	if err := c.requireRunning(); err != nil {
 		return err
 	}
+	skip, err := c.skipRecoveryReplay(input.Block)
+	if err != nil {
+		return err
+	}
+	if skip {
+		return nil
+	}
 
 	result, err := c.tracker.Apply(groups.ApplyInput{
 		Block: input.Block,
@@ -477,6 +555,48 @@ func (c *Controller) ApplyMasterchainState(ctx context.Context, input AppliedMas
 	}
 
 	return c.reconcileSnapshot(ctx, result.Snapshot)
+}
+
+// skipRecoveryReplay admits the durable node sync behind a bootstrapped group
+// snapshot without weakening Tracker's ordinary stale-state contract. The
+// recovery floor remains set until that exact snapshot completes all local
+// lifecycle work. Only blocks below an exact tracker/floor match are known to
+// be the durable node replay which led to that recovered child-store state.
+// An exact floor block must still pass through Apply and retry publication and
+// reconciliation; a newer tracker snapshot has no ancestry proof here and does
+// not weaken Tracker's stale-state contract.
+func (c *Controller) skipRecoveryReplay(input ton.BlockIDExt) (bool, error) {
+	floor := c.recoveryFloor
+	if floor == nil {
+		return false, nil
+	}
+	snapshot, err := c.tracker.Snapshot()
+	if errors.Is(err, groups.ErrNoSnapshot) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("collator controller: load recovery replay snapshot: %w", err)
+	}
+	current := snapshot.MasterchainBlock
+	if input.SeqNo == floor.SeqNo && current.SeqNo != floor.SeqNo && !sameBlockID(input, *floor) {
+		return false, fmt.Errorf(
+			"masterchain recovery floor conflicts at seqno %d: %w",
+			input.SeqNo,
+			ErrSessionConflict,
+		)
+	}
+	if current.SeqNo != floor.SeqNo {
+		return false, nil
+	}
+	if !sameBlockID(current, *floor) {
+		return false, fmt.Errorf(
+			"masterchain recovery floor conflicts at seqno %d: %w",
+			current.SeqNo,
+			ErrSessionConflict,
+		)
+	}
+
+	return input.SeqNo < floor.SeqNo, nil
 }
 
 // Status returns a coherent bounded controller projection and backend status.
@@ -621,8 +741,17 @@ func (c *Controller) handleConsensusProgress(ctx context.Context, progress Conse
 		return ErrNotFound
 	}
 
-	if err := managed.mu.LockCtx(ctx); err != nil {
-		return err
+	// Runtime progression calls this callback while holding its lifecycle lock.
+	// Reconciliation takes the session lock first and then calls UpdateSession,
+	// which needs that lifecycle lock. Waiting here would invert the two locks.
+	// Progress waits for readiness only after dropping its lifecycle lock, then
+	// retries the same window against the current projection.
+	if !managed.mu.TryLock() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		return &controllerProgressDeferred{session: managed}
 	}
 	defer managed.mu.Unlock()
 	if !managed.reconciled || !managed.hasProjection || !managed.hasObserver {
@@ -644,6 +773,39 @@ func (c *Controller) handleConsensusProgress(ctx context.Context, progress Conse
 	}
 
 	return nil
+}
+
+// handleConsensusSpeculation routes one observer bet to the backend. It is the
+// same admission the progress path applies — a live projection with a backend —
+// and nothing more: whether this collator may produce that window is the
+// backend's own question, answered from the delegation it holds.
+func (c *Controller) handleConsensusSpeculation(
+	ctx context.Context,
+	request SpeculativeWindowRequest,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.RLock()
+	managed := c.managed[request.SessionID]
+	c.mu.RUnlock()
+	if managed == nil {
+		return ErrNotFound
+	}
+
+	if err := managed.mu.LockCtx(ctx); err != nil {
+		return err
+	}
+	defer managed.mu.Unlock()
+	if !managed.reconciled || !managed.hasProjection || !managed.hasObserver {
+		return ErrNotFound
+	}
+	projection := managed.projection
+	if !projection.active() || !projection.hasBackend() || !managed.hasBackend {
+		return nil
+	}
+
+	return c.backend.SpeculateWindow(ctx, request)
 }
 
 func (c *Controller) handleConsensusFinalization(
@@ -720,8 +882,15 @@ func validateConsensusProgress(session Session, progress ConsensusProgress) erro
 }
 
 func (c *Controller) reconcileSnapshot(ctx context.Context, snapshot *groups.Snapshot) error {
-	if err := c.reconcileMessageTopology(snapshot); err != nil {
+	if err := c.feed.Reconcile(msgpool.NewTopology(snapshot)); err != nil {
+		return fmt.Errorf("collator controller: reconcile message topology: %w", err)
+	}
+	ready, err := c.recoverySnapshotReady(snapshot.MasterchainBlock)
+	if err != nil {
 		return err
+	}
+	if !ready {
+		return nil
 	}
 	if !snapshot.Ready || !snapshot.LifecycleEnabled {
 		return nil
@@ -758,10 +927,14 @@ func (c *Controller) reconcileSnapshot(ctx context.Context, snapshot *groups.Sna
 
 	results := c.runReconcileTasks(ctx, tasks)
 	var reconcileErr error
+	reconcileComplete := true
 	c.mu.Lock()
 	for i := range tasks {
 		task := &tasks[i]
 		result := results[i]
+		if !result.complete {
+			reconcileComplete = false
+		}
 		if result.retired && c.managed[task.id] == task.current {
 			delete(c.managed, task.id)
 		}
@@ -770,21 +943,82 @@ func (c *Controller) reconcileSnapshot(ctx context.Context, snapshot *groups.Sna
 		}
 	}
 	c.mu.Unlock()
+	if reconcileErr == nil && reconcileComplete {
+		c.completeRecoverySnapshot(snapshot.MasterchainBlock)
+	}
 
 	return reconcileErr
 }
 
-func (c *Controller) reconcileMessageTopology(snapshot *groups.Snapshot) error {
-	topology := msgpool.NewTopology(snapshot)
-	if c.topology != nil && c.topology.Equal(topology) {
-		return nil
+func recoveredSessionFloor(records []SessionRecord) (*ton.BlockIDExt, error) {
+	var floor *ton.BlockIDExt
+	blocks := make(map[uint32]ton.BlockIDExt, len(records))
+	for i := range records {
+		block := records[i].Update.MasterchainBlock
+		if previous, exists := blocks[block.SeqNo]; exists && !sameBlockID(previous, block) {
+			return nil, fmt.Errorf(
+				"recovered sessions disagree at masterchain seqno %d: %w",
+				block.SeqNo,
+				ErrSessionConflict,
+			)
+		}
+		blocks[block.SeqNo] = block
+		if floor == nil || block.SeqNo > floor.SeqNo {
+			cloned := cloneBlockID(block)
+			floor = &cloned
+		}
 	}
-	if err := topology.Reconcile(c.messages); err != nil {
-		return fmt.Errorf("collator controller: reconcile message topology: %w", err)
-	}
-	c.topology = &topology
 
-	return nil
+	return floor, nil
+}
+
+// recoverySnapshotReady prevents a child store which committed before the
+// node checkpoint from being reconciled against an older lifecycle view. The
+// message topology and acquisition view still advance while this returns
+// false, so ordinary block catch-up can reach the floor without a circular
+// dependency. A same-height fork is a hard conflict; a newer node checkpoint
+// is already authoritative and may reconcile immediately. The floor stays
+// armed until every reconciliation task completes the requested lifecycle.
+func (c *Controller) recoverySnapshotReady(block ton.BlockIDExt) (bool, error) {
+	floor := c.recoveryFloor
+	if floor == nil {
+		return true, nil
+	}
+	if block.SeqNo < floor.SeqNo {
+		if !c.recoveryWaitLogged {
+			c.log.Info().
+				Str("masterchain", storage.FormatBlockRef(block)).
+				Str("recovery_floor", storage.FormatBlockRef(*floor)).
+				Msg("recovered collator lifecycle is waiting for masterchain catch-up")
+			c.recoveryWaitLogged = true
+		}
+
+		return false, nil
+	}
+	if block.SeqNo == floor.SeqNo && !sameBlockID(block, *floor) {
+		return false, fmt.Errorf(
+			"masterchain recovery floor conflicts at seqno %d: %w",
+			block.SeqNo,
+			ErrSessionConflict,
+		)
+	}
+
+	return true, nil
+}
+
+func (c *Controller) completeRecoverySnapshot(block ton.BlockIDExt) {
+	floor := c.recoveryFloor
+	if floor == nil {
+		return
+	}
+	c.recoveryFloor = nil
+	if c.recoveryWaitLogged {
+		c.log.Info().
+			Str("masterchain", storage.FormatBlockRef(block)).
+			Str("recovery_floor", storage.FormatBlockRef(*floor)).
+			Msg("masterchain reached recovered collator lifecycle floor")
+	}
+	c.recoveryWaitLogged = false
 }
 
 func (c *Controller) runReconcileTasks(
@@ -818,12 +1052,15 @@ func (c *Controller) reconcileSession(
 		return controllerReconcileResult{err: err}
 	}
 	defer current.mu.Unlock()
+	wasReconciled := current.reconciled
 	current.reconciled = false
 	if task.next == nil {
 		err := c.retireSession(ctx, task.id, current)
+		retired := err == nil && !current.hasObserver && !current.hasBackend
 		return controllerReconcileResult{
-			retired: err == nil && !current.hasObserver && !current.hasBackend,
-			err:     err,
+			retired:  retired,
+			complete: retired,
+			err:      err,
 		}
 	}
 	next := *task.next
@@ -834,6 +1071,17 @@ func (c *Controller) reconcileSession(
 
 	if next.hasBackend() {
 		if err := c.reconcileBackendDescriptor(ctx, current, next); err != nil {
+			if errors.Is(err, ErrSessionUpdateDeferred) {
+				// The backend accepted a routine refresh for its next safe
+				// production boundary. Keep serving the last fully reconciled
+				// projection until a later snapshot observes the backend's
+				// accepted view; publishing next here would put controller and
+				// pipeline on different descriptors.
+				current.reconciled = wasReconciled
+
+				return controllerReconcileResult{}
+			}
+
 			return controllerReconcileResult{err: err}
 		}
 	} else if current.hasBackend {
@@ -866,16 +1114,62 @@ func (c *Controller) reconcileSession(
 				return controllerReconcileResult{err: fmt.Errorf("activate backend session: %w", err)}
 			}
 		}
-		if err := c.observer.ActivateSession(ctx, *next.activation); err != nil {
-			return controllerReconcileResult{err: fmt.Errorf("activate consensus observer: %w", err)}
+		if current.recoveredObserver && time.Now().Before(current.observerActivationRetryAt) {
+			if err := ctx.Err(); err != nil {
+				return controllerReconcileResult{err: err}
+			}
+
+			return controllerReconcileResult{}
 		}
+
+		activationCtx := ctx
+		cancelActivation := func() {}
+		if current.recoveredObserver {
+			activationCtx, cancelActivation = context.WithTimeout(
+				ctx,
+				recoveredObserverActivationProbeTimeout,
+			)
+		}
+		activationErr := c.observer.ActivateSession(activationCtx, *next.activation)
+		cancelActivation()
+		if activationErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return controllerReconcileResult{err: errors.Join(ctxErr, activationErr)}
+			}
+			if current.recoveredObserver && errors.Is(activationErr, context.DeadlineExceeded) {
+				current.observerActivationRetryAt = time.Now().Add(recoveredObserverActivationRetryDelay)
+				c.log.Debug().
+					Err(activationErr).
+					Hex("session_id", task.id[:]).
+					Dur("retry_after", recoveredObserverActivationRetryDelay).
+					Msg("recovered consensus observer activation deferred")
+
+				return controllerReconcileResult{}
+			}
+			if errors.Is(activationErr, ErrAcquisitionNotReady) {
+				// The exact genesis artifacts can be part of the masterchain state
+				// whose applied hook is driving this reconciliation. That state is
+				// published only after the hook returns, so readiness must defer this
+				// session without holding the whole block flow behind itself. The
+				// prepared projection remains closed to ingress by reconciled=false
+				// and an exact later snapshot retries activation.
+				return controllerReconcileResult{}
+			}
+
+			return controllerReconcileResult{err: fmt.Errorf(
+				"activate consensus observer: %w",
+				activationErr,
+			)}
+		}
+		current.recoveredObserver = false
+		current.observerActivationRetryAt = time.Time{}
 	} else if wasActive {
 		return controllerReconcileResult{err: ErrSessionConflict}
 	}
 
 	current.reconciled = true
 
-	return controllerReconcileResult{}
+	return controllerReconcileResult{complete: true}
 }
 
 func (c *Controller) reconcileBackendDescriptor(

@@ -154,6 +154,134 @@ func TestLocalAdvanceConsensusBasePreservesExistingRicherState(t *testing.T) {
 	}
 }
 
+func TestLocalAdvanceConsensusBasePreservesPendingDescendant(t *testing.T) {
+	baseCandidate := simplex.CandidateID{Slot: 4, Hash: [32]byte{0xa1}}
+	fixture := newSelectedBaseAcquisitionFixture(t, baseCandidate)
+	baseState, _ := selectedBaseRicherState(fixture)
+	installSelectedBaseFixtureState(t, fixture, baseCandidate, baseState)
+
+	descendantTip := [32]byte{0xa2}
+	if err := fixture.managed.branch.AddCandidate(msgpool.CandidateRequest{
+		ID: descendantTip, Parent: &fixture.queueTip, Seqno: baseState.block.ID.SeqNo + 1,
+		Delta: &msgpool.InternalsDelta{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	descendantState := baseState
+	descendantState.block.ID.SeqNo++
+	descendantState.block.ID.RootHash = append([]byte(nil), descendantTip[:]...)
+	descendantState.block.ID.FileHash = append([]byte(nil), descendantTip[:]...)
+	descendantState.queueTip = cloneHashPointer(&descendantTip)
+	descendantCandidate := simplex.CandidateID{Slot: 5, Hash: [32]byte{0xa3}}
+	fixture.managed.mu.Lock()
+	fixture.managed.candidates[descendantCandidate] = descendantState
+	fixture.managed.blocks[descendantTip] = descendantState
+	fixture.managed.mu.Unlock()
+
+	next := fixture.update
+	next.CurrentWindowObservedSlot++
+	next.CurrentBase = simplex.Parent(baseCandidate)
+	if err := fixture.acquisition.AdvanceConsensusBase(context.Background(), ConsensusBaseUpdate{
+		Session: fixture.session,
+		Update:  next,
+		Base:    fixture.base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fixture.managed.mu.Lock()
+	_, baseExists := fixture.managed.candidates[baseCandidate]
+	_, descendantExists := fixture.managed.candidates[descendantCandidate]
+	candidateCount := len(fixture.managed.candidates)
+	blockCount := len(fixture.managed.blocks)
+	fixture.managed.mu.Unlock()
+	if !baseExists || !descendantExists || candidateCount != 2 || blockCount != 2 {
+		t.Fatalf(
+			"retained maps = (base %t, descendant %t, %d candidates, %d blocks), want both lineage states",
+			baseExists,
+			descendantExists,
+			candidateCount,
+			blockCount,
+		)
+	}
+
+	successorTip := [32]byte{0xa4}
+	if err := fixture.managed.branch.AddCandidate(msgpool.CandidateRequest{
+		ID: successorTip, Parent: &descendantTip, Seqno: descendantState.block.ID.SeqNo + 1,
+		Delta: &msgpool.InternalsDelta{},
+	}); err != nil {
+		t.Fatalf("commit successor after consensus base advance: %v", err)
+	}
+}
+
+func TestLocalAdvanceConsensusBasePreservesBranchOnlySelectedLineage(t *testing.T) {
+	baseCandidate := simplex.CandidateID{Slot: 4, Hash: [32]byte{0xb1}}
+	fixture := newSelectedBaseAcquisitionFixture(t, baseCandidate)
+
+	descendantTip := [32]byte{0xb2}
+	if err := fixture.managed.branch.AddCandidate(msgpool.CandidateRequest{
+		ID: descendantTip, Parent: &fixture.queueTip, Seqno: fixture.base.block.ID.SeqNo + 1,
+		Delta: &msgpool.InternalsDelta{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	descendantState := localCandidateState{
+		block:    clonePreviousBlock(fixture.base.block),
+		queueTip: cloneHashPointer(&descendantTip),
+	}
+	descendantState.block.ID.SeqNo++
+	descendantState.block.ID.RootHash = append([]byte(nil), descendantTip[:]...)
+	descendantState.block.ID.FileHash = append([]byte(nil), descendantTip[:]...)
+	descendantCandidate := simplex.CandidateID{Slot: 5, Hash: [32]byte{0xb3}}
+	fixture.managed.mu.Lock()
+	fixture.managed.candidates[descendantCandidate] = descendantState
+	fixture.managed.blocks[descendantTip] = descendantState
+	fixture.managed.mu.Unlock()
+
+	next := fixture.update
+	next.CurrentWindowObservedSlot++
+	next.CurrentBase = simplex.Parent(baseCandidate)
+	if err := fixture.acquisition.AdvanceConsensusBase(context.Background(), ConsensusBaseUpdate{
+		Session: fixture.session,
+		Update:  next,
+		Base:    fixture.base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fixture.managed.mu.Lock()
+	selected, baseExists := fixture.managed.candidates[baseCandidate]
+	_, descendantExists := fixture.managed.candidates[descendantCandidate]
+	fixture.managed.mu.Unlock()
+	if !baseExists {
+		t.Fatal("resolver-owned selected state was not installed")
+	}
+	if selected.queueTip != nil {
+		t.Fatal("resolver-owned selected state acquired private queue lineage")
+	}
+	if !descendantExists {
+		t.Fatal("branch-only selected base lost its speculative descendant")
+	}
+
+	// The parked offer for the first slot carries the foreign base as its
+	// CandidateTip and installs its own block again when the producer adopts it.
+	// That insert must stay idempotent across the consensus-base advance.
+	if err := fixture.managed.branch.AddCandidate(msgpool.CandidateRequest{
+		ID: descendantTip, Parent: &fixture.queueTip, Seqno: descendantState.block.ID.SeqNo,
+		Delta: &msgpool.InternalsDelta{},
+	}); err != nil {
+		t.Fatalf("reinstall adopted first-slot parent: %v", err)
+	}
+
+	successorTip := [32]byte{0xb4}
+	if err := fixture.managed.branch.AddCandidate(msgpool.CandidateRequest{
+		ID: successorTip, Parent: &descendantTip, Seqno: descendantState.block.ID.SeqNo + 1,
+		Delta: &msgpool.InternalsDelta{},
+	}); err != nil {
+		t.Fatalf("commit successor of adopted first slot: %v", err)
+	}
+}
+
 func TestLocalAdvanceConsensusBaseRekeysEmptyAliasWithoutStoreRead(t *testing.T) {
 	ordinaryID := simplex.CandidateID{Slot: 4, Hash: [32]byte{0x88}}
 	fixture := newSelectedBaseAcquisitionFixture(t, ordinaryID)

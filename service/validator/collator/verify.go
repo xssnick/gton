@@ -981,9 +981,11 @@ func verifyPredecessorState(
 		if block.BlockInfo.Shard != state.ShardIdent || block.BlockInfo.SeqNo != state.Seqno {
 			return tlb.ShardStateUnsplit{}, fmt.Errorf("%w: %s predecessor block header differs from state", ErrInvalidInput, label)
 		}
-		if err = cell.ValidateMerkleUpdate(block.StateUpdate); err != nil {
-			return tlb.ShardStateUnsplit{}, fmt.Errorf("%w: invalid %s predecessor state update: %v", ErrInvalidInput, label, err)
-		}
+		// No update walk here either: the hash comparison below is what binds the
+		// predecessor block to the state we were handed, and the reference does
+		// not validate a predecessor's update at all — it takes the predecessor
+		// state from the manager, already accepted. On this path the walk was
+		// paid once per candidate we validate.
 		to, refErr := block.StateUpdate.PeekRef(1)
 		if refErr != nil || to.HashKeyAt(0) != previous.State.HashKeyAt(0) {
 			return tlb.ShardStateUnsplit{}, fmt.Errorf("%w: %s predecessor block does not produce supplied state", ErrInvalidInput, label)

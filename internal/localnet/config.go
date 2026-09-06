@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -44,6 +45,7 @@ type Config struct {
 type NodeConfig struct {
 	Name         string   `json:"name"`
 	Kind         string   `json:"kind"`
+	Roles        []string `json:"roles"`
 	LogPath      string   `json:"log_path"`
 	ProcessMatch string   `json:"process_match"`
 	Optional     bool     `json:"optional,omitempty"`
@@ -79,14 +81,27 @@ type DeployConfig struct {
 }
 
 type ConditionsConfig struct {
-	MinMasterchainAdvance uint32   `json:"min_masterchain_advance,omitempty"`
-	MaxMasterchainLag     uint32   `json:"max_masterchain_lag,omitempty"`
-	MinFinalizedBlocks    uint64   `json:"min_finalized_blocks,omitempty"`
-	MaxHardErrors         int      `json:"max_hard_errors,omitempty"`
-	RequireSplit          bool     `json:"require_split,omitempty"`
-	RequireMerge          bool     `json:"require_merge,omitempty"`
-	AllowErrorPatterns    []string `json:"allow_error_patterns,omitempty"`
+	MinMasterchainAdvance uint32                `json:"min_masterchain_advance,omitempty"`
+	MaxMasterchainLag     uint32                `json:"max_masterchain_lag,omitempty"`
+	MinFinalizedBlocks    uint64                `json:"min_finalized_blocks,omitempty"`
+	MaxHardErrors         int                   `json:"max_hard_errors,omitempty"`
+	RequireSplit          bool                  `json:"require_split,omitempty"`
+	RequireMerge          bool                  `json:"require_merge,omitempty"`
+	AllowErrorPatterns    []string              `json:"allow_error_patterns,omitempty"`
+	CandidateFlows        []CandidateFlowConfig `json:"candidate_flows,omitempty"`
 }
+
+type CandidateFlowConfig struct {
+	Producer   string   `json:"producer"`
+	Validators []string `json:"validators"`
+	Finalizers []string `json:"finalizers"`
+}
+
+const (
+	nodeRoleProducer  = "producer"
+	nodeRoleValidator = "validator"
+	nodeRoleFinalizer = "finalizer"
+)
 
 func LoadConfigFile(path string) (Config, error) {
 	data, err := os.ReadFile(path)
@@ -147,6 +162,19 @@ func (c Config) Validate() error {
 		if node.Kind != "go" && node.Kind != "cpp" {
 			return fmt.Errorf("lab config: node %q kind must be go or cpp", node.Name)
 		}
+		if len(node.Roles) == 0 {
+			return fmt.Errorf("lab config: node %q requires at least one role", node.Name)
+		}
+		roles := make(map[string]struct{}, len(node.Roles))
+		for _, role := range node.Roles {
+			if role != nodeRoleProducer && role != nodeRoleValidator && role != nodeRoleFinalizer {
+				return fmt.Errorf("lab config: node %q has unknown role %q", node.Name, role)
+			}
+			if _, exists := roles[role]; exists {
+				return fmt.Errorf("lab config: node %q repeats role %q", node.Name, role)
+			}
+			roles[role] = struct{}{}
+		}
 		if _, exists := names[node.Name]; exists {
 			return fmt.Errorf("lab config: duplicate node name %q", node.Name)
 		}
@@ -167,7 +195,50 @@ func (c Config) Validate() error {
 	if c.Conditions.MaxHardErrors < 0 {
 		return errors.New("lab config: max_hard_errors cannot be negative")
 	}
+	for index, flow := range c.Conditions.CandidateFlows {
+		producer, exists := findNodeConfig(c.Nodes, flow.Producer)
+		if !exists || !nodeHasRole(producer, nodeRoleProducer) {
+			return fmt.Errorf("lab config: candidate flow %d producer %q is not a producer node", index, flow.Producer)
+		}
+		if len(flow.Validators) == 0 || len(flow.Finalizers) == 0 {
+			return fmt.Errorf("lab config: candidate flow %d requires validators and finalizers", index)
+		}
+		if err := validateFlowTargets(c.Nodes, index, flow.Validators, nodeRoleValidator); err != nil {
+			return err
+		}
+		if err := validateFlowTargets(c.Nodes, index, flow.Finalizers, nodeRoleFinalizer); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func validateFlowTargets(nodes []NodeConfig, flowIndex int, targets []string, role string) error {
+	seen := make(map[string]struct{}, len(targets))
+	for _, name := range targets {
+		node, exists := findNodeConfig(nodes, name)
+		if !exists || !nodeHasRole(node, role) {
+			return fmt.Errorf("lab config: candidate flow %d target %q is not a %s node", flowIndex, name, role)
+		}
+		if _, exists := seen[name]; exists {
+			return fmt.Errorf("lab config: candidate flow %d repeats %s target %q", flowIndex, role, name)
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+func findNodeConfig(nodes []NodeConfig, name string) (NodeConfig, bool) {
+	for _, node := range nodes {
+		if node.Name == name {
+			return node, true
+		}
+	}
+	return NodeConfig{}, false
+}
+
+func nodeHasRole(node NodeConfig, role string) bool {
+	return slices.Contains(node.Roles, role)
 }
 
 func (c Config) ValidateRun() error {
@@ -177,8 +248,15 @@ func (c Config) ValidateRun() error {
 	if c.Load.Rate <= 0 || c.Load.Duration.Duration <= 0 {
 		return errors.New("lab config: load rate and duration must be positive")
 	}
-	if c.Load.Drain.Duration < 0 || c.Load.Settle.Duration < 0 {
-		return errors.New("lab config: load drain and settle cannot be negative")
+	// The drain is the loader's own upper bound on confirming that submitted
+	// transfers reached their destinations, and it refuses a zero one: there is
+	// no budget in which to observe a delivery. Rejected here, by name, rather
+	// than as an opaque per-sender failure once the load is already running.
+	if c.Load.Drain.Duration <= 0 {
+		return errors.New("lab config: load drain must be positive")
+	}
+	if c.Load.Settle.Duration < 0 {
+		return errors.New("lab config: load settle cannot be negative")
 	}
 	if c.Load.SenderCount < 0 || c.Load.SenderCount > 1024 {
 		return errors.New("lab config: load sender_count must be between 0 and 1024")

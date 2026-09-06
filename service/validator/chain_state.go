@@ -208,20 +208,43 @@ func (s *ChainState) NormalBlock() (ton.BlockIDExt, error) {
 }
 
 func (s *ChainState) apply(artifact *CandidateArtifact) (*ChainState, error) {
-	root, err := cell.FromBOC(artifact.BlockBOC)
-	if err != nil {
-		return nil, fmt.Errorf("validator runtime: decode applied block: %w", err)
+	var root *cell.Cell
+	if artifact.validationRoots != nil {
+		root = artifact.validationRoots.block
+	}
+	if root == nil {
+		var err error
+		root, err = cell.FromBOC(artifact.BlockBOC)
+		if err != nil {
+			return nil, fmt.Errorf("validator runtime: decode applied block: %w", err)
+		}
 	}
 	if !cellHashEquals(root, artifact.Candidate.Block.RootHash) {
 		return nil, errors.New("validator runtime: applied block root hash mismatch")
 	}
 
+	if artifact.validationRoots != nil {
+		if next, ok := artifact.validationRoots.builtSuccessor.Over(s.root.WithoutTrace(), s.tipStates()...); ok {
+			return &ChainState{
+				shard: s.shard,
+				tips: []ChainTip{{
+					ID:       *artifact.Candidate.Block.Copy(),
+					BlockBOC: artifact.BlockBOC,
+					Block:    root,
+					State:    next,
+				}},
+				root:           next,
+				minMasterchain: s.minMasterchain,
+			}, nil
+		}
+	}
+
 	var loader cell.Slice
-	if err = root.BeginParseInto(&loader); err != nil {
+	if err := root.BeginParseInto(&loader); err != nil {
 		return nil, fmt.Errorf("validator runtime: parse applied block root: %w", err)
 	}
 	var block tlb.Block
-	if err = tlb.LoadFromCell(&block, &loader); err != nil {
+	if err := tlb.LoadFromCell(&block, &loader); err != nil {
 		return nil, fmt.Errorf("validator runtime: parse applied block: %w", err)
 	}
 	if loader.BitsLeft() != 0 || loader.RefsNum() != 0 {

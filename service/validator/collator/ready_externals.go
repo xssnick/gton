@@ -372,9 +372,38 @@ func (b *Builder) buildShardReadyAttempt(
 			}
 		}
 
-		started := time.Now()
-		snapshots, nextErr := stream.Next(waitCtx, batchLimit)
-		live.wait += time.Since(started)
+		// The wait is for a block that is not full. One past the soft limit —
+		// on any axis the limits measure, the reference's block_full_ — has
+		// work the committee could be validating right now, and every
+		// millisecond it spends here waiting for the slot boundary comes off
+		// that validation: the candidate leaves the moment it is committed
+		// (runtime_service.go broadcastAt), so this wait is the only thing left
+		// between a finished block and its broadcast. Below the soft limit the
+		// block waits for its slot's externals the way the reference gathers
+		// them: when this gate stood at the underload class instead, our blocks
+		// on the stand clustered at 231-246 kB against that class's 256 kB, the
+		// externals the rest of the slot brought went to the next leader — the
+		// reference's blocks were 394-414 kB on the same shards — and the stage
+		// never once drained the pool.
+		//
+		// What the loaded block skips is the wait, not the externals that are
+		// ready this instant: those cost no waiting, and the reference takes
+		// every external its pool holds. The inner take above drained what was
+		// ready before the internals ran; whatever landed while they ran is
+		// taken here, without a wait, before the stage stops for being loaded.
+		var snapshots []msgpool.ExternalSnapshot
+		var nextErr error
+		if !c.limits.fits(LoadNormal) {
+			snapshots = stream.TakeReady(batchLimit)
+			if len(snapshots) == 0 {
+				ready.stop = externalPhaseStop(c, ExternalStopLoaded)
+				break
+			}
+		} else {
+			started := time.Now()
+			snapshots, nextErr = stream.Next(waitCtx, batchLimit)
+			live.wait += time.Since(started)
+		}
 		if nextErr != nil {
 			if errors.Is(nextErr, context.DeadlineExceeded) && errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
 				ready.stop = externalPhaseStop(c, ExternalStopDeadline)

@@ -720,14 +720,12 @@ func TestAcceptedShardBlockBroadcastSkipsSameOverlayFECRebroadcast(t *testing.T)
 	}
 }
 
-func TestAcceptedSimpleBroadcastUsesBoundedAppRebroadcastOnly(t *testing.T) {
+func TestAcceptedPublicSimpleExternalUsesTransportRelayOnly(t *testing.T) {
 	node := newTestNode(t)
 	source := testRebroadcastQueuePeer("simple-source")
-	peers := []*overlayPeer{source}
 	peerMap := map[PeerID]*overlayPeer{source.id: source}
 	for i := 0; i < rebroadcastFanout+2; i++ {
 		peer := testRebroadcastQueuePeer(fmt.Sprintf("simple-target-%d", i))
-		peers = append(peers, peer)
 		peerMap[peer.id] = peer
 	}
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -740,32 +738,25 @@ func TestAcceptedSimpleBroadcastUsesBoundedAppRebroadcastOnly(t *testing.T) {
 		log:   discardLogger(),
 		peers: peerMap,
 	})
-	msg := tonnodeapi.NewShardBlockBroadcast{
-		Block: tonnodeapi.NewShardBlock{
-			ID:      testBlockID(0, topShard, 204),
-			CCSeqno: 7,
-			Data:    testShardDescriptionData(0x02),
-		},
+	msg := tonnodeapi.NewExternalMessageBroadcast{
+		Message: tonnodeapi.ExternalMessage{Data: testExternalMessageBOC(t)},
 	}
 	payload, err := tl.Serialize(msg, true)
 	if err != nil {
-		t.Fatalf("serialize shard broadcast: %v", err)
+		t.Fatalf("serialize external broadcast: %v", err)
 	}
 
 	accepted := sub.classifyBroadcast(source, msg, payload, DeliverySimple, false, source.id)
 	if accepted == nil || accepted.rebroadcast == nil {
-		t.Fatal("expected simple shard broadcast to be accepted")
+		t.Fatal("expected simple external broadcast to be accepted")
 	}
-	if accepted.rebroadcast.skipOverlayRebroadcast {
-		t.Fatal("simple broadcast incorrectly skipped the bounded app rebroadcast path")
-	}
-	if fanout := sub.rebroadcastFanoutForRequest(*accepted.rebroadcast); fanout != rebroadcastFanout {
-		t.Fatalf("simple app rebroadcast fanout=%d, want %d", fanout, rebroadcastFanout)
+	if !accepted.rebroadcast.skipOverlayRebroadcast {
+		t.Fatal("simple external broadcast did not defer same-overlay forwarding to the transport relay")
 	}
 
 	node.acceptBroadcast(*accepted)
-	if got := countQueuedRebroadcasts(peerMap, false); got != rebroadcastFanout {
-		t.Fatalf("queued simple app rebroadcasts=%d, want %d", got, rebroadcastFanout)
+	if got := countQueuedRebroadcasts(peerMap, false); got != 0 {
+		t.Fatalf("queued simple app rebroadcasts=%d, want 0", got)
 	}
 	if _, ok := source.rebroadcastQueue.TryPop(); ok {
 		t.Fatal("simple source received its own app rebroadcast")

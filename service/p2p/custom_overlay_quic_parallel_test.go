@@ -12,11 +12,6 @@ import (
 	adnlquic "github.com/xssnick/tonutils-go/adnl/quic"
 )
 
-type twoStepSendOutcome struct {
-	result overlay.BroadcastTwoStepSendResult
-	err    error
-}
-
 func TestQUICDialContenderHonorsContextDuringPrewarm(t *testing.T) {
 	remotePub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -78,7 +73,10 @@ func TestQUICDialContenderHonorsContextDuringPrewarm(t *testing.T) {
 	}
 }
 
-func TestTwoStepQUICFastPeerIsNotHeldBySlowPrewarm(t *testing.T) {
+// The source fan-out must never dial: a peer without an established
+// connection fails immediately with a background dial requested, so one cold
+// peer costs its own part and nothing else. See quicRouteBroadcastPeer.
+func TestTwoStepQUICSendSkipsUnconnectedPeerWithoutDialing(t *testing.T) {
 	fastGateway, err := adnlquic.NewGateway(quicOutboundTestKey(t))
 	if err != nil {
 		t.Fatalf("create fast peer gateway: %v", err)
@@ -158,54 +156,60 @@ func TestTwoStepQUICFastPeerIsNotHeldBySlowPrewarm(t *testing.T) {
 		peers:      []*overlayPeer{slowPeer, fastPeer},
 	})
 
-	peerSet, failed := sub.resolveTwoStepPeerSet(context.Background(), PeerID{})
-	if len(failed) != 0 || len(peerSet) != 2 {
-		t.Fatalf("resolved peers = %d, failures = %+v; want two deferred send peers", len(peerSet), failed)
+	warmCtx, cancelWarm := context.WithTimeout(context.Background(), 5*time.Second)
+	if _, err = fastPeer.dialQUIC(warmCtx); err != nil {
+		t.Fatalf("warm the fast peer: %v", err)
 	}
-	if _, err = node.quicGateway.OutboundPeerDefaultID(fastID[:]); err == nil {
-		t.Fatal("fast peer was already connected before two-step send")
+	cancelWarm()
+
+	peerSet := sub.resolveTwoStepPeerSet(PeerID{})
+	if len(peerSet) != 2 {
+		t.Fatalf("resolved peers = %d, want two", len(peerSet))
 	}
 
+	// No peer send budget at all, exactly as the source path sends: if the
+	// fan-out waited for the cold peer it would hang on the blocked DHT until
+	// this context expires.
 	sendCtx, cancelSend := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancelSend()
-	sendDone := make(chan twoStepSendOutcome, 1)
-	go func() {
-		result, sendErr := overlay.SendBroadcastTwoStep(sendCtx, overlay.BroadcastTwoStepSendRequest{
-			Key:         node.privKey,
-			Certificate: overlay.CertificateEmpty{},
-			LocalADNLID: node.localID.Bytes(),
-			Payload:     []byte("independent cold dial"),
-			PeerSet:     peerSet,
-		},
-			overlay.WithBroadcastTwoStepDate(123),
-			overlay.WithBroadcastTwoStepSendConcurrency(2),
-			overlay.WithBroadcastTwoStepPeerSendTimeout(2*time.Second),
-		)
-		sendDone <- twoStepSendOutcome{result: result, err: sendErr}
-	}()
+	result, sendErr := overlay.SendBroadcastTwoStep(sendCtx, overlay.BroadcastTwoStepSendRequest{
+		Key:         node.privKey,
+		Certificate: overlay.CertificateEmpty{},
+		LocalADNLID: node.localID.Bytes(),
+		Payload:     []byte("no inline dial"),
+		PeerSet:     peerSet,
+	}, overlay.WithBroadcastTwoStepDate(123))
+
+	if !slowPeer.route.QUICDialInFlight() {
+		t.Fatal("two-step send waited for the cold peer's background dial")
+	}
+	if result.Sent != 1 || len(result.Failed) != 1 {
+		t.Fatalf("two-step result = %+v, want one delivery and one skipped peer", result)
+	}
+	if !errors.Is(result.Failed[0].Err, errQUICPeerOffline) {
+		t.Fatalf("cold peer error = %v, want %v", result.Failed[0].Err, errQUICPeerOffline)
+	}
+	if sendErr == nil {
+		t.Fatal("skipped peer was not reported to the caller")
+	}
+
+	outcome := sub.twoStepSendOutcome(result)
+	if outcome.Sent != 1 || outcome.Faults[TwoStepSendFaultOffline] != 1 {
+		t.Fatalf("classified outcome = %+v, want one sent and one offline", outcome)
+	}
+	for fault, count := range outcome.Faults {
+		if TwoStepSendFault(fault) != TwoStepSendFaultOffline && count != 0 {
+			t.Fatalf("outcome charged fault %d to the peer: %+v", fault, outcome)
+		}
+	}
+	if sub.peerByID(slowID) == nil {
+		t.Fatal("a peer this node never connected to was evicted by its own send")
+	}
 
 	select {
 	case <-fastMessages:
-		if !slowPeer.route.QUICDialInFlight() {
-			t.Fatal("fast send arrived only after the slow prewarm completed")
-		}
-	case outcome := <-sendDone:
-		t.Fatalf("two-step send completed before reaching the fast peer: result=%+v err=%v", outcome.result, outcome.err)
-	case <-sendCtx.Done():
-		t.Fatalf("fast peer did not receive while slow peer was blocked: %v", sendCtx.Err())
-	}
-
-	var outcome twoStepSendOutcome
-	select {
-	case outcome = <-sendDone:
-	case <-sendCtx.Done():
-		t.Fatalf("bounded two-step send did not finish: %v", sendCtx.Err())
-	}
-	if outcome.result.Sent != 1 || len(outcome.result.Failed) != 1 {
-		t.Fatalf("two-step result = %+v, want one fast success and one slow failure", outcome.result)
-	}
-	if outcome.err == nil || !errors.Is(outcome.result.Failed[0].Err, context.DeadlineExceeded) {
-		t.Fatalf("slow peer outcome = %+v, err=%v; want bounded deadline failure", outcome.result.Failed, outcome.err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("connected peer did not receive the two-step broadcast")
 	}
 
 	cancelRun()

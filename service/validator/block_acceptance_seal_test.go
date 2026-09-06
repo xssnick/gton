@@ -81,7 +81,7 @@ func TestBlockAccepterRejectsForeignSessionCertificate(t *testing.T) {
 			if err != nil {
 				t.Fatalf("construct block accepter: %v", err)
 			}
-			err = accepter.Accept(context.Background(), acceptance, acceptanceTestViewResolver(BlockAcceptanceView{}))
+			err = accepter.acceptForTest(context.Background(), acceptance, acceptanceTestViewResolver(BlockAcceptanceView{}))
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("accept foreign-session certificate error = %v, want %q", err, test.wantErr)
 			}
@@ -105,7 +105,7 @@ func TestBlockAccepterRejectsUnverifiedCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("construct block accepter: %v", err)
 	}
-	err = accepter.Accept(context.Background(), acceptance, acceptanceTestViewResolver(BlockAcceptanceView{}))
+	err = accepter.acceptForTest(context.Background(), acceptance, acceptanceTestViewResolver(BlockAcceptanceView{}))
 	if err == nil || !strings.Contains(err.Error(), "was not verified") {
 		t.Fatalf("accept unverified certificate error = %v, want a not-verified rejection", err)
 	}
@@ -159,7 +159,7 @@ func TestBlockAccepterStillBindsCertificateToBlock(t *testing.T) {
 			if err != nil {
 				t.Fatalf("construct block accepter: %v", err)
 			}
-			err = accepter.Accept(context.Background(), acceptance, acceptanceTestViewResolver(BlockAcceptanceView{}))
+			err = accepter.acceptForTest(context.Background(), acceptance, acceptanceTestViewResolver(BlockAcceptanceView{}))
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("accept error = %v, want %q", err, test.wantErr)
 			}
@@ -285,7 +285,7 @@ func TestAcceptedSignaturesVerifyAgainstTheNetworkPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("construct block accepter: %v", err)
 		}
-		if err = accepter.Accept(
+		if err = accepter.acceptForTest(
 			context.Background(),
 			acceptance,
 			acceptanceTestViewResolver(view),

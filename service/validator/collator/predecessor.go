@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 
@@ -505,26 +506,93 @@ func filterOutQueue(queue *tlb.OutMsgQueueAugDict, owner, target tlb.ShardIdent)
 	return size, nil
 }
 
-func queuedCurrentPrefix(value *cell.Slice, key *cell.Cell) (msgpool.AccountPrefix, error) {
-	var keyLoader cell.Slice
-	err := key.BeginParseInto(&keyLoader)
-	if err != nil {
-		return msgpool.AccountPrefix{}, err
-	}
-	var queueKey msgpool.QueueKey
-	if err = keyLoader.LoadSliceInto(queueKey[:], 352); err != nil {
-		return msgpool.AccountPrefix{}, err
-	}
+// queuedMessageHeader is int_msg_info as filter_out_msg_queue unpacks it
+// (block.cpp:1171-1195, CommonMsgInfo::Record_int_msg_info through
+// unpack_cell_inexact): the message root's own bits, with the StateInit and body
+// references left where they are. Loading it records the message root and
+// nothing beneath it.
+type queuedMessageHeader struct {
+	_               tlb.Magic        `tlb:"$0"`
+	IHRDisabled     bool             `tlb:"bool"`
+	Bounce          bool             `tlb:"bool"`
+	Bounced         bool             `tlb:"bool"`
+	SrcAddr         *address.Address `tlb:"addr"`
+	DstAddr         *address.Address `tlb:"addr"`
+	Amount          tlb.Coins        `tlb:"."`
+	ExtraCurrencies *cell.Dictionary `tlb:"dict 32"`
+	IHRFee          tlb.Coins        `tlb:"."`
+	FwdFee          tlb.Coins        `tlb:"."`
+	CreatedLT       uint64           `tlb:"## 64"`
+	CreatedAt       uint32           `tlb:"## 32"`
+}
 
+// queuedCurrentPrefix places one queued message the way filter_out_msg_queue
+// does (block.cpp:1171-1195): the entry is exactly enqueued_lt plus the
+// envelope reference, the envelope decodes whole with regular intermediate
+// addresses (MsgEnvelope::Record_std, block-parse.cpp:898-907), and the message
+// root is read for its int_msg_info alone. Nothing under the root is opened.
+//
+// This used to go through parseQueueEntry, which also materialises the body
+// root and every StateInit reference and re-derives the queue key — the
+// validator's generated EnqueuedMsg check, which the reference never runs on a
+// split. Every cell a collation reads is carried by the collated proof, and the
+// split reads every entry of the parent queue, so those roots were paid once
+// per queued message. Measured on the stand across the two post-split blocks of
+// 2026-09-03: 2,498,713 and 2,461,902 bytes of collated data against 2,168,633
+// and 2,160,356 for the reference's sibling blocks over the same parents
+// (+15%), with the blocks themselves within 0.3% of each other. On the
+// deep-queue fixture the bodies and StateInit cells were 188,426 of 1,585,867
+// proof bytes. The block does not move: the update's old side is the ancestors
+// of its boundaries, and a body is never one.
+func queuedCurrentPrefix(value *cell.Slice, key *cell.Cell) (msgpool.AccountPrefix, error) {
 	// Filter hands out the live value slice; the decode consumes it, so the
 	// copy is the ownership boundary rather than a defensive clone.
 	valueCopy := *value
-	entry, err := parseQueueEntry(&valueCopy, queueKey)
+	var enqueued tlb.EnqueuedMsg
+	if err := loadExactSlice(&enqueued, &valueCopy); err != nil {
+		return msgpool.AccountPrefix{}, fmt.Errorf("%w: decode queue entry %s: %v", ErrInvalidInput, queueKeyText(key), err)
+	}
+	var env tlb.MsgEnvelope
+	if err := parseExact(&env, enqueued.Msg); err != nil {
+		return msgpool.AccountPrefix{}, fmt.Errorf("%w: decode queued envelope %s: %v", ErrInvalidInput, queueKeyText(key), err)
+	}
+	if env.CurAddr.Type != tlb.IntermediateAddressRegular || env.NextAddr.Type != tlb.IntermediateAddressRegular {
+		return msgpool.AccountPrefix{},
+			fmt.Errorf("%w: queued envelope %s has a non-regular intermediate address", ErrInvalidInput, queueKeyText(key))
+	}
+	var loader cell.Slice
+	if err := env.Msg.BeginParseInto(&loader); err != nil {
+		return msgpool.AccountPrefix{}, fmt.Errorf("%w: decode queued message %s: %v", ErrInvalidInput, queueKeyText(key), err)
+	}
+	var header queuedMessageHeader
+	if err := tlb.LoadFromCell(&header, &loader); err != nil {
+		return msgpool.AccountPrefix{}, fmt.Errorf("%w: decode queued message %s: %v", ErrInvalidInput, queueKeyText(key), err)
+	}
+	source, err := accountPrefixFromAddress(header.SrcAddr)
 	if err != nil {
-		return msgpool.AccountPrefix{}, err
+		return msgpool.AccountPrefix{}, fmt.Errorf("%w: queued message %s source: %v", ErrInvalidInput, queueKeyText(key), err)
+	}
+	destination, err := accountPrefixFromAddress(header.DstAddr)
+	if err != nil {
+		return msgpool.AccountPrefix{}, fmt.Errorf("%w: queued message %s destination: %v", ErrInvalidInput, queueKeyText(key), err)
 	}
 
-	return msgpool.AccountPrefix{Workchain: entry.descr.CurWorkchain, Prefix: entry.descr.CurPrefix}, nil
+	return msgpool.InterpolatePrefix(source, destination, int(env.CurAddr.UseDestBits)), nil
+}
+
+// queueKeyText renders the 352-bit queue key Filter hands over as a cell, for
+// the error path only: the key is synthetic and reading it records nothing, but
+// there is no reason to decode it for entries that pass.
+func queueKeyText(key *cell.Cell) string {
+	var loader cell.Slice
+	if err := key.BeginParseInto(&loader); err != nil {
+		return "?"
+	}
+	var queueKey msgpool.QueueKey
+	if err := loader.LoadSliceInto(queueKey[:], 352); err != nil {
+		return "?"
+	}
+	return fmt.Sprintf("%x", queueKey)
 }
 
 func splitProcessed(dict *cell.Dictionary, owner, target tlb.ShardIdent) (*cell.Dictionary, error) {

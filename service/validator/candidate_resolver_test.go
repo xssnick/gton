@@ -438,7 +438,7 @@ func TestCandidateResolverHandsParsedDAGToOneValidation(t *testing.T) {
 	}
 }
 
-func TestCandidateResolverObserverDropsParsedDAG(t *testing.T) {
+func TestCandidateResolverObserverHandsBlockToOneWarmup(t *testing.T) {
 	resolver := newResolverForTest(
 		newRuntimeTestStorage(),
 		&retryCandidateProvider{called: make(chan struct{}, 1)},
@@ -451,18 +451,30 @@ func TestCandidateResolverObserverDropsParsedDAG(t *testing.T) {
 	artifact := &CandidateArtifact{
 		Candidate: simplex.Candidate{ID: id},
 		validationRoots: &candidateValidationRoots{
-			block: cell.BeginCell().EndCell(),
+			block:    cell.BeginCell().EndCell(),
+			collated: []*cell.Cell{cell.BeginCell().EndCell()},
 		},
 	}
 	if err := resolver.stage(artifact, []byte{0x78}); err != nil {
 		t.Fatal(err)
 	}
 
-	resolver.mu.Lock()
-	defer resolver.mu.Unlock()
-	entry := resolver.entries[id]
-	if entry.validationRoots != nil || entry.candidate.validationRoots != nil {
-		t.Fatal("non-voting resolver retained a validation DAG")
+	first, err := resolver.candidate(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.validationRoots == nil || first.validationRoots.block != artifact.validationRoots.block {
+		t.Fatal("observer lost the parsed block before successor preparation")
+	}
+	if first.validationRoots.collated != nil {
+		t.Fatal("observer retained collated proof roots it never validates")
+	}
+	second, err := resolver.candidate(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.validationRoots != nil {
+		t.Fatal("observer retained the preparation roots after their first use")
 	}
 }
 

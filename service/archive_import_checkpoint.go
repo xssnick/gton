@@ -10,6 +10,8 @@ import (
 	"github.com/xssnick/gton/service/storage"
 )
 
+const archiveCheckpointPersistRetryDelay = time.Second
+
 type archiveCheckpointResult struct {
 	persisted        *storage.CurrentState
 	states           appliedStateCheckpoint
@@ -374,13 +376,30 @@ func (r *archiveCatchUpRun) logCheckpointWait(started time.Time) {
 }
 
 func (r *archiveCatchUpRun) persistProgressBeforeRetry(err error) error {
-	if err == nil || r.current.ShardClientSeqno <= r.lastCheckpointSeqno || errors.Is(err, context.Canceled) {
+	if err == nil || r.current.ShardClientSeqno <= r.lastCheckpointSeqno || r.ctx.Err() != nil {
 		return nil
 	}
 
-	checkpointBlocks, persistErr := r.persistCheckpoint("retry")
-	if persistErr != nil {
-		return fmt.Errorf("persist archive retry checkpoint: %w", persistErr)
+	var checkpointBlocks uint32
+	for attempt := 1; ; attempt++ {
+		completed, persistErr := r.persistCheckpoint("retry")
+		if persistErr == nil {
+			checkpointBlocks = completed
+			break
+		}
+
+		r.archive.log.Warn().
+			Err(persistErr).
+			Str("masterchain", storage.FormatBlockRef(r.current.Masterchain.Block)).
+			Uint32("shard_client_seqno", r.current.ShardClientSeqno).
+			Uint32("persisted_masterchain_seqno", r.lastCheckpointSeqno).
+			Int("attempt", attempt).
+			Dur("retry_delay", archiveCheckpointPersistRetryDelay).
+			Msg("failed to persist archive progress before retry, retrying")
+
+		if retryErr := waitRetry(r.ctx, archiveCheckpointPersistRetryDelay); retryErr != nil {
+			return fmt.Errorf("persist archive retry checkpoint: %w", retryErr)
+		}
 	}
 
 	r.archive.log.Info().

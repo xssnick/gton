@@ -135,7 +135,7 @@ func (f acceptanceMappingFixture) acceptance(t *testing.T) BlockAcceptance {
 	}
 }
 
-// BlockAccepter.prepare deliberately drops the Ed25519 pass and keeps only
+// BlockAccepter.Prepare deliberately drops the Ed25519 pass and keeps only
 // CheckPreparedSignatureWeight. That is sound for the signatures themselves —
 // the consensus engine verified this quorum over a byte-identical payload — but
 // it is the one thing that stops checking the step in between: signatureSet
@@ -207,7 +207,7 @@ func TestBlockAccepterSignatureSetBindsEachSignatureToItsValidator(t *testing.T)
 		}
 		accepter.validatorIDs = append(accepter.validatorIDs, hash)
 	}
-	prepared, err := accepter.prepare(acceptance)
+	prepared, err := accepter.Prepare(t.Context(), acceptance, nil)
 	if err != nil {
 		t.Fatalf("prepare acceptance: %v", err)
 	}

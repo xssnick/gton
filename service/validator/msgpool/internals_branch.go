@@ -118,6 +118,32 @@ func (b *Branch) PinSource(source ShardIdent, visible SourceRef) error {
 	return err
 }
 
+// SourcePinnable reports whether PinSource would succeed for this exact
+// position, without pinning anything. It is the admission form of PinSource's
+// own precondition: a run this branch already holds is always pinnable, and
+// otherwise the committed state must hold that exact reference.
+//
+// Collation asks before it commits to a masterchain view. A view whose
+// registered neighbour tops this node has not ingested yet would force the
+// from-state seed walk at the slot, or be refused outright on a build that may
+// not seed, so the pick prefers a view whose whole neighbour set is already
+// there and only falls back to one that is not.
+func (b *Branch) SourcePinnable(source ShardIdent, visible SourceRef) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return false
+	}
+	if b.sources[branchSourceKey{source: source, visible: visible}] != nil {
+		return true
+	}
+	b.state.mu.Lock()
+	defer b.state.mu.Unlock()
+	_, err := b.state.sourceRunAtLocked(source, visible)
+
+	return err == nil
+}
+
 // SeedSourceFromStateRoot derives and installs one exact source snapshot with
 // the branch's pinned destination router and returns its immutable messages.
 // Unlike Internals.SeedsFromStateRoot, it cannot be redirected by a newer
@@ -182,17 +208,38 @@ func (b *Branch) DeltaFromBlockRoot(
 // Root candidates pin their committed predecessor queues once; children only
 // allocate indexes proportional to their own delta, never to queue length.
 func (b *Branch) AddCandidate(request CandidateRequest) error {
+	_, err := b.addCandidate(request, false)
+
+	return err
+}
+
+// AddOrReusePromotedCandidate is AddCandidate for a block-derived local
+// install that may race its predecessor's promotion from candidate to applied
+// state. It additionally accepts only the narrow linear Parent=P/Base=P
+// representation change, with the same seqno and complete delta. The returned
+// ownership tells a surrounding transaction whether it may roll this call back.
+func (b *Branch) AddOrReusePromotedCandidate(request CandidateRequest) (CandidateInstall, error) {
+	return b.addCandidate(request, true)
+}
+
+// ReusePromotedCandidate verifies an already installed candidate without
+// materializing a new applied-base snapshot. It accepts the same exact or
+// linear Parent=P/Base=P forms as AddOrReusePromotedCandidate and reports
+// ErrCandidateNotFound when the caller must prepare the base and install it.
+//
+// It deliberately does not run the delta prologue AddCandidate runs. This
+// installs nothing: it either recognizes the request as content-identical to a
+// node already in the branch — which was validated when it was installed, and
+// whose equality is decided over the whole delta — or it hands the request
+// straight to AddOrReusePromotedCandidate, which validates it there. Running
+// the prologue here too meant two passes building two maps over every message
+// of the delta on the way to the same install.
+func (b *Branch) ReusePromotedCandidate(request CandidateRequest) error {
 	if request.Delta == nil {
 		return errors.New("msgpool: candidate delta is required")
 	}
 	if request.ID == ([32]byte{}) {
 		return errors.New("msgpool: candidate id is zero")
-	}
-	if err := validateSorted(request.Delta.Added, b.destination); err != nil {
-		return err
-	}
-	if err := validateSource(request.Delta.Added, b.destination, request.Seqno); err != nil {
-		return err
 	}
 
 	b.mu.Lock()
@@ -200,32 +247,67 @@ func (b *Branch) AddCandidate(request CandidateRequest) error {
 	if b.closed {
 		return ErrClosed
 	}
+	existing := b.candidates[request.ID]
+	if existing == nil {
+		return fmt.Errorf("%w: candidate %x", ErrCandidateNotFound, request.ID[:8])
+	}
+	if branchCandidateMatches(existing, request) ||
+		b.branchCandidateMatchesPromotedBase(existing, request) {
+		return nil
+	}
+
+	return fmt.Errorf("%w: candidate %x conflicts with its recorded content", ErrCutStale, request.ID[:8])
+}
+
+func (b *Branch) addCandidate(
+	request CandidateRequest,
+	allowPromotedBase bool,
+) (CandidateInstall, error) {
+	if request.Delta == nil {
+		return 0, errors.New("msgpool: candidate delta is required")
+	}
+	if request.ID == ([32]byte{}) {
+		return 0, errors.New("msgpool: candidate id is zero")
+	}
+	if err := validateSorted(request.Delta.Added, b.destination); err != nil {
+		return 0, err
+	}
+	if err := validateSource(request.Delta.Added, b.destination, request.Seqno); err != nil {
+		return 0, err
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, ErrClosed
+	}
 	if existing := b.candidates[request.ID]; existing != nil {
-		if branchCandidateMatches(existing, request) {
-			return nil
+		if branchCandidateMatches(existing, request) ||
+			(allowPromotedBase && b.branchCandidateMatchesPromotedBase(existing, request)) {
+			return CandidateInstallReused, nil
 		}
-		return fmt.Errorf("%w: candidate %x conflicts with its recorded content", ErrCutStale, request.ID[:8])
+		return 0, fmt.Errorf("%w: candidate %x conflicts with its recorded content", ErrCutStale, request.ID[:8])
 	}
 	candidate := &branchCandidate{id: request.ID, seqno: request.Seqno}
 	if request.Parent == nil {
 		if err := validateCandidateBaseTopology(b.destination, request.Base, request.Seqno); err != nil {
-			return err
+			return 0, err
 		}
 		base, err := b.snapshotBaseLocked(request.Base)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		candidate.base = base
 	} else {
 		if len(request.Base) != 0 {
-			return errors.New("msgpool: continued candidate must not redefine its base")
+			return 0, errors.New("msgpool: continued candidate must not redefine its base")
 		}
 		parent := b.candidates[*request.Parent]
 		if parent == nil {
-			return fmt.Errorf("%w: candidate parent %x is unknown", ErrCutStale, request.Parent[:8])
+			return 0, fmt.Errorf("%w: candidate parent %x is unknown", ErrCutStale, request.Parent[:8])
 		}
 		if request.Seqno != parent.seqno+1 {
-			return fmt.Errorf("%w: candidate seqno %d does not follow parent %d",
+			return 0, fmt.Errorf("%w: candidate seqno %d does not follow parent %d",
 				ErrCutStale, request.Seqno, parent.seqno)
 		}
 		candidate.parent = parent
@@ -234,7 +316,7 @@ func (b *Branch) AddCandidate(request CandidateRequest) error {
 
 	delta, err := b.indexDeltaLocked(candidate.parent, candidate.base, request.Delta)
 	if err != nil {
-		return fmt.Errorf("%w: candidate %d delta: %v", ErrCutStale, request.Seqno, err)
+		return 0, fmt.Errorf("%w: candidate %d delta: %v", ErrCutStale, request.Seqno, err)
 	}
 	candidate.delta = delta
 	b.candidates[candidate.id] = candidate
@@ -247,7 +329,7 @@ func (b *Branch) AddCandidate(request CandidateRequest) error {
 		children[candidate.id] = struct{}{}
 	}
 
-	return nil
+	return CandidateInstallAdded, nil
 }
 
 // HasCandidate reports whether this lineage already holds the candidate node.
@@ -355,8 +437,11 @@ func (b *Branch) Cut(request CutRequest) (*Cut, error) {
 	return result, nil
 }
 
-// Retain keeps exactly tip and its ancestors. nil clears all speculative and
-// pinned source state. It is the window-transition ownership boundary.
+// Retain keeps tip, its ancestors and every descendant built on tip. nil clears
+// all speculative and pinned source state. It is the window-transition
+// ownership boundary: forks which diverged before the selected tip are stale,
+// while descendants of that exact tip may still belong to live pipelined
+// builds.
 func (b *Branch) Retain(tip *[32]byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -376,6 +461,19 @@ func (b *Branch) Retain(tip *[32]byte) error {
 	keep := make(map[[32]byte]struct{})
 	for at := candidate; at != nil; at = at.parent {
 		keep[at.id] = struct{}{}
+	}
+	pending := [][32]byte{candidate.id}
+	for len(pending) > 0 {
+		last := len(pending) - 1
+		id := pending[last]
+		pending = pending[:last]
+		for child := range b.children[id] {
+			if _, retained := keep[child]; retained {
+				continue
+			}
+			keep[child] = struct{}{}
+			pending = append(pending, child)
+		}
 	}
 	for id := range b.candidates {
 		if _, retained := keep[id]; !retained {
@@ -616,6 +714,38 @@ func branchCandidateMatches(candidate *branchCandidate, request CandidateRequest
 		}
 	}
 	return equalInternalsDelta(candidate.delta.raw, request.Delta)
+}
+
+func (b *Branch) branchCandidateMatchesPromotedBase(
+	candidate *branchCandidate,
+	request CandidateRequest,
+) bool {
+	if candidate.seqno != request.Seqno || !equalInternalsDelta(candidate.delta.raw, request.Delta) {
+		return false
+	}
+	if candidate.parent != nil && request.Parent == nil {
+		return len(request.Base) == 1 &&
+			candidateSourceNamesParent(request.Base[0], b.destination, candidate.parent)
+	}
+	if candidate.parent == nil && request.Parent != nil && len(request.Base) == 0 {
+		parent := b.candidates[*request.Parent]
+
+		return parent != nil && len(candidate.base.sources) == 1 &&
+			candidateSourceNamesParent(candidate.base.sources[0], b.destination, parent)
+	}
+
+	return false
+}
+
+func candidateSourceNamesParent(
+	source CandidateSource,
+	destination ShardIdent,
+	parent *branchCandidate,
+) bool {
+	return source.Source == destination && source.Visible == (SourceRef{
+		Seqno:    parent.seqno,
+		RootHash: parent.id,
+	})
 }
 
 func orderKey(message *InternalMessage) branchOrderKey {

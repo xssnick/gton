@@ -65,6 +65,11 @@ const (
 	// per-stage sum still adds up to the build; build_state_update itself now
 	// means exactly the state serialization plus the Merkle update.
 	CollationStageProcessedInfo
+	// CollationStageBuildCollatedProofs is the neighbour queue walk and the
+	// proofs it produces. It runs after execution, so its cost is bounded by
+	// the bound the block claims rather than by whatever the message pool
+	// offered — see finishShard.
+	CollationStageBuildCollatedProofs
 	CollationStageClaimedLocalCleanup
 	CollationStageFlushBatches
 	CollationStageValidationClosure
@@ -277,6 +282,11 @@ const (
 	// that never becomes a block is visible, and without it 85 bets could be
 	// started, none adopted, and nothing say so.
 	PipelineHandoffSpeculativeFailed
+	// PipelineHandoffSpeculativeSuperseded is a bet replaced by a fresher one
+	// for the same window before the window opened: the bets are placed from
+	// the last few slots of the window before, and each later slot's candidate
+	// is the better guess at the base. Neither a win nor a loss.
+	PipelineHandoffSpeculativeSuperseded
 	pipelineHandoffOutcomeCount
 )
 
@@ -316,6 +326,8 @@ func (o PipelineHandoffOutcome) String() string {
 		return "speculative_declined"
 	case PipelineHandoffSpeculativeFailed:
 		return "speculative_failed"
+	case PipelineHandoffSpeculativeSuperseded:
+		return "speculative_superseded"
 	default:
 		return "unknown"
 	}
@@ -362,6 +374,7 @@ var candidateAssemblyStages = [...]CollationStage{
 	CollationStageExecuteExternalMessages,
 	CollationStageFinalizeAccounts,
 	CollationStageProcessedInfo,
+	CollationStageBuildCollatedProofs,
 	CollationStageClaimedLocalCleanup,
 	CollationStageFlushBatches,
 	CollationStageBuildStateUpdate,
@@ -459,26 +472,49 @@ const (
 // which collation writes once per included external, and InternalMessages
 // counts msg_import_fin plus msg_import_tr, the two descriptors it writes for
 // an internal taken off a queue — executed here or relayed onward.
+// The three ways a message enters a block, in the order the message metrics
+// index them.
+const (
+	candidateMessageExternal = iota
+	candidateMessageInternal
+	candidateMessageImmediate
+	candidateMessageKindCount
+)
+
+var candidateMessageKindLabels = [candidateMessageKindCount]string{"external", "internal", "immediate"}
+
 type CandidateShape struct {
 	Transactions     uint32
 	ExternalMessages uint32
 	InternalMessages uint32
+	// ImmediateMessages counts msg_import_imm — generated and delivered inside
+	// the same block. Without it a shard with no neighbours reports a full
+	// block as externals only, because every message its transactions make
+	// lands right back in the same block and neither counter above sees it.
+	ImmediateMessages uint32
 }
 
 // CollationStats reports the shape a collation observed, for the paths that
 // hand a full Stats to the observer.
 func (s Stats) CollationShape() CandidateShape {
 	return CandidateShape{
-		Transactions:     s.Transactions,
-		ExternalMessages: s.ExternalIncluded,
-		InternalMessages: s.InternalsImported,
+		Transactions:      s.Transactions,
+		ExternalMessages:  s.ExternalIncluded,
+		InternalMessages:  s.InternalsImported,
+		ImmediateMessages: s.ImmediateMessages,
 	}
 }
 
 type CandidateObservation struct {
-	Chain         MetricChain
-	Origin        CandidateOrigin
-	Kind          CandidateKind
+	Chain  MetricChain
+	Origin CandidateOrigin
+	Kind   CandidateKind
+	// Shard names the shard this candidate belongs to, already formatted for a
+	// metric label. Optional: only a candidate this node produced carries it,
+	// and only the per-shard series below read it. The chain label alone
+	// cannot separate four basechain shards, which is exactly what a stacked
+	// per-shard graph of our own production needs.
+	Shard         string
 	BlockBytes    int
 	CollatedBytes int
 	Shape         CandidateShape
@@ -678,23 +714,29 @@ type PrometheusMetrics struct {
 	gasUsed            *prometheus.HistogramVec
 	messages           *prometheus.HistogramVec
 	latestMessages     *prometheus.GaugeVec
-	outQueueMessages   *prometheus.HistogramVec
-	externalBatches    *prometheus.HistogramVec
-	externalStops      *prometheus.CounterVec
-	queueCleanupStops  *prometheus.CounterVec
-	queueCleaned       *prometheus.HistogramVec
-	loadClasses        *prometheus.CounterVec
-	overloads          *prometheus.CounterVec
-	deadlineEvents     *prometheus.CounterVec
-	retries            *prometheus.CounterVec
-	alarms             *prometheus.CounterVec
-	pipelineHandoffs   *prometheus.CounterVec
-	handoffPickup      *prometheus.HistogramVec
-	pipelineOverlap    *prometheus.HistogramVec
-	scheduleLateness   *prometheus.HistogramVec
-	windowsInflight    *prometheus.GaugeVec
-	windows            *prometheus.CounterVec
-	windowDuration     *prometheus.HistogramVec
+
+	shardBlocks             *prometheus.CounterVec
+	shardTransactions       *prometheus.CounterVec
+	shardMessages           *prometheus.CounterVec
+	shardLatestTransactions *prometheus.GaugeVec
+	shardLatestBytes        *prometheus.GaugeVec
+	outQueueMessages        *prometheus.HistogramVec
+	externalBatches         *prometheus.HistogramVec
+	externalStops           *prometheus.CounterVec
+	queueCleanupStops       *prometheus.CounterVec
+	queueCleaned            *prometheus.HistogramVec
+	loadClasses             *prometheus.CounterVec
+	overloads               *prometheus.CounterVec
+	deadlineEvents          *prometheus.CounterVec
+	retries                 *prometheus.CounterVec
+	alarms                  *prometheus.CounterVec
+	pipelineHandoffs        *prometheus.CounterVec
+	handoffPickup           *prometheus.HistogramVec
+	pipelineOverlap         *prometheus.HistogramVec
+	scheduleLateness        *prometheus.HistogramVec
+	windowsInflight         *prometheus.GaugeVec
+	windows                 *prometheus.CounterVec
+	windowDuration          *prometheus.HistogramVec
 }
 
 // NewPrometheusMetrics registers all collator collectors as one atomic set.
@@ -787,8 +829,35 @@ func NewPrometheusMetrics(registry MetricsRegistry) (*PrometheusMetrics, error) 
 		}, []string{"mode", "chain", "origin", "kind"}),
 		latestMessages: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace, Subsystem: "collator", Name: "candidate_latest_messages",
-			Help: "External and imported internal messages in the latest candidate produced by this process.",
+			Help: "Messages in the latest candidate produced by this process, by kind: external, " +
+				"internal imported off a neighbour queue, and immediate — generated and delivered " +
+				"inside the same block. A shard with no neighbours produces almost only the last " +
+				"kind, so reading the first two as the whole block understates it by an order of " +
+				"magnitude.",
 		}, []string{"mode", "chain", "kind"}),
+		shardBlocks: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: "collator", Name: "shard_blocks_total",
+			Help: "Non-empty candidates this node produced, per shard.",
+		}, []string{"mode", "chain", "shard"}),
+		shardTransactions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: "collator", Name: "shard_block_transactions_total",
+			Help: "Transactions this node put into blocks, per shard. Stack rate() of this across " +
+				"shards for what this producer contributes to the network.",
+		}, []string{"mode", "chain", "shard"}),
+		shardMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: "collator", Name: "shard_block_messages_total",
+			Help: "Messages this node put into blocks, per shard and kind (external, internal, immediate).",
+		}, []string{"mode", "chain", "shard", "kind"}),
+		shardLatestTransactions: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: "collator", Name: "shard_block_latest_transactions",
+			Help: "Transactions in the last block this node produced for that shard. Graph it as " +
+				"max_over_time(...[$__interval]) stacked by shard to see how full our blocks were " +
+				"at each moment; between our leader windows the value stands still by construction.",
+		}, []string{"mode", "chain", "shard"}),
+		shardLatestBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: "collator", Name: "shard_block_latest_bytes",
+			Help: "Block bytes of the last block this node produced for that shard.",
+		}, []string{"mode", "chain", "shard"}),
 		outQueueMessages: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Subsystem: "collator", Name: "candidate_out_queue_messages",
 			Help: "Outbound queue size reported after producing a candidate.", Buckets: counts,
@@ -864,6 +933,8 @@ func NewPrometheusMetrics(registry MetricsRegistry) (*PrometheusMetrics, error) 
 		metrics.candidates, metrics.productionDuration, metrics.candidateSize, metrics.candidateSizeTotal,
 		metrics.transactions,
 		metrics.latestTransactions, metrics.gasUsed, metrics.messages, metrics.latestMessages,
+		metrics.shardBlocks, metrics.shardTransactions, metrics.shardMessages,
+		metrics.shardLatestTransactions, metrics.shardLatestBytes,
 		metrics.outQueueMessages,
 		metrics.externalBatches, metrics.externalStops, metrics.queueCleanupStops, metrics.queueCleaned,
 		metrics.loadClasses, metrics.overloads,
@@ -912,11 +983,11 @@ type prometheusObserver struct {
 	transactions       [metricChainCount][candidateOriginCount]prometheus.Observer
 	latestTransactions [metricChainCount]prometheus.Gauge
 	gasUsed            [metricChainCount]prometheus.Observer
-	messages           [metricChainCount][candidateOriginCount][2]prometheus.Observer
-	latestMessages     [metricChainCount][2]prometheus.Gauge
+	messages           [metricChainCount][candidateOriginCount][candidateMessageKindCount]prometheus.Observer
+	latestMessages     [metricChainCount][candidateMessageKindCount]prometheus.Gauge
 	outQueueMessages   [metricChainCount]prometheus.Observer
 	externalBatches    [metricChainCount]prometheus.Observer
-	externalStops      [metricChainCount][6]prometheus.Counter
+	externalStops      [metricChainCount][7]prometheus.Counter
 	queueCleanupStops  [metricChainCount][cleanupStopReasonCount]prometheus.Counter
 	queueCleaned       [metricChainCount]prometheus.Observer
 	loadClasses        [metricChainCount][6]prometheus.Counter
@@ -931,6 +1002,47 @@ type prometheusObserver struct {
 	windowsInflight    [metricChainCount]prometheus.Gauge
 	windows            [metricChainCount][collationResultCount]prometheus.Counter
 	windowDuration     [metricChainCount][collationResultCount]prometheus.Observer
+}
+
+// observeShardCandidate records one block this node produced against its own
+// shard. The chain label cannot do this: four basechain shards share it, so a
+// stacked graph of what this producer contributes per shard — and the size of
+// the last block it made for each — has nowhere else to come from.
+//
+// The label is whatever the producer formatted; an empty one means the caller
+// had no shard to name and the per-shard series are left alone. Series for a
+// shard this node no longer leads stop moving rather than disappearing, which
+// is why the counters are the honest view and the gauges say "latest".
+func (o *prometheusObserver) observeShardCandidate(
+	chain MetricChain,
+	kind CandidateKind,
+	observation CandidateObservation,
+) {
+	if o.metrics == nil || observation.Shard == "" || kind != CandidateKindBlock {
+		return
+	}
+	chainLabel := o.chainLabels[chain]
+	shape := observation.Shape
+	o.metrics.shardBlocks.WithLabelValues(o.modeLabel, chainLabel, observation.Shard).Inc()
+	o.metrics.shardTransactions.
+		WithLabelValues(o.modeLabel, chainLabel, observation.Shard).
+		Add(float64(shape.Transactions))
+	counts := [candidateMessageKindCount]uint32{
+		shape.ExternalMessages,
+		shape.InternalMessages,
+		shape.ImmediateMessages,
+	}
+	for messageKind, label := range candidateMessageKindLabels {
+		o.metrics.shardMessages.
+			WithLabelValues(o.modeLabel, chainLabel, observation.Shard, label).
+			Add(float64(counts[messageKind]))
+	}
+	o.metrics.shardLatestTransactions.
+		WithLabelValues(o.modeLabel, chainLabel, observation.Shard).
+		Set(float64(shape.Transactions))
+	o.metrics.shardLatestBytes.
+		WithLabelValues(o.modeLabel, chainLabel, observation.Shard).
+		Set(float64(max(observation.BlockBytes, 0)))
 }
 
 // Observer binds the mode label once, outside candidate processing.
@@ -954,7 +1066,7 @@ func (m *PrometheusMetrics) Observer(mode MetricsMode) CollationObserver {
 		"resolve_candidate_state", "restore_candidate", "sign_candidate",
 		"persist_candidate", "commit_candidate_state", "wait_broadcast_slot",
 		"deliver_candidate",
-		"processed_info", "claimed_local_cleanup", "flush_batches",
+		"processed_info", "build_collated_proofs", "claimed_local_cleanup", "flush_batches",
 		"validation_closure", "serialize_block",
 	}
 	kinds := [...]string{"block", "empty", "recovered"}
@@ -990,16 +1102,20 @@ func (m *PrometheusMetrics) Observer(mode MetricsMode) CollationObserver {
 			o.candidateSizeTotal[chain][origin][0] = m.candidateSizeTotal.WithLabelValues(modeLabel, chainLabel, originLabel, "block")
 			o.candidateSizeTotal[chain][origin][1] = m.candidateSizeTotal.WithLabelValues(modeLabel, chainLabel, originLabel, "collated")
 			o.transactions[chain][origin] = m.transactions.WithLabelValues(modeLabel, chainLabel, originLabel)
-			o.messages[chain][origin][0] = m.messages.WithLabelValues(modeLabel, chainLabel, originLabel, "external")
-			o.messages[chain][origin][1] = m.messages.WithLabelValues(modeLabel, chainLabel, originLabel, "internal")
+			for kind, kindLabel := range candidateMessageKindLabels {
+				o.messages[chain][origin][kind] = m.messages.WithLabelValues(
+					modeLabel, chainLabel, originLabel, kindLabel,
+				)
+			}
 		}
 		o.latestTransactions[chain] = m.latestTransactions.WithLabelValues(modeLabel, chainLabel)
-		o.latestMessages[chain][0] = m.latestMessages.WithLabelValues(modeLabel, chainLabel, "external")
-		o.latestMessages[chain][1] = m.latestMessages.WithLabelValues(modeLabel, chainLabel, "internal")
+		for kind, kindLabel := range candidateMessageKindLabels {
+			o.latestMessages[chain][kind] = m.latestMessages.WithLabelValues(modeLabel, chainLabel, kindLabel)
+		}
 		o.gasUsed[chain] = m.gasUsed.WithLabelValues(modeLabel, chainLabel)
 		o.outQueueMessages[chain] = m.outQueueMessages.WithLabelValues(modeLabel, chainLabel)
 		o.externalBatches[chain] = m.externalBatches.WithLabelValues(modeLabel, chainLabel)
-		for reason, label := range [...]string{"unknown", "ready_drained", "soft_limit", "deadline", "attempt_limit", "queue_brake"} {
+		for reason, label := range [...]string{"unknown", "ready_drained", "soft_limit", "deadline", "attempt_limit", "queue_brake", "loaded"} {
 			o.externalStops[chain][reason] = m.externalStops.WithLabelValues(modeLabel, chainLabel, label)
 		}
 		for reason := CleanupStopReason(0); reason < cleanupStopReasonCount; reason++ {
@@ -1085,8 +1201,10 @@ func (o *prometheusObserver) ObserveCollationCandidate(observation CandidateObse
 		o.candidates[chain][kind].Inc()
 		shape := observation.Shape
 		o.latestTransactions[chain].Set(float64(shape.Transactions))
-		o.latestMessages[chain][0].Set(float64(shape.ExternalMessages))
-		o.latestMessages[chain][1].Set(float64(shape.InternalMessages))
+		o.latestMessages[chain][candidateMessageExternal].Set(float64(shape.ExternalMessages))
+		o.latestMessages[chain][candidateMessageInternal].Set(float64(shape.InternalMessages))
+		o.latestMessages[chain][candidateMessageImmediate].Set(float64(shape.ImmediateMessages))
+		o.observeShardCandidate(chain, kind, observation)
 	}
 	blockBytes := float64(max(observation.BlockBytes, 0))
 	collatedBytes := float64(max(observation.CollatedBytes, 0))
@@ -1099,8 +1217,9 @@ func (o *prometheusObserver) ObserveCollationCandidate(observation CandidateObse
 	}
 	shape := observation.Shape
 	o.transactions[chain][origin].Observe(float64(shape.Transactions))
-	o.messages[chain][origin][0].Observe(float64(shape.ExternalMessages))
-	o.messages[chain][origin][1].Observe(float64(shape.InternalMessages))
+	o.messages[chain][origin][candidateMessageExternal].Observe(float64(shape.ExternalMessages))
+	o.messages[chain][origin][candidateMessageInternal].Observe(float64(shape.InternalMessages))
+	o.messages[chain][origin][candidateMessageImmediate].Observe(float64(shape.ImmediateMessages))
 	if origin != CandidateOriginCollation {
 		// Everything below is a producer's own bookkeeping — gas it metered,
 		// how long it waited for externals, why it stopped. A validator sees
@@ -1218,7 +1337,7 @@ func boundedCollationResult(result CollationResult) CollationResult {
 }
 
 func boundedExternalStop(reason ExternalStopReason) int {
-	if reason > ExternalStopQueueBrake {
+	if reason > ExternalStopLoaded {
 		return 0
 	}
 	return int(reason)

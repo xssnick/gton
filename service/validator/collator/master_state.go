@@ -111,12 +111,23 @@ func (c *collation) buildMasterStateAndBlockParts() (blockParts, error) {
 			return blockParts{}, err
 		}
 	}
+	// The sweep runs on the same terms as the reference: only where the
+	// capability is on, once per masterchain block, over a window of keys the
+	// block itself determines. Its width is what the block pays for it — the
+	// scanned range stops being one pruned branch in the state update — so it
+	// is the reference's number rather than one of ours.
+	scanKeys := 0
+	if createStatsEnabled {
+		scanKeys = creatorStatsScanKeys
+	}
 	c.master.creatorStats, err = updateBlockCreateStats(blockCreateStatsInput{
 		enabled:            createStatsEnabled,
 		previous:           c.master.oldCreatorStats,
 		now:                c.header.GenUtime,
 		shardBlockCreators: shardCreators,
 		masterchainCreator: c.req.createdBy,
+		scanStart:          creatorStatsScanStart(c.req.randSeed, c.header.SeqNo, c.header.GenUtime),
+		scanKeys:           scanKeys,
 	})
 	if err != nil {
 		return blockParts{}, err

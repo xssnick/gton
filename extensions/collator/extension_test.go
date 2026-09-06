@@ -153,6 +153,7 @@ func testExtensionOptions(t *testing.T, options Options) Options {
 
 	options.Messages = msgpool.New(msgpool.Config{})
 	t.Cleanup(options.Messages.Close)
+	options.Feed = msgpool.NewFeed(msgpool.FeedOptions{Pool: options.Messages})
 
 	return options
 }
@@ -232,13 +233,19 @@ func TestExtensionBootstrapsAndAppliesMasterchain(t *testing.T) {
 	}
 	appliedRoot := testAppliedBlockRoot(t, message)
 	appliedExternal := hooks.BlockAppliedEvent{
-		Meta: &storage.BlockMeta{ID: ton.BlockIDExt{
-			Workchain: 0,
-			Shard:     masterchainShard,
-			SeqNo:     14,
-			RootHash:  appliedRoot.Hash(),
-			FileHash:  make([]byte, 32),
-		}},
+		Meta: &storage.BlockMeta{
+			ID: ton.BlockIDExt{
+				Workchain: 0,
+				Shard:     masterchainShard,
+				SeqNo:     14,
+				RootHash:  appliedRoot.Hash(),
+				FileHash:  make([]byte, 32),
+			},
+			// Fresh: the pool feed defers a block older than its freshness
+			// window to the settled-head sweep, exactly as it does for a
+			// validator catching up.
+			GenUTime: uint32(time.Now().Unix()),
+		},
 		BlockRoot: appliedRoot,
 	}
 	if err = extension.OnBlockApplied(context.Background(), appliedExternal); err != nil {
@@ -284,6 +291,7 @@ func TestExternalCapacityRejectionDoesNotPrewarm(t *testing.T) {
 		Controller: &testController{},
 		ShardTops:  &testShardTopSink{},
 		Messages:   messages,
+		Feed:       msgpool.NewFeed(msgpool.FeedOptions{Pool: messages}),
 	})(hooks.Node{Store: &testNodeStore{}, AccountPrewarmer: warmer})
 	if err != nil {
 		t.Fatal(err)

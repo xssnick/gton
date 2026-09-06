@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -111,7 +112,7 @@ func (f *speculationFixture) speculate(
 ) error {
 	t.Helper()
 
-	return f.service.SpeculateSelfWindow(context.Background(), SpeculativeWindowRequest{
+	return f.service.SpeculateWindow(context.Background(), SpeculativeWindowRequest{
 		SessionID: f.session.ID,
 		StartSlot: startSlot,
 		Leader:    0,
@@ -927,7 +928,7 @@ func TestSpeculativeBuildOutlivesTheBetsLifetime(t *testing.T) {
 
 	baseID, base := fixture.candidate(t, fixture.windowSize-1, 0x93)
 	lifetime := 150 * time.Millisecond
-	err := fixture.service.SpeculateSelfWindow(context.Background(), SpeculativeWindowRequest{
+	err := fixture.service.SpeculateWindow(context.Background(), SpeculativeWindowRequest{
 		SessionID: fixture.session.ID,
 		StartSlot: fixture.windowSize,
 		Leader:    0,
@@ -1001,6 +1002,74 @@ func TestSpeculationExpiresWhileParked(t *testing.T) {
 	}
 	time.Sleep(120 * time.Millisecond)
 	awaitStopped(t, stopped, false)
+}
+
+// Adoption and build completion are independent goroutines. When adoption wins,
+// the later offer must be forwarded, and a withdrawal must not overtake the
+// producer installing the successor it names.
+func TestSpeculativeHandoffForwardsLateOfferBeforeWithdrawal(t *testing.T) {
+	handoff := &speculativeHandoff{}
+	acceptEntered := make(chan struct{})
+	releaseAccept := make(chan struct{})
+	accepted := make(chan SuccessorOffer, 1)
+	revoked := make(chan speculativeWithdrawal, 1)
+	handoff.adopt(
+		func(offer SuccessorOffer) {
+			close(acceptEntered)
+			<-releaseAccept
+			accepted <- offer
+		},
+		func(token *successorToken, root [32]byte, outcome PipelineHandoffOutcome) {
+			revoked <- speculativeWithdrawal{token: token, root: root, outcome: outcome}
+		},
+	)
+
+	root := [32]byte{0xb4}
+	token := &successorToken{}
+	offer := SuccessorOffer{
+		successorPayload: successorPayload{ID: runtimeTestBlockID(0, -1<<63, 9)},
+		token:            token,
+	}
+	offer.ID.RootHash = root[:]
+	parked := make(chan struct{})
+	go func() {
+		handoff.park(offer)
+		close(parked)
+	}()
+	select {
+	case <-acceptEntered:
+	case <-time.After(time.Second):
+		t.Fatal("offer parked after adoption was not forwarded to the producer")
+	}
+
+	handoff.withdraw(token, root, PipelineHandoffAbandonedSuperseded)
+	select {
+	case <-revoked:
+		t.Fatal("withdrawal overtook the producer accepting the late offer")
+	default:
+	}
+	close(releaseAccept)
+	select {
+	case <-parked:
+	case <-time.After(time.Second):
+		t.Fatal("late offer did not finish forwarding")
+	}
+	select {
+	case got := <-accepted:
+		if [32]byte(got.ID.RootHash) != root {
+			t.Fatal("producer accepted a different late offer")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("producer did not accept the late offer")
+	}
+	select {
+	case got := <-revoked:
+		if got.token != token || got.root != root || got.outcome != PipelineHandoffAbandonedSuperseded {
+			t.Fatalf("forwarded withdrawal = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("withdrawal was not forwarded after offer acceptance")
+	}
 }
 
 // The boundary the bet could not cover until now. A pipelined build hands its
@@ -1077,5 +1146,174 @@ func TestAdoptedSpeculativeFirstSlotHandsOffToTheSecond(t *testing.T) {
 	if !pending[fixture.windowSize+1] {
 		t.Fatal("the slot after an adopted speculative build was opened on schedule; " +
 			"the offer the bet parked was never collected")
+	}
+}
+
+// newSessionStartFixture prepares and activates a session on which consensus
+// has not opened a window yet: the state a session is in right after its
+// activation, when the session-start bet is placed.
+func newSessionStartFixture(
+	t *testing.T,
+	pipeline *runtimeTestPipeline,
+	emit EmitCandidate,
+) *speculationFixture {
+	t.Helper()
+	const windowSize = 2
+	fixture := newRuntimeSelfFixture(t, pipeline, nil, nil, emit)
+	session, update := fixture.session(83, windowSize, 0, time.Time{})
+	update.HasCurrentWindow = false
+	update.CurrentWindowObservedSlot = 0
+	update.CurrentWindowStartAt = time.Time{}
+	fixture.prepare(t, session, update)
+
+	return &speculationFixture{
+		runtimeFixture: fixture,
+		session:        session,
+		update:         update,
+		windowSize:     windowSize,
+	}
+}
+
+// openGenesisWindow is consensus opening window zero of a fresh session: its
+// base is the session genesis, and there is no base state to hand over.
+func (f *speculationFixture) openGenesisWindow(t *testing.T) {
+	t.Helper()
+	progress := ConsensusProgress{
+		SessionID: f.session.ID,
+		Window: simplex.Window{
+			Base:         simplex.Genesis(),
+			ObservedSlot: 0,
+			StartSlot:    0,
+			EndSlot:      f.windowSize,
+			Leader:       0,
+			ObservedAt:   time.Now(),
+		},
+		StartAt: time.Now(),
+	}
+	if err := f.service.ApplyConsensusProgress(context.Background(), progress); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.service.ActivateSelfWindow(
+		context.Background(),
+		f.selfRequest(f.session, 0, time.Now().Add(5*time.Second)),
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *speculationFixture) speculateSessionStart(t *testing.T) error {
+	t.Helper()
+
+	return f.service.SpeculateSessionStart(context.Background(), SpeculativeSessionStartRequest{
+		SessionID: f.session.ID,
+		Leader:    0,
+		StartAt:   time.Now(),
+		Deadline:  time.Now().Add(5 * time.Second),
+	})
+}
+
+// Window zero of a fresh session has no candidate to bet on: its base is the
+// session genesis. The bet is placed at activation, before consensus has
+// opened anything, and the producer that opens window zero on the genesis
+// adopts it — the first slot is collated exactly once, ahead of the window.
+func TestSessionStartSpeculationIsAdoptedByWindowZero(t *testing.T) {
+	probe := newSpeculationProbe()
+	pipeline := &runtimeTestPipeline{}
+	var stamped atomic.Bool
+	pipeline.build = func(_ context.Context, request BuildRequest) (*Candidate, error) {
+		probe.note(request)
+		if request.Slot == 0 && !request.sessionStartAt.IsZero() {
+			stamped.Store(true)
+		}
+
+		return runtimeBuiltCandidate(request), nil
+	}
+	emitted := make(chan CandidateArtifact, 4)
+	fixture := newSessionStartFixture(t, pipeline, func(_ context.Context, artifact CandidateArtifact) error {
+		emitted <- artifact
+
+		return nil
+	})
+	defer fixture.close(t)
+
+	if err := fixture.speculateSessionStart(t); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case slot := <-probe.entered:
+		if slot != 0 {
+			t.Fatalf("session-start build slot = %d, want 0", slot)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the session-start build never started")
+	}
+
+	fixture.openGenesisWindow(t)
+	first := runtimeAwaitArtifact(t, emitted)
+	if first.Candidate.ID.Slot != 0 {
+		t.Fatalf("first emitted slot = %d, want 0", first.Candidate.ID.Slot)
+	}
+	slots, _ := probe.snapshot()
+	builds := 0
+	for _, slot := range slots {
+		if slot == 0 {
+			builds++
+		}
+	}
+	if builds != 1 {
+		t.Fatalf("slot 0 builds = %d, want exactly the session-start one: %v", builds, slots)
+	}
+	if !stamped.Load() {
+		t.Fatal("the session-start build carried no header instant: the real acquisition would refuse it as outside the current window")
+	}
+}
+
+// Once consensus has opened a window the ordinary producer owns slot zero,
+// and a late session-start bet is declined without a build.
+func TestSessionStartSpeculationIsDeclinedOnceAWindowIsOpen(t *testing.T) {
+	probe := newSpeculationProbe()
+	pipeline := &runtimeTestPipeline{}
+	pipeline.build = func(_ context.Context, request BuildRequest) (*Candidate, error) {
+		probe.note(request)
+
+		return runtimeBuiltCandidate(request), nil
+	}
+	fixture := newSpeculationFixture(t, pipeline, func(context.Context, CandidateArtifact) error { return nil })
+	defer fixture.close(t)
+
+	if err := fixture.speculateSessionStart(t); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case slot := <-probe.entered:
+		t.Fatalf("a session-start build for slot %d started although a window is open", slot)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// The session-start bet is built before consensus has observed any window, so
+// the window-relative header arithmetic has nothing to measure from: the
+// header is stamped with the instant the bet was placed. Without this every
+// such bet failed on the stand with "build slot is outside the current window"
+// and window zero was collated only once the engine had started.
+func TestSessionStartBetStampsItsHeaderWithoutAWindow(t *testing.T) {
+	at := time.Unix(1_700_000_000, 250_000_000)
+	acquisition := &LocalAcquisition{}
+	request := BuildRequest{
+		Slot:           0,
+		Update:         SessionUpdate{TargetRate: 400 * time.Millisecond},
+		sessionStartAt: at,
+	}
+	header, err := acquisition.requestHeader(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header.GenUtimeMS != uint64(at.UnixMilli()) || header.GenUtime != uint32(at.Unix()) {
+		t.Fatalf("session-start header = %+v, want the bet's instant %d/%d", header, at.Unix(), at.UnixMilli())
+	}
+	// The same windowless request without the bet's instant is still refused.
+	request.sessionStartAt = time.Time{}
+	if _, err = acquisition.requestHeader(request); err == nil {
+		t.Fatal("a windowless build without the session-start instant must be refused")
 	}
 }

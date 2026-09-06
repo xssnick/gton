@@ -116,10 +116,10 @@ func (n *Node) newOverlaySubscriptionWithPrivate(
 		}
 	}
 	if spec.relaysFECBroadcasts() {
-		receiver.SetFECBroadcastLimits(publicBroadcastFECMaxActiveStreams, overlay.DefaultFECBroadcastMaxActiveBytes)
+		receiver.SetFECBroadcastLimits(publicBroadcastFECMaxActiveStreams, publicBroadcastFECMaxActiveBytes)
 		receiver.EnableBroadcastFECRelay(n.localID.Bytes(), overlayFECRelayPeerSet{sub: sub})
 	}
-	if spec.isPrivateOverlay() && spec.PrivateAllowLegacyBroadcasts {
+	if spec.relaysSimpleBroadcasts() {
 		receiver.EnableBroadcastSimpleRelay(n.localID.Bytes(), overlayFECRelayPeerSet{sub: sub})
 	}
 	return sub, nil

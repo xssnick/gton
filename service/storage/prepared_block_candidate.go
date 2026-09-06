@@ -36,19 +36,35 @@ func PrepareBlockCandidate(
 	seqno uint32,
 	root *cell.Cell,
 ) (*PreparedBlockCandidate, error) {
+	return PrepareBlockCandidateSized(workchain, shard, seqno, root, 0)
+}
+
+// PrepareBlockCandidateSized is PrepareBlockCandidate for a caller holding an
+// upper bound on the block's cell count — the consensus decoder, which reads
+// the combined candidate BOC's declared count off its header. It presizes the
+// detaching walk and the serializer's dedup structures; the capsule is the
+// same for every value of the hint, and zero means no hint.
+func PrepareBlockCandidateSized(
+	workchain int32,
+	shard int64,
+	seqno uint32,
+	root *cell.Cell,
+	cellsHint int,
+) (*PreparedBlockCandidate, error) {
 	if root == nil {
 		return nil, errors.New("prepare block candidate: block root is absent")
 	}
 
-	detachedRoot, err := root.CloneDetached()
+	detachedRoot, err := root.CloneDetachedSized(cellsHint)
 	if err != nil {
 		return nil, fmt.Errorf("prepare block candidate: detach block root: %w", err)
 	}
 	boc, err := detachedRoot.ToBOCWithOptionsErr(cell.BOCSerializeOptions{
-		WithCRC32C:    true,
-		WithIndex:     true,
-		WithCacheBits: true,
-		WithIntHashes: true,
+		WithCRC32C:     true,
+		WithIndex:      true,
+		WithCacheBits:  true,
+		WithIntHashes:  true,
+		CellsCountHint: cellsHint,
 	})
 	if err != nil {
 		return nil, err
@@ -83,4 +99,15 @@ func (p *PreparedBlockCandidate) Root() *cell.Cell {
 
 func (p *PreparedBlockCandidate) BlockBOC() []byte {
 	return bytes.Clone(p.boc)
+}
+
+// CanonicalBlockBOC is the serialization itself, not a copy of it. It exists
+// for one caller: the consensus decoder that built this capsule and places the
+// bytes into the immutable artifact it identifies the candidate by — the file
+// hash in ID was taken of exactly these bytes, and that artifact is the one
+// owner that never writes to what it holds. Every other consumer, and every
+// asynchronous one, takes BlockBOC: the trusted cache path in particular does
+// not rehash what it is handed, so it must hold bytes nobody else can reach.
+func (p *PreparedBlockCandidate) CanonicalBlockBOC() []byte {
+	return p.boc
 }

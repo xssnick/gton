@@ -40,9 +40,8 @@ type benchProfile struct {
 	accounts int
 	// externals and internals are the inbound work offered to the collator.
 	// Each one lands on its own sender account, which forwards one internal
-	// message to its own receiver account — so the block contains two
-	// transactions and one immediate delivery per inbound message, the shape of
-	// an ordinary transfer.
+	// message to its own receiver account. Below the soft block limits this
+	// produces two transactions and one immediate delivery per inbound message.
 	externals int
 	internals int
 	// queued is the number of masterchain-bound entries already sitting in the
@@ -53,6 +52,9 @@ type benchProfile struct {
 	// DispatchQueue. The first dispatch pass takes one message per account, so
 	// each becomes a delivered message and a transaction.
 	deferred int
+	// enqueued is the expected number of generated messages left for the next
+	// block once the soft limits switch collation to enqueue-only mode.
+	enqueued int
 	// fullCollated turns on capFullCollatedData, which makes collation carry a
 	// proof-size estimator on every cell load and build the collated proof roots
 	// at the end. Without it the collated data is an empty BOC and that whole
@@ -65,25 +67,25 @@ type benchProfile struct {
 }
 
 // benchProfiles are the shapes the benchmarks run by default. Each inbound
-// message costs two transactions — the sender and the receiver it delivers to —
-// and each deferred message one, so a profile yields 2*(externals+internals) +
-// deferred of them: idle 0, light 225, mid 400, typical 560, heavy 1000.
+// message can cost two transactions — the sender and the receiver it delivers
+// to — and each deferred message one. Enqueued messages defer the receiving
+// transaction, so a profile yields 2*(externals+internals) + deferred - enqueued
+// of them: idle 0, light 225, mid 400, typical 560, heavy 450.
 //
 // "idle" isolates the per-block fixed cost (prepare, processed info, account
 // finish, serialization) from the per-message cost of the rest. "mid" and
-// "heavy" share the same 100k accounts so that only the transaction count
-// differs between them. "heavy" is sized to sit just under the mainnet block
-// limits — at ~1.3 MB it is past the 1 MiB soft byte limit and short of the
-// 2 MiB hard one — and buildBenchWorkload rejects any profile they would
-// truncate.
+// "heavy" share the same 100k accounts. "heavy" reaches the soft limits and
+// enqueues its generated messages, exercising the queue-producing path as well
+// as TVM execution. buildBenchWorkload checks each profile's exact shape so a
+// change in scheduling or limits cannot silently change the measured workload.
 var benchProfiles = []benchProfile{
 	{name: "idle", accounts: 10_000},
 	{name: "light", accounts: 20_000, externals: 50, internals: 50, queued: 100, deferred: 25},
 	{name: "mid", accounts: 100_000, externals: 90, internals: 90, queued: 40, deferred: 40},
 	{name: "typical", accounts: 50_000, externals: 125, internals: 125, queued: 200, deferred: 60},
-	{name: "heavy", accounts: 100_000, externals: 225, internals: 225, queued: 100, deferred: 100},
+	{name: "heavy", accounts: 100_000, externals: 225, internals: 225, queued: 100, deferred: 100, enqueued: 550},
 	{name: "heavy-collated", accounts: 100_000, externals: 225, internals: 225, queued: 100, deferred: 100,
-		fullCollated: true},
+		enqueued: 550, fullCollated: true},
 }
 
 // benchWorkload is one prepared block: the collation request, the candidate the
@@ -132,13 +134,12 @@ func TestBenchWorkloadShape(t *testing.T) {
 	}
 }
 
-// TestBuildCandidateSerializesOverflowingBlock covers the one shape the
-// profiles deliberately stay under: the block hits its limits mid-flight, so
-// the generated messages that no longer fit are enqueued instead of delivered.
+// TestBuildCandidateSerializesOverflowingBlock covers a block that hits its
+// limits mid-flight, so generated messages that no longer fit are enqueued
+// instead of delivered.
 // Serializing that state used to fail — the state update pruned a queue node
 // the source proof could not resolve, and BuildShard returned "unknown pruned
-// branch" — so the overflow path is held down here even though no benchmark
-// measures it.
+// branch" — so the overflow path has a dedicated correctness check too.
 func TestBuildCandidateSerializesOverflowingBlock(t *testing.T) {
 	req := benchRequest(t, benchProfile{accounts: 2_000, externals: 300, internals: 300})
 	candidate, err := testBuilder().BuildShard(context.Background(), req)
@@ -201,20 +202,24 @@ func buildBenchWorkload(tb testing.TB, profile benchProfile) *benchWorkload {
 	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
 		tb.Fatalf("verify %s workload candidate: %v", profile.name, err)
 	}
-	// A profile that the block limits cut short would still benchmark, just not
-	// the block it claims to. Sizing is only ever wrong here by accident, so it
-	// is a build failure rather than a note in the output.
+	// Reject a workload whose work moved into or out of this block: otherwise
+	// benchmark results could compare different amounts of useful work.
 	stats := candidate.Stats
+	inbound := profile.externals + profile.internals
 	if int(stats.ExternalIncluded) != profile.externals ||
 		int(stats.InternalsImported) != profile.internals ||
 		int(stats.DispatchedMessages) != profile.deferred ||
-		stats.OutQueueSize != 0 {
-		tb.Fatalf("%s profile does not fit the block limits: included %d/%d externals, "+
+		int(stats.EnqueuedMessages) != profile.enqueued ||
+		stats.OutQueueSize != uint64(profile.enqueued) ||
+		int(stats.Transactions) != 2*inbound+profile.deferred-profile.enqueued ||
+		int(stats.ImmediateDelivered) != inbound+profile.deferred-profile.enqueued {
+		tb.Fatalf("%s profile changed shape: included %d/%d externals, "+
 			"imported %d/%d internals, dispatched %d/%d deferred, left %d messages queued "+
-			"(load class %v) — resize the profile",
+			"(want %d), transactions %d, immediate deliveries %d (load class %v)",
 			profile.name, stats.ExternalIncluded, profile.externals,
 			stats.InternalsImported, profile.internals,
-			stats.DispatchedMessages, profile.deferred, stats.OutQueueSize, stats.Load)
+			stats.DispatchedMessages, profile.deferred, stats.OutQueueSize, profile.enqueued,
+			stats.Transactions, stats.ImmediateDelivered, stats.Load)
 	}
 
 	return &benchWorkload{

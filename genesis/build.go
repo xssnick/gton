@@ -62,9 +62,10 @@ type LockedBlock struct {
 }
 
 type LockedAddresses struct {
-	Wallet  string `json:"wallet"`
-	Elector string `json:"elector"`
-	Config  string `json:"config"`
+	Wallet            string `json:"wallet"`
+	Elector           string `json:"elector"`
+	Config            string `json:"config"`
+	ValidatorRegistry string `json:"validator_registry,omitempty"`
 }
 
 type LockedValidator struct {
@@ -321,6 +322,10 @@ func buildLock(spec validatedSpec, sourceHash [32]byte, genesisTime uint32, buil
 			Weight:    validator.weight,
 		}
 	}
+	registryAddress := ""
+	if built.validatorRegistry != nil {
+		registryAddress = built.validatorRegistry.Bounce(true).Testnet(true).String()
+	}
 	return Lock{
 		FormatVersion: FormatVersion,
 		SourceSHA256:  hex.EncodeToString(sourceHash[:]),
@@ -329,9 +334,10 @@ func buildLock(spec validatedSpec, sourceHash [32]byte, genesisTime uint32, buil
 		Masterchain:   lockedBlock(built.master.block),
 		Basechain:     lockedBlock(built.base.block),
 		Addresses: LockedAddresses{
-			Wallet:  built.wallet.Bounce(true).Testnet(true).String(),
-			Elector: friendlyAddress(electorAddress),
-			Config:  friendlyAddress(configAddress),
+			Wallet:            built.wallet.Bounce(true).Testnet(true).String(),
+			Elector:           friendlyAddress(electorAddress),
+			Config:            friendlyAddress(configAddress),
+			ValidatorRegistry: registryAddress,
 		},
 		Validators: validators,
 	}, nil

@@ -99,7 +99,78 @@ func (s *Store) PublishAcceptedBlockState(artifacts storage.LiveBlockArtifacts) 
 	// half only, and nothing is lost.
 	artifacts.AvailabilityOnly = true
 
-	return s.publishLiveBlockArtifacts(artifacts, true)
+	if err := s.publishLiveBlockArtifacts(artifacts, true); err != nil {
+		return err
+	}
+	s.notifyAcceptedBlockState(artifacts)
+
+	return nil
+}
+
+// acceptedStateObserver is one ObserveAcceptedBlockStates registration.
+type acceptedStateObserver struct {
+	id      uint64
+	observe func(storage.LiveBlockArtifacts)
+}
+
+// ObserveAcceptedBlockStates registers observe to run for every publication
+// PublishAcceptedBlockState installs, with the artifacts as published: the
+// block root, the block BOC, the block metadata and the resident state cell.
+// The returned function removes the registration.
+//
+// It exists for the validator's internal-message pool. The pool mirrors the
+// out-queues of neighbour shards and used to advance only on the node's
+// applied-block hook, which under load runs about a second after this node has
+// finalized the block itself (apply lag p50 ~1 s on the stand). The state this
+// call publishes is the same resident tree the pool needs to read that queue
+// from, so the publication is the earliest point at which the pool can move,
+// and it is the point at which the C++ collator sees the neighbour state too
+// (a validated block's state, not a committed one).
+//
+// The observer runs synchronously on the publishing goroutine, strictly after the
+// publication is installed and outside every store lock: an observer that reads
+// the block or its state back from this store during the call is served the
+// publication. A failed publication notifies nobody, so an observer never learns
+// of a block the store itself cannot answer for.
+func (s *Store) ObserveAcceptedBlockStates(observe func(storage.LiveBlockArtifacts)) func() {
+	s.acceptedObserversMu.Lock()
+	s.acceptedObserverNext++
+	id := s.acceptedObserverNext
+	s.acceptedObservers = append(s.acceptedObservers, acceptedStateObserver{id: id, observe: observe})
+	s.acceptedObserversMu.Unlock()
+
+	return func() {
+		s.acceptedObserversMu.Lock()
+		defer s.acceptedObserversMu.Unlock()
+
+		for index := range s.acceptedObservers {
+			if s.acceptedObservers[index].id != id {
+				continue
+			}
+			s.acceptedObservers = append(s.acceptedObservers[:index], s.acceptedObservers[index+1:]...)
+
+			return
+		}
+	}
+}
+
+// notifyAcceptedBlockState runs every registered observer over one installed
+// publication. The registration list is copied under its lock and the observers
+// run outside it, so an observer may unregister itself or another from inside
+// the call.
+func (s *Store) notifyAcceptedBlockState(artifacts storage.LiveBlockArtifacts) {
+	s.acceptedObserversMu.Lock()
+	if len(s.acceptedObservers) == 0 {
+		s.acceptedObserversMu.Unlock()
+
+		return
+	}
+	observers := append([]acceptedStateObserver(nil), s.acceptedObservers...)
+	s.acceptedObserversMu.Unlock()
+
+	for index := range observers {
+		observers[index].observe(artifacts)
+	}
 }
 
 func validateAcceptedBlockState(artifacts storage.LiveBlockArtifacts) error {

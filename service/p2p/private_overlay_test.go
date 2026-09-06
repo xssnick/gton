@@ -155,6 +155,7 @@ func TestPrivateOverlayPolicyIsFixedAndSeparateFromTONCustomPolicy(t *testing.T)
 		"supports fixed probes":   (*overlaySpec).runsFixedPeerProbes,
 		"uses two-step":           (*overlaySpec).usesTwoStepDelivery,
 		"relays legacy FEC":       (*overlaySpec).relaysFECBroadcasts,
+		"relays legacy simple":    (*overlaySpec).relaysSimpleBroadcasts,
 	} {
 		if !predicate(&spec) {
 			t.Errorf("private overlay policy %q is disabled", name)

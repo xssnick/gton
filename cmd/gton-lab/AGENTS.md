@@ -49,16 +49,21 @@ inode. It never deletes attempt directories and refuses to run during a load.
 For parallel load, set `sender_count` and put `{sender}` in `state_path`.
 Optional setup runs senders sequentially because they share the funding-wallet
 sequence; only the load phase fans out. `topology_timeout` bounds post-load
-full-cycle observation independently of the normal `settle` delay.
+full-cycle observation independently of the normal `settle` delay. The report
+baseline is captured after setup. Setup, load, recovery, and topology phases
+record their own timestamps and log positions in the manifest.
 
-Use `topology-cycle` on a weak lab host when jetton load is only the split
-trigger. A sender which launched, submitted every batch (`failed_batches=0`),
-and timed out only while confirming transfers is reported as advisory
-`load_delivery_incomplete`; topology and parity polling continues. Process
-launch failures, unknown sender failures, and any failed batch remain hard.
-The report keeps `load_delivery_outcome` separate from
+Each load process writes exactly one schema-versioned JSON result to stdout;
+human-readable diagnostics stay on stderr. Missing, unknown, or inconsistent
+result evidence is a hard harness failure. Semantic outcomes such as
+`delivery_incomplete`, `workload_incompatible`, and `execution_failed` are also
+hard, but the configured recovery delay still runs before finalization.
+
+Node `roles` explicitly select `producer`, `validator`, and `finalizer`
+requirements. `conditions.candidate_flows` describes directed evidence from a
+producer to validator and finalizer nodes. Validation is matched only by exact
+candidate hash and finalization only by exact root+file block hashes. C++ nodes
+configured only as validator/finalizer are never required to collate. The
+report keeps `load_delivery_outcome` separate from
 `consensus_topology_verdict` and requires the ordered cycle
-linear → split → both children → rotation → merge → after-merge → linear,
-plus collation on every required node, validation on every required Go node,
-and a C++ candidate hash validated by Go. `full-cycle` and its `all` alias keep
-strict delivery semantics.
+linear → split → both children → rotation → merge → after-merge → linear.

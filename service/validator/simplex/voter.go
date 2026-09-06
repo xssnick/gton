@@ -202,6 +202,9 @@ func (e *Engine) acceptCandidate(c *Candidate) {
 	}
 	slot.pending = c
 	e.stats.CandidatesAccepted++
+	if c.Leader == uint32(e.localIndex) {
+		e.noteOwnCandidate(c.ID)
+	}
 	if c.Leader != uint32(e.localIndex) {
 		block := c.Block
 		var blockPtr *ton.BlockIDExt

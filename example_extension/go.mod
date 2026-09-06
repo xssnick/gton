@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/rs/zerolog v1.35.1
 	github.com/xssnick/gton v0.0.0
-	github.com/xssnick/tonutils-go v1.18.1-0.20260826121847-289d6710f3c1
+	github.com/xssnick/tonutils-go v1.18.1-0.20260904163020-6558ee9edbdc
 )
 
 require (

@@ -892,16 +892,13 @@ func TestQUICOutboundOperationsReuseGatewayPathAndFrameOverlay(t *testing.T) {
 		t.Fatalf("raw answer = %T, want overlay.Pong value", rawResult)
 	}
 
-	peerSet, failed := sub.resolveTwoStepPeerSet(ctx, PeerID{})
-	if len(failed) != 0 {
-		t.Fatalf("resolve QUIC two-step peers: %+v", failed)
-	}
+	peerSet := sub.resolveTwoStepPeerSet(PeerID{})
 	if len(peerSet) != 1 {
 		t.Fatalf("resolved QUIC two-step peers = %d, want 1", len(peerSet))
 	}
-	broadcastPeer, ok := peerSet[0].(quicTwoStepSendPeer)
+	broadcastPeer, ok := peerSet[0].(quicRouteBroadcastPeer)
 	if !ok {
-		t.Fatalf("resolved two-step peer = %T, want dial-on-send QUIC peer", peerSet[0])
+		t.Fatalf("resolved two-step peer = %T, want route-bound QUIC peer", peerSet[0])
 	}
 	if !bytes.Equal(broadcastPeer.ID(), serverID[:]) {
 		t.Fatalf("broadcast peer id = %x, want %x", broadcastPeer.ID(), serverID)
@@ -1385,19 +1382,18 @@ func TestCustomTwoStepQUICDoesNotFallbackWithoutRoute(t *testing.T) {
 	})
 	t.Cleanup(sub.broadcastReceiver.Close)
 
-	peerSet, failed := sub.resolveTwoStepPeerSet(context.Background(), PeerID{})
+	peerSet := sub.resolveTwoStepPeerSet(PeerID{})
 	if len(peerSet) != 1 {
 		t.Fatalf("deferred peers without QUIC route = %d, want 1", len(peerSet))
 	}
-	if len(failed) != 0 {
-		t.Fatalf("unexpected eager QUIC route failures = %+v", failed)
-	}
-	sendPeer, ok := peerSet[0].(quicTwoStepSendPeer)
+	sendPeer, ok := peerSet[0].(quicRouteBroadcastPeer)
 	if !ok {
-		t.Fatalf("deferred two-step peer = %T, want dial-on-send QUIC peer", peerSet[0])
+		t.Fatalf("deferred two-step peer = %T, want route-bound QUIC peer", peerSet[0])
 	}
-	if err = sendPeer.SendCustomMessage(context.Background(), overlay.Ping{}); !errors.Is(err, errQUICRouteMissing) {
-		t.Fatalf("deferred QUIC send error = %v, want missing route", err)
+	// The send path never dials, so an unconnected peer is skipped rather than
+	// resolved inline; the route is brought up by the background dial instead.
+	if err = sendPeer.SendCustomMessage(context.Background(), overlay.Ping{}); !errors.Is(err, errQUICPeerOffline) {
+		t.Fatalf("deferred QUIC send error = %v, want offline peer", err)
 	}
 	if len(rldpTransport.sent) != 0 || len(base.sent) != 0 {
 		t.Fatal("missing QUIC route fell back to RLDP or ADNL")

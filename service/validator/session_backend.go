@@ -72,11 +72,6 @@ type BlockAcceptance struct {
 	// verified under, so the accepter checks that binding before trusting it.
 	Certificate        simplex.VerifiedCertificate
 	CertifiedCandidate *CandidateArtifact
-	// Retry means the same in-process acceptance is waiting on a newer chain
-	// view. Local ingress is retried because its asynchronous attempt may have
-	// been rejected with the same stale view; network publication is not, since
-	// acceptance publishes before it ever consults that view.
-	Retry bool
 	// state is the chain state whose single tip IS the accepted block: the
 	// successor this session already computed by applying the block's update to
 	// the full parent it holds. It is carried here so acceptance can publish it
@@ -102,6 +97,16 @@ type BlockAcceptance struct {
 	Replay bool
 }
 
+// PreparedBlockAcceptance owns one acceptance. Submit hands it to local ingress
+// and publishes it before any chain-view lookup; retries reuse its verified
+// proof and never repeat network publication. Describe may wait for predecessor
+// proofs and is called only after Submit succeeds. Calls must be sequential:
+// after the first Describe, only Describe may be retried.
+type PreparedBlockAcceptance interface {
+	Submit(context.Context) error
+	Describe(context.Context) error
+}
+
 // LeaderWindow is the resolved production input emitted after the window
 // journal record and its base state are both ready.
 type LeaderWindow struct {
@@ -120,7 +125,7 @@ type SessionBackend interface {
 	UpdateSession(context.Context, SessionState) error
 	LoadChainState(context.Context, ChainStateRequest) (ChainStateData, error)
 	ValidateCandidate(context.Context, CandidateValidationRequest) (CandidateValidation, error)
-	AcceptBlock(context.Context, BlockAcceptance) error
+	PrepareBlockAcceptance(context.Context, BlockAcceptance) (PreparedBlockAcceptance, error)
 	HandleLeaderWindow(context.Context, LeaderWindow) error
 	HandleMisbehavior(context.Context, uint32, simplex.Misbehavior) error
 	// Close releases this runtime attachment but preserves durable collator

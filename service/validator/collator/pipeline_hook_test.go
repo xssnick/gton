@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/validator/groups"
+	"github.com/xssnick/gton/service/validator/simplex"
 )
 
 // pipelineHookProbe records, per slot, the order in which the runtime committed
@@ -514,10 +515,16 @@ func TestRetriedPredecessorIsNeverAdoptedBySuccessor(t *testing.T) {
 		return stale
 	}
 	built := make(chan BuildRequest, 16)
+	commits := make(chan CandidateCommit, 8)
 	pipeline.build = func(_ context.Context, request BuildRequest) (*Candidate, error) {
 		built <- request
 
 		return runtimeBuiltCandidate(request), nil
+	}
+	pipeline.commit = func(_ context.Context, commit CandidateCommit) error {
+		commits <- commit
+
+		return nil
 	}
 
 	emitted := make(chan CandidateArtifact, 8)
@@ -533,10 +540,23 @@ func TestRetriedPredecessorIsNeverAdoptedBySuccessor(t *testing.T) {
 	if err := fixture.service.CommitDelegation(context.Background(), fixture.request(t, session, 0)); err != nil {
 		t.Fatal(err)
 	}
+	emittedBySlot := make(map[uint32]CandidateArtifact, 3)
 	for slot := uint32(0); slot < 3; slot++ {
 		artifact := runtimeAwaitArtifact(t, emitted)
 		if artifact.Candidate.ID.Slot != slot {
 			t.Fatalf("emitted slot %d, want %d", artifact.Candidate.ID.Slot, slot)
+		}
+		emittedBySlot[slot] = artifact
+	}
+	var slotOneCommit CandidateCommit
+	for slot := uint32(0); slot < 3; slot++ {
+		select {
+		case commit := <-commits:
+			if commit.Artifact.Candidate.ID.Slot == 1 {
+				slotOneCommit = commit
+			}
+		case <-time.After(time.Second):
+			t.Fatal("candidate commit was not observed")
 		}
 	}
 
@@ -571,9 +591,18 @@ func TestRetriedPredecessorIsNeverAdoptedBySuccessor(t *testing.T) {
 		t.Fatal("every build of slot 1 came from the stale offer; the producer adopted a successor " +
 			"built on a predecessor root it never committed")
 	}
-	committed := slotOne[len(slotOne)-1]
-	if committed.Previous == nil {
+	// A canceled speculative goroutine may enter the test pipeline after the
+	// sequential build that replaced it, so request arrival order cannot identify
+	// the build that produced the emitted candidate. CommitCandidate can: it is
+	// called only for the artifact the producer actually accepted.
+	if slotOneCommit.Artifact.Candidate.ID != emittedBySlot[1].Candidate.ID {
+		t.Fatal("slot 1 commit does not name the emitted candidate")
+	}
+	if slotOneCommit.Request.Previous == nil || slotOneCommit.Request.PreviousPending != nil {
 		t.Fatal("the slot that produced the emitted block was not chained to the committed predecessor")
+	}
+	if slotOneCommit.Request.Parent != simplex.Parent(emittedBySlot[0].Candidate.ID) {
+		t.Fatal("the emitted slot 1 candidate was built on the wrong predecessor")
 	}
 }
 
@@ -615,10 +644,10 @@ func TestProducerDeclinesASuccessorThatGaveTheSlotBack(t *testing.T) {
 				hardDeadline: time.Now().Add(time.Minute),
 			}
 			future.result <- test.result
-			if !slot.install(future, root) {
+			if !slot.install(future, root, &successorToken{}, nil) {
 				t.Fatal("the successor was not parked")
 			}
-			parked, gotRoot := slot.take()
+			parked, gotRoot, _ := slot.take()
 			if parked == nil || gotRoot != root {
 				t.Fatal("the parked successor was not handed back")
 			}

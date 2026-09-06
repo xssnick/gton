@@ -26,15 +26,50 @@ const (
 	// C++ ADNL get_peer_node keeps an outbound message pending for up to ten
 	// seconds while peer discovery completes. The per-peer worker provides the
 	// same bound without creating an unbounded goroutine per vote.
-	consensusPeerSendTimeout   = 10 * time.Second
+	consensusPeerSendTimeout = 10 * time.Second
+	// Detaching the fan-out from the producing slot moves the memory bound
+	// here, and nowhere else: at most candidateOutboundQueueSize candidates
+	// wait by reference plus candidateSenderWorkerCount fan-outs in flight,
+	// each holding one FEC encoding of its candidate. Nothing per-broadcast is
+	// unbounded - tonutils dispatches a bounded number of peer goroutines and
+	// joins them before the worker takes the next candidate.
 	candidateOutboundQueueSize = 8
 	candidateSenderWorkerCount = 4
-	// C++ detaches candidate sends into the transport actor. Go retains a
-	// bounded worker until all peer sends report, so cap that occupancy: a
-	// candidate still blocked after this budget can no longer help the current
-	// fast-finality round and must not hold later slots behind it.
-	candidateTransportSendTimeout = 750 * time.Millisecond
+	// C++ hands every recipient to the transport actor and returns, with no
+	// send deadline on the source side at all
+	// (cppnode/ton/overlay/broadcast-twostep.cpp:263-265). Go keeps a bounded
+	// background sender instead, so it needs exactly one guard: a wedged
+	// connection must not own a worker forever. That guard sits above every
+	// transport bound - tonutils keeps the QUIC MaxIdleTimeout at 15s
+	// (adnl/quic/transport.go) - so it can only fire on a connection that is
+	// already dead, never on a delivery that is merely slower than one slot.
+	// The previous 750ms was a latency policy in disguise: it cut 58% of
+	// fan-outs mid-flight and then charged the expiry to the peers.
+	candidateTransportSendBudget = 15 * time.Second
+	// candidateSenderDrainWait bounds how long retiring a session waits for
+	// in-flight fan-outs. It is short because the wait happens under the
+	// manager-wide operation lock: whatever is still sending belongs to a
+	// session the network has already moved past.
+	candidateSenderDrainWait = 250 * time.Millisecond
 )
+
+// waitBounded reports whether the group finished within the timeout. A false
+// answer is not a failure — the caller has decided the work may outlive it.
+func waitBounded(wg *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
 
 var errCandidateOutboundQueueFull = errors.New("validator network: candidate outbound queue is full")
 
@@ -48,7 +83,7 @@ type privateOverlay interface {
 		[]byte,
 		tl.Raw,
 		int32,
-	) (adnloverlay.BroadcastTwoStepSendResult, error)
+	) (p2p.TwoStepSendOutcome, error)
 }
 
 type privateOverlayOpener func(
@@ -549,7 +584,19 @@ func (e *sessionEndpoint) runTransport(
 			_ = producer.Close()
 		}
 		senders.stop()
-		e.sendWG.Wait()
+		// Bounded on purpose. A send is fire-and-forget with a 15 s wedge guard
+		// above it, and retire() is called under the manager's operation lock
+		// that the NEXT session's prepare takes — so waiting for an in-flight
+		// fan-out here would let one wedged QUIC write delay a validator-set
+		// rotation by the whole guard. Cancelling does not help: a write blocked
+		// on peer flow control only unblocks at its own deadline. Stragglers
+		// finish detached; they hold a bounded queue slot and nothing the next
+		// session needs.
+		if !waitBounded(&e.sendWG, candidateSenderDrainWait) {
+			e.hub.manager.log.Debug().
+				Hex("session_id", e.hub.id[:]).
+				Msg("candidate senders still in flight at retire; draining detached")
+		}
 		e.drainOutbound()
 		e.callbackWG.Wait()
 		close(runDone)
@@ -857,12 +904,34 @@ func (e *sessionEndpoint) enqueueCandidate(message outboundCandidateMessage) err
 	case e.candidateOutbound <- message:
 		return nil
 	default:
-		if e.hub.manager.candidateMetrics != nil {
-			e.hub.manager.candidateMetrics.AddCandidateOutboundQueue(message.chain, -1)
-		}
-
-		return errCandidateOutboundQueueFull
 	}
+
+	// The queue is what bounds memory once sends are detached, so its depth
+	// must stay fixed - but when it overflows, the candidate worth keeping is
+	// the newest: one whose fan-out has not started can still be notarized,
+	// while the candidate queued behind it cannot. Evict the head and take its
+	// slot rather than refusing the fresh block.
+	select {
+	case evicted := <-e.candidateOutbound:
+		e.observeCandidateDequeued(evicted, false)
+		if e.hub.manager.candidateMetrics != nil {
+			e.hub.manager.candidateMetrics.AddCandidateOutboundDrop(
+				evicted.chain,
+				CandidateOutboundDropQueueFull,
+			)
+		}
+	default:
+	}
+	select {
+	case e.candidateOutbound <- message:
+		return nil
+	default:
+	}
+	if e.hub.manager.candidateMetrics != nil {
+		e.hub.manager.candidateMetrics.AddCandidateOutboundQueue(message.chain, -1)
+	}
+
+	return errCandidateOutboundQueueFull
 }
 
 func (e *sessionEndpoint) runCandidateSender(ctx context.Context) {
@@ -876,13 +945,29 @@ func (e *sessionEndpoint) runCandidateSender(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			sendCtx, cancel := context.WithTimeout(ctx, candidateTransportSendTimeout)
+			sendCtx, cancel := context.WithTimeout(ctx, candidateTransportSendBudget)
 			started := time.Now()
-			err := e.hub.broadcastTwoStep(sendCtx, message.signer, message.data, message.extra)
+			outcome, err := e.hub.broadcastTwoStep(sendCtx, message.signer, message.data, message.extra)
 			cancel()
-			e.observeCandidateSend(message.chain, started, err)
-			if err != nil && ctx.Err() == nil {
-				e.hub.warn("send private candidate broadcast", err)
+			e.observeCandidateSend(message.chain, started, outcome, err)
+			if ctx.Err() != nil {
+				return
+			}
+			// A partial fan-out is normal and usually harmless: two-step FEC
+			// reconstructs from (n-1)/2 parts, so a few missing recipients cost
+			// nothing. Only a candidate that reached nobody is worth a warning;
+			// the per-recipient counters carry the rest.
+			if outcome.Sent == 0 && (outcome.Attempted > 0 || err != nil) {
+				e.hub.warn("private candidate broadcast reached no peer", err)
+				continue
+			}
+			if err != nil {
+				e.hub.manager.log.Debug().
+					Err(err).
+					Hex("session_id", e.hub.id[:]).
+					Int("sent", outcome.Sent).
+					Int("failed", outcome.Failed()).
+					Msg("partial private candidate broadcast")
 			}
 		}
 	}
@@ -928,29 +1013,78 @@ func (e *sessionEndpoint) observeCandidateDequeued(
 	)
 }
 
+// observeCandidateSend records both shapes the operator needs: how the fan-out
+// as a whole ended, and how many individual recipients took a part and why the
+// rest did not. Without the second one, "one peer missing of fifteen" and "the
+// candidate reached nobody" are the same line in a dashboard.
 func (e *sessionEndpoint) observeCandidateSend(
 	chain collator.MetricChain,
 	started time.Time,
+	outcome p2p.TwoStepSendOutcome,
 	err error,
 ) {
-	if e.hub.manager.candidateMetrics == nil {
+	metrics := e.hub.manager.candidateMetrics
+	if metrics == nil {
 		return
 	}
 
-	result := CandidateTransportSendError
-	switch {
-	case err == nil:
-		result = CandidateTransportSendSuccess
-	case errors.Is(err, context.DeadlineExceeded):
-		result = CandidateTransportSendDeadline
-	case errors.Is(err, context.Canceled):
-		result = CandidateTransportSendCanceled
-	}
-	e.hub.manager.candidateMetrics.ObserveCandidateTransportSend(CandidateTransportSendObservation{
+	metrics.ObserveCandidateTransportSend(CandidateTransportSendObservation{
 		Chain:    chain,
-		Result:   result,
+		Result:   candidateTransportSendResult(outcome, err),
 		Duration: time.Since(started),
 	})
+	if outcome.Sent > 0 {
+		metrics.AddCandidateTransportPeerSends(chain, CandidateTransportPeerSent, outcome.Sent)
+	}
+	for fault, count := range outcome.Faults {
+		if count == 0 {
+			continue
+		}
+		metrics.AddCandidateTransportPeerSends(
+			chain,
+			candidateTransportPeerOutcome(p2p.TwoStepSendFault(fault)),
+			count,
+		)
+	}
+}
+
+func candidateTransportSendResult(
+	outcome p2p.TwoStepSendOutcome,
+	err error,
+) CandidateTransportSendResult {
+	switch {
+	case outcome.Attempted == 0 && err == nil:
+		// Nobody to send to is not a failed delivery: a session with no peers
+		// attached yet produces this on every slot, and calling it failed would
+		// bury a real "reached nobody" under a warning per block.
+		return CandidateTransportSendSuccess
+	case outcome.Sent == 0:
+		return CandidateTransportSendFailed
+	case outcome.Sent+outcome.Pending < outcome.Attempted || err != nil:
+		// Pending recipients are still being written to: the fan-out was
+		// released once enough of the committee held a symbol. Only a genuine
+		// per-peer failure makes the delivery partial.
+		return CandidateTransportSendPartial
+	default:
+		return CandidateTransportSendSuccess
+	}
+}
+
+func candidateTransportPeerOutcome(fault p2p.TwoStepSendFault) CandidateTransportPeerOutcome {
+	switch fault {
+	case p2p.TwoStepSendFaultOffline:
+		return CandidateTransportPeerOffline
+	case p2p.TwoStepSendFaultDialDeferred:
+		return CandidateTransportPeerDialDeferred
+	case p2p.TwoStepSendFaultWriteDeadline:
+		return CandidateTransportPeerWriteDeadline
+	case p2p.TwoStepSendFaultContextDeadline:
+		return CandidateTransportPeerContextDeadline
+	case p2p.TwoStepSendFaultCanceled:
+		return CandidateTransportPeerCanceled
+	default:
+		return CandidateTransportPeerError
+	}
 }
 
 func candidateTransportChain(spec sessionSpec) collator.MetricChain {
@@ -1345,23 +1479,27 @@ func (s *session) broadcastTwoStep(
 	signer adnloverlay.BroadcastSigner,
 	data []byte,
 	extra []byte,
-) error {
+) (p2p.TwoStepSendOutcome, error) {
+	// Snapshot under the lock, send without it. The fan-out writes a symbol to
+	// every committee peer and returns when enough of them have taken it, which
+	// on a loaded stand was hundreds of milliseconds; holding handleMu for that
+	// long blocks sendMessageRaw and queryRaw behind any session rebind, since
+	// Go's RWMutex stops admitting readers once a writer waits. The overlay
+	// handle carries its own lifecycle — a retired one refuses the broadcast —
+	// and the snapshotted context still cancels the send when the session ends.
 	s.handleMu.RLock()
-	defer s.handleMu.RUnlock()
-	if s.handleContext == nil {
-		return ErrSessionInactive
-	}
 	handle := s.consensusHandle
 	if s.handleSpec.hasBlockSync() {
 		handle = s.blockSyncHandle
 	}
-	if handle == nil {
-		return ErrSessionInactive
+	handleContext := s.handleContext
+	s.handleMu.RUnlock()
+	if handleContext == nil || handle == nil {
+		return p2p.TwoStepSendOutcome{}, ErrSessionInactive
 	}
-	requestCtx, cancel := contextWithPeerLifetime(ctx, s.handleContext)
+	requestCtx, cancel := contextWithPeerLifetime(ctx, handleContext)
 	defer cancel()
-	_, err := handle.BroadcastTwoStep(requestCtx, signer, data, tl.Raw(extra), 0)
-	return err
+	return handle.BroadcastTwoStep(requestCtx, signer, data, tl.Raw(extra), 0)
 }
 
 func newHandleLifetime() (context.Context, context.CancelFunc) {

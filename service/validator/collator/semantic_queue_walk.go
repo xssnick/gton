@@ -254,3 +254,11 @@ func semanticQueuePrefixDirectionBorrowed(current *cell.Slice, target *cell.Cell
 
 	return int(next) + 1, nil
 }
+
+// drainedQueueScanBudget caps the queue entries a drained claim may walk per
+// neighbour before the claim is abandoned. It is deliberately small: the claim
+// is only worth making when the prefix under it is nearly empty, which is the
+// case where the reference's own merger would have reached the end of the
+// queues and made the same claim for free. A deeper prefix means there was work
+// to import, and importing it advances the bound without a special claim.
+const drainedQueueScanBudget = 64

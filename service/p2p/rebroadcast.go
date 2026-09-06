@@ -906,15 +906,11 @@ func sendFastFECToPeer(
 		if err != nil {
 			return fmt.Errorf("build FEC part %d: %w", seqno, err)
 		}
-		if prepared, ok := peer.(overlay.PreparedBroadcastPeer); ok {
-			err = prepared.SendPreparedCustomMessage(sendCtx, part.FullWire)
-		} else {
-			// BroadcastPeer is a released extension point; production transports
-			// implement the prepared path, while external implementations retain
-			// source compatibility with the original interface.
-			err = peer.SendCustomMessage(sendCtx, part.Full)
-		}
-		if err != nil {
+		// One sender feeds every peer worker of the fanout; the part's
+		// prepared message carries the ADNL frame built on the first send,
+		// so the other peers copy bytes instead of serializing again. QUIC
+		// peers take the body with their own prefix, legacy peers the object.
+		if err = overlay.SendPreparedBroadcast(sendCtx, peer, part.Full, part.FullMessage); err != nil {
 			return fmt.Errorf("send FEC part %d to peer %x: %w", seqno, peer.ID(), err)
 		}
 	}

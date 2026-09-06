@@ -65,12 +65,29 @@ func TestBlockLimitsV1UsesByteLimitsForCollatedData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want, err := newLimitThresholds(bytes)
+	// The V1 config states one size limit and both size axes take it — through
+	// the same admission scaling, which is what a collation stops against.
+	want, err := newLimitThresholds(scaleAdmissionLimits(bytes))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if limits.collatedData != want {
 		t.Fatalf("collated data limits = %v, want %v", limits.collatedData, want)
+	}
+	if limits.bytes != limits.collatedData {
+		t.Fatalf("bytes %v and collated data %v must take the same V1 limit", limits.bytes, limits.collatedData)
+	}
+	// The scaling is admission policy and must never move the boundary a
+	// validator replaying this block checks: a block past the config's hard
+	// limit is a rejected block.
+	if limits.bytes[LoadHard-1] != uint64(bytes.HardLimit) {
+		t.Fatalf("hard byte threshold = %d, want the config's %d untouched", limits.bytes[LoadHard-1], bytes.HardLimit)
+	}
+	if limits.collatedData[LoadHard-1] != uint64(bytes.HardLimit) {
+		t.Fatalf("hard collated threshold = %d, want the config's %d untouched", limits.collatedData[LoadHard-1], bytes.HardLimit)
+	}
+	if limits.gas[LoadHard-1] != 60 || limits.gas[1] != 50 {
+		t.Fatalf("gas limits = %v, want the config's own %v", limits.gas, []int{40, 50, 60})
 	}
 }
 

@@ -9,7 +9,46 @@ import (
 	"github.com/xssnick/gton/service/validator/msgpool"
 )
 
-func (v *semanticQueueValidation) applyOutQueueChanges() error {
+func (v *semanticQueueValidation) verifyOutQueueChange(key msgpool.QueueKey, entry *semanticQueueEntry, added bool) error {
+	hash := entry.envelope.message.HashKey()
+	descriptor := v.out[hash]
+	if descriptor == nil {
+		return fmt.Errorf("%w: outbound queue change %x has no message descriptor", ErrInvalidInput, key)
+	}
+
+	envelope := descriptor.envelope
+	if added {
+		switch descriptor.tag {
+		case semanticOutNew, semanticOutTransit, semanticOutTransitRequest, semanticOutDeferredTransit:
+		default:
+			return fmt.Errorf("%w: outbound descriptor %x does not enqueue a message", ErrInvalidInput, hash)
+		}
+	} else {
+		switch descriptor.tag {
+		case semanticOutDequeue, semanticOutDequeueImmediate:
+		case semanticOutDequeueShort:
+			if descriptor.next != entry.envelope.next || cell.Hash(descriptor.envelopeHash) != entry.envelope.root.HashKey() {
+				return fmt.Errorf("%w: short dequeue descriptor %x differs from outbound queue entry", ErrInvalidInput, hash)
+			}
+			return nil
+		case semanticOutTransitRequest:
+			inbound := v.in[hash]
+			if inbound == nil || inbound.tag != semanticInTransit {
+				return fmt.Errorf("%w: transit-request descriptor %x has no transit reimport", ErrInvalidInput, hash)
+			}
+			envelope = inbound.envelope
+		default:
+			return fmt.Errorf("%w: outbound descriptor %x does not dequeue a message", ErrInvalidInput, hash)
+		}
+	}
+	if !equalCell(envelope.root, entry.envelope.root) {
+		return fmt.Errorf("%w: outbound queue change %x contains another envelope", ErrInvalidInput, key)
+	}
+
+	return nil
+}
+
+func (v *semanticQueueValidation) verifyOutQueueChanges() error {
 	for _, entry := range v.outOrder {
 		hash, descriptor := entry.hash, entry.descriptor
 		if err := v.replay.ctx.Err(); err != nil {
@@ -31,7 +70,7 @@ func (v *semanticQueueValidation) applyOutQueueChanges() error {
 				return fmt.Errorf("immediate outbound message %x: %w", hash, err)
 			}
 		case semanticOutNew:
-			if err := v.enqueue(descriptor.envelope); err != nil {
+			if err := v.verifyEnqueued(descriptor.envelope); err != nil {
 				return fmt.Errorf("new outbound message %x: %w", hash, err)
 			}
 		case semanticOutTransit:
@@ -41,11 +80,11 @@ func (v *semanticQueueValidation) applyOutQueueChanges() error {
 			if err := v.verifyTransitRewrite(hash, descriptor, semanticInTransit); err != nil {
 				return err
 			}
-			if err := v.enqueue(descriptor.envelope); err != nil {
+			if err := v.verifyEnqueued(descriptor.envelope); err != nil {
 				return fmt.Errorf("transit outbound message %x: %w", hash, err)
 			}
 		case semanticOutDequeue:
-			entry, err := v.dequeue(descriptor.envelope.next, hash, descriptor.envelope.root.HashKey())
+			entry, err := v.verifyDequeued(descriptor.envelope.next, hash, descriptor.envelope.root.HashKey())
 			if err != nil {
 				return fmt.Errorf("dequeue outbound message %x: %w", hash, err)
 			}
@@ -53,7 +92,7 @@ func (v *semanticQueueValidation) applyOutQueueChanges() error {
 				return err
 			}
 		case semanticOutDequeueShort:
-			entry, err := v.dequeue(descriptor.next, hash, cell.Hash(descriptor.envelopeHash))
+			entry, err := v.verifyDequeued(descriptor.next, hash, cell.Hash(descriptor.envelopeHash))
 			if err != nil {
 				return fmt.Errorf("short dequeue outbound message %x: %w", hash, err)
 			}
@@ -65,20 +104,20 @@ func (v *semanticQueueValidation) applyOutQueueChanges() error {
 				return err
 			}
 			inbound := v.in[cell.Hash(hash)]
-			if _, err := v.dequeue(inbound.envelope.next, hash, inbound.envelope.root.HashKey()); err != nil {
+			if _, err := v.verifyDequeued(inbound.envelope.next, hash, inbound.envelope.root.HashKey()); err != nil {
 				return fmt.Errorf("transit-request dequeue %x: %w", hash, err)
 			}
 			if err := v.verifyTransitRewrite(hash, descriptor, semanticInTransit); err != nil {
 				return err
 			}
-			if err := v.enqueue(descriptor.envelope); err != nil {
+			if err := v.verifyEnqueued(descriptor.envelope); err != nil {
 				return fmt.Errorf("transit-request enqueue %x: %w", hash, err)
 			}
 		case semanticOutDequeueImmediate:
 			if err := v.verifyReimport(hash, descriptor, semanticInFinal); err != nil {
 				return err
 			}
-			if _, err := v.dequeue(descriptor.envelope.next, hash, descriptor.envelope.root.HashKey()); err != nil {
+			if _, err := v.verifyDequeued(descriptor.envelope.next, hash, descriptor.envelope.root.HashKey()); err != nil {
 				return fmt.Errorf("immediate dequeue %x: %w", hash, err)
 			}
 		case semanticOutNewDeferred:
@@ -99,10 +138,8 @@ func (v *semanticQueueValidation) applyOutQueueChanges() error {
 			// The consequence is what matters to us: a reference collator never
 			// walks the real key's path, so it is not in the collated proof,
 			// and demanding it rejects blocks every other node accepts. The
-			// property itself is not lost — verifyQueueRoots compares the queue
-			// rebuilt from these descriptors against the candidate's own root,
-			// so a deferred message that was also enqueued shows up there as an
-			// entry no descriptor accounts for.
+			// property itself is not lost: precheckOutQueueUpdate rejects an
+			// enqueued entry whose descriptor is deferred.
 			continue
 		case semanticOutDeferredTransit:
 			if err := v.verifyReimport(hash, descriptor, semanticInDeferredTransit); err != nil {
@@ -111,7 +148,7 @@ func (v *semanticQueueValidation) applyOutQueueChanges() error {
 			if err := v.verifyTransitRewrite(hash, descriptor, semanticInDeferredTransit); err != nil {
 				return err
 			}
-			if err := v.enqueue(descriptor.envelope); err != nil {
+			if err := v.verifyEnqueued(descriptor.envelope); err != nil {
 				return fmt.Errorf("deferred transit message %x: %w", hash, err)
 			}
 		default:
@@ -290,13 +327,12 @@ func semanticOptionalLTEqual(left, right *uint64) bool {
 	return left == nil && right == nil || left != nil && right != nil && *left == *right
 }
 
-func (v *semanticQueueValidation) enqueue(envelope *semanticEnvelope) error {
+func (v *semanticQueueValidation) verifyEnqueued(envelope *semanticEnvelope) error {
 	key := msgpool.MakeQueueKey(envelope.next, envelope.message.HashKey())
 	var value, extra cell.Slice
 	if err := v.candidate.OutQueue.LoadValueExtraByBytesKeyInto(key[:], &value, &extra); err != nil {
 		return fmt.Errorf("%w: outbound queue has no new message leaf", ErrInvalidInput)
 	}
-	rawValue := value
 	entry, err := parseSemanticQueueEntryKeyWithMode(key, &value, &extra, false, semanticQueueLeafCells{}, &v.replay.envelopes)
 	if err != nil {
 		return err
@@ -318,19 +354,10 @@ func (v *semanticQueueValidation) enqueue(envelope *semanticEnvelope) error {
 	if entry.enqueued.EnqueuedLT < entry.envelope.bound.lt {
 		return fmt.Errorf("%w: new outbound queue enqueued lt is below the message emitted lt", ErrInvalidInput)
 	}
-	// Add mode is safe to run in descriptor order without replaying dequeues
-	// first: the key must be present in the candidate out-queue above, while
-	// dequeue only accepts entries enqueued before StartLt, so no key is both
-	// added and removed by one block. The collator guards the mirror hazard on
-	// its side with queueDeletePending.
-	var queueValue cell.Builder
-	rawValue.ToBuilderInto(&queueValue)
-	inserted, err := v.outQueue.SetBuilderByBytesKeyWithMode(key[:], &queueValue, cell.DictSetModeAdd)
-	if err != nil {
-		return err
-	}
-	if !inserted {
+	if err = v.old.OutQueue.LoadValueByBytesKeyInto(key[:], &value); err == nil {
 		return fmt.Errorf("%w: outbound queue key already exists", ErrInvalidInput)
+	} else if !isMissingKey(err) {
+		return err
 	}
 	if v.queueSize == maxOutMsgQueueSize {
 		return fmt.Errorf("%w: outbound queue size overflow", ErrInvalidInput)
@@ -346,14 +373,14 @@ func (v *semanticQueueValidation) enqueue(envelope *semanticEnvelope) error {
 	return nil
 }
 
-func (v *semanticQueueValidation) dequeue(
+func (v *semanticQueueValidation) verifyDequeued(
 	next msgpool.AccountPrefix,
 	hash cell.Hash,
 	envelopeHash cell.Hash,
 ) (semanticQueueEntry, error) {
 	key := msgpool.MakeQueueKey(next, hash)
 	var value cell.Slice
-	if err := v.outQueue.LoadValueAndDeleteByBytesKeyInto(key[:], &value); err != nil {
+	if err := v.old.OutQueue.LoadValueByBytesKeyInto(key[:], &value); err != nil {
 		return semanticQueueEntry{}, fmt.Errorf("%w: outbound queue entry is absent", ErrInvalidInput)
 	}
 	entry, err := parseSemanticQueueEntryKeyWithMode(key, &value, nil, false, semanticQueueLeafCells{}, &v.replay.envelopes)
@@ -365,6 +392,11 @@ func (v *semanticQueueValidation) dequeue(
 	}
 	if entry.enqueued.Msg.HashKey() != envelopeHash {
 		return semanticQueueEntry{}, fmt.Errorf("%w: dequeued envelope differs from descriptor", ErrInvalidInput)
+	}
+	if err = v.candidate.OutQueue.LoadValueByBytesKeyInto(key[:], &value); err == nil {
+		return semanticQueueEntry{}, fmt.Errorf("%w: dequeued message remains in candidate outbound queue", ErrInvalidInput)
+	} else if !isMissingKey(err) {
+		return semanticQueueEntry{}, err
 	}
 	if v.queueSize == 0 {
 		return semanticQueueEntry{}, fmt.Errorf("%w: outbound queue size underflow", ErrInvalidInput)

@@ -37,7 +37,7 @@ func CaptureStatus(ctx context.Context, cfg Config) (Status, error) {
 			}
 		}
 		nodeStatus := NodeStatus{
-			Name: node.Name, Kind: node.Kind, Optional: node.Optional,
+			Name: node.Name, Kind: node.Kind, Roles: node.Roles, Optional: node.Optional,
 			Running: len(pids) > 0, PIDs: pids, LogPath: node.LogPath,
 		}
 		_, stats, size, modified, logErr := readLogTail(node)
@@ -47,9 +47,12 @@ func CaptureStatus(ctx context.Context, cfg Config) (Status, error) {
 			nodeStatus.MasterchainSeqno = stats.MasterchainSeqno
 			nodeStatus.FinalizedBlocks = stats.Finalized
 			nodeStatus.CollatedBlocks = stats.Collated
+			nodeStatus.EmittedCandidates = stats.Emitted
 			nodeStatus.ValidatedBlocks = stats.Validated
 			nodeStatus.HardErrors = stats.HardErrors
 			nodeStatus.AdvisoryWarnings = stats.AdvisoryWarnings
+			nodeStatus.ErrorCategories = stats.ErrorCategories
+			nodeStatus.WarningCategories = stats.WarningCategories
 		} else if !node.Optional {
 			status.Healthy = false
 		}

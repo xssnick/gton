@@ -90,9 +90,15 @@ type Store struct {
 	acceptedStates    map[storage.BlockRootHash]ton.BlockIDExt
 	acceptedOrder     []storage.BlockRootHash
 	acceptedCacheSize int
-	blockDataLoad     liveLoadGroup[liveBlockLookupKey, []byte]
-	blockLoad         liveLoadGroup[liveBlockLookupKey, *liveBlockLoadResult]
-	fragmentLoad      liveLoadGroup[liveBlockLookupKey, *BlockView]
+	// acceptedObservers are told about every accepted-state publication once it
+	// is readable, under their own lock because they run outside s.mu. See
+	// ObserveAcceptedBlockStates.
+	acceptedObserversMu  sync.Mutex
+	acceptedObservers    []acceptedStateObserver
+	acceptedObserverNext uint64
+	blockDataLoad        liveLoadGroup[liveBlockLookupKey, []byte]
+	blockLoad            liveLoadGroup[liveBlockLookupKey, *liveBlockLoadResult]
+	fragmentLoad         liveLoadGroup[liveBlockLookupKey, *BlockView]
 
 	fragmentBuildSlots   chan struct{}
 	fragmentMasterSlots  chan struct{}

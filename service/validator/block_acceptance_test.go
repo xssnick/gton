@@ -21,6 +21,22 @@ import (
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
+func (a *BlockAccepter) acceptForTest(
+	ctx context.Context,
+	acceptance BlockAcceptance,
+	resolveView BlockAcceptanceViewResolver,
+) error {
+	prepared, err := a.Prepare(ctx, acceptance, resolveView)
+	if err != nil {
+		return err
+	}
+	if err = prepared.Submit(ctx); err != nil {
+		return err
+	}
+
+	return prepared.Describe(ctx)
+}
+
 type acceptanceTestNode struct {
 	blocks    []p2p.DownloadedBlock
 	proofs    map[string][]byte
@@ -107,7 +123,7 @@ func acceptanceTestViewResolver(view BlockAcceptanceView) BlockAcceptanceViewRes
 func (f acceptanceTestFixture) view(t *testing.T) BlockAcceptanceView {
 	t.Helper()
 
-	_, parsed, err := parseAcceptedBlock(f.candidate.Candidate.Block, f.candidate.BlockBOC)
+	_, parsed, err := parseAcceptedBlock(f.candidate.Candidate.Block, f.candidate.BlockBOC, nil)
 	if err != nil {
 		t.Fatalf("parse acceptance view block: %v", err)
 	}
@@ -131,7 +147,7 @@ func (f acceptanceTestFixture) view(t *testing.T) BlockAcceptanceView {
 func (f acceptanceTestFixture) masterchainBlock(t *testing.T) ton.BlockIDExt {
 	t.Helper()
 
-	_, parsed, err := parseAcceptedBlock(f.candidate.Candidate.Block, f.candidate.BlockBOC)
+	_, parsed, err := parseAcceptedBlock(f.candidate.Candidate.Block, f.candidate.BlockBOC, nil)
 	if err != nil {
 		t.Fatalf("parse acceptance fixture block: %v", err)
 	}
@@ -172,7 +188,7 @@ func TestBlockAccepterAcceptsShardCertificates(t *testing.T) {
 				t.Fatalf("construct block accepter: %v", err)
 			}
 
-			if err = accepter.Accept(context.Background(), acceptance, acceptanceTestViewResolver(fixture.view(t))); err != nil {
+			if err = accepter.acceptForTest(context.Background(), acceptance, acceptanceTestViewResolver(fixture.view(t))); err != nil {
 				t.Fatalf("accept block: %v", err)
 			}
 			block := requireAcceptanceTestBlock(t, node, fixture)
@@ -223,7 +239,7 @@ func TestBlockAccepterAcceptsMasterchainFinalCertificates(t *testing.T) {
 				t.Fatalf("construct block accepter: %v", err)
 			}
 
-			if err = accepter.Accept(
+			if err = accepter.acceptForTest(
 				context.Background(),
 				acceptance,
 				acceptanceTestViewResolver(BlockAcceptanceView{}),
@@ -272,7 +288,7 @@ func TestBlockAccepterRejectsMasterchainNotarization(t *testing.T) {
 		t.Fatalf("construct block accepter: %v", err)
 	}
 
-	err = accepter.Accept(
+	err = accepter.acceptForTest(
 		context.Background(),
 		fixture.acceptance(simplex.VoteNotarize, false),
 		acceptanceTestViewResolver(BlockAcceptanceView{}),
@@ -397,12 +413,21 @@ func TestBlockAccepterRejectsInvalidBlockHeadersBeforeSignatures(t *testing.T) {
 				t.Fatalf("construct block accepter: %v", err)
 			}
 
-			err = accepter.Accept(context.Background(), acceptance, acceptanceTestViewResolver(BlockAcceptanceView{}))
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("accept invalid block error = %v, want %q", err, test.want)
-			}
-			if len(node.blocks) != 0 {
-				t.Fatalf("submitted %d invalid blocks", len(node.blocks))
+			for _, resident := range []bool{false, true} {
+				name := "decode wire"
+				if resident {
+					name = "resident root"
+					acceptance.state = acceptanceResidentState(t, acceptance.Candidate)
+				}
+				t.Run(name, func(t *testing.T) {
+					err := accepter.acceptForTest(t.Context(), acceptance, acceptanceTestViewResolver(BlockAcceptanceView{}))
+					if err == nil || !strings.Contains(err.Error(), test.want) {
+						t.Fatalf("accept invalid block error = %v, want %q", err, test.want)
+					}
+					if len(node.blocks) != 0 {
+						t.Fatalf("submitted %d invalid blocks", len(node.blocks))
+					}
+				})
 			}
 		})
 	}
@@ -411,7 +436,7 @@ func TestBlockAccepterRejectsInvalidBlockHeadersBeforeSignatures(t *testing.T) {
 func TestValidateAcceptedBlockHeaderRejectsMalformedShape(t *testing.T) {
 	shard := groups.ShardID{Workchain: 0, Shard: math.MinInt64}
 	fixture := newAcceptanceTestFixture(t, shard)
-	_, parsed, err := parseAcceptedBlock(fixture.candidate.Candidate.Block, fixture.candidate.BlockBOC)
+	_, parsed, err := parseAcceptedBlock(fixture.candidate.Candidate.Block, fixture.candidate.BlockBOC, nil)
 	if err != nil {
 		t.Fatalf("parse fixture block: %v", err)
 	}
@@ -822,7 +847,7 @@ func TestAcceptancePublishesTheShardStateAheadOfTheStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("construct block accepter: %v", err)
 	}
-	if err = accepter.Accept(context.Background(), acceptance, acceptanceTestViewResolver(fixture.view(t))); err != nil {
+	if err = accepter.acceptForTest(context.Background(), acceptance, acceptanceTestViewResolver(fixture.view(t))); err != nil {
 		t.Fatalf("accept block: %v", err)
 	}
 
@@ -871,7 +896,7 @@ func TestAcceptanceWithoutAResolvedStatePublishesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("construct block accepter: %v", err)
 	}
-	if err = accepter.Accept(context.Background(), acceptance, acceptanceTestViewResolver(fixture.view(t))); err != nil {
+	if err = accepter.acceptForTest(context.Background(), acceptance, acceptanceTestViewResolver(fixture.view(t))); err != nil {
 		t.Fatalf("accept block: %v", err)
 	}
 	if len(node.published) != 0 {
@@ -902,7 +927,7 @@ func TestAcceptanceDoesNotPublishMasterchainStates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("construct block accepter: %v", err)
 	}
-	if err = accepter.Accept(
+	if err = accepter.acceptForTest(
 		context.Background(),
 		acceptance,
 		acceptanceTestViewResolver(BlockAcceptanceView{}),

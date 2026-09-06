@@ -1079,11 +1079,16 @@ func internalCursorLess(left, right internalMessageCursor) bool {
 	return left.run < right.run
 }
 
+// errQueueScanBudget stops a budgeted prefix walk. It never leaves
+// traceInternalCut: reaching the budget is an answer, not a failure.
+var errQueueScanBudget = errors.New("collator: queue scan budget exhausted")
+
 func traceInternalCut(
 	scan FullCollatedQueueScan,
 	messages []*msgpool.InternalMessage,
 	views map[msgpool.ShardIdent]*localNeighborView,
-) error {
+) (bool, error) {
+	exhausted := true
 	expected := make(map[msgpool.ShardIdent]map[cell.Hash]*msgpool.InternalMessage)
 	for i := range messages {
 		message := messages[i]
@@ -1110,7 +1115,12 @@ func traceInternalCut(
 		}
 		byHash := expected[source]
 		bound := semanticMessageBound{lt: scan.LT, hash: scan.Hash}
+		visited := uint32(0)
 		err := walkSemanticQueuePrefix(view.queue.OutQueue, scan.Target, bound, func(entry semanticQueueEntry) error {
+			visited++
+			if scan.Budget != 0 && visited > scan.Budget {
+				return errQueueScanBudget
+			}
 			message := byHash[entry.envelope.message.HashKey()]
 			if message == nil {
 				return nil
@@ -1122,8 +1132,15 @@ func traceInternalCut(
 
 			return nil
 		})
+		if errors.Is(err, errQueueScanBudget) {
+			// The prefix is deeper than the claim is worth. The caller drops the
+			// claim, so nothing here is owed a proof; the entries this walk
+			// already touched are the budget's cost and are bounded by it.
+			exhausted = false
+			continue
+		}
 		if err != nil {
-			return fmt.Errorf(
+			return false, fmt.Errorf(
 				"%w: trace inbound queue from (%d,%016x): %v",
 				ErrInvalidInput,
 				source.Workchain,
@@ -1132,7 +1149,7 @@ func traceInternalCut(
 			)
 		}
 		if len(byHash) != 0 {
-			return fmt.Errorf(
+			return false, fmt.Errorf(
 				"%w: %d acquired internal messages are absent from source (%d,%016x)",
 				ErrInvalidInput,
 				len(byHash),
@@ -1142,7 +1159,7 @@ func traceInternalCut(
 		}
 	}
 
-	return nil
+	return exhausted, nil
 }
 
 func localSourceRef(id ton.BlockIDExt) (msgpool.SourceRef, error) {
@@ -1173,30 +1190,33 @@ type localFullProofProvider struct {
 func (p *localFullProofProvider) BuildFullCollatedProofs(
 	ctx context.Context,
 	request FullCollatedProofRequest,
-) ([]*cell.Cell, error) {
+) (FullCollatedProofs, error) {
+	exhausted := true
 	if request.QueueScan != nil {
-		if err := traceInternalCut(*request.QueueScan, request.Internals, p.messageViews); err != nil {
-			return nil, err
+		var err error
+		exhausted, err = traceInternalCut(*request.QueueScan, request.Internals, p.messageViews)
+		if err != nil {
+			return FullCollatedProofs{}, err
 		}
 	}
 
 	previousKey, err := blockRootKey(request.Previous.ID)
 	if err != nil {
-		return nil, err
+		return FullCollatedProofs{}, err
 	}
 	var previous2Key [32]byte
 	hasPrevious2 := request.Previous2 != nil
 	if request.Previous2 != nil {
 		previous2Key, err = blockRootKey(request.Previous2.ID)
 		if err != nil {
-			return nil, err
+			return FullCollatedProofs{}, err
 		}
 	}
 
 	proofs := make([]*cell.Cell, 0, len(request.Neighbors)*2)
 	for i := range request.Neighbors {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return FullCollatedProofs{}, err
 		}
 		neighbor := &request.Neighbors[i]
 		if neighbor.Block.Workchain == masterchainWorkchainID {
@@ -1204,33 +1224,33 @@ func (p *localFullProofProvider) BuildFullCollatedProofs(
 		}
 		key, err := blockRootKey(neighbor.Block)
 		if err != nil {
-			return nil, err
+			return FullCollatedProofs{}, err
 		}
 		if key == previousKey || hasPrevious2 && key == previous2Key {
 			continue
 		}
 		view := p.proofViews[neighbor.Shard]
 		if view == nil || view.proof == nil || !view.previous.ID.Equals(&neighbor.Block) {
-			return nil, fmt.Errorf("%w: proof view for neighbor %d is unavailable", ErrAcquisitionNotReady, i)
+			return FullCollatedProofs{}, fmt.Errorf("%w: proof view for neighbor %d is unavailable", ErrAcquisitionNotReady, i)
 		}
 		if neighbor.Block.SeqNo != 0 {
 			if view.previous.Block == nil {
-				return nil, fmt.Errorf("%w: block root for neighbor %d is unavailable", ErrAcquisitionNotReady, i)
+				return FullCollatedProofs{}, fmt.Errorf("%w: block root for neighbor %d is unavailable", ErrAcquisitionNotReady, i)
 			}
 			blockProof, err := blockproof.BlockStateRootProof(view.previous.Block)
 			if err != nil {
-				return nil, fmt.Errorf("build neighbor %d block proof: %w", i, err)
+				return FullCollatedProofs{}, fmt.Errorf("build neighbor %d block proof: %w", i, err)
 			}
 			proofs = append(proofs, blockProof)
 		}
 		stateProof, err := view.proof.CreateProof()
 		if err != nil {
-			return nil, fmt.Errorf("build neighbor %d state proof: %w", i, err)
+			return FullCollatedProofs{}, fmt.Errorf("build neighbor %d state proof: %w", i, err)
 		}
 		proofs = append(proofs, stateProof)
 	}
 
-	return proofs, nil
+	return FullCollatedProofs{Roots: proofs, ScanExhausted: exhausted}, nil
 }
 
 func (a *LocalAcquisition) historicalShardEndLT(

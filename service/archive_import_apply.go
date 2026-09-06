@@ -1,8 +1,11 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -49,6 +52,236 @@ type shardClientArchiveWindow struct {
 	shardApplyElapsed        time.Duration
 	shardBlocksApplied       int
 	shardBlocksReused        int
+	blockApplied             archiveWindowBlockAppliedEvents
+}
+
+type archiveWindowBlockAppliedState uint8
+
+const (
+	archiveWindowBlockAppliedCollecting archiveWindowBlockAppliedState = iota
+	archiveWindowBlockAppliedDispatching
+	archiveWindowBlockAppliedDispatched
+)
+
+type archiveWindowBlockAppliedEvents struct {
+	mu         sync.Mutex
+	state      archiveWindowBlockAppliedState
+	configured bool
+	enabled    bool
+	masters    []BlockAppliedEvent
+	shards     map[uint32][]BlockAppliedEvent
+}
+
+type archiveMasterBlockAppliedEvents struct {
+	master *BlockAppliedEvent
+	shards []BlockAppliedEvent
+}
+
+func (e *archiveWindowBlockAppliedEvents) configure(enabled bool) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.state != archiveWindowBlockAppliedCollecting {
+		return errors.New("archive block-applied collection has already started dispatch")
+	}
+	if e.configured {
+		if e.enabled != enabled {
+			return errors.New("archive block-applied collection capability changed within one window")
+		}
+		return nil
+	}
+	if len(e.masters) != 0 || len(e.shards) != 0 {
+		return errors.New("archive block-applied events were collected before capability configuration")
+	}
+
+	e.configured = true
+	e.enabled = enabled
+	return nil
+}
+
+func (e *archiveWindowBlockAppliedEvents) deferMaster(event BlockAppliedEvent) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.state != archiveWindowBlockAppliedCollecting {
+		return
+	}
+	e.masters = append(e.masters, event)
+}
+
+func (e *archiveWindowBlockAppliedEvents) deferShard(masterSeqno uint32, event BlockAppliedEvent) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.state != archiveWindowBlockAppliedCollecting {
+		return
+	}
+	if e.shards == nil {
+		e.shards = make(map[uint32][]BlockAppliedEvent)
+	}
+	e.shards[masterSeqno] = append(e.shards[masterSeqno], event)
+}
+
+func (w *shardClientArchiveWindow) beginBlockAppliedDispatch(current, next *storage.CurrentState) ([]archiveMasterBlockAppliedEvents, bool, error) {
+	events := &w.blockApplied
+	events.mu.Lock()
+	defer events.mu.Unlock()
+
+	switch events.state {
+	case archiveWindowBlockAppliedDispatching:
+		return nil, false, fmt.Errorf("archive window #%d block-applied events are already dispatching", w.startSeqno)
+	case archiveWindowBlockAppliedDispatched:
+		return nil, true, nil
+	}
+	if !events.configured {
+		return nil, false, fmt.Errorf("archive window #%d block-applied collection capability was not configured", w.startSeqno)
+	}
+	if !events.enabled {
+		if len(events.masters) != 0 || len(events.shards) != 0 {
+			return nil, false, fmt.Errorf("archive window #%d collected block-applied events while processing is disabled", w.startSeqno)
+		}
+		events.state = archiveWindowBlockAppliedDispatching
+		return nil, false, nil
+	}
+	if current == nil || next == nil {
+		return nil, false, fmt.Errorf("archive window #%d block-applied dispatch state is absent", w.startSeqno)
+	}
+	if next.ShardClientSeqno <= current.ShardClientSeqno {
+		return nil, false, fmt.Errorf("archive window #%d block-applied dispatch did not advance seqno %d", w.startSeqno, current.ShardClientSeqno)
+	}
+	if w.startSeqno != current.ShardClientSeqno+1 {
+		return nil, false, fmt.Errorf("archive window #%d block-applied dispatch follows seqno %d", w.startSeqno, current.ShardClientSeqno)
+	}
+	lastMaster := w.masterStates[next.ShardClientSeqno]
+	if lastMaster == nil || !next.Masterchain.Block.Equals(&lastMaster.Block) {
+		return nil, false, fmt.Errorf("archive window #%d accepted current does not match masterchain seqno %d", w.startSeqno, next.ShardClientSeqno)
+	}
+
+	expectedMasters := int(next.ShardClientSeqno - current.ShardClientSeqno)
+	if len(events.masters) != expectedMasters {
+		return nil, false, fmt.Errorf("archive window #%d collected %d master block-applied events, want %d", w.startSeqno, len(events.masters), expectedMasters)
+	}
+	for seqno := range events.shards {
+		if seqno < w.startSeqno || seqno > next.ShardClientSeqno {
+			return nil, false, fmt.Errorf("archive window #%d collected shard block-applied events for masterchain seqno %d outside accepted range", w.startSeqno, seqno)
+		}
+	}
+
+	totalEvents := len(events.masters)
+	shardEvents := 0
+	for _, shards := range events.shards {
+		totalEvents += len(shards)
+		shardEvents += len(shards)
+	}
+	if shardEvents != w.shardBlocksApplied {
+		return nil, false, fmt.Errorf("archive window #%d collected %d shard block-applied events, want %d applied blocks", w.startSeqno, shardEvents, w.shardBlocksApplied)
+	}
+	seen := make(map[storage.BlockRootHash]ton.BlockIDExt, totalEvents)
+	remember := func(event BlockAppliedEvent, kind string) error {
+		if event.Meta == nil {
+			return fmt.Errorf("archive window #%d collected %s block-applied event without metadata", w.startSeqno, kind)
+		}
+
+		key := storage.BlockKey(event.Meta.ID)
+		if previous, exists := seen[key]; exists {
+			return fmt.Errorf("archive window #%d collected duplicate block-applied event %s (previous %s)", w.startSeqno, storage.FormatBlockRef(event.Meta.ID), storage.FormatBlockRef(previous))
+		}
+		seen[key] = event.Meta.ID
+		return nil
+	}
+
+	batches := make([]archiveMasterBlockAppliedEvents, 0, expectedMasters)
+	for idx := range events.masters {
+		seqno := current.ShardClientSeqno + uint32(idx) + 1
+		masterState := w.masterStates[seqno]
+		if masterState == nil {
+			return nil, false, fmt.Errorf("archive window #%d has no applied masterchain state for block-applied seqno %d", w.startSeqno, seqno)
+		}
+
+		masterEvent := &events.masters[idx]
+		if err := remember(*masterEvent, "master"); err != nil {
+			return nil, false, err
+		}
+		if !masterEvent.Meta.ID.Equals(&masterState.Block) {
+			return nil, false, fmt.Errorf("archive window #%d master block-applied event %s does not match applied state %s", w.startSeqno, storage.FormatBlockRef(masterEvent.Meta.ID), storage.FormatBlockRef(masterState.Block))
+		}
+		if masterEvent.CurrentState != masterState.Cell {
+			return nil, false, fmt.Errorf("archive window #%d master block-applied event %s has a different state root", w.startSeqno, storage.FormatBlockRef(masterEvent.Meta.ID))
+		}
+
+		shards := events.shards[seqno]
+		for _, event := range shards {
+			if err := remember(event, "shard"); err != nil {
+				return nil, false, err
+			}
+			if event.InclusionMasterRef == nil || !event.InclusionMasterRef.Equals(&masterState.Block) {
+				return nil, false, fmt.Errorf("archive window #%d shard block-applied event %s has invalid inclusion master for seqno %d", w.startSeqno, storage.FormatBlockRef(event.Meta.ID), seqno)
+			}
+			if event.InclusionMasterState != masterState.Cell {
+				return nil, false, fmt.Errorf("archive window #%d shard block-applied event %s has a different inclusion master state", w.startSeqno, storage.FormatBlockRef(event.Meta.ID))
+			}
+		}
+		// Resolver workers append concurrently. Sort by causal block height and
+		// then the full block id so the external observer sees one stable order.
+		sort.Slice(shards, func(i, j int) bool {
+			left := shards[i].Meta.ID
+			right := shards[j].Meta.ID
+			if left.SeqNo != right.SeqNo {
+				return left.SeqNo < right.SeqNo
+			}
+			if left.Workchain != right.Workchain {
+				return left.Workchain < right.Workchain
+			}
+			if left.Shard != right.Shard {
+				return left.Shard < right.Shard
+			}
+			if comparison := bytes.Compare(left.RootHash, right.RootHash); comparison != 0 {
+				return comparison < 0
+			}
+			return bytes.Compare(left.FileHash, right.FileHash) < 0
+		})
+
+		batches = append(batches, archiveMasterBlockAppliedEvents{
+			master: masterEvent,
+			shards: shards,
+		})
+	}
+
+	events.state = archiveWindowBlockAppliedDispatching
+	return batches, false, nil
+}
+
+func (w *shardClientArchiveWindow) finishBlockAppliedDispatch() {
+	events := &w.blockApplied
+	events.mu.Lock()
+	events.state = archiveWindowBlockAppliedDispatched
+	events.masters = nil
+	events.shards = nil
+	events.mu.Unlock()
+}
+
+func (r *archiveCatchUpRun) dispatchArchiveWindowBlockApplied(window *shardClientArchiveWindow, current, next *storage.CurrentState) error {
+	batches, dispatched, err := window.beginBlockAppliedDispatch(current, next)
+	if err != nil {
+		return err
+	}
+	if dispatched {
+		return nil
+	}
+
+	for _, batch := range batches {
+		if err = r.archive.masterTransitions.processArchiveBlockApplied(r.ctx, *batch.master); err != nil {
+			return fmt.Errorf("process archive master block-applied event %s: %w", storage.FormatBlockRef(batch.master.Meta.ID), err)
+		}
+		for _, event := range batch.shards {
+			if err = r.archive.masterTransitions.processArchiveBlockApplied(r.ctx, event); err != nil {
+				return fmt.Errorf("process archive shard block-applied event %s: %w", storage.FormatBlockRef(event.Meta.ID), err)
+			}
+		}
+	}
+
+	window.finishBlockAppliedDispatch()
+	return nil
 }
 
 func (l archiveShardBlockLoader) load(_ context.Context, block ton.BlockIDExt) (PreparedBlock, error) {
@@ -157,6 +390,12 @@ func (r *archiveCatchUpRun) applyArchiveMasterBlocks(ctx context.Context, start 
 			window.syncUntilReached = true
 			break
 		}
+		if err := window.blockApplied.configure(r.archive.masterTransitions.archiveBlockAppliedEnabled()); err != nil {
+			return nil, fmt.Errorf("configure archive window #%d block-applied collection: %w", window.startSeqno, err)
+		}
+		observerMeta := &blockAppliedObserverMeta{
+			deferEvent: window.blockApplied.deferMaster,
+		}
 
 		proof := window.masterProofs[downloaded.ID.SeqNo]
 		if proof == nil || !proof.block.Equals(&downloaded.ID) {
@@ -168,7 +407,7 @@ func (r *archiveCatchUpRun) applyArchiveMasterBlocks(ctx context.Context, start 
 		}
 		downloaded.consensus = proof
 
-		next, timing, consensusElapsed, err := r.archive.masterTransitions.applyArchiveMasterBlock(ctx, master, &downloaded, proof, applier)
+		next, timing, consensusElapsed, err := r.archive.masterTransitions.applyArchiveMasterBlock(ctx, master, &downloaded, proof, applier, observerMeta)
 		window.masterApplyElapsed += timing.total
 		window.masterPrepareElapsed += timing.prepare
 		window.masterConsensusElapsed += consensusElapsed + timing.consensus
@@ -269,6 +508,13 @@ func (r *archiveCatchUpRun) applyArchiveShardTargets(
 	master := masterState.Block
 
 	applier := window.stateCells
+	observerMeta := &blockAppliedObserverMeta{
+		InclusionMasterRef:   &masterState.Block,
+		InclusionMasterState: masterState.Cell,
+		deferEvent: func(event BlockAppliedEvent) {
+			window.blockApplied.deferShard(master.SeqNo, event)
+		},
+	}
 
 	var appliedMu sync.Mutex
 	var blockLoaderMu sync.Mutex
@@ -287,7 +533,7 @@ func (r *archiveCatchUpRun) applyArchiveShardTargets(
 			mu:     &blockLoaderMu,
 		}.load,
 		apply: func(ctx context.Context, target ton.BlockIDExt, previous []*storage.BlockState, downloaded PreparedBlock) (*storage.BlockState, error) {
-			return r.archive.shardTransitions.applyArchiveShardBlock(ctx, target, previous, downloaded, applier, masterState)
+			return r.archive.shardTransitions.applyArchiveShardBlock(ctx, target, previous, downloaded, applier, observerMeta)
 		},
 		afterApplyState: func(_ context.Context, state *storage.BlockState, downloaded PreparedBlock, _ time.Duration) error {
 			setShardStateMasterchainRef(state, master)

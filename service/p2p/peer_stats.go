@@ -725,7 +725,7 @@ func (s *overlaySubscription) buildBroadcastTargetsSnapshot() *broadcastTargetsS
 		builtAt:   now,
 		peers:     receivers,
 		broadcast: broadcast,
-		relay:     sampleBroadcastRelayTargets(broadcast, neighbourTargets),
+		relay:     s.budgetRelayPeers(sampleBroadcastRelayTargets(broadcast, neighbourTargets)),
 		plumtree:  plumtree,
 	}
 }

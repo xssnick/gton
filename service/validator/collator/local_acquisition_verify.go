@@ -94,8 +94,8 @@ type ValidationRequest struct {
 	AnnounceTransition TransitionAnnouncer
 }
 
-// LiveSuccessorState is the successor tree verification itself produced, handed
-// back on the runs where producing it again would be pure duplication.
+// LiveSuccessorState is the successor tree this process built or verified over
+// exact resident predecessors, handed back to avoid repeating the same apply.
 //
 // The distinction it encodes is which parent the verifier applied the update
 // to. On the whole masterchain path, and for a shard candidate without full
@@ -107,7 +107,7 @@ type ValidationRequest struct {
 // lineage state.
 //
 // So the type is empty exactly there, and cannot be filled from outside this
-// package: its fields are unexported, its only producer refuses a proof-backed
+// package: its fields are unexported, verification refuses a proof-backed
 // run, and Over hands the root out only to a caller that presents the trees it
 // was built on. Carrying a narrow root back is unrepresentable rather than
 // merely discouraged — the property ValidatedSuccessor was stripped of its

@@ -3,6 +3,7 @@ package collator
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -123,13 +124,41 @@ type FullCollatedQueueScan struct {
 	Target msgpool.ShardIdent
 	LT     uint64
 	Hash   [32]byte
+	// Budget caps how many queue entries the trace may visit per neighbour.
+	// Zero means unbounded, which is what a scan bounded by an imported
+	// message asks for: that prefix is exactly what the block consumed and is
+	// owed in full.
+	//
+	// A drained claim is different. It says "everything below the reference lt
+	// is processed" without a single message to show for it, and proving it
+	// means walking every neighbour's whole prefix. The reference only makes
+	// that claim when its own merger reached the end of the queues while
+	// importing (collator.cpp: inbound_queues_empty_ = nb_out_msgs_->is_eof()),
+	// so the walk is already paid for and the claim is free. Ours comes from
+	// the message pool instead, so it can be made over a deep backlog the pool
+	// simply did not see — measured on the stand as 3.4 MB of collated proof on
+	// a block carrying 2.3 kB of content, which puts the block over the collated
+	// limit before a single message can be admitted. The budget is what keeps
+	// that claim to the case where it is cheap, which is the case where the
+	// reference would have reached EOF too.
+	Budget uint32
+}
+
+// FullCollatedProofs is what the provider returns: the proof roots, and whether
+// the queue scan it was asked for reached the end of every neighbour's prefix
+// within its budget. The collation may only claim the drained bound when it
+// did — the claim and the proof that backs it have to be decided by one fact.
+type FullCollatedProofs struct {
+	Roots []*cell.Cell
+	// ScanExhausted is meaningless unless the request carried a budgeted scan.
+	ScanExhausted bool
 }
 
 // FullCollatedProofProvider supplies Merkle proofs for neighbor blocks and the
 // queue-bearing state views used during collation. The deterministic core
 // validates their shape and block-to-state bindings before serializing them.
 type FullCollatedProofProvider interface {
-	BuildFullCollatedProofs(context.Context, FullCollatedProofRequest) ([]*cell.Cell, error)
+	BuildFullCollatedProofs(context.Context, FullCollatedProofRequest) (FullCollatedProofs, error)
 }
 
 // AccountStorageStats is a content-addressed cache of account storage
@@ -254,6 +283,13 @@ type ShardRequest struct {
 	// disables the budget under the same convention QueueCleanupUntil uses.
 	// Derive it with internalMsgUntil.
 	InternalMsgUntil time.Time
+	// MaxTransactions, when non-zero, caps the transactions this block admits:
+	// once reached the block counts as full for every phase below the hard
+	// class. The producer sets it on the first slot of a leader window, where
+	// the committee's time to notarize is what bounds the block rather than the
+	// byte limits; see firstSlotTransactions. Zero, the deterministic default,
+	// leaves the block bounded by its limits alone.
+	MaxTransactions uint32
 
 	accountPrewarmer AccountPrewarmer
 	assembly         *candidateAssemblyDurations
@@ -440,6 +476,9 @@ type collationRequest struct {
 	// generated-message phases in wall-clock time. Zero leaves the budget
 	// inert; see internalMsgUntil for the derivation.
 	internalMsgUntil time.Time
+	// maxTransactions is ShardRequest.MaxTransactions, carried through. A
+	// masterchain build leaves it zero.
+	maxTransactions  uint32
 	accountPrewarmer AccountPrewarmer
 	assembly         *candidateAssemblyDurations
 	// internalWaveWorkers is ShardRequest's message-wave override, carried
@@ -470,6 +509,7 @@ func shardCollationRequest(req ShardRequest) collationRequest {
 		fullCollatedProofs:  req.FullCollatedProofs,
 		queueCleanupUntil:   req.QueueCleanupUntil,
 		internalMsgUntil:    req.InternalMsgUntil,
+		maxTransactions:     req.MaxTransactions,
 		accountPrewarmer:    req.accountPrewarmer,
 		assembly:            req.assembly,
 		internalWaveWorkers: req.internalWaveWorkers,
@@ -549,6 +589,13 @@ type Stats struct {
 	ExternalStop         ExternalStopReason
 	InternalsImported    uint32
 	InternalsSkipped     uint32
+	// ImmediateMessages counts msg_import_imm: a message this block generated
+	// and delivered inside itself, because its destination is in this shard.
+	// It is neither an external nor an imported internal, so both of those
+	// counters are blind to it — and in a network of one shard it is nearly
+	// every message there is, which is what made a full block read as empty
+	// on the produced-contents panel.
+	ImmediateMessages uint32
 	// InternalsSpeculated counts inbound internal transactions that were
 	// emulated ahead of their admission by the wave executor, and
 	// InternalsDiscarded those among them the block turned out to have no room
@@ -681,6 +728,11 @@ const (
 	// the stop metric alone, instead of reading as ordinary slot-boundary
 	// deadlines the way it did on the test stand.
 	ExternalStopQueueBrake
+	// ExternalStopLoaded is a phase that did not wait for the slot boundary
+	// because the block was already past the soft limit — full, in the
+	// reference's sense: it had work to ship and shipped it. See
+	// buildShardReadyAttempt.
+	ExternalStopLoaded
 )
 
 func (r ExternalStopReason) String() string {
@@ -695,6 +747,8 @@ func (r ExternalStopReason) String() string {
 		return "attempt_limit"
 	case ExternalStopQueueBrake:
 		return "queue_brake"
+	case ExternalStopLoaded:
+		return "loaded"
 	default:
 		return "unknown"
 	}
@@ -784,6 +838,24 @@ type Builder struct {
 	storageCells      atomic.Int64
 	storageProofCells atomic.Int64
 	updateMemoCells   atomic.Int64
+	// neighborProofBytes is what the last build's neighbour proofs serialized
+	// to, per shard the build was for. The next build of that shard charges it
+	// against the collated budget before it has walked anything, because the
+	// walk that produces the real number runs after the block has decided what
+	// to import.
+	//
+	// Keyed, unlike the counters above, because this one is not a capacity: it
+	// is charged against a limit, and one Builder serves every chain the node
+	// collates, interleaved. On the stand that is the masterchain and one
+	// shard, 3,416 chain switches in a day, with neighbour proofs of 3 kB on
+	// the masterchain against a p90 of 339 kB and a maximum of 2.7 MB on the
+	// shard. A single figure would have let a backed-up shard's proof close
+	// the next masterchain block before its first message (collated limits on
+	// this network are the block's byte band, medium at 768 kB), and let every
+	// masterchain build reset the shard's charge to a few kB right before the
+	// backlog build the charge exists for.
+	neighborProofMu    sync.Mutex
+	neighborProofBytes map[msgpool.ShardIdent]int64
 }
 
 // NewBuilder creates a candidate builder backed by a prepared TVM instance.
@@ -833,6 +905,39 @@ func (b *Builder) updateMemoHint() int {
 		hint = updateMemoMaxPresizedCells
 	}
 	return hint
+}
+
+// neighborProofHint is the collated charge a build of shard carries for its
+// neighbour proofs before it has built them. It is deliberately generous: the
+// walk that produces the real number runs at the end, so an under-charge lets
+// the block admit work it then cannot prove within the limit and pays for it
+// with a size-limit rebuild, while an over-charge costs only a little admitted
+// work on one block and corrects itself on the next. A shard this Builder has
+// not finished a build for yet — a fresh process, or the first block after a
+// split or merge — charges nothing.
+func (b *Builder) neighborProofHint(shard msgpool.ShardIdent) int {
+	if b == nil {
+		return 0
+	}
+	b.neighborProofMu.Lock()
+	bytes := int(b.neighborProofBytes[shard])
+	b.neighborProofMu.Unlock()
+	if bytes <= 0 {
+		return 0
+	}
+	return bytes + bytes/4
+}
+
+func (b *Builder) observeNeighborProofBytes(shard msgpool.ShardIdent, size int) {
+	if b == nil || size < 0 {
+		return
+	}
+	b.neighborProofMu.Lock()
+	if b.neighborProofBytes == nil {
+		b.neighborProofBytes = make(map[msgpool.ShardIdent]int64)
+	}
+	b.neighborProofBytes[shard] = int64(size)
+	b.neighborProofMu.Unlock()
 }
 
 // observeBuildSizes records what a finished build measured, for the next one to

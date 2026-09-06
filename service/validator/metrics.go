@@ -139,6 +139,19 @@ type SessionSpecRejectionObservation struct {
 // ValidationObserver uses bounded enums only. Its Prometheus implementation
 // pre-binds every label, so the synchronous validation path does no map lookup
 // or label construction.
+// OwnSlotOutcome is what consensus did with a slot this node led.
+type OwnSlotOutcome uint8
+
+const (
+	// OwnSlotNotarized is our candidate carrying the slot.
+	OwnSlotNotarized OwnSlotOutcome = iota
+	// OwnSlotLost is a slot we published a candidate for that consensus moved
+	// past without notarizing — skipped by the committee, or superseded. The
+	// block was built and delivered and none of it counted.
+	OwnSlotLost
+	ownSlotOutcomeCount
+)
+
 type ValidationObserver interface {
 	collator.ValidationCoreObserver
 	AddValidationInflight(ValidationContext, int)
@@ -190,6 +203,15 @@ type ValidationObserver interface {
 	// session runtime holds.
 	RegisterConsensusSession(ConsensusSessionKey, ConsensusSessionSource)
 	UnregisterConsensusSession(ConsensusSessionKey)
+	// ObserveOwnSlot and the two below report what became of the slots this
+	// node led. Everything else on this interface describes work; these three
+	// describe whether the work counted.
+	ObserveOwnSlot(collator.MetricChain, OwnSlotOutcome)
+	ObserveOwnNotarization(collator.MetricChain, time.Duration)
+	// ObserveOwnSlotNotarization is the same certificate measured from the
+	// committee's anchor for the slot rather than from our handoff.
+	ObserveOwnSlotNotarization(collator.MetricChain, time.Duration)
+	ObserveOwnFinalization(collator.MetricChain, time.Duration)
 }
 
 // NewBlockStatsObserver records validator-engine-compatible block counters at
@@ -208,6 +230,30 @@ func NewBlockStatsObserver(
 type blockStatsValidationObserver struct {
 	stats    *blockstats.Accumulator
 	observer ValidationObserver
+}
+
+func (o *blockStatsValidationObserver) ObserveOwnSlot(chain collator.MetricChain, outcome OwnSlotOutcome) {
+	if o.observer != nil {
+		o.observer.ObserveOwnSlot(chain, outcome)
+	}
+}
+
+func (o *blockStatsValidationObserver) ObserveOwnNotarization(chain collator.MetricChain, d time.Duration) {
+	if o.observer != nil {
+		o.observer.ObserveOwnNotarization(chain, d)
+	}
+}
+
+func (o *blockStatsValidationObserver) ObserveOwnSlotNotarization(chain collator.MetricChain, d time.Duration) {
+	if o.observer != nil {
+		o.observer.ObserveOwnSlotNotarization(chain, d)
+	}
+}
+
+func (o *blockStatsValidationObserver) ObserveOwnFinalization(chain collator.MetricChain, d time.Duration) {
+	if o.observer != nil {
+		o.observer.ObserveOwnFinalization(chain, d)
+	}
 }
 
 func (o *blockStatsValidationObserver) AddValidationInflight(ctx ValidationContext, delta int) {
@@ -360,6 +406,10 @@ type PrometheusValidationMetrics struct {
 	sessionRejections     *prometheus.CounterVec
 	lineageWalkCandidates *prometheus.HistogramVec
 	lineageWalkDuration   *prometheus.HistogramVec
+	ownSlots              *prometheus.CounterVec
+	ownNotarization       *prometheus.HistogramVec
+	ownSlotNotarization   *prometheus.HistogramVec
+	ownFinalization       *prometheus.HistogramVec
 	lineageWalkSteps      *prometheus.CounterVec
 	consensus             *consensusCollector
 }
@@ -464,6 +514,37 @@ func NewPrometheusValidationMetrics(registry MetricsRegistry) (*PrometheusValida
 			Help:    "Wall-clock duration of one leader-window lineage walk, including the anchor state load.",
 			Buckets: durations,
 		}, []string{"chain", "result"}),
+		ownSlots: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: "validator", Name: "own_slots_total",
+			Help: "Slots this node produced a candidate for, by what consensus did with it. " +
+				"\"notarized\" is the committee accepting our block; \"lost\" is a slot whose " +
+				"candidate we published and consensus moved past without notarizing — the block " +
+				"was built, delivered and thrown away, which no other series says out loud.",
+		}, []string{"chain", "outcome"}),
+		ownNotarization: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace, Subsystem: "validator", Name: "own_candidate_notarization_seconds",
+			Help: "Time from publishing our own candidate to holding its notarization certificate: " +
+				"delivery, the committee's validation and the vote round together. This is the " +
+				"budget a leader slot really has, and the quantity the per-slot skip deadline is " +
+				"racing.",
+			Buckets: durations,
+		}, []string{"chain"}),
+		ownSlotNotarization: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace, Subsystem: "validator", Name: "own_slot_notarization_seconds",
+			Help: "Time from the committee's own anchor for our slot — window observation plus one " +
+				"target rate per slot — to our block's notarization certificate. This is the " +
+				"quantity the voters' skip alarm is racing: it fires at first_block_timeout plus " +
+				"one target rate past the same anchor, so a distribution creeping toward that sum " +
+				"is a window about to lose its tail. own_candidate_notarization_seconds measures " +
+				"the same certificate from our own handoff instead, and the difference between " +
+				"the two is what collation and the broadcast slot spent.",
+			Buckets: durations,
+		}, []string{"chain"}),
+		ownFinalization: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace, Subsystem: "validator", Name: "own_candidate_finalization_seconds",
+			Help:    "Time from publishing our own candidate to its finalization certificate.",
+			Buckets: durations,
+		}, []string{"chain"}),
 		lineageWalkSteps: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Subsystem: "validator", Name: "lineage_walk_steps_total",
 			Help: "Lineage walk steps by where the candidate had to come from. Storage and peer " +
@@ -483,6 +564,7 @@ func NewPrometheusValidationMetrics(registry MetricsRegistry) (*PrometheusValida
 		metrics.chainTipWaitBackstops,
 		metrics.sessionRejections,
 		metrics.lineageWalkCandidates, metrics.lineageWalkDuration, metrics.lineageWalkSteps,
+		metrics.ownSlots, metrics.ownNotarization, metrics.ownSlotNotarization, metrics.ownFinalization,
 		metrics.consensus,
 	}); err != nil {
 		return nil, err
@@ -526,6 +608,10 @@ type prometheusValidationObserver struct {
 	lineageWalkCandidates [2]prometheus.Observer
 	lineageWalkDuration   [2][lineageWalkResultCount]prometheus.Observer
 	lineageWalkSteps      [2][lineageStepSourceCount]prometheus.Counter
+	ownSlots              [2][ownSlotOutcomeCount]prometheus.Counter
+	ownNotarization       [2]prometheus.Observer
+	ownSlotNotarization   [2]prometheus.Observer
+	ownFinalization       [2]prometheus.Observer
 	consensus             *consensusCollector
 }
 
@@ -605,8 +691,14 @@ func (m *PrometheusValidationMetrics) Observer() ValidationObserver {
 			}
 		}
 		o.lineageWalkCandidates[chain] = m.lineageWalkCandidates.WithLabelValues(chainLabel)
+		o.ownNotarization[chain] = m.ownNotarization.WithLabelValues(chainLabel)
+		o.ownSlotNotarization[chain] = m.ownSlotNotarization.WithLabelValues(chainLabel)
+		o.ownFinalization[chain] = m.ownFinalization.WithLabelValues(chainLabel)
 		for result, label := range [...]string{"ok", "error"} {
 			o.lineageWalkDuration[chain][result] = m.lineageWalkDuration.WithLabelValues(chainLabel, label)
+		}
+		for outcome, label := range [...]string{"notarized", "lost"} {
+			o.ownSlots[chain][outcome] = m.ownSlots.WithLabelValues(chainLabel, label)
 		}
 		for source, label := range [...]string{"memory", "storage", "peer"} {
 			o.lineageWalkSteps[chain][source] = m.lineageWalkSteps.WithLabelValues(chainLabel, label)
@@ -615,6 +707,31 @@ func (m *PrometheusValidationMetrics) Observer() ValidationObserver {
 	o.consensus = m.consensus
 
 	return o
+}
+
+// ObserveOwnSlot counts what consensus did with a slot this node led.
+func (o *prometheusValidationObserver) ObserveOwnSlot(chain collator.MetricChain, outcome OwnSlotOutcome) {
+	if outcome >= ownSlotOutcomeCount {
+		return
+	}
+	o.ownSlots[boundedValidationChain(chain)][outcome].Inc()
+}
+
+// ObserveOwnNotarization records how long our own candidate took to be
+// notarized, measured from the instant we published it.
+func (o *prometheusValidationObserver) ObserveOwnNotarization(chain collator.MetricChain, d time.Duration) {
+	o.ownNotarization[boundedValidationChain(chain)].Observe(d.Seconds())
+}
+
+// ObserveOwnSlotNotarization records the notarization measured from the
+// committee's own anchor for the slot.
+func (o *prometheusValidationObserver) ObserveOwnSlotNotarization(chain collator.MetricChain, d time.Duration) {
+	o.ownSlotNotarization[boundedValidationChain(chain)].Observe(d.Seconds())
+}
+
+// ObserveOwnFinalization records how long our own candidate took to finalize.
+func (o *prometheusValidationObserver) ObserveOwnFinalization(chain collator.MetricChain, d time.Duration) {
+	o.ownFinalization[boundedValidationChain(chain)].Observe(d.Seconds())
 }
 
 // ObserveLineageWalk records one completed lineage walk.

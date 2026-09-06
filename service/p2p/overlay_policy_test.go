@@ -50,6 +50,7 @@ func TestOverlayPolicyMatrix(t *testing.T) {
 		{"dropsIHRBroadcasts", (*overlaySpec).dropsIHRBroadcasts, false, true, false},
 		{"authorizesBroadcastSenders", (*overlaySpec).authorizesBroadcastSenders, false, true, false},
 		{"relaysFECBroadcasts", (*overlaySpec).relaysFECBroadcasts, true, false, true},
+		{"relaysSimpleBroadcasts", (*overlaySpec).relaysSimpleBroadcasts, true, false, false},
 		{"usesPlumtree", (*overlaySpec).usesPlumtree, true, false, true},
 		{"usesTwoStepDelivery", (*overlaySpec).usesTwoStepDelivery, false, true, true},
 		{"alwaysTwoStepFEC", (*overlaySpec).alwaysTwoStepFEC, false, true, false},

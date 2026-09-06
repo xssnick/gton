@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/xssnick/gton/service/validator/collator"
 	"github.com/xssnick/gton/service/validator/groups"
+	"github.com/xssnick/gton/service/validator/simplex"
+	"github.com/xssnick/tonutils-go/ton"
 )
 
 const speculativeTestWindow = 4
@@ -66,8 +69,37 @@ func TestSpeculationIsPlacedOnTheLastSlotOfTheWindowBeforeOurs(t *testing.T) {
 	}
 }
 
+// The tail of the window before ours bets too: when the committee skips that
+// window's last slots, the window opens on an earlier candidate, and a bet
+// placed only from the last slot never existed. Each tail slot's bet lives for
+// the slots still to come plus the two rates the last slot's bet always had.
+func TestSpeculationIsPlacedFromTheTailOfTheWindowBeforeOurs(t *testing.T) {
+	backend := speculativeTestBackend(1, 4)
+	rate := 400 * time.Millisecond
+	now := time.Unix(1787464321, 0)
+	for _, test := range []struct {
+		slot     uint32
+		deadline time.Duration
+	}{
+		{slot: speculativeTestWindow - 1, deadline: 3 * rate},
+		{slot: speculativeTestWindow - 2, deadline: 4 * rate},
+		{slot: speculativeTestWindow - 3, deadline: 5 * rate},
+	} {
+		bet, ok := backend.nextWindowBet(speculativeTestView(0, rate), test.slot, time.Time{}, now)
+		if !ok {
+			t.Fatalf("no bet was placed from slot %d", test.slot)
+		}
+		if bet.startSlot != speculativeTestWindow {
+			t.Fatalf("slot %d bet on window %d, want %d", test.slot, bet.startSlot, speculativeTestWindow)
+		}
+		if !bet.deadline.Equal(now.Add(test.deadline)) {
+			t.Fatalf("slot %d bet deadline = %v, want %s out", test.slot, bet.deadline, test.deadline)
+		}
+	}
+}
+
 // Every position a bet must NOT be placed from. Each is a case where the
-// candidate just validated either is not the one whose notarization opens a
+// candidate just validated either cannot be the one whose notarization opens a
 // window, or opens a window this node does not lead, or belongs to a session
 // that cannot act on it.
 func TestSpeculationIsRefusedOutsideItsOneMoment(t *testing.T) {
@@ -79,10 +111,13 @@ func TestSpeculationIsRefusedOutsideItsOneMoment(t *testing.T) {
 		slot    uint32
 	}{
 		{
-			name:    "a slot inside the window",
+			// The window before ours is four slots here, and the last three of
+			// them bet (speculationTailSlots); its first slot is the one that
+			// does not.
+			name:    "a slot before the tail of the window",
 			backend: func() *LocalSessionBackend { return speculativeTestBackend(1, 4) },
 			view:    func() *localValidationView { return speculativeTestView(0, rate) },
-			slot:    speculativeTestWindow - 2,
+			slot:    speculativeTestWindow - 4,
 		},
 		{
 			name:    "the next window belongs to another leader",
@@ -250,5 +285,65 @@ func TestSpeculationIsReachedFromCandidateValidation(t *testing.T) {
 	}
 	if callers["ValidateCandidate"] != 1 || len(callers) != 1 {
 		t.Fatalf("speculateNextWindow callers = %v, want exactly ValidateCandidate", callers)
+	}
+}
+
+// Activating a session this node leads from slot zero places the session-start
+// bet with the collator, timed from now and bounded by the first-block timeout
+// plus two target rates; a session led by someone else places none.
+func TestSessionStartBetIsPlacedAtActivationWhenWeLeadWindowZero(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		index uint32
+		bets  int
+	}{
+		{name: "leader of window zero", index: 0, bets: 1},
+		{name: "another validator", index: 1, bets: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			producer := &localBackendTestCollator{id: [32]byte{0x63}, sessionStartWake: make(chan struct{}, 1)}
+			backend := speculativeTestBackend(tc.index, 4)
+			backend.collator = producer
+			backend.self = producer
+			backend.state = SessionState{Params: simplex.DefaultParams()}
+			backend.update = collator.SessionUpdate{SessionID: backend.config.SessionID, TargetRate: 400 * time.Millisecond}
+			start := SessionStart{
+				Genesis:        []ton.BlockIDExt{localBackendTestBlockID(0, math.MinInt64, 7, []byte{7}, nil)},
+				MinMasterchain: localBackendTestBlockID(-1, math.MinInt64, 3, []byte{3}, nil),
+			}
+			before := time.Now()
+			if err := backend.ActivateSession(context.Background(), start); err != nil {
+				t.Fatal(err)
+			}
+			if tc.bets == 1 {
+				select {
+				case <-producer.sessionStartWake:
+				case <-time.After(2 * time.Second):
+					t.Fatal("no session-start bet reached the collator")
+				}
+			} else {
+				time.Sleep(100 * time.Millisecond)
+			}
+			producer.mu.Lock()
+			calls := append([]collator.SpeculativeSessionStartRequest(nil), producer.sessionStartCall...)
+			producer.mu.Unlock()
+			if len(calls) != tc.bets {
+				t.Fatalf("session-start bets = %d, want %d", len(calls), tc.bets)
+			}
+			if tc.bets == 0 {
+				return
+			}
+			bet := calls[0]
+			if bet.SessionID != backend.config.SessionID || bet.Leader != tc.index {
+				t.Fatalf("bet = %+v, want session %x led by %d", bet, backend.config.SessionID[:2], tc.index)
+			}
+			if bet.StartAt.Before(before) {
+				t.Fatalf("bet start %v precedes the activation at %v", bet.StartAt, before)
+			}
+			want := simplex.DefaultParams().FirstBlockTimeout + 2*400*time.Millisecond
+			if got := bet.Deadline.Sub(bet.StartAt); got != want {
+				t.Fatalf("bet lifetime = %v, want the first-block timeout plus two target rates %v", got, want)
+			}
+		})
 	}
 }

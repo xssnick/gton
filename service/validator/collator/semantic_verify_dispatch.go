@@ -15,6 +15,7 @@ type semanticDispatchOrder struct {
 }
 
 type semanticDispatchChange struct {
+	queue        *tlb.AccountDispatchQueue
 	hadOld       bool
 	oldMax       uint64
 	removed      bool
@@ -48,10 +49,7 @@ func (v *semanticQueueValidation) applyDispatchChanges() error {
 		if err != nil {
 			return err
 		}
-		accountQueue, err := loadAccountDispatchQueue(v.dispatch, accountID)
-		if err != nil {
-			return fmt.Errorf("%w: load deferred source %x: %v", ErrInvalidInput, accountID, err)
-		}
+		accountQueue := change.queue
 		var value cell.Slice
 		if err := accountQueue.Messages.LoadValueAndDeleteByUintKeyInto(envelope.internal.CreatedLT, &value); err != nil {
 			return fmt.Errorf("%w: deferred inbound message %x is absent from DispatchQueue", ErrInvalidInput, hash)
@@ -90,8 +88,10 @@ func (v *semanticQueueValidation) applyDispatchChanges() error {
 		accountQueue.Count--
 		change.removed = true
 		change.maxRemoved = max(change.maxRemoved, envelope.internal.CreatedLT)
-		if err = storeAccountDispatchQueue(v.dispatch.AugmentedDictionary, accountID, accountQueue); err != nil {
-			return fmt.Errorf("%w: update deferred source %x: %v", ErrInvalidInput, accountID, err)
+		// Persisting every removal previously checked this before the next
+		// operation could hide a malformed predecessor count by appending again.
+		if (accountQueue.Count == 0) != accountQueue.Messages.IsEmpty() {
+			return fmt.Errorf("%w: deferred source %x count disagrees with queue emptiness", ErrInvalidInput, accountID)
 		}
 		orders[accountID] = append(orders[accountID], semanticDispatchOrder{
 			created: envelope.internal.CreatedLT,
@@ -121,12 +121,7 @@ func (v *semanticQueueValidation) applyDispatchChanges() error {
 		if err != nil {
 			return err
 		}
-		accountQueue, err := loadAccountDispatchQueue(v.dispatch, accountID)
-		if isMissingKey(err) {
-			accountQueue = &tlb.AccountDispatchQueue{Messages: cell.NewDict(64)}
-		} else if err != nil {
-			return fmt.Errorf("%w: load deferred destination %x: %v", ErrInvalidInput, accountID, err)
-		}
+		accountQueue := change.queue
 		enqueued, err := (tlb.EnqueuedMsg{
 			EnqueuedLT: envelope.internal.CreatedLT,
 			Msg:        envelope.root,
@@ -150,7 +145,12 @@ func (v *semanticQueueValidation) applyDispatchChanges() error {
 		accountQueue.Count++
 		change.added = true
 		change.minimumAdded = min(change.minimumAdded, envelope.internal.CreatedLT)
-		if err = storeAccountDispatchQueue(v.dispatch.AugmentedDictionary, accountID, accountQueue); err != nil {
+	}
+
+	// Each account owns one decoded working queue. Rebuild its outer path once,
+	// after all removals and additions, retaining the final root comparison.
+	for _, accountID := range sortedAccountKeys(changes) {
+		if err := storeAccountDispatchQueue(v.dispatch.AugmentedDictionary, accountID, changes[accountID].queue); err != nil {
 			return fmt.Errorf("%w: store deferred source %x: %v", ErrInvalidInput, accountID, err)
 		}
 	}
@@ -191,11 +191,16 @@ func (v *semanticQueueValidation) dispatchChange(
 		if original.Count == 0 || original.Messages.IsEmpty() {
 			return nil, fmt.Errorf("%w: predecessor dispatch account %x is empty", ErrInvalidInput, accountID)
 		}
+		// The decoder owns this dictionary wrapper; its cells are immutable, so
+		// updating it does not mutate the predecessor or another validation.
+		change.queue = original
 		change.hadOld = true
 		change.oldMax, err = dispatchDictionaryBoundary(original.Messages, true)
 		if err != nil {
 			return nil, fmt.Errorf("%w: predecessor dispatch account %x maximum: %v", ErrInvalidInput, accountID, err)
 		}
+	} else {
+		change.queue = &tlb.AccountDispatchQueue{Messages: cell.NewDict(64)}
 	}
 	changes[accountID] = change
 

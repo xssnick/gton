@@ -1,12 +1,33 @@
 package collator
 
 import (
+	"bytes"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"slices"
 	"testing"
 )
+
+func TestPhaseCollationMatchesProductionAndStopsWorkers(t *testing.T) {
+	for _, profile := range []benchProfile{benchProfiles[1], benchProfiles[5]} {
+		t.Run(profile.name, func(t *testing.T) {
+			workload := benchWorkloadFor(t, profile)
+			c := collateThroughAccounts(t, testBuilder(), workload.request, newPhaseTimer())
+			if c.externalWaves.queue != nil || c.generatedWaves.queue != nil {
+				t.Fatal("phase helper retained idle workers")
+			}
+			candidate, err := c.finish()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(candidate.BlockBOC, workload.candidate.BlockBOC) ||
+				!bytes.Equal(candidate.CollatedData, workload.candidate.CollatedData) {
+				t.Fatal("phase helper produced another candidate than BuildShard")
+			}
+		})
+	}
+}
 
 // The phase benchmarks drive the pipeline themselves so that production
 // collation and validation stay free of instrumentation. That leaves the phase
@@ -22,7 +43,9 @@ func TestCollationPhaseOrderMatchesBuildShard(t *testing.T) {
 		"processDispatchQueue",
 		"processInternals",
 		"processExternals",
+		"topUpInternals",
 		"processNewMessages",
+		"buildDeferredCollatedProofs",
 		"updateProcessedInfo",
 		"cleanupClaimedLocalDequeues",
 		"finishAccounts",
@@ -32,7 +55,12 @@ func TestCollationPhaseOrderMatchesBuildShard(t *testing.T) {
 	// pre-external preparation can run early, while finalization runs only after
 	// the ready stream closes. Flatten those production helpers before comparing
 	// them to the benchmark's deliberately linear mirror.
-	got := append(methodCallOrder(t, "build.go", "prepareShardPhases", "b", "c"), "processExternals", "processNewMessages")
+	got := methodCallOrder(t, "build.go", "prepareShardPhases", "b", "c")
+	for _, phase := range methodCallOrder(t, "build.go", "buildShardAttemptPaced", "c") {
+		if phase != "stopWaves" && phase != "finishShard" {
+			got = append(got, phase)
+		}
+	}
 	got = append(got, methodCallOrder(t, "build.go", "finishShard", "c")...)
 	if !slices.Equal(got, want) {
 		t.Fatalf("shard attempt runs %v; collateWithPhases in bench_phases_test.go mirrors %v", got, want)

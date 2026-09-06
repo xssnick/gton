@@ -12,6 +12,7 @@ import (
 
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/keys"
+	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"github.com/xssnick/tonutils-go/tl"
@@ -189,6 +190,88 @@ func signedTestSimpleBroadcast(tb testing.TB, payload tl.Serializable) overlay.B
 	}
 }
 
+func TestPublicSimpleExternalRelayPreservesEnvelope(t *testing.T) {
+	node := newTestNode(t)
+	overlayID := testPeerID("simple-external-relay-overlay")
+	sub := mustGetOrCreateSubscription(t, node, overlaySpec{
+		Name:    "public.simple-external-relay",
+		Kind:    overlayKindPublicShard,
+		ShortID: overlayID.Bytes(),
+	})
+
+	relayTransport := &testSimpleRelayPeer{
+		id:   testPeerID("simple-external-relay-target").Bytes(),
+		sent: make(chan tl.Serializable, 1),
+	}
+	relayPeer := testRebroadcastQueuePeer("simple-external-relay-target")
+	relayPeer.broadcastPeer = relayTransport
+	sub.mx.Lock()
+	sub.peers[relayPeer.id] = relayPeer
+	sub.neighbours = append(sub.neighbours, relayPeer.id)
+	sub.notifyPeersChangedLocked()
+	sub.mx.Unlock()
+
+	inbound := newTestOverlayADNL()
+	inbound.id = testPeerID("simple-external-relay-source").Bytes()
+	wrapper := overlay.CreateExtendedADNL(inbound)
+	attached, err := wrapper.AttachOverlay(sub.broadcastReceiver)
+	if err != nil {
+		t.Fatalf("attach public broadcast receiver: %v", err)
+	}
+	t.Cleanup(attached.Close)
+
+	msg := signedTestSimpleBroadcast(t, tonnodeapi.NewExternalMessageBroadcast{
+		Message: tonnodeapi.ExternalMessage{Data: testExternalMessageBOC(t)},
+	})
+	if err = inbound.customHandler(&adnl.MessageCustom{Data: []tl.Serializable{
+		overlay.Message{Overlay: overlayID.Bytes()},
+		msg,
+	}}); err != nil {
+		t.Fatalf("process public simple external broadcast: %v", err)
+	}
+
+	// Relay dispatch is asynchronous, and a prepared send reaches a legacy
+	// transport as tl.Raw. Compare the encoded envelope after the send arrives.
+	var relayed tl.Serializable
+	select {
+	case relayed = <-relayTransport.sent:
+	case <-time.After(5 * time.Second):
+		t.Fatal("transport relay did not send the broadcast")
+	}
+	originalWire, err := tl.Serialize(msg, true)
+	if err != nil {
+		t.Fatalf("serialize original envelope: %v", err)
+	}
+	relayedWire, err := tl.Serialize(relayed, true)
+	if err != nil {
+		t.Fatalf("serialize relayed envelope: %v", err)
+	}
+	if !bytes.Equal(relayedWire, originalWire) {
+		t.Fatal("transport relay changed the simple broadcast envelope")
+	}
+	if _, ok := relayPeer.rebroadcastQueue.TryPop(); ok {
+		t.Fatal("transport-relayed simple broadcast was also queued for app-level rebroadcast")
+	}
+}
+
+type testSimpleRelayPeer struct {
+	id   []byte
+	sent chan tl.Serializable
+}
+
+func (p *testSimpleRelayPeer) ID() []byte {
+	return p.id
+}
+
+func (p *testSimpleRelayPeer) SendCustomMessage(ctx context.Context, message tl.Serializable) error {
+	select {
+	case p.sent <- message:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func TestUnlistedPublicBroadcastArrivingAsRLDPMessageUsesResolver(t *testing.T) {
 	peerID := testPeerID("unlisted-rldp-peer")
 	node := newTestNode(t)
@@ -356,7 +439,7 @@ func TestReceivedBroadcastMetricsUseCommonDirection(t *testing.T) {
 	}
 }
 
-func TestReceivedSimpleBroadcastKeepsRawPayloadAndExactQueueWeight(t *testing.T) {
+func TestReceivedPublicSimpleBroadcastDoesNotEnterAppQueue(t *testing.T) {
 	node := newTestNode(t)
 	target := testRebroadcastQueuePeer("raw-payload-target")
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -386,16 +469,8 @@ func TestReceivedSimpleBroadcastKeepsRawPayloadAndExactQueueWeight(t *testing.T)
 		t.Fatalf("broadcast disposition = %v, want accept", disposition)
 	}
 
-	queued, ok := target.rebroadcastQueue.TryPop()
-	if !ok {
-		t.Fatal("accepted simple broadcast was not queued")
-	}
-	if queued.payloadSource != nil || !bytes.Equal(queued.payload, payload) {
-		t.Fatal("queued broadcast did not retain the exact incoming payload")
-	}
-	wantBytes := int64(len(payload) + 256)
-	if got := rebroadcastRequestBytes(queued); got != wantBytes {
-		t.Fatalf("queued broadcast weight = %d, want %d", got, wantBytes)
+	if _, ok := target.rebroadcastQueue.TryPop(); ok {
+		t.Fatal("accepted public simple broadcast entered the app-level rebroadcast queue")
 	}
 }
 

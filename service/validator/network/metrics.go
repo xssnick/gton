@@ -20,15 +20,33 @@ const (
 )
 
 // CandidateTransportSendResult is the terminal state of one source-side
-// two-step fan-out attempt.
+// two-step fan-out, measured by coverage rather than by the first error:
+// two-step FEC reconstructs from (n-1)/2 parts, so a fan-out that lost a
+// recipient is not a failed broadcast.
 type CandidateTransportSendResult uint8
 
 const (
 	CandidateTransportSendSuccess CandidateTransportSendResult = iota
-	CandidateTransportSendDeadline
-	CandidateTransportSendCanceled
-	CandidateTransportSendError
+	CandidateTransportSendPartial
+	CandidateTransportSendFailed
 	candidateTransportSendResultCount
+)
+
+// CandidateTransportPeerOutcome is the per-recipient result inside one
+// fan-out. The fault classes separate this node's own state - a connection it
+// has not opened, a dial it deferred, a budget it imposed - from a fault the
+// peer is answerable for.
+type CandidateTransportPeerOutcome uint8
+
+const (
+	CandidateTransportPeerSent CandidateTransportPeerOutcome = iota
+	CandidateTransportPeerOffline
+	CandidateTransportPeerDialDeferred
+	CandidateTransportPeerWriteDeadline
+	CandidateTransportPeerContextDeadline
+	CandidateTransportPeerCanceled
+	CandidateTransportPeerError
+	candidateTransportPeerOutcomeCount
 )
 
 type CandidateTransportSendObservation struct {
@@ -45,6 +63,7 @@ type CandidateTransportObserver interface {
 	ObserveCandidateOutboundQueueAge(collator.MetricChain, time.Duration)
 	AddCandidateOutboundDrop(collator.MetricChain, CandidateOutboundDropReason)
 	ObserveCandidateTransportSend(CandidateTransportSendObservation)
+	AddCandidateTransportPeerSends(collator.MetricChain, CandidateTransportPeerOutcome, int)
 }
 
 // PrometheusCandidateTransportMetrics owns the source-side candidate transport
@@ -91,6 +110,12 @@ func NewPrometheusCandidateTransportMetrics(
 		Help:      "Source-side private two-step candidate fan-out duration by terminal result.",
 		Buckets:   durations,
 	}, []string{"chain", "result"})
+	peerSends := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "validator",
+		Name:      "candidate_transport_peer_sends_total",
+		Help:      "Source-side private two-step candidate parts by per-recipient outcome.",
+	}, []string{"chain", "outcome"})
 
 	metrics := &PrometheusCandidateTransportMetrics{}
 	for chain := collator.MetricChain(0); chain < 2; chain++ {
@@ -109,6 +134,12 @@ func NewPrometheusCandidateTransportMetrics(
 				candidateTransportSendResultLabel(result),
 			)
 		}
+		for outcome := CandidateTransportPeerOutcome(0); outcome < candidateTransportPeerOutcomeCount; outcome++ {
+			metrics.observer.peerSends[chain][outcome] = peerSends.WithLabelValues(
+				chainLabel,
+				candidateTransportPeerOutcomeLabel(outcome),
+			)
+		}
 	}
 
 	if err := registry.RegisterCollector(candidateTransportCollectorSet{
@@ -116,6 +147,7 @@ func NewPrometheusCandidateTransportMetrics(
 		queueAge,
 		drops,
 		sendDuration,
+		peerSends,
 	}); err != nil {
 		return nil, err
 	}
@@ -150,6 +182,7 @@ type prometheusCandidateTransportObserver struct {
 	queueAge     [2]prometheus.Observer
 	drops        [2][candidateOutboundDropReasonCount]prometheus.Counter
 	sendDuration [2][candidateTransportSendResultCount]prometheus.Observer
+	peerSends    [2][candidateTransportPeerOutcomeCount]prometheus.Counter
 }
 
 func (o *prometheusCandidateTransportObserver) AddCandidateOutboundQueue(
@@ -181,11 +214,25 @@ func (o *prometheusCandidateTransportObserver) ObserveCandidateTransportSend(
 ) {
 	result := observation.Result
 	if result >= candidateTransportSendResultCount {
-		result = CandidateTransportSendError
+		result = CandidateTransportSendFailed
 	}
 	o.sendDuration[boundedCandidateTransportChain(observation.Chain)][result].Observe(
 		nonNegativeCandidateTransportSeconds(observation.Duration),
 	)
+}
+
+func (o *prometheusCandidateTransportObserver) AddCandidateTransportPeerSends(
+	chain collator.MetricChain,
+	outcome CandidateTransportPeerOutcome,
+	count int,
+) {
+	if count <= 0 {
+		return
+	}
+	if outcome >= candidateTransportPeerOutcomeCount {
+		outcome = CandidateTransportPeerError
+	}
+	o.peerSends[boundedCandidateTransportChain(chain)][outcome].Add(float64(count))
 }
 
 func boundedCandidateTransportChain(chain collator.MetricChain) collator.MetricChain {
@@ -217,9 +264,26 @@ func candidateTransportSendResultLabel(result CandidateTransportSendResult) stri
 	switch result {
 	case CandidateTransportSendSuccess:
 		return "success"
-	case CandidateTransportSendDeadline:
-		return "deadline"
-	case CandidateTransportSendCanceled:
+	case CandidateTransportSendPartial:
+		return "partial"
+	default:
+		return "failed"
+	}
+}
+
+func candidateTransportPeerOutcomeLabel(outcome CandidateTransportPeerOutcome) string {
+	switch outcome {
+	case CandidateTransportPeerSent:
+		return "sent"
+	case CandidateTransportPeerOffline:
+		return "peer_offline"
+	case CandidateTransportPeerDialDeferred:
+		return "dial_deferred"
+	case CandidateTransportPeerWriteDeadline:
+		return "write_deadline"
+	case CandidateTransportPeerContextDeadline:
+		return "context_deadline"
+	case CandidateTransportPeerCanceled:
 		return "canceled"
 	default:
 		return "error"

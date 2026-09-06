@@ -73,6 +73,9 @@ type Node struct {
 	externalBroadcastPacer    *externalBroadcastPacer
 	allowDuplicateExternals   bool
 	localExternalFanout       int
+	// relayEgress meters the FEC parts this node forwards on public overlays;
+	// nil disables the metering. See relay_budget.go.
+	relayEgress *relayEgressBudget
 
 	onceStop sync.Once
 	stopped  chan struct{}
@@ -306,6 +309,10 @@ func New(opts Options) (*Node, error) {
 		return nil, err
 	}
 	localExternalFanout, err := normalizeLocalExternalFanout(opts.LocalExternalFanout)
+	relayEgressBits := opts.RelayEgressBitsPerSecond
+	if relayEgressBits == 0 {
+		relayEgressBits = defaultRelayEgressBitsPerSecond
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -348,6 +355,7 @@ func New(opts Options) (*Node, error) {
 		externalBroadcastPacer:        externalBroadcastPacer,
 		allowDuplicateExternals:       opts.AllowDuplicateExternals,
 		localExternalFanout:           localExternalFanout,
+		relayEgress:                   newRelayEgressBudget(relayEgressBits, time.Now()),
 		runCtx:                        context.Background(),
 		stopped:                       make(chan struct{}),
 		failed:                        make(chan struct{}),

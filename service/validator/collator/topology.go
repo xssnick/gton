@@ -238,12 +238,34 @@ func validateRegisteredShardTopology(
 	topology *shardTopology,
 	registered registeredShardTopology,
 ) error {
+	var second *ton.BlockIDExt
+	if req.Previous2 != nil {
+		second = &req.Previous2.ID
+	}
+
+	return admitRegisteredShardChain(registered, topology.kind, req.Previous.ID, second)
+}
+
+// admitRegisteredShardChain is the registry-versus-predecessor rule taken from
+// block ids alone, so it can be asked before a build exists. It is the hard
+// protocol rule of the reference validator — ValidateQuery::check_prev_block
+// (cppnode/ton/validator/impl/validate-query.cpp:1197-1213) and
+// check_prev_block_exact (:1224-1233) — and it stays one function on purpose:
+// the per-slot masterchain view pick asks it as an admission test and the build
+// asks it again as a non-retryable ErrInvalidInput, and the two may never
+// drift. A view the pick admitted must be one the build accepts.
+func admitRegisteredShardChain(
+	registered registeredShardTopology,
+	kind topologyKind,
+	first ton.BlockIDExt,
+	second *ton.BlockIDExt,
+) error {
 	switch registered.kind {
 	case topologyLinear:
-		if topology.kind != topologyLinear {
+		if kind != topologyLinear {
 			return fmt.Errorf("%w: split or merge transition is absent from the masterchain shard registry", ErrInvalidInput)
 		}
-		if err := validateRegisteredPredecessor(registered.first.Block, req.Previous.ID); err != nil {
+		if err := validateRegisteredPredecessor(registered.first.Block, first); err != nil {
 			return err
 		}
 		if registered.first.BeforeSplit {
@@ -257,11 +279,11 @@ func validateRegisteredShardTopology(
 			return fmt.Errorf("%w: registered split parent is not marked before split", ErrInvalidInput)
 		}
 
-		switch topology.kind {
+		switch kind {
 		case topologyAfterSplit:
-			return validateExactRegisteredPredecessor(registered.first.Block, req.Previous.ID)
+			return validateExactRegisteredPredecessor(registered.first.Block, first)
 		case topologyLinear:
-			return validateRegisteredPredecessor(registered.first.Block, req.Previous.ID)
+			return validateRegisteredPredecessor(registered.first.Block, first)
 		default:
 			return fmt.Errorf("%w: predecessor topology conflicts with the registered split", ErrInvalidInput)
 		}
@@ -270,14 +292,17 @@ func validateRegisteredShardTopology(
 			return fmt.Errorf("%w: registered merge children are not both marked before merge", ErrInvalidInput)
 		}
 
-		switch topology.kind {
+		switch kind {
 		case topologyAfterMerge:
-			if err := validateExactRegisteredPredecessor(registered.first.Block, req.Previous.ID); err != nil {
+			if second == nil {
+				return fmt.Errorf("%w: merge topology has no second predecessor", ErrInvalidInput)
+			}
+			if err := validateExactRegisteredPredecessor(registered.first.Block, first); err != nil {
 				return err
 			}
-			return validateExactRegisteredPredecessor(registered.second.Block, req.Previous2.ID)
+			return validateExactRegisteredPredecessor(registered.second.Block, *second)
 		case topologyLinear:
-			return validateMergedRegisteredPredecessor(registered, req.Previous.ID)
+			return validateMergedRegisteredPredecessor(registered, first)
 		default:
 			return fmt.Errorf("%w: predecessor topology conflicts with the registered merge", ErrInvalidInput)
 		}
@@ -286,6 +311,46 @@ func validateRegisteredShardTopology(
 	}
 
 	return nil
+}
+
+// predecessorTopologyKind classifies the shard transition from block ids alone.
+// resolveShardTopologyState reaches the same verdict from the predecessor
+// states and stays the binding the build uses; this exists because the view
+// pick runs before a topology is resolved.
+//
+// Its errors are view-independent — no other masterchain view repairs a
+// malformed predecessor set — so the pick returns them unchanged instead of
+// treating a refusal as a reason to step down to an older view. The
+// before-split consistency checks resolveShardTopologyState makes against the
+// predecessor STATES stay there for the same reason.
+func predecessorTopologyKind(target groups.ShardID, previous []PreviousBlock) (topologyKind, error) {
+	switch len(previous) {
+	case 1:
+		if previous[0].ID.Workchain == target.Workchain && previous[0].ID.Shard == target.Shard {
+			return topologyLinear, nil
+		}
+		if previous[0].ID.Workchain != target.Workchain ||
+			!shard.IsDirectChild(previous[0].ID.Shard, target.Shard) {
+			return 0, fmt.Errorf("%w: split predecessor is not the target's direct parent", ErrInvalidInput)
+		}
+		return topologyAfterSplit, nil
+	case 2:
+		left, err := shard.Child(target.Shard, true)
+		if err != nil {
+			return 0, fmt.Errorf("%w: derive merge children: %v", ErrInvalidInput, err)
+		}
+		right, err := shard.Child(target.Shard, false)
+		if err != nil {
+			return 0, fmt.Errorf("%w: derive merge children: %v", ErrInvalidInput, err)
+		}
+		if previous[0].ID.Workchain != target.Workchain || previous[0].ID.Shard != left ||
+			previous[1].ID.Workchain != target.Workchain || previous[1].ID.Shard != right {
+			return 0, fmt.Errorf("%w: merge predecessors are not the target's ordered direct children", ErrInvalidInput)
+		}
+		return topologyAfterMerge, nil
+	default:
+		return 0, fmt.Errorf("%w: shard build needs one or two predecessors", ErrInvalidInput)
+	}
 }
 
 func validateRegisteredPredecessor(listed, previous ton.BlockIDExt) error {

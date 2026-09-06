@@ -117,12 +117,21 @@ type payloadHintArm struct {
 // collated sums are unchanged, which is the shape of the change: only the OLD
 // side of the state update moved, and only in which instance it was rebuilt
 // from. The resident arms are untouched, as is the full-collated golden.
+//
+// PROVENANCE, collated halves of both RESIDENT arms (333752 / 8477744a… and
+// 421273 / 008f13c1… -> the values below; blocks unchanged). The previous-state
+// proof now prunes every leaf the collation did not read instead of keeping a
+// resident one whole (tonutils proof_usage.go, pruneUnloadedLeaves). Over a
+// store-shaped parent those leaves were lazy and already pruned, so the
+// resident arms now produce the store-shaped arms' collated bytes exactly —
+// 332325 / 20034512… and 419846 / 3270aade… — and the collated data no longer
+// depends on how the predecessor happens to be resident.
 func payloadHintArms() []payloadHintArm {
 	return []payloadHintArm{
 		{
 			"resident repeat=1", 1, false,
 			424977, "726bd7970581d9916c1405a1a337b5c877e1fc0ba4adbe1dfe874f6e2ae6ea41",
-			333752, "8477744ac9ab1b0de653d2c6b638fccbf428b0ed936a9b448309b2a9fd06bfa0",
+			332325, "200345126757bce36e99953590b6840c8877b78f2d33cff5903b5ceb3d2f290d",
 		},
 		{
 			"store-shaped repeat=1", 1, true,
@@ -132,7 +141,7 @@ func payloadHintArms() []payloadHintArm {
 		{
 			"resident repeat=3", 3, false,
 			667442, "2a2290a6e36d8145c9da6efa58c6d1736988c1820d92c4ad1c870a7e4e21dc6d",
-			421273, "008f13c15f1300375f5d6671d47863688aee25e76008541fac5c1f967c16309d",
+			419846, "3270aade3dc8066dcfdcc7f039686d0ce12edfdfd95a766211a508d0b5d2a5bb",
 		},
 		{
 			"store-shaped repeat=3", 3, true,

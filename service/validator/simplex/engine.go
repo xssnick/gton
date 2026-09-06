@@ -153,6 +153,10 @@ type Engine struct {
 	// and still need their signature checked; see FlushVerify.
 	pendingVerify []pendingVote
 
+	// ownCandidates times the gap between our own candidate leaving and its
+	// notarize certificate; see own_candidate_timing.go.
+	ownCandidates map[CandidateID]*ownCandidateTiming
+
 	stats Stats
 }
 

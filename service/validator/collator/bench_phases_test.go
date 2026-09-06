@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -23,7 +24,9 @@ var collationPhases = []string{
 	"dispatch-queue",
 	"internals",
 	"externals",
+	"internals-top-up",
 	"new-messages",
+	"build-collated-proofs",
 	"processed-info",
 	"claimed-local-cleanup",
 	"finish-accounts",
@@ -37,8 +40,7 @@ var verificationPhases = []string{
 	"decode",
 	"structural",
 	"semantic-prepare",
-	"semantic-account-precheck",
-	"semantic-queue-prepare",
+	"semantic-precheck",
 	"semantic-accounts",
 	"semantic-queue-verify",
 	"semantic-master",
@@ -73,8 +75,8 @@ func (p *phaseTimer) nest(parent string, children ...string) {
 }
 
 // report emits one metric per phase for benchstat, and logs the same numbers as
-// a table in pipeline order — the alphabetical metric line is not something you
-// can read a breakdown out of.
+// a table in pipeline order. The phase sum excludes timing scaffolding and
+// worker shutdown; the benchmark's ns/op includes both.
 func (p *phaseTimer) report(b *testing.B, phases []string) {
 	for parent, children := range p.nested {
 		for _, child := range children {
@@ -102,7 +104,7 @@ func (p *phaseTimer) report(b *testing.B, phases []string) {
 		fmt.Fprintf(&table, "\n  %-*s %9.3f ms  %5.1f%%", width, phase, float64(each.Microseconds())/1000, share)
 		b.ReportMetric(float64(p.total[phase].Nanoseconds())/float64(b.N), phase+"-ns/op")
 	}
-	fmt.Fprintf(&table, "\n  %-*s %9.3f ms", width, "total", float64((total/time.Duration(b.N)).Microseconds())/1000)
+	fmt.Fprintf(&table, "\n  %-*s %9.3f ms", width, "phase sum", float64((total/time.Duration(b.N)).Microseconds())/1000)
 	b.Log(table.String())
 }
 
@@ -125,6 +127,14 @@ func collateBeforeAccounts(tb testing.TB, builder *Builder, req ShardRequest, ti
 
 	ctx := context.Background()
 	var c *collation
+	// All wave work is finished before this helper returns. Join here so
+	// callers inspecting accounts cannot retain idle pools between iterations,
+	// including when a phase aborts the test.
+	defer func() {
+		if c != nil {
+			c.stopWaves()
+		}
+	}()
 	timer.run(tb, "prepare", func() error {
 		var err error
 		if c, err = builder.prepare(ctx, req); err != nil {
@@ -139,9 +149,11 @@ func collateBeforeAccounts(tb testing.TB, builder *Builder, req ShardRequest, ti
 	timer.run(tb, "dispatch-queue", c.processDispatchQueue)
 	timer.run(tb, "internals", c.processInternals)
 	timer.run(tb, "externals", c.processExternals)
+	timer.run(tb, "internals-top-up", c.topUpInternals)
 	timer.run(tb, "new-messages", func() error {
 		return c.processNewMessages(c.blockFull || c.haveUnprocessedDispatchQueue || req.internalsIncomplete())
 	})
+	timer.run(tb, "build-collated-proofs", c.buildDeferredCollatedProofs)
 	timer.run(tb, "processed-info", c.updateProcessedInfo)
 	timer.run(tb, "claimed-local-cleanup", c.cleanupClaimedLocalDequeues)
 	return c
@@ -179,16 +191,27 @@ func (p *phaseSemantics) VerifyCandidateTransition(ctx context.Context, transiti
 		replay, err = newSemanticReplay(ctx, p.verifier, transition)
 		return err
 	})
-	p.timer.run(p.tb, "semantic-account-precheck", replay.precheckAccountUpdates)
 	var queues *semanticQueueValidation
-	p.timer.run(p.tb, "semantic-queue-prepare", func() error {
-		var err error
-		queues, err = replay.prepareQueueValidation()
-		return err
+	p.timer.run(p.tb, "semantic-precheck", func() error {
+		var precheck sync.WaitGroup
+		var precheckErr error
+		precheck.Add(1)
+		go func() {
+			defer precheck.Done()
+			precheckErr = replay.precheckAccountUpdates()
+		}()
+		var queuesErr error
+		queues, queuesErr = replay.prepareQueueValidation()
+		precheck.Wait()
+		if precheckErr != nil {
+			return precheckErr
+		}
+		return queuesErr
 	})
 	p.timer.run(p.tb, "semantic-accounts", replay.verifyAccounts)
 	p.timer.run(p.tb, "semantic-queue-verify", queues.verifyAfterReplay)
 	p.timer.run(p.tb, "semantic-master", replay.verifyMasterSemantics)
+	transition.prepared.candidate.shape = replay.shape
 
 	return nil
 }

@@ -23,6 +23,8 @@ const (
 	shardDescriptionPrefetchMaxAhead = 20
 )
 
+var errShardDescriptionUnanchored = errors.New("shard block description is not anchored to current shard state")
+
 type nextSyncMode int
 
 const (
@@ -64,14 +66,26 @@ type nextSyncRunner struct {
 	shardDescriptionPrefetchMu        sync.Mutex
 	shardDescriptionPrefetchScheduled map[storage.BlockRootHash]struct{}
 	shardDescriptionPrefetchOrder     []storage.BlockRootHash
-	shardAheadWake                    chan struct{}
-	shardAheadMu                      sync.Mutex
-	shardAheadPending                 map[uint32]shardApplyAheadJob
-	shardAheadRecorders               map[storage.BlockRootHash]shardAheadRecorderEntry
-	shardStageMu                      sync.Mutex
-	shardStageDeferred                map[uint32][]deferredShardCheckpointState
-	blockAppliedMu                    sync.Mutex
-	shardBlockApplied                 map[uint32][]BlockAppliedEvent
+	// shardDescriptionPrefetchHints is the previous pass's hint snapshot and
+	// the scratch the next one is copied into; shardDescriptionPrefetchGen is
+	// the table generation it reflects.
+	shardDescriptionPrefetchHints []shardDescriptionHint
+	shardDescriptionPrefetchGen   shardDescriptionHintGeneration
+	// shardDescriptionPrefetchCurrent memoises the resolver's current blocks
+	// per shard until the current shard set moves.
+	shardDescriptionPrefetchCurrent map[storage.ShardKey]shardCurrentBlocksLookup
+	// shardDescriptionPrefetchRerun makes the next pass re-judge the hints
+	// even when the table is unchanged: the current shard set moved, or the
+	// previous pass ran out of worker slots with admissible hints left.
+	shardDescriptionPrefetchRerun bool
+	shardAheadWake                chan struct{}
+	shardAheadMu                  sync.Mutex
+	shardAheadPending             map[uint32]shardApplyAheadJob
+	shardAheadRecorders           map[storage.BlockRootHash]shardAheadRecorderEntry
+	shardStageMu                  sync.Mutex
+	shardStageDeferred            map[uint32][]deferredShardCheckpointState
+	blockAppliedMu                sync.Mutex
+	shardBlockApplied             map[uint32][]BlockAppliedEvent
 	// committedMasterSeqno is published by the commit stage and read by the
 	// apply-ahead stage to decide whether resolving a master can only touch
 	// shard blocks that master itself includes.
@@ -802,16 +816,45 @@ type shardCurrentBlocksLookup struct {
 	err    error
 }
 
+// updateShardResolverCurrent moves the resolver's current shard set and
+// invalidates what the description prefetch derived from the old one: the
+// memoised per-shard lookups describe it, and hints it rejected as unrelated
+// or too far ahead may be admissible against the new set.
+func (r *nextSyncRunner) updateShardResolverCurrent(shards map[storage.ShardKey]storage.BlockState) {
+	r.shardResolver.updateCurrent(shards)
+
+	r.shardDescriptionPrefetchMu.Lock()
+	clear(r.shardDescriptionPrefetchCurrent)
+	r.shardDescriptionPrefetchRerun = true
+	r.shardDescriptionPrefetchMu.Unlock()
+}
+
 func (r *nextSyncRunner) prefetchShardDescriptionHints() {
 	r.shardDescriptionPrefetchMu.Lock()
 	defer r.shardDescriptionPrefetchMu.Unlock()
 
-	hints := r.service.shardDescriptionHintSnapshot(time.Now())
+	hints, gen, changed := r.service.shardDescriptionHintSnapshot(time.Now(), r.shardDescriptionPrefetchHints, r.shardDescriptionPrefetchGen)
+	r.shardDescriptionPrefetchHints, r.shardDescriptionPrefetchGen = hints, gen
+	if !changed && !r.shardDescriptionPrefetchRerun {
+		// Same hints against the same current state: every verdict of the
+		// previous pass still stands.
+		return
+	}
+	r.shardDescriptionPrefetchRerun = false
+
 	// currentBlocksForBlock takes the shard resolver mutex and clones the
-	// matched block IDs; resolve every shard once per pass instead of per hint.
-	currentByShard := make(map[storage.ShardKey]shardCurrentBlocksLookup)
-	for _, hint := range hints {
-		desc := hint.Description
+	// matched block IDs; resolve every shard once per current state instead
+	// of per hint.
+	currentByShard := r.shardDescriptionPrefetchCurrent
+	if currentByShard == nil {
+		currentByShard = make(map[storage.ShardKey]shardCurrentBlocksLookup)
+		r.shardDescriptionPrefetchCurrent = currentByShard
+	}
+	for i := range hints {
+		// Read the snapshot in place: a per-hint copy handed to the prefetch
+		// goroutine escaped to the heap for every hint on every pass.
+		hint := &hints[i]
+		desc := &hint.Description
 
 		// Already-scheduled hints need no validation; check before touching the
 		// shard resolver.
@@ -828,7 +871,7 @@ func (r *nextSyncRunner) prefetchShardDescriptionHints() {
 		}
 		err := lookup.err
 		if err == nil {
-			err = validateShardDescriptionPrefetchAgainst(&desc, lookup.blocks)
+			err = validateShardDescriptionPrefetchAgainst(desc, lookup.blocks)
 		}
 		if errors.Is(err, storage.ErrNotFound) {
 			continue
@@ -850,7 +893,10 @@ func (r *nextSyncRunner) prefetchShardDescriptionHints() {
 			continue
 		}
 
-		if !r.prefetchShardDescriptionTarget(hint, &desc) {
+		if !r.prefetchShardDescriptionTarget(*hint, desc) {
+			// No free worker: the hint stays unscheduled, so a pass over an
+			// otherwise unchanged table must still retry it.
+			r.shardDescriptionPrefetchRerun = true
 			continue
 		}
 		rememberScheduledShardPrefetch(r.shardDescriptionPrefetchScheduled, &r.shardDescriptionPrefetchOrder, key)
@@ -871,7 +917,7 @@ func validateShardDescriptionPrefetchAgainst(desc *p2p.ShardBlockDescription, cu
 		return errShardDescriptionTooNew
 	}
 	if !shardDescriptionAnchorsCurrent(desc, currentBlocks) {
-		return fmt.Errorf("shard block description is not anchored to current shard state")
+		return errShardDescriptionUnanchored
 	}
 	return nil
 }
@@ -916,21 +962,25 @@ func (r *nextSyncRunner) prefetchShardDescriptionTarget(hint shardDescriptionHin
 		Int("chain_links", len(desc.Chain)).
 		Msg("prefetching shard block from description broadcast")
 
+	// desc points into the caller's snapshot scratch, which the next pass
+	// overwrites; the goroutine keeps only the block ID, whose hash arrays were
+	// cloned at remember time and never change.
+	block, overlay := desc.Block, hint.Overlay
 	go func() {
 		defer r.releaseShardPrefetchSlot()
 
-		err := r.service.node.PrefetchShardBlockFullFromBroadcastHint(r.ctx, desc.Block)
+		err := r.service.node.PrefetchShardBlockFullFromBroadcastHint(r.ctx, block)
 		if err != nil {
 			if r.ctx.Err() == nil {
 				r.service.log.Debug().
 					Err(err).
-					Str("block", storage.FormatBlockRef(desc.Block)).
-					Str("overlay", hint.Overlay).
+					Str("block", storage.FormatBlockRef(block)).
+					Str("overlay", overlay).
 					Msg("shard block description prefetch failed")
 			}
 			return
 		}
-		r.service.prepareShardBlockAheadByID(r.ctx, desc.Block)
+		r.service.prepareShardBlockAheadByID(r.ctx, block)
 	}()
 	return true
 }
@@ -1087,7 +1137,7 @@ func (r *nextSyncRunner) commitOne(item nextAppliedMaster, masterPipelineWait ti
 	}
 
 	r.current = nextCurrent
-	r.shardResolver.updateCurrent(r.current.Shards)
+	r.updateShardResolverCurrent(r.current.Shards)
 	r.committedMasterSeqno.Store(r.current.Masterchain.Block.SeqNo)
 	// The committed head moved, so a master the stage had to skip may now be
 	// admissible without it receiving a new schedule.

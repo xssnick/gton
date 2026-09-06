@@ -237,6 +237,23 @@ func (c *localMasterViewCache) lookup(id ton.BlockIDExt) (*localMasterView, bool
 	return nil, false
 }
 
+// resident returns the newest installed masterchain view, or nil before the
+// first PublishMasterchainView. It is the reference collator's
+// ValidatorManager::get_top_masterchain_state (cppnode collator.cpp:719/729),
+// already decoded once per masterchain block off the collation path.
+//
+// The install above refuses to lower the resident seqno, which bounds churn and
+// keeps the block cache coherent — it proves nothing about ancestry. A view
+// returned here may be stamped into a block only after requireAncestor and
+// requirePredecessorMasterReference have run against it; those checks are not
+// redundant with the install order and must never be dropped as such.
+func (c *localMasterViewCache) resident() *localMasterView {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.view
+}
+
 // store publishes one built view. Unlike the resident install it has no side
 // effects: it never advances the block cache and never warms registered tops,
 // because those are correct exactly once per masterchain block and a cached
@@ -357,6 +374,49 @@ func (a *LocalAcquisition) warmRegisteredTops(view *localMasterView) {
 			}()
 		}
 		wg.Wait()
+
+		// Pinning here, not at the slot. The slot takes the same positions
+		// under the session mutex a build already holds, and a miss there costs
+		// the from-state seed walk. Once a slot may select a masterchain view
+		// newer than the one its session was updated to, those positions move
+		// with every masterchain block instead of once per leader window, so
+		// the pin has to move off the slot with them.
+		//
+		// Failures are dropped exactly as the reads above are: this decides
+		// nothing, and the view pick probes the same positions authoritatively
+		// before it chooses a view.
+		a.mu.RLock()
+		sessions := make([]*localAcquisitionSession, 0, len(a.sessions))
+		for _, managed := range a.sessions {
+			sessions = append(sessions, managed)
+		}
+		a.mu.RUnlock()
+		for _, managed := range sessions {
+			managed.mu.Lock()
+			target := managed.session.Shard
+			branch := managed.branch
+			retired := managed.retired
+			managed.mu.Unlock()
+			if branch == nil || retired || target.IsMasterchain() {
+				continue
+			}
+			expected, err := expectedShardNeighbors(view.context, target)
+			if err != nil {
+				continue
+			}
+			destination := targetShardIdent(target)
+			for _, block := range expected {
+				source := blockShardIdent(block)
+				if block.SeqNo == 0 || source == destination {
+					continue
+				}
+				ref, refErr := localSourceRef(block)
+				if refErr != nil {
+					continue
+				}
+				_ = branch.PinSource(source, ref)
+			}
+		}
 	}()
 }
 

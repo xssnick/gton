@@ -548,10 +548,22 @@ func compressCandidatePayload(seqNo uint32, rootHash []byte, roots []*cell.Cell,
 	if len(rootHash) != 32 {
 		return nil, fmt.Errorf("simplex: candidate root hash is %d bytes", len(rootHash))
 	}
-	combined, err := cell.ToBOCWithOptionsErr(roots, cell.BOCSerializeOptions{
+	// The combined BOC exists only as the LZ4 input: it is compressed, its
+	// length goes into the frame header, and nothing keeps it. At mainnet size
+	// that was ~0.9 MB of fresh garbage per candidate, so it is laid into a
+	// pooled buffer under the same safety argument as the LZ4 scratch below —
+	// the bytes never leave this function.
+	combinedBuf := acquireCombinedScratch()
+	combined, err := cell.AppendBOCWithOptions((*combinedBuf)[:0], roots, cell.BOCSerializeOptions{
 		WithCRC32C:     true,
 		CellsCountHint: cellsHint,
 	})
+	defer func() {
+		if combined != nil {
+			*combinedBuf = combined[:0]
+		}
+		combinedScratch.Put(combinedBuf)
+	}()
 	if err != nil {
 		return nil, fmt.Errorf("simplex: serialize combined candidate BOC: %w", err)
 	}
@@ -601,6 +613,19 @@ func compressCandidatePayload(seqNo uint32, rootHash []byte, roots []*cell.Cell,
 // the payload is copied out of it into the buffer the wire is built in, and a
 // scratch that outlived that copy would be broadcast bytes owned by a pool.
 var compressScratch sync.Pool
+
+// combinedScratch hands out the buffer the combined candidate BOC is laid
+// into. Pooling it is safe for the same reason compressScratch is: the BOC is
+// LZ4 input and a header length, both consumed before this function returns,
+// and the buffer never leaves compressCandidatePayload.
+var combinedScratch sync.Pool
+
+func acquireCombinedScratch() *[]byte {
+	if buf, _ := combinedScratch.Get().(*[]byte); buf != nil {
+		return buf
+	}
+	return new([]byte)
+}
 
 func acquireCompressScratch(size int) *[]byte {
 	if buf, _ := compressScratch.Get().(*[]byte); buf != nil && len(*buf) >= size {

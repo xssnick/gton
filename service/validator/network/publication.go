@@ -26,6 +26,18 @@ func (m *Manager) PublishAcceptedBlock(publication validator.AcceptedBlockPublic
 			Msg("dropping block publication without an active validator session")
 		return
 	}
+	if session.currentSpec().kind == sessionKindObserver {
+		// Observer-only sessions validate and accept finalized blocks so the
+		// standalone collator can follow consensus, but they intentionally have
+		// no validator signer. Public acceptance publication is therefore not a
+		// degraded path for this role; the validators which signed the block own
+		// that publication.
+		m.log.Debug().
+			Hex("session_id", publication.SessionID[:]).
+			Str("publication", "accepted").
+			Msg("skipping block publication for an observer session")
+		return
+	}
 	spec, err := session.contribution(sessionKindValidator)
 	if err != nil || spec.signer == nil {
 		m.log.Warn().

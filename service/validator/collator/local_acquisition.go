@@ -102,6 +102,13 @@ type LocalAcquisition struct {
 	// second Merkle apply again.
 	builtBindMisses atomic.Int64
 
+	// selectedViewFallbacks counts slots whose newest resident masterchain view
+	// was refused by the per-slot pick and which therefore built against an
+	// older one. Sustained non-zero means the node is silently back to building
+	// on the view its session update pinned, which is the behaviour the
+	// per-slot pick exists to replace.
+	selectedViewFallbacks atomic.Int64
+
 	mu       sync.RWMutex
 	sessions map[[32]byte]*localAcquisitionSession
 }
@@ -500,15 +507,23 @@ func (a *LocalAcquisition) AdvanceConsensusBase(
 	}
 
 	if !selectedBaseInstalled(managed, request.Base) {
-		if err = managed.branch.Retain(baseState.queueTip); err != nil {
+		retainTip := baseState.queueTip
+		if retainTip == nil && request.Base != nil && managed.branch.HasCandidate(baseKey) {
+			// A speculative first-slot build installs its foreign base only in
+			// the private branch. The resolver-owned selected state deliberately
+			// carries no queue lineage, but its block root still names that exact
+			// branch node. Retain it so opening the window cannot invalidate the
+			// parked successor which is already descending from the selected base.
+			retainTip = &baseKey
+		}
+		if err = managed.branch.Retain(retainTip); err != nil {
 			return fmt.Errorf("retain selected consensus base: %w", err)
 		}
-		clear(managed.candidates)
-		clear(managed.blocks)
 		if request.Base != nil {
 			managed.candidates[request.Base.candidate] = baseState
 			managed.blocks[baseKey] = baseState
 		}
+		managed.pruneCandidates(request.Update.CurrentBase)
 	}
 
 	managed.update = cloneSessionUpdate(request.Update)
@@ -681,17 +696,8 @@ func validateAcquisitionGroup(
 	if matched == nil {
 		return fmt.Errorf("%w: session is absent from the exact validator group snapshot", ErrAcquisitionNotReady)
 	}
-	if matched.Shard != session.Shard || matched.CatchainSeqno != session.CatchainSeqno ||
-		!equalBlockIDs(matched.Genesis, session.Genesis) ||
-		!matched.MinMasterchain.Equals(&session.MinMasterchain) ||
-		len(matched.Validators) != len(session.Validators) {
-		return fmt.Errorf("%w: session differs from the validator group snapshot", ErrInvalidInput)
-	}
-	for i := range session.Validators {
-		left, right := session.Validators[i], matched.Validators[i]
-		if left.PublicKey != right.PublicKey || left.ADNLID != groups.ValidatorADNL(right) || left.Weight != right.Weight {
-			return fmt.Errorf("%w: session validator %d differs from the group roster", ErrInvalidInput, i)
-		}
+	if err := requireSameSessionIdentity(session, matched); err != nil {
+		return err
 	}
 	if active {
 		if !equalShardDescriptions(update.Registered, matched.Registered) {
@@ -703,6 +709,35 @@ func validateAcquisitionGroup(
 		if matched.FinalizedBlock != nil && (!update.HasFinalizedBlock ||
 			!matched.FinalizedBlock.Equals(&update.FinalizedBlock)) {
 			return fmt.Errorf("%w: finalized block differs from the group snapshot", ErrInvalidInput)
+		}
+	}
+
+	return nil
+}
+
+// requireSameSessionIdentity compares the fields a running session may never
+// see change under it: shard, catchain seqno, genesis, minimum masterchain
+// block and every roster entry. They are exactly the fields the candidate
+// header is stamped from out of the snapshot the build binds to, so a snapshot
+// that fails this may not be adopted by a producer that has already emitted
+// blocks bound to another one.
+//
+// Split out of validateAcquisitionGroup so the per-slot masterchain view pick
+// can ask the identity question about a snapshot NEWER than the one the session
+// update pinned — where the rest of that function, which compares the frozen
+// update's registered and finalized view against the snapshot, is by
+// construction the wrong question.
+func requireSameSessionIdentity(session ActivatedSession, matched *groups.Session) error {
+	if matched.Shard != session.Shard || matched.CatchainSeqno != session.CatchainSeqno ||
+		!equalBlockIDs(matched.Genesis, session.Genesis) ||
+		!matched.MinMasterchain.Equals(&session.MinMasterchain) ||
+		len(matched.Validators) != len(session.Validators) {
+		return fmt.Errorf("%w: session differs from the validator group snapshot", ErrInvalidInput)
+	}
+	for i := range session.Validators {
+		left, right := session.Validators[i], matched.Validators[i]
+		if left.PublicKey != right.PublicKey || left.ADNLID != groups.ValidatorADNL(right) || left.Weight != right.Weight {
+			return fmt.Errorf("%w: session validator %d differs from the group roster", ErrInvalidInput, i)
 		}
 	}
 
@@ -735,6 +770,15 @@ func (a *LocalAcquisition) requestHeader(request BuildRequest) (HeaderParams, er
 	// from producing a block the reference rejects as non-monotonic.
 	if spec := request.speculative; spec != nil {
 		return headerParamsAt(spec.at)
+	}
+	// The session-start bet is built before any window exists: its instant is
+	// the activation, and clampLocalHeaderTime raises it past the genesis and
+	// the masterchain just as it does for a speculative build. On the stand
+	// every such bet failed here for a night — the header wanted a window the
+	// session had not observed yet — and window zero kept being collated only
+	// once the engine had started.
+	if !request.sessionStartAt.IsZero() {
+		return headerParamsAt(request.sessionStartAt)
 	}
 	if !request.Update.HasCurrentWindow || request.Slot < request.Update.CurrentWindowStart {
 		return HeaderParams{}, fmt.Errorf("%w: build slot is outside the current window", ErrInvalidInput)
@@ -816,12 +860,32 @@ func (s *localAcquisitionSession) pruneCandidates(base simplex.ParentID) {
 		return
 	}
 
-	clear(s.candidates)
-	clear(s.blocks)
-	s.candidates[base.ID] = state
-	if key, err := blockRootKey(state.block.ID); err == nil {
-		s.blocks[key] = state
+	key, err := blockRootKey(state.block.ID)
+	if err != nil {
+		clear(s.candidates)
+		clear(s.blocks)
+
+		return
 	}
+	for id, candidate := range s.candidates {
+		if id == base.ID {
+			continue
+		}
+		if sameBlockID(candidate.block.ID, state.block.ID) || candidate.queueTip == nil ||
+			!s.branch.HasCandidate(*candidate.queueTip) {
+			delete(s.candidates, id)
+		}
+	}
+	for root, candidate := range s.blocks {
+		if root == key {
+			continue
+		}
+		if candidate.queueTip == nil || !s.branch.HasCandidate(*candidate.queueTip) {
+			delete(s.blocks, root)
+		}
+	}
+	s.candidates[base.ID] = state
+	s.blocks[key] = state
 }
 
 func targetShardIdent(shard groups.ShardID) msgpool.ShardIdent {

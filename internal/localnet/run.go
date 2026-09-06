@@ -1,9 +1,12 @@
 package localnet
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,9 +16,12 @@ import (
 	"time"
 )
 
-const runManifestVersion = 2
+const runManifestVersion = 3
 
 func Run(ctx context.Context, cfg Config, scenario string) (Summary, error) {
+	if err := cfg.Validate(); err != nil {
+		return Summary{}, err
+	}
 	if err := cfg.ValidateRun(); err != nil {
 		return Summary{}, err
 	}
@@ -28,10 +34,16 @@ func Run(ctx context.Context, cfg Config, scenario string) (Summary, error) {
 	if observesTopology(scenario) && cfg.Load.TopologyTimeout.Duration <= 0 {
 		return Summary{}, errors.New("topology scenario requires a positive load.topology_timeout")
 	}
+	if observesTopology(scenario) && len(cfg.Conditions.CandidateFlows) == 0 {
+		return Summary{}, errors.New("topology scenario requires at least one conditions.candidate_flows entry")
+	}
 	if _, err := Preflight(ctx, cfg); err != nil {
 		return Summary{}, err
 	}
+	return executeRun(ctx, cfg, scenario)
+}
 
+func executeRun(ctx context.Context, cfg Config, scenario string) (Summary, error) {
 	if err := os.MkdirAll(cfg.RunRoot, 0o755); err != nil {
 		return Summary{}, fmt.Errorf("create run root: %w", err)
 	}
@@ -53,30 +65,78 @@ func Run(ctx context.Context, cfg Config, scenario string) (Summary, error) {
 		return Summary{}, fmt.Errorf("create run directory: %w", err)
 	}
 
-	baseline, err := captureBaseline(ctx, cfg)
+	manifest := RunManifest{
+		Version: runManifestVersion, Scenario: scenario, StartedAt: started, Config: cfg,
+		Load: newLoadResult(cfg.Load),
+	}
+	setupComplete := true
+	if cfg.Load.SetupBeforeRun {
+		manifest.Phases.Setup, err = beginRunPhase(cfg)
+		if err != nil {
+			return Summary{}, err
+		}
+		setupComplete = executeLoadSetup(ctx, cfg.Load, runDirectory, &manifest.Load)
+		if err = finishRunPhase(cfg, manifest.Phases.Setup); err != nil {
+			return Summary{}, err
+		}
+	}
+
+	manifest.Baseline, err = captureBaseline(ctx, cfg)
 	if err != nil {
 		return Summary{}, err
 	}
-	manifest := RunManifest{Version: runManifestVersion, Scenario: scenario, StartedAt: started, Config: cfg, Baseline: baseline}
 	if err = writeJSON(filepath.Join(runDirectory, "manifest.json"), manifest); err != nil {
 		return Summary{}, err
 	}
-	if err = writeJSON(filepath.Join(runDirectory, "baseline.json"), baseline); err != nil {
+	if err = writeJSON(filepath.Join(runDirectory, "baseline.json"), manifest.Baseline); err != nil {
 		return Summary{}, err
 	}
+	if !setupComplete {
+		summary, reportErr := finalizeRun(runDirectory, &manifest)
+		if reportErr != nil {
+			return summary, reportErr
+		}
+		return summary, fmt.Errorf("scenario verdict: %s", summary.Verdict)
+	}
 
-	manifest.Load = executeLoad(ctx, cfg.Load, runDirectory)
+	manifest.Phases.Load = beginRunPhaseFromBaseline(manifest.Baseline)
+	executeLoadRun(ctx, cfg.Load, runDirectory, &manifest.Load)
+	if err = finishRunPhase(cfg, manifest.Phases.Load); err != nil {
+		return Summary{}, err
+	}
 	if cancelErr := ctx.Err(); cancelErr != nil {
 		return finalizeCanceledRun(runDirectory, &manifest, cancelErr)
 	}
-	if !observesTopology(scenario) && !loadStopsScenario(scenario, manifest.Load) && cfg.Load.Settle.Duration > 0 {
+	if cfg.Load.Settle.Duration > 0 && loadHasStructuredResult(manifest.Load) {
+		manifest.Phases.Recovery, err = beginRunPhase(cfg)
+		if err != nil {
+			return Summary{}, err
+		}
 		if err = waitContext(ctx, cfg.Load.Settle.Duration); err != nil {
 			return finalizeCanceledRun(runDirectory, &manifest, err)
 		}
+		if err = finishRunPhase(cfg, manifest.Phases.Recovery); err != nil {
+			return Summary{}, err
+		}
+	}
+	if loadStopsScenario(manifest.Load) || !observesTopology(scenario) {
+		summary, reportErr := finalizeRun(runDirectory, &manifest)
+		if reportErr != nil {
+			return summary, reportErr
+		}
+		if summary.Verdict != "passed" {
+			return summary, fmt.Errorf("scenario verdict: %s", summary.Verdict)
+		}
+		return summary, nil
+	}
+
+	manifest.Phases.Topology, err = beginRunPhase(cfg)
+	if err != nil {
+		return Summary{}, err
 	}
 	topologyDeadline := time.Now().Add(cfg.Load.TopologyTimeout.Duration)
-	cursors := make(map[string]LogPosition, len(baseline.Nodes))
-	for _, node := range baseline.Nodes {
+	cursors := make(map[string]LogPosition, len(manifest.Baseline.Nodes))
+	for _, node := range manifest.Baseline.Nodes {
 		cursors[node.Name] = node.Log
 	}
 	observed := make([]Event, 0, 1024)
@@ -98,13 +158,15 @@ func Run(ctx context.Context, cfg Config, scenario string) (Summary, error) {
 				observed = append(observed, nodeEvents...)
 				cursors[node.Name] = manifest.EndPositions[node.Name]
 			}
-			complete = evaluateTopology(observed, cfg.Nodes).Complete
+			complete = evaluateTopology(observed, cfg).Complete
 		}
 		if cancelErr := ctx.Err(); cancelErr != nil {
 			return finalizeCanceledRun(runDirectory, &manifest, cancelErr)
 		}
-		if loadStopsScenario(scenario, manifest.Load) || !observesTopology(scenario) ||
-			complete || !time.Now().Before(topologyDeadline) {
+		if complete || !time.Now().Before(topologyDeadline) {
+			if err = finishRunPhase(cfg, manifest.Phases.Topology); err != nil {
+				return Summary{}, err
+			}
 			summary, reportErr := finalizeRun(runDirectory, &manifest)
 			if reportErr != nil {
 				return summary, reportErr
@@ -154,6 +216,7 @@ func partialRunSummary(runDirectory string, manifest RunManifest) Summary {
 		FinishedAt:         manifest.FinishedAt,
 		LoadDeliveryStatus: manifest.Load.Outcome,
 		Load:               manifest.Load,
+		Phases:             manifest.Phases,
 	}
 }
 
@@ -191,6 +254,33 @@ func captureLogPositions(cfg Config) (map[string]LogPosition, error) {
 	return positions, nil
 }
 
+func beginRunPhase(cfg Config) (*RunPhase, error) {
+	started := time.Now().UTC()
+	positions, err := captureLogPositions(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &RunPhase{StartedAt: started, StartPositions: positions}, nil
+}
+
+func beginRunPhaseFromBaseline(baseline Baseline) *RunPhase {
+	positions := make(map[string]LogPosition, len(baseline.Nodes))
+	for _, node := range baseline.Nodes {
+		positions[node.Name] = node.Log
+	}
+	return &RunPhase{StartedAt: time.Now().UTC(), StartPositions: positions}
+}
+
+func finishRunPhase(cfg Config, phase *RunPhase) error {
+	positions, err := captureLogPositions(cfg)
+	if err != nil {
+		return err
+	}
+	phase.EndPositions = positions
+	phase.FinishedAt = time.Now().UTC()
+	return nil
+}
+
 func statusMasterchainSeqno(status Status, name string) (uint32, error) {
 	for _, node := range status.Nodes {
 		if node.Name == name {
@@ -200,7 +290,7 @@ func statusMasterchainSeqno(status Status, name string) (uint32, error) {
 	return 0, fmt.Errorf("status has no node %q", name)
 }
 
-func executeLoad(ctx context.Context, load LoadConfig, runDirectory string) LoadResult {
+func newLoadResult(load LoadConfig) LoadResult {
 	result := LoadResult{
 		StartedAt:         time.Now().UTC(),
 		ExitCode:          0,
@@ -217,54 +307,97 @@ func executeLoad(ctx context.Context, load LoadConfig, runDirectory string) Load
 	for i := range count {
 		result.Senders[i] = SenderResult{
 			SenderIndex: first + uint64(i),
-			Setup:       ProcessResult{ExitCode: 0, Outcome: loadOutcomeComplete},
+			Setup:       ProcessResult{ExitCode: 0},
 		}
 	}
-	if load.SetupBeforeRun {
-		for i := range result.Senders {
-			result.Senders[i].Setup = executeLoadProcess(ctx, load, runDirectory, "setup", result.Senders[i].SenderIndex, load.SetupExtraArgs)
-			sender := result.Senders[i]
-			if sender.Setup.ExitCode != 0 {
-				result.ExitCode = 1
-				result.Outcome = loadOutcomeFailed
-				result.HardFailure = true
-				result.Error = "one or more sender setup processes failed"
-				result.FinishedAt = time.Now().UTC()
-				result.Duration = result.FinishedAt.Sub(result.StartedAt)
-				return result
-			}
+	return result
+}
+
+func executeLoadSetup(ctx context.Context, load LoadConfig, runDirectory string, result *LoadResult) bool {
+	for i := range result.Senders {
+		result.Senders[i].Setup = executeLoadProcess(ctx, load, runDirectory, "setup", result.Senders[i].SenderIndex, load.SetupExtraArgs)
+		if !result.Senders[i].Setup.EvidenceValid || result.Senders[i].Setup.Outcome != loadOutcomeComplete {
+			result.ExitCode = 1
+			result.Outcome = loadOutcomeFailed
+			result.HardFailure = true
+			result.Error = "one or more sender setup processes failed"
+			finishLoadResult(result)
+			return false
 		}
 	}
+	return true
+}
+
+func executeLoadRun(ctx context.Context, load LoadConfig, runDirectory string, result *LoadResult) {
 	executeSenderPhase(ctx, load, runDirectory, result.Senders, "run", load.ExtraArgs)
+	result.OutcomeCounts = make(map[string]int)
+	result.FailureStages = make(map[string]int)
 
 	for _, sender := range result.Senders {
 		result.Submitted += sender.Load.Submitted
 		result.Accepted += sender.Load.Accepted
 		result.FailedBatches += sender.Load.FailedBatches
+		result.OutcomeCounts[sender.Load.Outcome]++
+		if sender.Load.FailureStage != "" {
+			result.FailureStages[sender.Load.FailureStage]++
+		}
 
+		if !sender.Load.EvidenceValid {
+			result.ExitCode = 1
+			result.HardFailure = true
+			result.FailureStages["result_protocol"]++
+			continue
+		}
 		switch sender.Load.Outcome {
 		case loadOutcomeDeliveryIncomplete:
 			result.ExitCode = 1
+			result.HardFailure = true
 			result.IncompleteSenders = append(result.IncompleteSenders, sender.SenderIndex)
-		case loadOutcomeFailed:
+		case loadOutcomeExecutionFailed, loadOutcomeSubmissionFailed, loadOutcomeWorkloadInvalid, loadOutcomeFailed:
 			result.ExitCode = 1
 			result.HardFailure = true
 		}
 	}
-	switch {
-	case result.HardFailure:
-		result.Outcome = loadOutcomeFailed
-		result.Error = "one or more load senders failed"
-	case len(result.IncompleteSenders) > 0:
-		result.Outcome = loadOutcomeDeliveryIncomplete
-		result.Advisory = true
-		result.Error = "one or more load senders did not confirm all submitted transfers"
-	default:
-		result.Outcome = loadOutcomeComplete
+	failureOutcomes := make([]string, 0, 5)
+	for _, outcome := range []string{
+		loadOutcomeDeliveryIncomplete,
+		loadOutcomeExecutionFailed,
+		loadOutcomeSubmissionFailed,
+		loadOutcomeWorkloadInvalid,
+		loadOutcomeFailed,
+	} {
+		if result.OutcomeCounts[outcome] > 0 {
+			failureOutcomes = append(failureOutcomes, outcome)
+		}
 	}
+	switch {
+	case result.FailureStages["result_protocol"] > 0 || len(failureOutcomes) > 1:
+		result.Outcome = loadOutcomeFailed
+		result.Error = "load senders returned different failures or invalid result evidence"
+	case len(failureOutcomes) == 1:
+		result.Outcome = failureOutcomes[0]
+		result.Error = "one or more load senders returned " + failureOutcomes[0]
+	case !result.HardFailure:
+		result.Outcome = loadOutcomeComplete
+	default:
+		result.Outcome = loadOutcomeFailed
+		result.Error = "one or more load senders returned invalid result evidence"
+	}
+	finishLoadResult(result)
+}
+
+func finishLoadResult(result *LoadResult) {
 	result.FinishedAt = time.Now().UTC()
 	result.Duration = result.FinishedAt.Sub(result.StartedAt)
-	return result
+}
+
+func loadHasStructuredResult(load LoadResult) bool {
+	for _, sender := range load.Senders {
+		if sender.Load.EvidenceValid {
+			return true
+		}
+	}
+	return false
 }
 
 func executeSenderPhase(ctx context.Context, load LoadConfig, runDirectory string, senders []SenderResult, phase string, extra []string) {
@@ -284,21 +417,25 @@ func executeSenderPhase(ctx context.Context, load LoadConfig, runDirectory strin
 	group.Wait()
 }
 
-func executeLoadProcess(ctx context.Context, load LoadConfig, runDirectory, phase string, sender uint64, extra []string) ProcessResult {
-	result := ProcessResult{StartedAt: time.Now().UTC(), ExitCode: -1, Outcome: loadOutcomeFailed}
+func executeLoadProcess(ctx context.Context, load LoadConfig, runDirectory, phase string, sender uint64, extra []string) (result ProcessResult) {
+	result = ProcessResult{StartedAt: time.Now().UTC(), ExitCode: -1}
+	defer func() {
+		result.FinishedAt = time.Now().UTC()
+		result.Duration = result.FinishedAt.Sub(result.StartedAt)
+	}()
 	prefix := fmt.Sprintf("load-%d-%s", sender, phase)
-	stdout, err := os.Create(filepath.Join(runDirectory, prefix+".stdout.log"))
+	stdoutPath := filepath.Join(runDirectory, prefix+".stdout.log")
+	stdout, err := os.Create(stdoutPath)
 	if err != nil {
-		result.Error = fmt.Sprintf("create stdout: %v", err)
+		result.ProcessError = fmt.Sprintf("create stdout: %v", err)
 		return result
 	}
-	defer stdout.Close()
 	stderr, err := os.Create(filepath.Join(runDirectory, prefix+".stderr.log"))
 	if err != nil {
-		result.Error = fmt.Sprintf("create stderr: %v", err)
+		_ = stdout.Close()
+		result.ProcessError = fmt.Sprintf("create stderr: %v", err)
 		return result
 	}
-	defer stderr.Close()
 
 	args := []string{
 		phase,
@@ -330,7 +467,7 @@ func executeLoadProcess(ctx context.Context, load LoadConfig, runDirectory, phas
 	command.Stdout = stdout
 	command.Stderr = stderr
 	if err = command.Run(); err != nil {
-		result.Error = err.Error()
+		result.ProcessError = err.Error()
 		var exitError *exec.ExitError
 		if errors.As(err, &exitError) {
 			result.ExitCode = exitError.ExitCode()
@@ -338,81 +475,135 @@ func executeLoadProcess(ctx context.Context, load LoadConfig, runDirectory, phas
 	} else {
 		result.ExitCode = 0
 	}
-	if phase == "setup" {
-		if result.ExitCode == 0 {
-			result.Outcome = loadOutcomeComplete
-		}
-	} else if evidenceErr := classifyLoadProcess(stderr.Name(), &result); evidenceErr != nil {
-		result.Outcome = loadOutcomeFailed
-		if result.Error == "" {
-			result.Error = evidenceErr.Error()
+	closeErr := errors.Join(stdout.Close(), stderr.Close())
+	if closeErr != nil {
+		if result.ProcessError == "" {
+			result.ProcessError = closeErr.Error()
 		} else {
-			result.Error = errors.Join(errors.New(result.Error), evidenceErr).Error()
+			result.ProcessError = errors.Join(errors.New(result.ProcessError), closeErr).Error()
 		}
 	}
-	result.FinishedAt = time.Now().UTC()
-	result.Duration = result.FinishedAt.Sub(result.StartedAt)
+	evidence, evidenceErr := classifyLoadProcess(stdoutPath, phase, sender, result.ExitCode)
+	if closeErr != nil {
+		evidenceErr = errors.Join(evidenceErr, fmt.Errorf("close load result files: %w", closeErr))
+	}
+	result.LoadEvidence = evidence
+	result.EvidenceValid = evidenceErr == nil
+	if evidenceErr != nil {
+		result.ProtocolError = evidenceErr.Error()
+	}
 	return result
 }
 
-func classifyLoadProcess(stderrPath string, result *ProcessResult) error {
-	data, err := os.ReadFile(stderrPath)
+func classifyLoadProcess(stdoutPath, phase string, sender uint64, exitCode int) (LoadEvidence, error) {
+	data, err := os.ReadFile(stdoutPath)
 	if err != nil {
-		return fmt.Errorf("read load diagnostics: %w", err)
+		return LoadEvidence{}, fmt.Errorf("read load result: %w", err)
 	}
-	plain := ansiPattern.ReplaceAllString(string(data), "")
-	result.Submitted = loadMetric(plain, "submitted")
-	result.Accepted = loadMetric(plain, "accepted")
-	result.FailedBatches = loadMetric(plain, "failed_batches")
-
-	if result.ExitCode == 0 {
-		if result.FailedBatches > 0 {
-			return errors.New("load reported failed batches with a successful exit")
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(data, &fields); err != nil {
+		return LoadEvidence{}, fmt.Errorf("decode load result fields: %w", err)
+	}
+	for _, name := range requiredLoadEvidenceFields {
+		value, exists := fields[name]
+		if !exists {
+			return LoadEvidence{}, fmt.Errorf("load result has no %q field", name)
 		}
-		result.Outcome = loadOutcomeComplete
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return LoadEvidence{}, fmt.Errorf("load result field %q is null", name)
+		}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var evidence LoadEvidence
+	if err = decoder.Decode(&evidence); err != nil {
+		return LoadEvidence{}, fmt.Errorf("decode load result: %w", err)
+	}
+	var trailing json.RawMessage
+	if err = decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return evidence, fmt.Errorf("decode load result trailing data: %w", err)
+	}
+	if err = validateLoadEvidence(evidence, phase, sender, exitCode); err != nil {
+		return evidence, err
+	}
+	return evidence, nil
+}
+
+var requiredLoadEvidenceFields = []string{
+	"schema_version",
+	"command",
+	"outcome",
+	"sender_index",
+	"submitted",
+	"accepted",
+	"failed_batches",
+	"external_batches",
+	"rpc_accepted_batches",
+	"canary_submitted",
+	"canary_accepted",
+	"undelivered",
+	"submitted_tps",
+}
+
+func validateLoadEvidence(evidence LoadEvidence, phase string, sender uint64, exitCode int) error {
+	if evidence.SchemaVersion != 1 {
+		return fmt.Errorf("unsupported load result schema version %d", evidence.SchemaVersion)
+	}
+	if evidence.Command != phase {
+		return fmt.Errorf("load result command %q does not match %q", evidence.Command, phase)
+	}
+	if evidence.SenderIndex != sender {
+		return fmt.Errorf("load result sender %d does not match %d", evidence.SenderIndex, sender)
+	}
+	if evidence.Submitted < 0 || evidence.Accepted < 0 || evidence.FailedBatches < 0 ||
+		evidence.ExternalBatches < 0 || evidence.RPCAcceptedBatches < 0 ||
+		evidence.CanarySubmitted < 0 || evidence.CanaryAccepted < 0 || evidence.Undelivered < 0 ||
+		evidence.SubmittedTPS < 0 {
+		return errors.New("load result counters cannot be negative")
+	}
+	if evidence.Accepted > evidence.Submitted || evidence.CanaryAccepted > evidence.CanarySubmitted ||
+		evidence.RPCAcceptedBatches > evidence.ExternalBatches {
+		return errors.New("load result accepted counters exceed submitted counters")
+	}
+	if evidence.Undelivered != evidence.Submitted-evidence.Accepted {
+		return errors.New("load result undelivered count does not match submitted minus accepted")
+	}
+	if !validLoadOutcome(evidence.Outcome) {
+		return fmt.Errorf("unknown load result outcome %q", evidence.Outcome)
+	}
+	if evidence.Outcome == loadOutcomeComplete {
+		if exitCode != 0 || evidence.Error != "" || evidence.FailureStage != "" {
+			return errors.New("complete load result conflicts with process failure")
+		}
+		if evidence.FailedBatches != 0 || evidence.Undelivered != 0 {
+			return errors.New("complete load result contains failed or undelivered work")
+		}
+		if evidence.ContractProfile == "" || evidence.MinterCodeHash == "" || evidence.WalletCodeHash == "" {
+			return errors.New("complete load result has no contract profile evidence")
+		}
+		if phase == "setup" && (evidence.Minter == "" || evidence.HighloadWallet == "" ||
+			evidence.SourceJettonWallet == "") {
+			return errors.New("complete setup result has no contract address evidence")
+		}
 		return nil
 	}
-	if result.FailedBatches > 0 {
-		result.Outcome = loadOutcomeFailed
-		return nil
+	if exitCode == 0 || evidence.Error == "" || evidence.FailureStage == "" {
+		return errors.New("failed load result has no process failure evidence")
 	}
-	deliveryShortfall := result.Submitted > 0 && result.Accepted < result.Submitted
-	if deliveryShortfall && isDeliveryIncompleteDiagnostic(plain) {
-		result.Outcome = loadOutcomeDeliveryIncomplete
-		return nil
+	if evidence.Outcome == loadOutcomeDeliveryIncomplete &&
+		(evidence.FailedBatches != 0 || evidence.Undelivered == 0) {
+		return errors.New("delivery-incomplete result has inconsistent counters")
 	}
-	result.Outcome = loadOutcomeFailed
 	return nil
 }
 
-func loadMetric(output, name string) int {
-	marker := name + "="
-	position := strings.LastIndex(output, marker)
-	if position < 0 {
-		marker = `"` + name + `":`
-		position = strings.LastIndex(output, marker)
-	}
-	if position < 0 {
-		return 0
-	}
-	value := strings.TrimLeft(output[position+len(marker):], " \t")
-	end := 0
-	for end < len(value) && value[end] >= '0' && value[end] <= '9' {
-		end++
-	}
-	if end == 0 {
-		return 0
-	}
-	number, _ := strconv.Atoi(value[:end])
-	return number
-}
-
-func isDeliveryIncompleteDiagnostic(output string) bool {
-	if strings.Contains(output, "drain timeout after observing ") {
-		return true
-	}
-	return strings.Contains(output, " submitted transfers were observed") &&
-		strings.Contains(output, "only ")
+func validLoadOutcome(outcome string) bool {
+	return outcome == loadOutcomeComplete || outcome == loadOutcomeDeliveryIncomplete ||
+		outcome == loadOutcomeExecutionFailed || outcome == loadOutcomeSubmissionFailed ||
+		outcome == loadOutcomeWorkloadInvalid || outcome == loadOutcomeFailed
 }
 
 func waitContext(ctx context.Context, delay time.Duration) error {

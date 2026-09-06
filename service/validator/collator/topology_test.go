@@ -737,3 +737,246 @@ func mustTopologyChild(t *testing.T, parent int64, left bool) int64 {
 	}
 	return child
 }
+
+// TestAdmitRegisteredShardChainAgreesWithTheBuildTimeCheck pins the two askings
+// of one rule to each other. The per-slot masterchain view pick asks
+// admitRegisteredShardChain from block ids alone, before any build exists; the
+// build asks validateRegisteredShardTopology once the topology is resolved and
+// treats a refusal as fatal ErrInvalidInput rather than a retry. Any drift
+// between them means the pick admits a masterchain view our own builder then
+// refuses, the slot degrades to an empty candidate, and the leader forfeits the
+// rest of its window — the shard-share collapse the per-slot pick exists to end.
+func TestAdmitRegisteredShardChainAgreesWithTheBuildTimeCheck(t *testing.T) {
+	registries := []struct {
+		name string
+		kind topologyKind
+	}{
+		{name: "registered linear", kind: topologyLinear},
+		{name: "registered split", kind: topologyAfterSplit},
+		{name: "registered merge", kind: topologyAfterMerge},
+	}
+	predecessors := []struct {
+		name   string
+		kind   topologyKind
+		second bool
+	}{
+		{name: "linear predecessor", kind: topologyLinear},
+		{name: "after split predecessor", kind: topologyAfterSplit},
+		{name: "after merge predecessor", kind: topologyAfterMerge, second: true},
+		// The pick asks the rule about a predecessor set nothing has resolved
+		// yet, so a merge kind arriving without its second block must be
+		// refused by both spellings instead of faulting inside one of them.
+		{name: "after merge predecessor without second", kind: topologyAfterMerge},
+	}
+	chains := []struct {
+		name  string
+		build func(listed ton.BlockIDExt, top uint32, marker byte) ton.BlockIDExt
+	}{
+		{
+			name: "exact registered predecessor",
+			build: func(listed ton.BlockIDExt, _ uint32, _ byte) ton.BlockIDExt {
+				return topologyCopyBlock(listed)
+			},
+		},
+		{
+			name: "registry ahead of the predecessor",
+			build: func(listed ton.BlockIDExt, _ uint32, _ byte) ton.BlockIDExt {
+				behind := topologyCopyBlock(listed)
+				behind.SeqNo--
+				return behind
+			},
+		},
+		{
+			name: "equal height fork",
+			build: func(listed ton.BlockIDExt, _ uint32, _ byte) ton.BlockIDExt {
+				fork := topologyCopyBlock(listed)
+				fork.RootHash[0]++
+				return fork
+			},
+		},
+		{
+			name: "seven unregistered blocks",
+			build: func(listed ton.BlockIDExt, top uint32, marker byte) ton.BlockIDExt {
+				return testBlockID(listed.Workchain, listed.Shard, top+7, marker)
+			},
+		},
+		{
+			name: "eight unregistered blocks",
+			build: func(listed ton.BlockIDExt, top uint32, marker byte) ton.BlockIDExt {
+				return testBlockID(listed.Workchain, listed.Shard, top+8, marker)
+			},
+		},
+		{
+			name: "nine unregistered blocks",
+			build: func(listed ton.BlockIDExt, top uint32, marker byte) ton.BlockIDExt {
+				return testBlockID(listed.Workchain, listed.Shard, top+9, marker)
+			},
+		},
+	}
+
+	for _, registry := range registries {
+		for _, predecessor := range predecessors {
+			for _, chain := range chains {
+				t.Run(registry.name+"/"+predecessor.name+"/"+chain.name, func(t *testing.T) {
+					fixture := newTopologyFixture(t, registry.kind)
+					registered, err := resolveRegisteredShardTopology(&fixture.req.Masterchain.Groups.Active[0])
+					if err != nil {
+						t.Fatalf("resolveRegisteredShardTopology: %v", err)
+					}
+
+					top := registered.first.Block.SeqNo
+					secondSource := registered.first
+					if registered.second != nil {
+						top = max(top, registered.second.Block.SeqNo)
+						secondSource = registered.second
+					}
+
+					first := chain.build(registered.first.Block, top, 0x7a)
+					var second *ton.BlockIDExt
+					if predecessor.second {
+						block := chain.build(secondSource.Block, top, 0x7b)
+						second = &block
+					}
+
+					// The build reaches the rule through the request it is
+					// already holding; the pick reaches it through bare ids.
+					// Both must be handed the same chain, so the request is
+					// filled from copies of exactly those ids.
+					req := ShardRequest{Previous: PreviousBlock{ID: topologyCopyBlock(first)}}
+					if second != nil {
+						req.Previous2 = &PreviousBlock{ID: topologyCopyBlock(*second)}
+					}
+					topology := shardTopology{kind: predecessor.kind}
+
+					want := validateRegisteredShardTopology(req, &topology, registered)
+					got := admitRegisteredShardChain(registered, predecessor.kind, first, second)
+
+					if (got == nil) != (want == nil) {
+						t.Fatalf("admission = %v, build-time check = %v", got, want)
+					}
+					if got == nil {
+						return
+					}
+					if got.Error() != want.Error() {
+						t.Fatalf("admission error = %q, build-time error = %q", got, want)
+					}
+					if !errors.Is(got, ErrInvalidInput) {
+						t.Fatalf("error = %v, want ErrInvalidInput", got)
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestPredecessorTopologyKindMatchesResolvedTopology keeps the id-only
+// classification the masterchain view pick runs before a build exists in step
+// with the state-derived classification the build binds to. If the pick reads a
+// transition differently from resolveShardTopologyState, it tests the candidate
+// view against the wrong registry rule and admits a view the build then refuses
+// as fatal, which costs the slot. The malformed sets below must be refused by
+// the pick outright rather than treated as a reason to step down to an older
+// masterchain view: no view repairs a predecessor set that is not the target's.
+func TestPredecessorTopologyKindMatchesResolvedTopology(t *testing.T) {
+	agreements := []struct {
+		name string
+		kind topologyKind
+	}{
+		{name: "linear", kind: topologyLinear},
+		{name: "after split", kind: topologyAfterSplit},
+		{name: "after merge", kind: topologyAfterMerge},
+	}
+
+	for _, test := range agreements {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newTopologyFixture(t, test.kind)
+
+			resolved, err := resolveShardTopologyState(fixture.req, fixture.first, fixture.second)
+			if err != nil {
+				t.Fatalf("resolveShardTopologyState: %v", err)
+			}
+
+			previous := []PreviousBlock{fixture.req.Previous}
+			if fixture.req.Previous2 != nil {
+				previous = append(previous, *fixture.req.Previous2)
+			}
+
+			got, err := predecessorTopologyKind(fixture.req.Shard, previous)
+			if err != nil {
+				t.Fatalf("predecessorTopologyKind: %v", err)
+			}
+			if got != resolved.kind {
+				t.Fatalf("kind = %d, want %d", got, resolved.kind)
+			}
+		})
+	}
+
+	root := groups.ShardID{Workchain: 0, Shard: shard.Root}
+	left := groups.ShardID{Workchain: 0, Shard: mustTopologyChild(t, root.Shard, true)}
+	right := groups.ShardID{Workchain: 0, Shard: mustTopologyChild(t, root.Shard, false)}
+	leftLeft := groups.ShardID{Workchain: 0, Shard: mustTopologyChild(t, left.Shard, true)}
+
+	malformed := []struct {
+		name     string
+		target   groups.ShardID
+		previous []PreviousBlock
+	}{
+		{
+			name:   "merge predecessors reversed",
+			target: root,
+			previous: []PreviousBlock{
+				{ID: topologyTestBlock(right, 9, 0x81)},
+				{ID: topologyTestBlock(left, 7, 0x82)},
+			},
+		},
+		{
+			name:   "merge predecessor is not a direct child",
+			target: root,
+			previous: []PreviousBlock{
+				{ID: topologyTestBlock(leftLeft, 7, 0x83)},
+				{ID: topologyTestBlock(right, 9, 0x84)},
+			},
+		},
+		{
+			name:     "linear predecessor in another workchain",
+			target:   root,
+			previous: []PreviousBlock{{ID: topologyTestBlock(groups.ShardID{Workchain: 1, Shard: root.Shard}, 7, 0x85)}},
+		},
+		{
+			name:     "split predecessor in another workchain",
+			target:   left,
+			previous: []PreviousBlock{{ID: topologyTestBlock(groups.ShardID{Workchain: 1, Shard: root.Shard}, 7, 0x86)}},
+		},
+		{
+			name:     "single predecessor is a sibling",
+			target:   left,
+			previous: []PreviousBlock{{ID: topologyTestBlock(right, 7, 0x87)}},
+		},
+		{
+			name:     "single predecessor is the target's own child",
+			target:   root,
+			previous: []PreviousBlock{{ID: topologyTestBlock(leftLeft, 7, 0x88)}},
+		},
+		{
+			name:   "no predecessors",
+			target: root,
+		},
+		{
+			name:   "three predecessors",
+			target: root,
+			previous: []PreviousBlock{
+				{ID: topologyTestBlock(left, 7, 0x89)},
+				{ID: topologyTestBlock(right, 9, 0x8a)},
+				{ID: topologyTestBlock(root, 9, 0x8b)},
+			},
+		},
+	}
+
+	for _, test := range malformed {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := predecessorTopologyKind(test.target, test.previous); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("error = %v, want ErrInvalidInput", err)
+			}
+		})
+	}
+}

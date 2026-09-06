@@ -23,10 +23,10 @@ var errQUICDialDeferred = errors.New("QUIC dial retry is deferred")
 const (
 	quicAddressCacheMaxAge      = 30 * time.Second
 	quicPeerDiscoveryRetryDelay = 100 * time.Millisecond
-	// outboundQUICDialParallelism bounds transport setup shared by proactive
-	// route prewarm and cold two-step delivery. Candidate fanout still dials
-	// peers concurrently, while simultaneous overlays cannot multiply the
-	// handshake and DHT load without a bound.
+	// outboundQUICDialParallelism bounds transport setup for the background
+	// route prewarm, so simultaneous overlays cannot multiply the handshake and
+	// DHT load. No send path waits behind it: broadcasts go out over an
+	// established connection or not at all.
 	outboundQUICDialParallelism = 16
 )
 
@@ -47,26 +47,25 @@ type quicBroadcastSource struct {
 	id *PeerID
 }
 
+// quicRouteBroadcastPeer is the only outbound broadcast peer: receive-side FEC
+// relay, source fan-out and queued rebroadcast all send through it, so none of
+// them can dial inline. C++ hands every recipient to the transport actor and
+// returns (cppnode/ton/overlay/broadcast-twostep.cpp:263-265); a source that
+// instead resolved and handshook a cold peer inside its own send budget spent
+// that budget on transport setup and then reported the expiry as a peer fault.
+// Connection setup belongs to the paths that can afford to wait for it: the
+// attach-time prewarm, requestBackgroundQUICDial, and the per-peer consensus
+// senders, which dial under their own budget every slot and so keep a live
+// validator's path warm.
 type quicRouteBroadcastPeer struct {
-	peer     *overlayPeer
-	envelope *quicOverlayEnvelope
-}
-
-// quicTwoStepSendPeer is used only by source and queued-rebroadcast fanout.
-// Unlike receive-side relay, each bounded tonutils send worker may establish
-// its own route before sending, so one cold peer does not form an all-peer
-// connection barrier.
-type quicTwoStepSendPeer struct {
 	peer     *overlayPeer
 	envelope *quicOverlayEnvelope
 }
 
 var _ overlay.BroadcastPeer = quicBroadcastSource{}
 var _ overlay.BroadcastPeer = quicRouteBroadcastPeer{}
-var _ overlay.BroadcastPeer = quicTwoStepSendPeer{}
 var _ overlay.PreparedBroadcastPeer = quicBroadcastSource{}
 var _ overlay.PreparedBroadcastPeer = quicRouteBroadcastPeer{}
-var _ overlay.PreparedBroadcastPeer = quicTwoStepSendPeer{}
 
 func (p quicBroadcastSource) ID() []byte {
 	return p.id[:]
@@ -107,52 +106,50 @@ func (p quicRouteBroadcastPeer) ID() []byte {
 	return p.peer.id[:]
 }
 
-// SendCustomMessage runs on the FEC part-processing path, so it never dials
-// inline: parts go out only over an existing outbound connection, and at most
-// one background dial per retry window brings a missing connection up. An
-// offline peer yields errQUICPeerOffline so the caller can stop early and count
-// the drop honestly rather than mistaking it for a delivery; dropping parts for
-// an unreachable peer is acceptable FEC redundancy loss.
+// SendCustomMessage never dials inline: parts go out only over an existing
+// outbound connection, and at most one background dial per retry window brings
+// a missing connection up. An offline peer yields errQUICPeerOffline so the
+// caller can stop early and count the drop honestly rather than mistaking it
+// for a delivery; dropping parts for an unreachable peer is acceptable FEC
+// redundancy loss.
+//
+// Every write through this type is relay traffic - somebody else's broadcast
+// forwarded to the peer - and defers to this node's own candidate symbol in
+// flight to the same peer (see quicPrioritySendLatch); the candidate itself
+// goes out through quicPriorityBroadcastPeer.
 func (p quicRouteBroadcastPeer) SendCustomMessage(ctx context.Context, req tl.Serializable) error {
-	node := p.peer.node
-	peer, err := node.quicGateway.OutboundPeerDefaultID(p.peer.id[:])
-	if err != nil {
-		p.peer.requestBackgroundQUICDial()
-		return errQUICPeerOffline
-	}
-	payload, err := p.envelope.Message(req)
+	peer, err := p.outbound()
 	if err != nil {
 		return err
 	}
-	if err = peer.SendOutboundMessage(ctx, payload); err != nil {
-		return fmt.Errorf("send quic overlay message: %w", err)
-	}
-	return nil
+	p.peer.awaitPrioritySend(ctx)
+	return p.writeMessage(ctx, peer, req)
 }
 
 func (p quicRouteBroadcastPeer) SendPreparedCustomMessage(ctx context.Context, body []byte) error {
-	node := p.peer.node
-	peer, err := node.quicGateway.OutboundPeerDefaultID(p.peer.id[:])
-	if err != nil {
-		p.peer.requestBackgroundQUICDial()
-		return errQUICPeerOffline
-	}
-	prefix := p.envelope.state.Load().messagePrefix
-	if err = peer.SendOutboundMessageParts(ctx, prefix, body); err != nil {
-		return fmt.Errorf("send prepared quic overlay message: %w", err)
-	}
-	return nil
-}
-
-func (p quicTwoStepSendPeer) ID() []byte {
-	return p.peer.id[:]
-}
-
-func (p quicTwoStepSendPeer) SendCustomMessage(ctx context.Context, req tl.Serializable) error {
-	peer, err := p.peer.quicPath().dialBounded(ctx)
+	peer, err := p.outbound()
 	if err != nil {
 		return err
 	}
+	p.peer.awaitPrioritySend(ctx)
+	return p.writePrepared(ctx, peer, body)
+}
+
+// outbound is the live outbound connection to the peer or errQUICPeerOffline
+// with a background dial requested; it never waits on anything.
+func (p quicRouteBroadcastPeer) outbound() (*adnlquic.Peer, error) {
+	peer, err := p.peer.node.quicGateway.OutboundPeerDefaultID(p.peer.id[:])
+	if err != nil {
+		p.peer.requestBackgroundQUICDial()
+		return nil, errQUICPeerOffline
+	}
+	return peer, nil
+}
+
+// writeMessage and writePrepared are the route-bound writes shared by relay
+// and priority sends; the caller decides how the peer's latch applies before
+// opening the stream.
+func (p quicRouteBroadcastPeer) writeMessage(ctx context.Context, peer *adnlquic.Peer, req tl.Serializable) error {
 	payload, err := p.envelope.Message(req)
 	if err != nil {
 		return err
@@ -163,13 +160,9 @@ func (p quicTwoStepSendPeer) SendCustomMessage(ctx context.Context, req tl.Seria
 	return nil
 }
 
-func (p quicTwoStepSendPeer) SendPreparedCustomMessage(ctx context.Context, body []byte) error {
-	peer, err := p.peer.quicPath().dialBounded(ctx)
-	if err != nil {
-		return err
-	}
+func (p quicRouteBroadcastPeer) writePrepared(ctx context.Context, peer *adnlquic.Peer, body []byte) error {
 	prefix := p.envelope.state.Load().messagePrefix
-	if err = peer.SendOutboundMessageParts(ctx, prefix, body); err != nil {
+	if err := peer.SendOutboundMessageParts(ctx, prefix, body); err != nil {
 		return fmt.Errorf("send prepared quic overlay message: %w", err)
 	}
 	return nil
@@ -320,9 +313,14 @@ type quicDialTurn struct {
 	owner bool
 }
 
-// dialBounded shares a node-wide transport-setup budget between background
-// prewarm and cold candidate fanout. A nil limiter is retained for hand-built
-// nodes in narrow package tests; every node created through New has the bound.
+// dialBounded runs the background route prewarm under a node-wide
+// transport-setup budget. Its only caller is requestBackgroundQUICDial, whose
+// context is the reachability probe itself (quicRelayDialTimeout), which is
+// what makes dialClaimed's retry gate honest: a broadcast that entered here
+// under its own send budget would arm a 10-30s per-peer gate for a peer that
+// was merely slower than one candidate. A nil limiter is retained for
+// hand-built nodes in narrow package tests; every node created through New has
+// the bound.
 func (p quicPeerPath) dialBounded(ctx context.Context) (*adnlquic.Peer, error) {
 	turn, err := p.awaitQUICDialTurn(ctx)
 	if err != nil {
@@ -405,6 +403,11 @@ func (p quicPeerPath) awaitQUICDialTurn(ctx context.Context) (quicDialTurn, erro
 // dialClaimed enters the transport only after this caller owns the route. No
 // second caller for the same peer can now block on tonutils' non-context
 // dialMu; it waits on the route completion channel instead.
+//
+// A failure here arms the per-peer retry gate, so every caller's context must
+// be a genuine reachability budget rather than a latency budget of its own:
+// broadcast fan-out reaches peers through quicRouteBroadcastPeer and never
+// arrives here at all.
 func (p quicPeerPath) dialClaimed(ctx context.Context) (*adnlquic.Peer, error) {
 	endpointChosen := false
 	peer, err := p.node.quicGateway.DialDefaultResolvedID(

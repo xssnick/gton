@@ -35,8 +35,10 @@ type blockAcceptanceAnchor struct {
 type acceptedProofLink struct {
 	block     ton.BlockIDExt
 	proofRoot *cell.Cell
-	parsed    *tlb.Block
-	meta      *storage.BlockMeta
+	// Copy the header so a pending description does not retain the parsed
+	// block's transaction and message dictionaries through a field pointer.
+	header tlb.BlockHeader
+	meta   *storage.BlockMeta
 }
 
 // BlockAcceptanceViewResolver produces the shard registry view that binds a
@@ -146,13 +148,13 @@ func (a *BlockAccepter) buildShardTopDescription(
 	if err != nil {
 		return err
 	}
-	if prepared.block.ID.SeqNo <= anchor.seqno {
+	if prepared.link.block.SeqNo <= anchor.seqno {
 		return nil
 	}
-	if prepared.block.ID.SeqNo-anchor.seqno > 8 {
+	if prepared.link.block.SeqNo-anchor.seqno > 8 {
 		return fmt.Errorf(
 			"validator block acceptance: block %s needs more than eight shard proof links after registered seqno %d",
-			storage.FormatBlockRef(prepared.block.ID),
+			storage.FormatBlockRef(prepared.link.block),
 			anchor.seqno,
 		)
 	}
@@ -173,7 +175,7 @@ func (a *BlockAccepter) buildShardTopDescription(
 		proofs[i] = links[i].proofRoot
 	}
 	root, err := p2p.BuildShardTopBlockDescription(
-		prepared.block.ID,
+		prepared.link.block,
 		prepared.signaturesCell,
 		proofs,
 	)
@@ -181,22 +183,22 @@ func (a *BlockAccepter) buildShardTopDescription(
 		return fmt.Errorf("validator block acceptance: build shard top description: %w", err)
 	}
 	parsed, err := p2p.ParseShardTopBlockDescription(
-		prepared.block.ID,
+		prepared.link.block,
 		int32(a.catchainSeqno),
 		root,
 	)
 	if err != nil {
 		a.log.Warn().
 			Err(err).
-			Str("block", storage.FormatBlockRef(prepared.block.ID)).
+			Str("block", storage.FormatBlockRef(prepared.link.block)).
 			Msg("new shard top description failed strict validation")
 
 		return nil
 	}
-	if err = blockproof.CheckPreparedBlockSignatures(prepared.block.ID, parsed.Signatures, a.validators); err != nil {
+	if err = blockproof.CheckPreparedBlockSignatures(prepared.link.block, parsed.Signatures, a.validators); err != nil {
 		a.log.Warn().
 			Err(err).
-			Str("block", storage.FormatBlockRef(prepared.block.ID)).
+			Str("block", storage.FormatBlockRef(prepared.link.block)).
 			Msg("new shard top description signatures failed validation")
 
 		return nil
@@ -209,7 +211,7 @@ func (a *BlockAccepter) buildShardTopDescription(
 			}
 			a.log.Warn().
 				Err(err).
-				Str("block", storage.FormatBlockRef(prepared.block.ID)).
+				Str("block", storage.FormatBlockRef(prepared.link.block)).
 				Msg("failed to install local shard top description")
 		}
 	}
@@ -333,17 +335,12 @@ func (a *BlockAccepter) loadAcceptedProofChain(
 	anchor blockAcceptanceAnchor,
 	prepared *preparedBlockAcceptance,
 ) ([]acceptedProofLink, error) {
-	links := make([]acceptedProofLink, 0, prepared.block.ID.SeqNo-anchor.seqno)
-	links = append(links, acceptedProofLink{
-		block:     prepared.block.ID,
-		proofRoot: prepared.proofRoot,
-		parsed:    prepared.parsed,
-		meta:      prepared.block.Meta,
-	})
+	links := make([]acceptedProofLink, 0, prepared.link.block.SeqNo-anchor.seqno)
+	links = append(links, prepared.link)
 
 	for links[len(links)-1].block.SeqNo > anchor.seqno+1 {
 		current := &links[len(links)-1]
-		if current.parsed.BlockInfo.AfterSplit || current.parsed.BlockInfo.AfterMerge {
+		if current.header.AfterSplit || current.header.AfterMerge {
 			return nil, fmt.Errorf(
 				"validator block acceptance: intermediate block %s crosses a split or merge",
 				storage.FormatBlockRef(current.block),
@@ -427,7 +424,7 @@ func parseAcceptedProofLink(block ton.BlockIDExt, proofBOC []byte) (acceptedProo
 	return acceptedProofLink{
 		block:     block,
 		proofRoot: parsed.Proof.Root,
-		parsed:    parsed.Block,
+		header:    parsed.Block.BlockInfo,
 		meta:      parsed.Meta,
 	}, nil
 }
@@ -451,7 +448,7 @@ func validateAcceptedProofAnchor(anchor blockAcceptanceAnchor, oldest *acceptedP
 		}
 	}
 
-	header := &oldest.parsed.BlockInfo
+	header := &oldest.header
 	switch anchor.kind {
 	case blockAcceptanceAnchorLinear:
 		if header.AfterSplit || header.AfterMerge {
@@ -480,7 +477,7 @@ func validateAcceptedProofMasterchain(
 ) error {
 	var newer *ton.BlockIDExt
 	for i := range links {
-		masterRef := links[i].parsed.BlockInfo.MasterRef
+		masterRef := links[i].header.MasterRef
 		if masterRef == nil {
 			return fmt.Errorf(
 				"validator block acceptance: shard proof %s has no masterchain reference",

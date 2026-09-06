@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -19,6 +20,14 @@ import (
 type selfRejectionObserver struct {
 	selfRejected map[collator.MetricChain]int
 }
+
+func (o *selfRejectionObserver) ObserveOwnSlot(collator.MetricChain, OwnSlotOutcome) {}
+
+func (o *selfRejectionObserver) ObserveOwnNotarization(collator.MetricChain, time.Duration) {}
+
+func (o *selfRejectionObserver) ObserveOwnSlotNotarization(collator.MetricChain, time.Duration) {}
+
+func (o *selfRejectionObserver) ObserveOwnFinalization(collator.MetricChain, time.Duration) {}
 
 func (o *selfRejectionObserver) AddSelfRejectedCandidate(chain collator.MetricChain) {
 	if o.selfRejected == nil {

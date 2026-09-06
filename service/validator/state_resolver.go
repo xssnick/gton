@@ -71,6 +71,10 @@ type stateResolver struct {
 	lineageFloor      uint32
 	lineageFloorKnown bool
 	isClosed          bool
+	// describeFailed reports a shard-top description that gave up with an error
+	// other than not-ready. It runs on the detached description goroutine, so
+	// the session runtime installs a logger here rather than passing one in.
+	describeFailed func(simplex.CandidateID, error)
 }
 
 type stateFlight struct {
@@ -707,25 +711,21 @@ func (r *stateResolver) ancestry(
 	visitedCandidate := false
 	for base.Exists {
 		walk.Visited++
-		walk.Steps[r.candidates.payloadResidency(base.ID)]++
-		resolution, err := r.candidates.resolve(ctx, base.ID)
+		walk.Steps[r.candidates.lineageResidency(base.ID)]++
+		lineage, err := r.candidates.lineage(ctx, base.ID)
 		if err != nil {
 			return walk, err
 		}
-		artifact := resolution.Candidate
-		if artifact == nil || artifact.Candidate.ID != base.ID {
-			return walk, errors.New("validator runtime: resolved ancestry candidate differs from its id")
-		}
-		oldestVisitedSlot = artifact.Candidate.ID.Slot
+		oldestVisitedSlot = base.ID.Slot
 		visitedCandidate = true
-		if sameBlockID(artifact.Candidate.Block, *finalizedBlock) {
+		if lineage.matches(*finalizedBlock) {
 			r.mu.Lock()
 			r.noteLineageFloorLocked(oldestVisitedSlot)
 			r.mu.Unlock()
 
 			return walk, nil
 		}
-		base = artifact.Candidate.Parent
+		base = lineage.parent
 	}
 
 	r.mu.Lock()
@@ -783,11 +783,45 @@ func (r *stateResolver) resolveInner(ctx context.Context, id simplex.ParentID) (
 		return ResolvedState{State: genesis}, nil
 	}
 
-	resolution, err := r.candidates.resolve(ctx, id.ID)
+	var artifact *CandidateArtifact
+	if !r.candidates.validateCandidates {
+		var err error
+		artifact, err = r.candidates.candidate(ctx, id.ID)
+		if err != nil && !errors.Is(err, ErrCandidateUnavailable) {
+			return ResolvedState{}, err
+		}
+	}
+	if artifact == nil {
+		resolution, err := r.candidates.resolve(ctx, id.ID)
+		if err != nil {
+			return ResolvedState{}, err
+		}
+
+		return r.resolveCandidateState(ctx, id.ID, resolution.Candidate)
+	}
+
+	// Only observers speculate on an unvalidated payload. Keep the computed
+	// state inside this flight until the committee certifies it: neither a
+	// window nor finalization can read it through resolve before that edge.
+	result, err := r.resolveCandidateState(ctx, id.ID, artifact)
 	if err != nil {
 		return ResolvedState{}, err
 	}
-	artifact := resolution.Candidate
+	// The shared flight's ordinary lifetime bounds both computation and this
+	// wait. A shorter speculative timer could cancel a certified resolution
+	// that a newly opened window has already joined.
+	if err = r.candidates.awaitNotarization(ctx, id.ID); err != nil {
+		return ResolvedState{}, err
+	}
+
+	return result, nil
+}
+
+func (r *stateResolver) resolveCandidateState(
+	ctx context.Context,
+	id simplex.CandidateID,
+	artifact *CandidateArtifact,
+) (ResolvedState, error) {
 	if artifact.Candidate.Empty {
 		return r.resolve(ctx, artifact.Candidate.Parent)
 	}
@@ -797,7 +831,7 @@ func (r *stateResolver) resolveInner(ctx context.Context, id simplex.ParentID) (
 	}
 
 	r.mu.Lock()
-	isFinalized := r.finalized[id.ID] != nil && r.finalized[id.ID].isDone
+	isFinalized := r.finalized[id] != nil && r.finalized[id].isDone
 	genesis := r.genesis
 	r.mu.Unlock()
 	if isFinalized {
@@ -816,7 +850,15 @@ func (r *stateResolver) resolveInner(ctx context.Context, id simplex.ParentID) (
 		//     full re-apply per candidate — with no error and no metric.
 		//
 		// Both are fixed by asking first and by returning the canonical object.
-		if state := r.residentAppliedState(id.ID, artifact.Candidate.Block); state != nil {
+		if state := r.residentAppliedState(id, artifact.Candidate.Block); state != nil {
+			return ResolvedState{State: state, GenUtime: genUtime}, nil
+		}
+		// Then from what the session holds for an ancestor, before the store.
+		// The store answers only once the node's apply pipeline has reached this
+		// block, and the pipeline is fed by the very acceptances that wait here:
+		// on the stand a lagging pipeline held every validation of a session in
+		// this read for 75 s, and the standstill that followed fed the lag.
+		if state, ok := r.reconstructFinalizedState(ctx, id, artifact); ok {
 			return ResolvedState{State: state, GenUtime: genUtime}, nil
 		}
 		request := ChainStateRequest{
@@ -833,7 +875,7 @@ func (r *stateResolver) resolveInner(ctx context.Context, id simplex.ParentID) (
 			return ResolvedState{}, loadErr
 		}
 
-		return ResolvedState{State: r.rememberAppliedCandidateState(id.ID, state), GenUtime: genUtime}, nil
+		return ResolvedState{State: r.rememberAppliedCandidateState(id, state), GenUtime: genUtime}, nil
 	}
 
 	previous, err := r.resolve(ctx, artifact.Candidate.Parent)
@@ -846,6 +888,143 @@ func (r *stateResolver) resolveInner(ctx context.Context, id simplex.ParentID) (
 	}
 
 	return ResolvedState{State: state, GenUtime: genUtime}, nil
+}
+
+// finalizedStateReconstructionWindows bounds reconstructFinalizedState: how many
+// leader windows of blocks it may walk back and apply forward before giving the
+// question to the store. Two windows is where the retention margins stop keeping
+// candidate payloads resident anyway, so a longer walk would be reading them back
+// from storage one by one and applying them one by one — at which point the
+// store's own applied state is the cheaper answer.
+const finalizedStateReconstructionWindows = 2
+
+// reconstructFinalizedState rebuilds the state of a finalized candidate from a
+// state this session still holds — a resolved parent, an applied finalization or
+// the session genesis — by applying each intervening block's update forward, the
+// same apply the non-finalized branch of resolveInner performs. It never asks the
+// node for a state.
+//
+// This is what the reference gets for free: it applies a block right after
+// validating it, so the state of anything it finalized is in its own database.
+// Ours is applied by a separate pipeline, and when that pipeline lags, the store
+// read this replaces waits for it — with every validation of the session queued
+// behind the wait, because the parent of the next candidate is the block being
+// waited for. The states rebuilt here are remembered exactly where a load would
+// have put them, so the sweeps release them on the same margins.
+//
+// It reports false when the walk finds no resident ancestor inside its bound,
+// when a payload cannot be resolved, or when an update does not apply; the
+// caller then falls back to the store.
+func (r *stateResolver) reconstructFinalizedState(
+	ctx context.Context,
+	id simplex.CandidateID,
+	artifact *CandidateArtifact,
+) (*ChainState, bool) {
+	if artifact == nil || artifact.Candidate.Empty || artifact.Candidate.ID != id {
+		return nil, false
+	}
+	bound := int(r.slotsPerLeaderWindow) * finalizedStateReconstructionWindows
+	if bound <= 0 {
+		return nil, false
+	}
+
+	// Newest first: the candidate itself, then every non-empty ancestor down to
+	// the one whose state is resident.
+	chain := []*CandidateArtifact{artifact}
+	parent := artifact.Candidate.Parent
+	var base *ChainState
+	for base == nil {
+		if !parent.Exists {
+			r.mu.Lock()
+			base = r.genesis
+			r.mu.Unlock()
+			if base == nil {
+				return nil, false
+			}
+			break
+		}
+		if state := r.residentParentState(parent); state != nil {
+			base = state
+			break
+		}
+		if len(chain) >= bound {
+			return nil, false
+		}
+		resolution, err := r.candidates.resolve(ctx, parent.ID)
+		if err != nil || resolution.Candidate == nil {
+			return nil, false
+		}
+		ancestor := resolution.Candidate
+		if !ancestor.Candidate.Empty {
+			chain = append(chain, ancestor)
+		}
+		parent = ancestor.Candidate.Parent
+	}
+
+	state := base
+	for i := len(chain) - 1; i >= 0; i-- {
+		next, err := state.apply(chain[i])
+		if err != nil {
+			return nil, false
+		}
+		genUtime, err := chain[i].generationTime()
+		if err != nil {
+			return nil, false
+		}
+		state = r.rememberReconstructedState(chain[i].Candidate.ID, next, genUtime)
+	}
+
+	return state, true
+}
+
+// residentParentState is the state this session holds for the parent relation
+// "my parent is parent", or nil. A finished resolve flight is the common case; a
+// finalization that still carries its applied state is the other. Nothing is
+// read or computed.
+func (r *stateResolver) residentParentState(parent simplex.ParentID) *ChainState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if flight := r.states[parent]; flight != nil {
+		select {
+		case <-flight.done:
+			if flight.err == nil && flight.result.State != nil {
+				return flight.result.State
+			}
+		default:
+		}
+	}
+	if !parent.Exists {
+		return nil
+	}
+	if state := r.finalized[parent.ID]; state != nil && state.isDone && state.appliedState != nil {
+		r.applied[parent.ID] = state
+
+		return state.appliedState
+	}
+
+	return nil
+}
+
+// rememberReconstructedState files one rebuilt state where a load or a
+// validation would have filed it — under the finalization marker when the block
+// is already final, and as the resolved parent relation otherwise — and returns
+// the canonical object for that slot, so a concurrent resolve that won the race
+// is not answered with a second materialization.
+func (r *stateResolver) rememberReconstructedState(
+	id simplex.CandidateID,
+	state *ChainState,
+	genUtime time.Time,
+) *ChainState {
+	r.mu.Lock()
+	if final := r.finalized[id]; final != nil && final.isDone {
+		r.rememberAppliedStateLocked(id, final, state)
+		state = final.appliedState
+	}
+	r.mu.Unlock()
+	r.rememberValidatedState(id, ResolvedState{State: state, GenUtime: genUtime})
+
+	return state
 }
 
 // residentAppliedState returns the applied state this session already holds for
@@ -1130,6 +1309,9 @@ func (r *stateResolver) finalizeInner(
 		}
 		certifiedCandidate = artifact
 	}
+	if err = r.candidates.store(r.ctx, id); err != nil {
+		return fmt.Errorf("validator runtime: store finalized candidate: %w", err)
+	}
 
 	if artifact.Candidate.Empty {
 		if artifact.Candidate.Parent.Exists {
@@ -1160,12 +1342,27 @@ func (r *stateResolver) finalizeInner(
 			certificate = finalCertificate
 			certified = certifiedCandidate
 		}
+		// The state acceptance publishes into the live view is what every later
+		// reader — the next validations, the collator — takes instead of waiting
+		// for the node to apply this block. When this node did not validate the
+		// block there is nothing resident to publish, so the state is rebuilt from
+		// a resident ancestor first, on a budget: the handoff must not wait on a
+		// payload fetch, and a block that cannot be rebuilt is accepted without a
+		// state exactly as before.
+		state := r.acceptedCandidateState(id, artifact.Candidate.Block)
+		if state == nil && !replay {
+			rebuildCtx, cancelRebuild := context.WithTimeout(r.ctx, r.reconstructionBudget())
+			if rebuilt, ok := r.reconstructFinalizedState(rebuildCtx, id, artifact); ok {
+				state = rebuilt
+			}
+			cancelRebuild()
+		}
 		if err = r.acceptBlock(BlockAcceptance{
 			Candidate:          artifact,
 			Certificate:        certificate,
 			CertifiedCandidate: certified,
 			Replay:             replay,
-			state:              r.acceptedCandidateState(id, artifact.Candidate.Block),
+			state:              state,
 		}); err != nil {
 			return err
 		}
@@ -1265,36 +1462,84 @@ func (r *stateResolver) acceptedCandidateState(
 	return resolved
 }
 
-// acceptBlock hands one finalized block to the node, retrying at 1 Hz for as long
-// as the session lives.
-//
-// THIS POLL IS DELIBERATE, and it is the one that stays. It is parity with
-// cppnode/ton/validator/consensus/bridge.cpp:69, where accept_block retries after
-// coro_sleep(Timestamp::in(1.0)) on timeout or notready, forever, with the
-// broadcast modes cleared on the second attempt — the same shape as
-// acceptance.Retry here. The 1 Hz polls the change around it removed were reads of
-// state this node itself had published, where the thing being waited for raises an
-// edge; this one waits on the node's whole apply pipeline accepting a block, which
-// publishes no such edge and whose failure modes are not ours to interpret. There
-// is nothing to subscribe to, and the reference paces it exactly this way.
-//
-// Anyone tidying this into an edge-triggered wait would have to invent the edge,
-// and would be diverging from the reference to do it. The retry above it in
-// loadFinalizedChainState is the converted one; this is not that.
+// acceptBlock prepares one acceptance and submits it on the finalization chain,
+// so a child never reaches the node before its parent. The shard-top description
+// may wait on the node's apply pipeline and runs detached from that chain.
 func (r *stateResolver) acceptBlock(acceptance BlockAcceptance) error {
+	prepared, err := r.backend.PrepareBlockAcceptance(r.ctx, acceptance)
+	if err != nil {
+		return fmt.Errorf("validator runtime: prepare finalized block: %w", err)
+	}
+
 	for {
-		err := r.backend.AcceptBlock(r.ctx, acceptance)
+		err = prepared.Submit(r.ctx)
 		if err == nil {
-			return nil
+			break
 		}
 		if !errors.Is(err, ErrBlockNotReady) && !errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("validator runtime: accept finalized block: %w", err)
 		}
-		acceptance.Retry = true
+		// Match cppnode/ton/validator/consensus/bridge.cpp: retry transient node
+		// acceptance failures at 1 Hz. The apply pipeline has no readiness edge.
 		if err = waitDuration(r.ctx, time.Second); err != nil {
 			return ErrResolverClosed
 		}
 	}
+	if r.shard.IsMasterchain() || acceptance.Certificate.IsZero() ||
+		acceptance.Certificate.Vote().Kind != simplex.VoteFinalize {
+		return nil
+	}
+
+	r.mu.Lock()
+	closed := r.isClosed
+	if !closed {
+		r.wg.Add(1)
+	}
+	r.mu.Unlock()
+	if closed {
+		return ErrResolverClosed
+	}
+	go r.describeAcceptedBlock(acceptance.Candidate.Candidate.ID, prepared)
+
+	return nil
+}
+
+// describeAcceptedBlock retries the description at the reference's 1 Hz pace
+// for the session lifetime. Permanent failures are reported and dropped; the
+// block itself has already been accepted.
+func (r *stateResolver) describeAcceptedBlock(id simplex.CandidateID, prepared PreparedBlockAcceptance) {
+	defer r.wg.Done()
+
+	for {
+		err := prepared.Describe(r.ctx)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, ErrBlockNotReady) && !errors.Is(err, context.DeadlineExceeded) {
+			if r.describeFailed != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrResolverClosed) {
+				r.describeFailed(id, err)
+			}
+			return
+		}
+		if waitDuration(r.ctx, time.Second) != nil {
+			return
+		}
+	}
+}
+
+// reconstructionBudget bounds the state rebuild acceptance attempts before the
+// handoff: a leader window of wall clock, which covers the applies a resident
+// ancestor two windows back needs and stops a payload fetch from holding the
+// chain.
+func (r *stateResolver) reconstructionBudget() time.Duration {
+	r.mu.Lock()
+	rate := r.targetRate
+	r.mu.Unlock()
+	if rate <= 0 {
+		return time.Second
+	}
+
+	return time.Duration(r.slotsPerLeaderWindow) * rate
 }
 
 func (r *stateResolver) close() {

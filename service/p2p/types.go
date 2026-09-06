@@ -90,19 +90,15 @@ const (
 	dhtFindTimeout             = 30 * time.Second
 	peerQueryTimeout           = 10 * time.Second
 	broadcastSignatureTimeout  = 2 * time.Second
-	// Two-step candidate parts are useful only on the fast consensus path. A
-	// blocked peer must release its bounded sender before it can hold later
-	// candidates behind socket backpressure.
-	twoStepPeerSendTimeout    = 750 * time.Millisecond
-	peerRebroadcastTimeout    = 5 * time.Second
-	peerRebroadcastQueueItems = 2048
-	peerRebroadcastQueueBytes = int64(1024 << 20)
-	externalRebroadcastFanout = 5
-	laggedExternalFanout      = 3
-	minLocalExternalFanout    = 3
-	maxLocalExternalFanout    = maxPeersPerOverlay
-	localRebroadcastAttempts  = 3
-	dhtServerStoreMaxKeys     = 300000
+	peerRebroadcastTimeout     = 5 * time.Second
+	peerRebroadcastQueueItems  = 2048
+	peerRebroadcastQueueBytes  = int64(1024 << 20)
+	externalRebroadcastFanout  = 5
+	laggedExternalFanout       = 3
+	minLocalExternalFanout     = 3
+	maxLocalExternalFanout     = maxPeersPerOverlay
+	localRebroadcastAttempts   = 3
+	dhtServerStoreMaxKeys      = 300000
 
 	maxBlockDownloadAnswerSize  = 32 << 20
 	maxKeyBlockLookupAnswerSize = 1 << 20
@@ -202,21 +198,25 @@ func (e BroadcastEvent) BlockRef() string {
 }
 
 type Options struct {
-	Logger                     *zerolog.Logger
-	GlobalConfig               *liteclient.GlobalConfig
-	PrivateKey                 ed25519.PrivateKey
-	ListenAddr                 string
-	ExternalIP                 net.IP
-	ExternalPort               uint16
-	DHTPrivateKey              ed25519.PrivateKey
-	DHTListenAddr              string
-	StateFilesDir              string
-	PeerStorage                PeerStorage
-	StateArtifactStorage       StateArtifactStorage
-	LiveBlockCache             *storage.LiveBlockCache
-	ExternalBroadcastCapacity  ExternalBroadcastCapacityOptions
-	AllowDuplicateExternals    bool
-	LocalExternalFanout        int
+	Logger                    *zerolog.Logger
+	GlobalConfig              *liteclient.GlobalConfig
+	PrivateKey                ed25519.PrivateKey
+	ListenAddr                string
+	ExternalIP                net.IP
+	ExternalPort              uint16
+	DHTPrivateKey             ed25519.PrivateKey
+	DHTListenAddr             string
+	StateFilesDir             string
+	PeerStorage               PeerStorage
+	StateArtifactStorage      StateArtifactStorage
+	LiveBlockCache            *storage.LiveBlockCache
+	ExternalBroadcastCapacity ExternalBroadcastCapacityOptions
+	AllowDuplicateExternals   bool
+	LocalExternalFanout       int
+	// RelayEgressBitsPerSecond bounds the FEC parts this node forwards on the
+	// public overlays; zero takes the default, a negative value disables the
+	// bound. See relay_budget.go.
+	RelayEgressBitsPerSecond   int64
 	CustomOverlays             []CustomOverlayConfig
 	PeerCache                  storage.OverlayPeerCache
 	FastSyncCertificateStorage storage.FastSyncCertificateStorage

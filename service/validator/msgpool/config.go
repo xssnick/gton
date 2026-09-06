@@ -11,7 +11,8 @@
 //     that included externals are valid, and different nodes may pick
 //     different sets.
 //
-//   - Internals (fed by the validator extension): a derived,
+//   - Internals (fed by Feed from applied blocks, in both the validator
+//     and the standalone-collator deployment): a derived,
 //     pre-ordered view of the inbound internal message stream — per-source
 //     out-queue runs advanced by finalized block deltas or reseeded from
 //     state, extended past finality by

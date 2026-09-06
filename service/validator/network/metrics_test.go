@@ -39,9 +39,19 @@ func TestPrometheusCandidateTransportMetrics(t *testing.T) {
 	)
 	observer.ObserveCandidateTransportSend(CandidateTransportSendObservation{
 		Chain:    collator.MetricChainMasterchain,
-		Result:   CandidateTransportSendDeadline,
+		Result:   CandidateTransportSendPartial,
 		Duration: 500 * time.Millisecond,
 	})
+	observer.AddCandidateTransportPeerSends(
+		collator.MetricChainMasterchain,
+		CandidateTransportPeerSent,
+		14,
+	)
+	observer.AddCandidateTransportPeerSends(
+		collator.MetricChainMasterchain,
+		CandidateTransportPeerOffline,
+		1,
+	)
 
 	families, err := registry.Gather()
 	if err != nil {
@@ -72,9 +82,21 @@ func TestPrometheusCandidateTransportMetrics(t *testing.T) {
 	}
 	if got := candidateTransportMetric(
 		byName["gton_validator_candidate_transport_send_duration_seconds"],
-		map[string]string{"chain": "masterchain", "result": "deadline"},
+		map[string]string{"chain": "masterchain", "result": "partial"},
 	).GetHistogram().GetSampleCount(); got != 1 {
-		t.Fatalf("master candidate deadline samples = %d, want 1", got)
+		t.Fatalf("master candidate partial fan-out samples = %d, want 1", got)
+	}
+	if got := candidateTransportMetric(
+		byName["gton_validator_candidate_transport_peer_sends_total"],
+		map[string]string{"chain": "masterchain", "outcome": "sent"},
+	).GetCounter().GetValue(); got != 14 {
+		t.Fatalf("delivered candidate recipients = %v, want 14", got)
+	}
+	if got := candidateTransportMetric(
+		byName["gton_validator_candidate_transport_peer_sends_total"],
+		map[string]string{"chain": "masterchain", "outcome": "peer_offline"},
+	).GetCounter().GetValue(); got != 1 {
+		t.Fatalf("offline candidate recipients = %v, want 1", got)
 	}
 }
 

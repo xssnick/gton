@@ -799,6 +799,56 @@ func (e sizeLimitError) Unwrap() error { return ErrSizeLimit }
 
 type limitThresholds [4]uint64
 
+// blockLimitScale lifts the marks at which a block stops taking work, without
+// touching the boundary a block may not cross.
+//
+// The three lower marks are this node's own admission policy: underload,
+// where internals stop, and the soft and medium marks between which externals
+// are allowed to carry the block further. The HARD threshold is not policy —
+// it is what a validator replaying the block checks, so a block past it is a
+// rejected block, and it stays exactly where the network config put it.
+//
+// Measured on the stand (2026-09-04): with the committee estimator raised, its
+// cap went to 450-500 transactions and the blocks stayed at 382, stopping at
+// the size marks instead — 1.06 MB on average against a 1.048 MB soft mark and
+// a 1.57 MB medium one, with the collated proof on the same axis at 1.06-1.23
+// MB. The marks, not the pace, were the binding limit.
+//
+// The step is deliberately small. Lifting the limits by half on this stand once
+// cost the network a third of its throughput: bigger blocks are slower for the
+// committee to validate, and the leader window is a fixed span of wall clock,
+// so a block that buys transactions with bytes can lose whole slots.
+//
+// Measured on the stand (2026-09-04, five minutes per point, one loaded shard,
+// same generator), scale against what a leader gets out of a window:
+//
+//	scale  tx/block  blocks/window  tx/window  TPS while leading
+//	1.00      382.6           11.7       4464                880
+//	1.05      392.1           10.0       3922                902
+//	1.20      406.1            8.5       3452                926
+//
+// Both directions are monotone and they disagree: a bigger block does carry
+// more transactions and does raise the rate while this node is producing, and
+// it costs slots faster than it gains density. A leader gets a fixed share of
+// windows, so what it contributes is transactions per window — and that falls.
+// Left at 1: the marks the network config states are, on this committee, the
+// ones that pay.
+const blockLimitScale = 1.0
+
+func scaleAdmissionLimits(p tlb.ParamLimits) tlb.ParamLimits {
+	scaled := p
+	scaled.Underload = uint32(float64(p.Underload) * blockLimitScale)
+	scaled.SoftLimit = uint32(float64(p.SoftLimit) * blockLimitScale)
+	if scaled.SoftLimit > p.HardLimit {
+		scaled.SoftLimit = p.HardLimit
+	}
+	if scaled.Underload > scaled.SoftLimit {
+		scaled.Underload = scaled.SoftLimit
+	}
+
+	return scaled
+}
+
 func newLimitThresholds(p tlb.ParamLimits) (limitThresholds, error) {
 	if p.Underload > p.SoftLimit || p.SoftLimit > p.HardLimit {
 		return limitThresholds{}, fmt.Errorf("%w: unordered block limits", ErrInvalidInput)
@@ -861,7 +911,9 @@ func parseBlockLimits(raw *tlb.BlockLimits) (blockLimits, error) {
 		return blockLimits{}, fmt.Errorf("%w: unknown block limits type %T", ErrInvalidInput, raw.Limits)
 	}
 
-	bytesLimit, err := newLimitThresholds(source.Bytes)
+	// Size axes take the lifted admission marks; gas and logical time are left
+	// as the config states them, because neither is what stops our blocks.
+	bytesLimit, err := newLimitThresholds(scaleAdmissionLimits(source.Bytes))
 	if err != nil {
 		return blockLimits{}, fmt.Errorf("bytes: %w", err)
 	}
@@ -873,7 +925,7 @@ func parseBlockLimits(raw *tlb.BlockLimits) (blockLimits, error) {
 	if err != nil {
 		return blockLimits{}, fmt.Errorf("lt delta: %w", err)
 	}
-	collatedLimit, err := newLimitThresholds(source.CollatedData)
+	collatedLimit, err := newLimitThresholds(scaleAdmissionLimits(source.CollatedData))
 	if err != nil {
 		return blockLimits{}, fmt.Errorf("collated data: %w", err)
 	}
@@ -957,7 +1009,12 @@ type blockLimitStatus struct {
 	accountPaths     accountPathSizeEstimator
 	accountPathBytes uint64
 
-	transactions      uint64
+	transactions uint64
+	// maxTransactions, when non-zero, is a ceiling on transactions below which
+	// the block already counts as full for every admission class under hard.
+	// It is the one axis the reference does not have, and it exists for the
+	// first slot of a leader window: see firstSlotTransactions.
+	maxTransactions   uint64
 	extraOutMsgs      uint64
 	publicLibraryDiff uint64
 	gas               uint64
@@ -1161,6 +1218,13 @@ func (s *blockLimitStatus) hardOverflow() (string, uint64, uint64, bool) {
 }
 
 func (s *blockLimitStatus) fits(class LoadClass) bool {
+	// The transaction ceiling is an admission cap, not a limit axis: a capped
+	// block reads as full to every phase that asks whether more work fits, so
+	// its generated messages are enqueued the way a full block's are, while the
+	// hard-overflow diagnosis and the size retry never see it.
+	if class < LoadHard && s.maxTransactions != 0 && s.transactions >= s.maxTransactions {
+		return false
+	}
 	return s.limits.bytes.fits(class, s.estimatedBytes()) &&
 		s.limits.gas.fits(class, s.gas) &&
 		s.limits.ltDelta.fits(class, s.endLT-s.startLT) &&

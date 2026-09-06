@@ -85,6 +85,18 @@ func deployNode(ctx context.Context, binary string, node NodeConfig, timeout tim
 		result.Error = fmt.Sprintf("stop old process: %v", err)
 		return result
 	}
+	// The old process may append lifecycle cancellation and shutdown messages
+	// after tmux receives the stop. Startup health begins only once that process
+	// and its pane are gone, so place the range boundary after the join rather
+	// than attributing its final messages to the replacement process.
+	_, _, offset, _, err = readLogTail(node)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			result.Error = err.Error()
+			return result
+		}
+		offset = 0
+	}
 
 	command := deploymentCommand(binary, node)
 	for time.Now().Before(deadline) {

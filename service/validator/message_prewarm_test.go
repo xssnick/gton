@@ -11,9 +11,14 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
+type prewarmedAccount struct {
+	workchain int32
+	account   [32]byte
+}
+
 type recordedServiceAccountPrewarmer struct {
 	mu       sync.Mutex
-	accounts []pooledAccountPrewarmKey
+	accounts []prewarmedAccount
 	roots    []cell.Hash
 }
 
@@ -27,7 +32,7 @@ func (w *recordedServiceAccountPrewarmer) EnqueueRoot(root cell.Hash) bool {
 
 func (w *recordedServiceAccountPrewarmer) EnqueueAccount(workchain int32, account [32]byte) bool {
 	w.mu.Lock()
-	w.accounts = append(w.accounts, pooledAccountPrewarmKey{workchain: workchain, account: account})
+	w.accounts = append(w.accounts, prewarmedAccount{workchain: workchain, account: account})
 	w.mu.Unlock()
 
 	return true
@@ -37,11 +42,11 @@ func (*recordedServiceAccountPrewarmer) PrewarmAccountNow(int32, [32]byte) bool 
 	return true
 }
 
-func (w *recordedServiceAccountPrewarmer) snapshot() []pooledAccountPrewarmKey {
+func (w *recordedServiceAccountPrewarmer) snapshot() []prewarmedAccount {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	return append([]pooledAccountPrewarmKey(nil), w.accounts...)
+	return append([]prewarmedAccount(nil), w.accounts...)
 }
 
 func (w *recordedServiceAccountPrewarmer) rootSnapshot() []cell.Hash {
@@ -49,54 +54,6 @@ func (w *recordedServiceAccountPrewarmer) rootSnapshot() []cell.Hash {
 	defer w.mu.Unlock()
 
 	return append([]cell.Hash(nil), w.roots...)
-}
-
-func TestPrewarmPooledInternalsDeduplicatesDestinations(t *testing.T) {
-	warmer := &recordedServiceAccountPrewarmer{}
-	service := &Service{accountPrewarmer: warmer}
-	first := [32]byte{0x11}
-	second := [32]byte{0x22}
-	seen := pooledInternalsPrewarmSeen{
-		accounts:  make(map[pooledAccountPrewarmKey]struct{}),
-		envelopes: make(map[cell.Hash]struct{}),
-	}
-	firstEnvelope := cell.Hash{0xa1}
-	secondEnvelope := cell.Hash{0xa2}
-	variableEnvelope := cell.Hash{0xa3}
-
-	service.prewarmPooledInternals([]*msgpool.InternalMessage{
-		{DestinationWorkchain: 0, DestinationAccount: first, DestinationPrewarmable: true, EnvHash: firstEnvelope},
-		{DestinationWorkchain: 0, DestinationAccount: first, DestinationPrewarmable: true, EnvHash: firstEnvelope},
-		{DestinationWorkchain: -1, DestinationAccount: second, DestinationPrewarmable: true, EnvHash: secondEnvelope},
-		{DestinationWorkchain: 0, DestinationAccount: [32]byte{0x33}, EnvHash: variableEnvelope},
-	}, &seen)
-	service.prewarmPooledInternals([]*msgpool.InternalMessage{
-		{DestinationWorkchain: -1, DestinationAccount: second, DestinationPrewarmable: true, EnvHash: secondEnvelope},
-	}, &seen)
-
-	got := warmer.snapshot()
-	want := []pooledAccountPrewarmKey{
-		{workchain: 0, account: first},
-		{workchain: -1, account: second},
-	}
-	if len(got) != len(want) {
-		t.Fatalf("prewarmed accounts = %+v, want %+v", got, want)
-	}
-	for index := range want {
-		if got[index] != want[index] {
-			t.Fatalf("prewarmed account %d = %+v, want %+v", index, got[index], want[index])
-		}
-	}
-	roots := warmer.rootSnapshot()
-	wantRoots := []cell.Hash{firstEnvelope, secondEnvelope, variableEnvelope}
-	if len(roots) != len(wantRoots) {
-		t.Fatalf("prewarmed envelope roots = %x, want %x", roots, wantRoots)
-	}
-	for index := range wantRoots {
-		if roots[index] != wantRoots[index] {
-			t.Fatalf("prewarmed envelope root %d = %x, want %x", index, roots[index], wantRoots[index])
-		}
-	}
 }
 
 func TestExternalPoolAdmissionPrewarmsDestination(t *testing.T) {
@@ -142,7 +99,7 @@ func TestExternalPoolAdmissionPrewarmsDestination(t *testing.T) {
 		t.Fatalf("external mempool overflow = %d, want 1", overflow)
 	}
 	got := warmer.snapshot()
-	want := pooledAccountPrewarmKey{workchain: 0, account: account}
+	want := prewarmedAccount{workchain: 0, account: account}
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("prewarmed accounts = %+v, want %+v", got, want)
 	}

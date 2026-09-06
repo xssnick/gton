@@ -176,6 +176,18 @@ func (c *collation) finishMaster(req MasterRequest) (*Candidate, error) {
 	if err := c.updateMasterPublicLibraries(); err != nil {
 		return nil, err
 	}
+	timer.stop()
+	// Directly before updateProcessedInfo, with nothing in between that can
+	// move the processed bound: the scan inside is bounded by
+	// prospectiveProcessedBound, the same read updateProcessedInfo is about to
+	// write down, and the validator opens the neighbour queues exactly to what
+	// the block claims. See prepareMaster for why this is not done earlier.
+	timer = c.req.assembly.start(CollationStageBuildCollatedProofs)
+	if err := c.buildDeferredCollatedProofs(); err != nil {
+		return nil, err
+	}
+	timer.stop()
+	timer = c.req.assembly.start(CollationStageProcessedInfo)
 	if err := c.updateProcessedInfo(); err != nil {
 		return nil, err
 	}
@@ -403,9 +415,21 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 	if err != nil {
 		return nil, err
 	}
-	if err = c.prepareFullCollatedProofs(); err != nil {
-		return nil, err
-	}
+	// The neighbour proofs are NOT built here, and the reason is not the cost
+	// argument prepareShardPhases makes. The masterchain does have inbound
+	// queues to walk — every shard top it registers is a neighbour whose
+	// out-queue it imports from — and the walk that puts those queue cells in
+	// the proof (traceInternalCut) is bounded by the ProcessedInfo claim the
+	// block is about to make. Before processInternals has run there is no such
+	// claim, so a build asked for here walks nothing and ships each neighbour's
+	// OutMsgQueue as one pruned branch. On the stand that refused six of six
+	// masterchain candidates that imported a shard message on 2026-09-03 —
+	// "load message from neighbor (0,8000000000000000,N): dict has special
+	// cells in tree structure", from our own validator and the committee alike
+	// — and cost each slot. finishMaster builds them after the import phase,
+	// where the reference does (create_collated_data, collator.cpp:6345-6360,
+	// which is not gated on the workchain); the estimate below charges the
+	// last build's measured size in the meantime, as the shard path does.
 	if err = c.prepareMasterCollatedPrefix(); err != nil {
 		return nil, err
 	}
@@ -857,6 +881,15 @@ func extraCurrencyAmount(dict *cell.Dictionary, id uint32) (*big.Int, error) {
 	return amount, nil
 }
 
+// prepareMasterCollatedEstimate charges the collated cost known before
+// execution: the TopBlockDescr set and the consensus root, which are fixed, plus
+// the last masterchain build's measured neighbour-proof size in place of the
+// proofs themselves. The proofs are built in finishMaster, after the import
+// phase (see prepareMaster), and buildDeferredCollatedProofs then replaces the
+// hint with what they cost — the same split the shard path makes. The hint is
+// the masterchain's own: the Builder keeps one per collated shard, so a shard
+// build's proofs (hundreds of kB on a backlog) are never charged here, and this
+// build's few kB never stand in for the shard's.
 func (c *collation) prepareMasterCollatedEstimate() error {
 	if !c.fullCollated {
 		return nil
@@ -865,12 +898,12 @@ func (c *collation) prepareMasterCollatedEstimate() error {
 	if err != nil {
 		return err
 	}
-	roots = append(roots, c.fullCollatedProofs...)
 	size, err := collatedBOCSize(roots)
 	if err != nil {
 		return fmt.Errorf("estimate fixed masterchain collated data: %w", err)
 	}
-	c.collatedFixedEstimate = size
+	c.collatedCheapEstimate = size
+	c.collatedFixedEstimate = size + uint64(c.builder.neighborProofHint(c.shard))
 	c.updateCollatedEstimate()
 	return nil
 }
@@ -1080,6 +1113,7 @@ func (c *collation) processMasterSpecial(amount tlb.CurrencyCollection, destinat
 	if err != nil {
 		return nil, err
 	}
+	c.stats.ImmediateMessages++
 	if err = c.insert(c.inMessages.AugmentedDictionary, &c.inDescr, root, in); err != nil {
 		return nil, err
 	}

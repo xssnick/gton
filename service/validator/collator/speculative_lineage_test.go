@@ -322,3 +322,121 @@ func TestSpeculativeLineageSurvivesTheFrontierAdvancing(t *testing.T) {
 		t.Fatal("re-resolution lost the candidate tip")
 	}
 }
+
+// A first slot built speculatively over foreign candidate B1 records its own
+// block X as Parent=B1 when the pipelined X+1 acquisition starts. Consensus can
+// then promote B1 before X commits; the observed retry resolves X as Base=B1.
+// X is byte-for-byte identical because its slot seed is stable, so its block
+// root must reuse the already installed Parent-shaped node rather than conflict
+// with it or replace it underneath a live descendant.
+func TestCandidateCommitReusesParentShapeAfterPredecessorPromotion(t *testing.T) {
+	f := newSpeculativeLineageFixture(t)
+	request := f.betRequest(t)
+
+	speculative, err := f.acquisition.resolveChain(context.Background(), f.managed, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	build := emptyCandidateRequest(t)
+	build.Previous = f.prevB1
+	x, err := testBuilder().BuildShard(context.Background(), build)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xRoot := candidateBlock(t, x)
+	xKey := f.key(t, x)
+	_, xStartLT, err := shardParentBlockID(x.ID, xRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hints prewarmHints
+	if _, err = f.acquisition.installCandidateDeltaLocked(
+		f.managed,
+		speculative,
+		xRoot,
+		x.ID,
+		xKey,
+		xStartLT,
+		false,
+		&hints,
+	); err != nil {
+		t.Fatalf("install X through speculative Parent lineage: %v", err)
+	}
+
+	apply := func(previous PreviousBlock) {
+		t.Helper()
+		ref, applyErr := localSourceRef(previous.ID)
+		if applyErr != nil {
+			t.Fatal(applyErr)
+		}
+		_, startLT, applyErr := shardParentBlockID(previous.ID, previous.Block)
+		if applyErr != nil {
+			t.Fatal(applyErr)
+		}
+		delta, applyErr := f.branch.DeltaFromBlockRoot(f.destination, ref, previous.Block, startLT)
+		if applyErr != nil {
+			t.Fatal(applyErr)
+		}
+		if applyErr = f.pool.Internals().ApplyBlock(f.destination, f.destination, ref, delta); applyErr != nil {
+			t.Fatal(applyErr)
+		}
+	}
+	apply(f.prevB0)
+	apply(f.prevB1)
+	b1Key := f.key(t, f.b1)
+	if err = f.branch.Retain(&b1Key); err != nil {
+		t.Fatal(err)
+	}
+
+	// The retry's consensus-owned chain has no CandidateTip: B1 is now its
+	// applied predecessor. Before the fix this second install reached
+	// AddCandidate with Base=B1 and failed against X's existing Parent=B1 form.
+	observed := localResolvedChain{previous: []PreviousBlock{f.prevB1}}
+	derivation, err := f.acquisition.deriveCommitLocked(x, observed.previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := CandidateArtifact{
+		SessionID: request.Session.ID,
+		Candidate: simplex.Candidate{
+			ID:    simplex.CandidateID{Slot: request.Slot, Hash: [32]byte{0x7a}},
+			Block: cloneBlockID(x.ID),
+		},
+		BlockBOC: x.BlockBOC,
+	}
+	child := [32]byte{0x7b}
+	if err = f.branch.AddCandidate(msgpool.CandidateRequest{
+		ID: child, Parent: &xKey, Seqno: x.ID.SeqNo + 1, Delta: &msgpool.InternalsDelta{},
+	}); err != nil {
+		t.Fatalf("append before reusing X: %v", err)
+	}
+	completeErr := errors.New("complete reused candidate externals")
+	failing := &localAcquisitionFailingMessages{pool: f.pool, completeErr: completeErr}
+	f.acquisition.messages = failing
+	if err = f.acquisition.recordCandidateLocked(
+		context.Background(), f.managed, request, x, artifact, observed, derivation, &hints,
+	); !errors.Is(err, completeErr) {
+		t.Fatalf("failed reused commit error = %v, want %v", err, completeErr)
+	}
+	if !f.branch.HasCandidate(xKey) || !f.branch.HasCandidate(child) {
+		t.Fatal("failed commit rolled back a candidate node owned by the speculative pipeline")
+	}
+	if _, exists := f.managed.candidates[artifact.Candidate.ID]; exists {
+		t.Fatal("failed reused commit published candidate state")
+	}
+
+	f.acquisition.messages = f.pool
+	if err = f.acquisition.recordCandidateLocked(
+		context.Background(), f.managed, request, x, artifact, observed, derivation, &hints,
+	); err != nil {
+		t.Fatalf("commit X after B1 promotion: %v", err)
+	}
+	state, exists := f.managed.candidates[artifact.Candidate.ID]
+	if !exists || state.queueTip == nil || *state.queueTip != xKey {
+		t.Fatal("the committed retry did not retain X as its queue tip")
+	}
+	if !f.branch.HasCandidate(child) {
+		t.Fatal("successful reuse lost X's live descendant")
+	}
+}

@@ -229,31 +229,33 @@ func (n *localBackendTestNode) SubmitBlockLocally(block p2p.DownloadedBlock) {
 type localBackendTestCollator struct {
 	mu sync.Mutex
 
-	id            [32]byte
-	record        *collator.SessionRecord
-	sessionErr    error
-	probeErr      error
-	commitErr     error
-	commit        func(context.Context, collator.WindowRequest) error
-	selfErr       error
-	updateErr     error
-	activateErr   error
-	progressErr   error
-	retireErr     error
-	prepareCalls  []collator.SessionRecord
-	activateCalls []collator.SessionActivation
-	updateCalls   []collator.SessionUpdate
-	probeCalls    []collator.WindowPreparation
-	commitCalls   []collator.WindowRequest
-	selfCalls     []collator.SelfWindowRequest
-	selfDeadlines []time.Time
-	speculateErr  error
-	speculateWake chan struct{}
-	speculateCall []collator.SpeculativeWindowRequest
-	retireCalls   [][32]byte
-	progressCalls []collator.ConsensusProgress
-	updateEntered chan struct{}
-	updateRelease <-chan struct{}
+	id               [32]byte
+	record           *collator.SessionRecord
+	sessionErr       error
+	probeErr         error
+	commitErr        error
+	commit           func(context.Context, collator.WindowRequest) error
+	selfErr          error
+	updateErr        error
+	activateErr      error
+	progressErr      error
+	retireErr        error
+	prepareCalls     []collator.SessionRecord
+	activateCalls    []collator.SessionActivation
+	updateCalls      []collator.SessionUpdate
+	probeCalls       []collator.WindowPreparation
+	commitCalls      []collator.WindowRequest
+	selfCalls        []collator.SelfWindowRequest
+	selfDeadlines    []time.Time
+	speculateErr     error
+	speculateWake    chan struct{}
+	speculateCall    []collator.SpeculativeWindowRequest
+	sessionStartWake chan struct{}
+	sessionStartCall []collator.SpeculativeSessionStartRequest
+	retireCalls      [][32]byte
+	progressCalls    []collator.ConsensusProgress
+	updateEntered    chan struct{}
+	updateRelease    <-chan struct{}
 }
 
 // localBackendAdvancingTestCollator models the collator's durable monotonic
@@ -394,7 +396,25 @@ func (c *localBackendTestCollator) CommitDelegation(
 	return err
 }
 
-func (c *localBackendTestCollator) SpeculateSelfWindow(
+func (c *localBackendTestCollator) SpeculateSessionStart(
+	_ context.Context,
+	request collator.SpeculativeSessionStartRequest,
+) error {
+	c.mu.Lock()
+	c.sessionStartCall = append(c.sessionStartCall, request)
+	wake := c.sessionStartWake
+	c.mu.Unlock()
+	if wake != nil {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+
+	return nil
+}
+
+func (c *localBackendTestCollator) SpeculateWindow(
 	_ context.Context,
 	window collator.SpeculativeWindowRequest,
 ) error {
@@ -856,6 +876,38 @@ func TestLocalSessionBackendValidationDoesNotWaitForCollatorUpdate(t *testing.T)
 	}
 }
 
+func TestLocalSessionBackendCommitsDeferredCollatorUpdate(t *testing.T) {
+	backend, producer := newLocalBackendTestRemoteVotingBackend(t)
+	defer func() {
+		if err := backend.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	producer.updateErr = fmt.Errorf("production boundary: %w", collator.ErrSessionUpdateDeferred)
+	next := cloneSessionState(backend.state)
+	next.MasterchainBlock.SeqNo++
+	next.MasterchainBlock.RootHash = bytes.Repeat([]byte{0x92}, 32)
+	next.MasterchainBlock.FileHash = bytes.Repeat([]byte{0x93}, 32)
+
+	if err := backend.UpdateSession(context.Background(), next); err != nil {
+		t.Fatalf("accepted deferred collator update: %v", err)
+	}
+	if !backend.state.MasterchainBlock.Equals(&next.MasterchainBlock) ||
+		!backend.update.MasterchainBlock.Equals(&next.MasterchainBlock) {
+		t.Fatalf("committed deferred state/update = %+v/%+v, want masterchain %v",
+			backend.state, backend.update, next.MasterchainBlock)
+	}
+	if len(producer.updateCalls) != 1 ||
+		!producer.updateCalls[0].MasterchainBlock.Equals(&next.MasterchainBlock) {
+		t.Fatalf("deferred producer updates = %+v, want accepted update", producer.updateCalls)
+	}
+	view := backend.validation.Load()
+	if view == nil || !view.update.MasterchainBlock.Equals(&next.MasterchainBlock) {
+		t.Fatalf("validation view after deferred update = %+v, want committed update", view)
+	}
+}
+
 // The predecessor root a validation hands the collator comes from ChainTip.Block,
 // which every producer of a tip already parsed — the store loader, the applied
 // path and, since the successor of a validated candidate carries its own block
@@ -918,15 +970,27 @@ func TestLocalSessionBackendValidateCandidateDoesNotDecodePredecessorBOC(t *test
 	}
 }
 
+func acceptLocalBackendTestBlock(ctx context.Context, backend *LocalSessionBackend, acceptance BlockAcceptance) error {
+	prepared, err := backend.PrepareBlockAcceptance(ctx, acceptance)
+	if err != nil {
+		return err
+	}
+	if err = prepared.Submit(ctx); err != nil {
+		return err
+	}
+
+	return prepared.Describe(ctx)
+}
+
 func TestLocalSessionBackendAcceptBlockAfterClose(t *testing.T) {
 	backend, _ := newLocalBackendTestRemoteVotingBackend(t)
 	if err := backend.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	err := backend.AcceptBlock(context.Background(), BlockAcceptance{})
+	_, err := backend.PrepareBlockAcceptance(context.Background(), BlockAcceptance{})
 	if !errors.Is(err, ErrLocalSessionBackendClosed) {
-		t.Fatalf("AcceptBlock after Close error = %v, want ErrLocalSessionBackendClosed", err)
+		t.Fatalf("PrepareBlockAcceptance after Close error = %v, want ErrLocalSessionBackendClosed", err)
 	}
 }
 
@@ -965,7 +1029,7 @@ func TestLocalSessionBackendDoesNotReplayFinalizationIntoDeferredCollator(t *tes
 	}
 	backend.collatorDeferred.Store(true)
 
-	if err = backend.AcceptBlock(context.Background(), acceptance); err != nil {
+	if err = acceptLocalBackendTestBlock(context.Background(), backend, acceptance); err != nil {
 		t.Fatalf("accept replayed block: %v", err)
 	}
 	if observed != 0 {
@@ -1013,7 +1077,7 @@ func TestLocalSessionBackendAcceptsFromLatestAppliedShardRegistry(t *testing.T) 
 		}
 	}()
 
-	if err = backend.AcceptBlock(t.Context(), latest.acceptance(simplex.VoteFinalize, false)); err != nil {
+	if err = acceptLocalBackendTestBlock(t.Context(), backend, latest.acceptance(simplex.VoteFinalize, false)); err != nil {
 		t.Fatalf("accept with latest applied shard registry: %v", err)
 	}
 	if inbox.Len() != 1 {
@@ -1250,6 +1314,29 @@ func TestPrepareLocalCollatorSessionRetriesExactRecoveredUpdate(t *testing.T) {
 	}
 	if len(producer.prepareCalls) != 0 || len(producer.updateCalls) != 1 {
 		t.Fatalf("prepare/update calls = %d/%d, want 0/1", len(producer.prepareCalls), len(producer.updateCalls))
+	}
+}
+
+func TestPrepareLocalCollatorSessionAcceptsDeferredRecoveredUpdate(t *testing.T) {
+	session, recovered := localBackendTestCollatorRecord()
+	latest := recovered
+	latest.MasterchainBlock.SeqNo++
+	latest.MasterchainBlock.RootHash = bytes.Repeat([]byte{0x23}, 32)
+	latest.MasterchainBlock.FileHash = bytes.Repeat([]byte{0x24}, 32)
+	producer := &localBackendTestCollator{
+		record:    &collator.SessionRecord{Session: session, Update: recovered},
+		updateErr: fmt.Errorf("production boundary: %w", collator.ErrSessionUpdateDeferred),
+	}
+
+	got, err := prepareLocalCollatorSession(context.Background(), producer, session, latest)
+	if err != nil {
+		t.Fatalf("accepted deferred recovered update: %v", err)
+	}
+	if !got.ready || !got.update.Equal(latest) {
+		t.Fatalf("deferred recovered preparation = %+v, want ready latest update", got)
+	}
+	if len(producer.updateCalls) != 1 || !producer.updateCalls[0].Equal(latest) {
+		t.Fatalf("deferred recovered update calls = %+v, want latest update", producer.updateCalls)
 	}
 }
 
@@ -2095,6 +2182,61 @@ func TestLocalSessionBackendSelfModeActivatesAndRoutesValidatorCandidate(t *test
 	wrongLeader.Candidate.Leader = backend.validator.Index + 1
 	if err = backend.routeCandidate(context.Background(), wrongLeader); err == nil {
 		t.Fatal("self route accepted a candidate that names another leader")
+	}
+}
+
+func TestLocalSessionBackendLeaderWindowContinuesAfterDeferredUpdate(t *testing.T) {
+	fixture := newLocalBackendProductionTestFixture(t, collator.ProductionModeSelf, nil)
+	fixture.producer.updateErr = fmt.Errorf("production boundary: %w", collator.ErrSessionUpdateDeferred)
+	t.Cleanup(func() {
+		if err := fixture.backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	routed := make(chan *CandidateArtifact, 1)
+	window := fixture.window(0, 0)
+	window.Submit = func(_ context.Context, artifact *CandidateArtifact) error {
+		routed <- artifact
+
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := fixture.backend.HandleLeaderWindow(ctx, window); err != nil {
+		t.Fatalf("handle leader window with accepted deferred update: %v", err)
+	}
+	if len(fixture.producer.updateCalls) != 1 || len(fixture.producer.selfCalls) != 1 {
+		t.Fatalf("deferred leader update/self calls = %d/%d, want 1/1",
+			len(fixture.producer.updateCalls), len(fixture.producer.selfCalls))
+	}
+	if !fixture.backend.update.HasCurrentWindow ||
+		fixture.backend.update.CurrentWindowStart != window.Window.StartSlot ||
+		fixture.backend.update.CurrentWindowObservedSlot != window.Window.ObservedSlot {
+		t.Fatalf("committed deferred leader update = %+v, want window %+v", fixture.backend.update, window.Window)
+	}
+
+	artifact := collator.CandidateArtifact{
+		SessionID: fixture.config.SessionID,
+		WindowID: collator.WindowID{
+			SessionID: fixture.config.SessionID,
+			StartSlot: window.Window.StartSlot,
+		},
+		Candidate: simplex.Candidate{
+			ID:     simplex.CandidateID{Slot: window.Window.StartSlot, Hash: [32]byte{0x95}},
+			Leader: fixture.config.Identity.Validator.Index,
+		},
+	}
+	if err := fixture.backend.routeCandidate(t.Context(), artifact); err != nil {
+		t.Fatalf("route candidate after accepted deferred update: %v", err)
+	}
+	select {
+	case got := <-routed:
+		if got.Candidate.ID != artifact.Candidate.ID {
+			t.Fatalf("routed candidate = %+v, want %+v", got.Candidate.ID, artifact.Candidate.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("candidate route was cleared by accepted deferred update")
 	}
 }
 

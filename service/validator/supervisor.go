@@ -255,6 +255,12 @@ type sessionPrepareResult struct {
 	preparation *sessionPreparation
 	session     SessionRuntime
 	err         error
+	// prepared and recovered are what the two preparation phases took; they
+	// are logged when the session goes on to start, because a session's first
+	// window is due against the committee's first-block timeout and every
+	// phase of the start is on that path.
+	prepared  time.Duration
+	recovered time.Duration
 }
 
 type sessionSpecError struct {
@@ -1131,8 +1137,12 @@ func (s *sessionSupervisor) startPreparation(
 	go func() {
 		defer prepareWG.Done()
 
+		preparing := time.Now()
 		session, err := s.prepare(prepareCtx, desired.config, desired.state, desired.start)
+		prepared := time.Since(preparing)
+		var recovered time.Duration
 		if err == nil && len(desired.start.Genesis) != 0 {
+			recovering := time.Now()
 			if recoverErr := session.Recover(prepareCtx, desired.start); recoverErr != nil {
 				closeErr := session.Close()
 				err = errors.Join(
@@ -1141,12 +1151,15 @@ func (s *sessionSupervisor) startPreparation(
 				)
 				session = nil
 			}
+			recovered = time.Since(recovering)
 		}
 		cancel()
 		result := sessionPrepareResult{
 			id:          id,
 			preparation: preparation,
 			session:     session,
+			prepared:    prepared,
+			recovered:   recovered,
 			err:         err,
 		}
 		select {
@@ -1224,14 +1237,25 @@ func (s *sessionSupervisor) handlePrepareResult(
 		return
 	}
 
+	var updated time.Duration
 	if !sessionStateEqual(result.preparation.desired.state, next.state) {
+		updating := time.Now()
 		if err := result.session.Update(ctx, next.state); err != nil {
 			s.log.Warn().Err(err).Hex("session_id", result.id.SessionID[:]).Msg("validator session initial state update failed")
 			s.closePrepared(result.id, result.session, false)
 			retryAt[result.id] = sessionRetry{at: time.Now().Add(sessionStateRetryDelay)}
 			return
 		}
+		updated = time.Since(updating)
 	}
+	s.log.Info().
+		Hex("session_id", result.id.SessionID[:]).
+		Int32("workchain", next.config.Shard.Workchain).
+		Int64("shard", next.config.Shard.Shard).
+		Dur("prepare", result.prepared).
+		Dur("recover", result.recovered).
+		Dur("initial_update", updated).
+		Msg("validator session prepared")
 
 	current := &managedConsensusSession{session: result.session, desired: next}
 	managed[result.id] = current

@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 
 	tnstore "github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/gton/service/validator/collator"
 	"github.com/xssnick/gton/service/validator/groups"
 	"github.com/xssnick/gton/service/validator/simplex"
 )
@@ -76,9 +78,9 @@ type CandidateArtifact struct {
 
 	// validationRoots is the parsed payload of this candidate, from whoever
 	// already held it: the network codec that decoded a received candidate, or
-	// the collator that built one here. A voting resolver moves it out of the
-	// retained artifact and hands it to at most one validation; observers and
-	// long-lived candidate storage keep only the canonical bytes.
+	// the collator that built one here. The resolver hands it to one validation
+	// or observer state preparation and retains only canonical bytes afterwards.
+	// Observers discard the collated proof roots immediately.
 	validationRoots *candidateValidationRoots
 
 	// generationTimeMS is the exact millisecond timestamp carried by the
@@ -94,8 +96,9 @@ type CandidateArtifact struct {
 }
 
 type candidateValidationRoots struct {
-	block    *cell.Cell
-	collated []*cell.Cell
+	block          *cell.Cell
+	collated       []*cell.Cell
+	builtSuccessor collator.LiveSuccessorState
 }
 
 // PreparedBlockCandidate is the storage-ready Protocol-1 block artifact, or nil
@@ -222,12 +225,20 @@ func (c *candidateCodec) decodeVerified(wire []byte, expected *simplex.Candidate
 // The delegation is copied before it becomes part of the artifact: transport
 // buffers are owned only for this callback, while a lazy canonical wire may
 // retain the candidate until a later store or request.
+//
+// The same ownership rule is why the frame is parsed without copying. The
+// compressed candidate inside it is the one large field, and it is consumed
+// before this function returns — decompressed into a buffer the parsed cells
+// then own — so copying it first only doubled the transient bytes of every
+// received candidate. The fields the artifact keeps beyond the call, the
+// signature and the ids, are copied where the artifact is built, in
+// decodeBlock and decodeEmpty, which serve both this path and the wrapped one.
 func (c *candidateCodec) decodeBroadcast(
 	payload []byte,
 	delegation *simplex.Delegation,
 	expectedSlot uint32,
 ) (*CandidateArtifact, error) {
-	data, err := simplex.ParseCandidateData(payload)
+	data, err := simplex.ParseCandidateDataNoCopy(payload)
 	if err != nil {
 		return nil, fmt.Errorf("validator runtime: decode candidate broadcast: %w", err)
 	}
@@ -408,7 +419,11 @@ func (c *candidateCodec) decodeBlock(
 		Parent:           parent,
 		Block:            block,
 		CollatedFileHash: payload.collatedFileHash,
-		Signature:        data.Signature,
+		// The one byte field of the frame the artifact keeps. The frame may
+		// have been parsed without copying out of a buffer owned only for the
+		// duration of the decode (decodeBroadcast), so it is copied here, on
+		// every path, rather than trusted to be private.
+		Signature: bytes.Clone(data.Signature),
 	}
 	candidate.ID = candidate.ComputeID(uint32(data.Slot))
 
@@ -439,11 +454,13 @@ func (c *candidateCodec) decodeEmpty(data simplex.ConsensusEmptyData) (*Candidat
 		return nil, err
 	}
 
+	// Both byte-carrying fields are copied for the reason decodeBlock gives:
+	// the frame may alias a buffer that is gone once the decode returns.
 	candidate := simplex.Candidate{
 		Parent:    simplex.Parent(parent),
 		Empty:     true,
-		Block:     data.Block,
-		Signature: data.Signature,
+		Block:     *data.Block.Copy(),
+		Signature: bytes.Clone(data.Signature),
 	}
 	candidate.ID = candidate.ComputeID(uint32(data.Slot))
 
@@ -463,9 +480,15 @@ type decodedCandidatePayload struct {
 	generationTimeMS uint64
 }
 
+// decodePayload owns data only for the duration of the call, and parses the
+// frame without copying on that basis: the compressed bytes are consumed by
+// LZ4 (or by the structural decompressor, which builds its cells out of a
+// buffer of its own) before it returns, the root hash is copied into the
+// result by finishPayload, and the source is only compared. Nothing that
+// leaves this function points into data.
 func (c *candidateCodec) decodePayload(data []byte) (decodedCandidatePayload, error) {
 	var payload tl.Serializable
-	rest, err := tl.Parse(&payload, data, true)
+	rest, err := tl.ParseNoCopy(&payload, data, true)
 	if err != nil {
 		return decodedCandidatePayload{}, fmt.Errorf("validator runtime: decode compressed candidate: %w", err)
 	}
@@ -626,19 +649,27 @@ func (c *candidateCodec) finishPayload(
 	// hand, so that worker does not deserialize and hash the same block again.
 	// Later protocols do not use that cache route and keep the allocation-free
 	// direct serialization.
+	//
+	// The combined cell count bounds the block's, so it presizes the detaching
+	// walk and the serializer there as it does the direct serialization below.
+	// The artifact's BlockBOC is the capsule's own serialization, not a copy:
+	// the artifact is immutable and its file hash was taken of these bytes,
+	// while every consumer that could write to what it holds copies through
+	// PreparedBlockCandidate.BlockBOC.
 	var preparedBlock *tnstore.PreparedBlockCandidate
 	var blockBOC []byte
 	if c.protocolVersion == 1 {
-		preparedBlock, err = tnstore.PrepareBlockCandidate(
+		preparedBlock, err = tnstore.PrepareBlockCandidateSized(
 			c.shard.Workchain,
 			c.shard.Shard,
 			uint32(round),
 			roots[0],
+			combinedCellsHint,
 		)
 		if err != nil {
 			err = fmt.Errorf("validator runtime: prepare candidate block: %w", err)
 		} else {
-			blockBOC = preparedBlock.BlockBOC()
+			blockBOC = preparedBlock.CanonicalBlockBOC()
 		}
 	} else {
 		// This is the byte form emitted by reference std_boc_serialize(root, 31):

@@ -93,7 +93,6 @@ type semanticInDescriptor struct {
 
 type semanticOutDescriptor struct {
 	tag           uint8
-	root          *cell.Cell
 	message       *cell.Cell
 	envelope      *semanticEnvelope
 	transaction   *cell.Cell
@@ -131,7 +130,6 @@ type semanticQueueValidation struct {
 
 	old       tlb.OutMsgQueueInfo
 	candidate *tlb.OutMsgQueueInfo
-	outQueue  *tlb.OutMsgQueueAugDict
 	dispatch  *tlb.DispatchQueueAugDict
 	queueSize uint64
 
@@ -161,13 +159,13 @@ func (r *semanticReplay) prepareQueueValidation() (*semanticQueueValidation, err
 	if err != nil {
 		return nil, err
 	}
+	if err = validation.loadDescriptors(); err != nil {
+		return nil, err
+	}
 	if err = validation.precheckOutQueueUpdate(); err != nil {
 		return nil, err
 	}
 	if err = validation.precheckDispatchQueueUpdate(); err != nil {
-		return nil, err
-	}
-	if err = validation.loadDescriptors(); err != nil {
 		return nil, err
 	}
 	r.parsedIn = validation.in
@@ -180,8 +178,9 @@ func (r *semanticReplay) prepareQueueValidation() (*semanticQueueValidation, err
 
 // precheckOutQueueUpdate mirrors ValidateQuery::precheck_message_queue_update:
 // the reference validator performs a structural mode-2 diff before semantic
-// descriptor replay and validates both changed EnqueuedMsg values. The final
-// root comparison alone cannot detect a pruned cell required by that pass.
+// descriptor replay. Every changed key must match an outbound descriptor; the
+// later descriptor pass checks old/new membership in the other direction. This
+// proves the complete queue delta without rebuilding a third dictionary.
 func (v *semanticQueueValidation) precheckOutQueueUpdate() error {
 	err := v.old.OutQueue.ScanDiffRaw(v.candidate.OutQueue.AugmentedDictionary, true, func(view cell.AugDictDiffRawView) error {
 		var key msgpool.QueueKey
@@ -189,33 +188,28 @@ func (v *semanticQueueValidation) precheckOutQueueUpdate() error {
 			return fmt.Errorf("%w: outbound queue key is malformed", ErrInvalidInput)
 		}
 		copy(key[:], view.Key)
-
-		for side := 0; side < 2; side++ {
-			hasValue := view.HasOld
-			valueExtra := view.OldValueExtra
-			if side == 1 {
-				hasValue = view.HasNew
-				valueExtra = view.NewValueExtra
-			}
-			if !hasValue {
-				continue
-			}
-			value := valueExtra
-			if err := (tlb.AugOutMsgQueue{}).SkipExtra(&value); err != nil {
-				return fmt.Errorf("%w: decode outbound queue augmentation: %v", ErrInvalidInput, err)
-			}
-			entry, err := parseSemanticQueueEntryKeyWithMode(key, &value, nil, false, semanticQueueLeafCells{}, &v.replay.envelopes)
-			if err != nil {
-				return err
-			}
-			// EnqueuedMsg's generated validator opens an indirect Anything body
-			// root. Its descendants remain opaque.
-			var body cell.Slice
-			if err = entry.envelope.internal.Body.BeginParseInto(&body); err != nil {
-				return fmt.Errorf("%w: open outbound queue message body: %v", ErrInvalidInput, err)
-			}
+		if view.HasOld && view.HasNew {
+			return fmt.Errorf("%w: outbound queue entry %x changed without changing its key", ErrInvalidInput, key)
 		}
-		return nil
+
+		value := view.NewValueExtra
+		if view.HasOld {
+			value = view.OldValueExtra
+		}
+		if err := (tlb.AugOutMsgQueue{}).SkipExtra(&value); err != nil {
+			return fmt.Errorf("%w: decode outbound queue augmentation: %v", ErrInvalidInput, err)
+		}
+		entry, err := parseSemanticQueueEntryKeyWithMode(key, &value, nil, false, semanticQueueLeafCells{}, &v.replay.envelopes)
+		if err != nil {
+			return err
+		}
+		// EnqueuedMsg's generated validator opens an indirect Anything body
+		// root. Its descendants remain opaque.
+		var body cell.Slice
+		if err = entry.envelope.internal.Body.BeginParseInto(&body); err != nil {
+			return fmt.Errorf("%w: open outbound queue message body: %v", ErrInvalidInput, err)
+		}
+		return v.verifyOutQueueChange(key, &entry, view.HasNew)
 	})
 	if err != nil {
 		if errors.Is(err, ErrInvalidInput) {
@@ -271,7 +265,7 @@ func (v *semanticQueueValidation) verifyAfterReplay() error {
 	if err := v.applyDispatchChanges(); err != nil {
 		return err
 	}
-	if err := v.applyOutQueueChanges(); err != nil {
+	if err := v.verifyOutQueueChanges(); err != nil {
 		return err
 	}
 	if err := v.verifyInboundMessages(); err != nil {
@@ -321,7 +315,6 @@ func newSemanticQueueValidation(r *semanticReplay) (*semanticQueueValidation, er
 		old:            old,
 		candidate:      &r.candidate.queue,
 		shardEndLT:     newShardEndLTResolver(r.transition.NeighborShardEndLT),
-		outQueue:       &tlb.OutMsgQueueAugDict{AugmentedDictionary: old.OutQueue.Copy()},
 		dispatch:       dispatch,
 		queueSize:      queueSize,
 		in:             make(map[cell.Hash]*semanticInDescriptor),
@@ -466,9 +459,6 @@ func loadSemanticQueueEntryWithMode(
 }
 
 func (v *semanticQueueValidation) verifyQueueRoots() error {
-	if !equalCell(v.outQueue.RootCell(), v.candidate.OutQueue.RootCell()) {
-		return fmt.Errorf("%w: outbound queue delta differs from message descriptors", ErrInvalidInput)
-	}
 	candidateDispatch, err := copiedDispatchQueue(v.candidate)
 	if err != nil {
 		return fmt.Errorf("%w: decode candidate dispatch queue: %v", ErrInvalidInput, err)

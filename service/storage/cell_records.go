@@ -740,12 +740,24 @@ func stateCellLogicalRef(parent *cell.Cell, ref *cell.Cell) *cell.Cell {
 		return ref
 	}
 
-	var level uint8
+	// A raw parent is its own view at its own level, and its children live at
+	// that level, not at zero. The distinction only exists inside a Merkle
+	// proof carried by the state — a message body proving a dictionary entry,
+	// say — where the walk reaches raw level-1 cells: PeekRef on the proof view
+	// hands the interior root back raw, because a level-1 cell viewed at level
+	// 1 is itself. Virtualizing its children to level 0 recorded every level-1
+	// child as a level-0 ref: the level-1 hash and depth were dropped, the
+	// parent's record then decoded to a depth at level 1 one deeper than the
+	// cell's own, and every lazy read of the proof's interior failed with
+	// "loaded lazy ref does not match placeholder: depth mismatch at level 1".
+	// On the stand that cost a shard block its slot 65 times in a row, on one
+	// inbound message whose body carried such a proof.
+	level := parent.Level()
 	switch parent.GetType() {
 	case cell.MerkleProofCellType, cell.MerkleUpdateCellType:
-		level = 1
+		level++
 	}
-	return ref.Virtualize(level)
+	return ref.Virtualize(uint8(level))
 }
 
 func materializePrunedStateCell(cl *cell.Cell) (*cell.Cell, error) {

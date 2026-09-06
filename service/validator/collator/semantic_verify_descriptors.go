@@ -40,6 +40,8 @@ func (v *semanticQueueValidation) loadDescriptors() error {
 		switch descriptor.tag {
 		case semanticInExternal:
 			v.replay.shape.ExternalMessages++
+		case semanticInImmediate:
+			v.replay.shape.ImmediateMessages++
 		case semanticInFinal, semanticInTransit:
 			// The pair collation writes for an internal taken off a queue,
 			// executed here or relayed onward. Immediates never touched a queue
@@ -168,16 +170,12 @@ func parseSemanticInDescriptor(value cell.Slice, key [32]byte, envelopes *semant
 }
 
 func parseSemanticOutDescriptor(value cell.Slice, key [32]byte, envelopes *semanticEnvelopeCache) (*semanticOutDescriptor, error) {
-	raw, err := value.ToCell()
-	if err != nil {
-		return nil, fmt.Errorf("%w: materialize outbound descriptor %x: %v", ErrInvalidInput, key, err)
-	}
 	loader := value
 	tag3, err := loader.LoadUInt(3)
 	if err != nil {
 		return nil, fmt.Errorf("%w: load outbound descriptor %x tag: %v", ErrInvalidInput, key, err)
 	}
-	descriptor := &semanticOutDescriptor{tag: uint8(tag3), root: raw}
+	descriptor := &semanticOutDescriptor{tag: uint8(tag3)}
 	var first, second, third *cell.Cell
 	switch tag3 {
 	case semanticOutExternal:

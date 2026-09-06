@@ -504,6 +504,19 @@ func (s *runtimeLateCandidateSaveStorage) releaseCallback() {
 	s.releaseOnce.Do(func() { close(s.release) })
 }
 
+type runtimeObservedCandidateSaveStorage struct {
+	*runtimeMemoryStorage
+	accepted chan struct{}
+	once     sync.Once
+}
+
+func (s *runtimeObservedCandidateSaveStorage) SaveCandidate(record CandidateRecord, done func(error)) {
+	s.runtimeMemoryStorage.SaveCandidate(record, func(err error) {
+		done(err)
+		s.once.Do(func() { close(s.accepted) })
+	})
+}
+
 // runtimeStuckWriterStorage blocks inside the submission itself rather than
 // before its callback, the way the shared store blocks on a full write queue
 // while holding its global lock: no callback exists yet, so a wait that only
@@ -1946,8 +1959,24 @@ func (f *runtimeFixture) prepare(t *testing.T, session Session, update SessionUp
 		}
 		managed.mu.Lock()
 		managed.progressReady = true
+		managed.progressApplied = true
 		managed.mu.Unlock()
 	}
+}
+
+// forceProgressReady isolates tests of post-admission transitions from the
+// delegated-ingress readiness contract. Production code reaches this state
+// only through a successful ApplyConsensusProgress call.
+func (f *runtimeFixture) forceProgressReady(t *testing.T, sessionID [32]byte) {
+	t.Helper()
+	managed, err := f.service.runningSession(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed.mu.Lock()
+	managed.progressReady = true
+	managed.progressApplied = true
+	managed.mu.Unlock()
 }
 
 func (f *runtimeFixture) request(t *testing.T, session Session, start uint32) WindowRequest {
@@ -2068,14 +2097,17 @@ func TestRuntimeCommitDelegationStaysInReceiverMemory(t *testing.T) {
 	if err := fixture.service.CommitDelegation(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.service.CommitDelegation(context.Background(), request); err != nil {
-		t.Fatalf("exact duplicate delegation: %v", err)
-	}
-
 	managed, err := fixture.service.runningSession(session.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	managed.mu.Lock()
+	managed.progressReady = false
+	managed.mu.Unlock()
+	if err := fixture.service.CommitDelegation(context.Background(), request); err != nil {
+		t.Fatalf("exact duplicate delegation after progress disarmed: %v", err)
+	}
+
 	managed.mu.Lock()
 	window, authorized := managed.authorizations[request.ID()]
 	managed.mu.Unlock()
@@ -2094,8 +2126,7 @@ func TestRuntimeCommitDelegationStaysInReceiverMemory(t *testing.T) {
 func TestRuntimeDelegationHorizonMatchesReference(t *testing.T) {
 	fixture := newRuntimeFixture(t, 1, 1, nil, nil, nil)
 	defer fixture.close(t)
-	session, update := fixture.session(21, 3, 0, time.Time{})
-	update.HasCurrentWindow = false
+	session, update := fixture.session(21, 3, 0, time.Now())
 	fixture.prepare(t, session, update)
 
 	probe := WindowPreparation{
@@ -2112,7 +2143,7 @@ func TestRuntimeDelegationHorizonMatchesReference(t *testing.T) {
 	}
 }
 
-func TestRuntimeDelegationBeforeObservedWindowStartsAfterUpdate(t *testing.T) {
+func TestRuntimeDelegationRequiresFreshConsensusProgress(t *testing.T) {
 	emitted := make(chan CandidateArtifact, 1)
 	pipeline := &runtimeTestPipeline{}
 	fixture := newRuntimeFixture(t, 1, 1, pipeline, nil, func(_ context.Context, artifact CandidateArtifact) error {
@@ -2126,35 +2157,51 @@ func TestRuntimeDelegationBeforeObservedWindowStartsAfterUpdate(t *testing.T) {
 	fixture.prepare(t, session, update)
 
 	probe := WindowPreparation{SessionID: session.ID, SourceADNL: fixture.sourceADNL}
-	if err := fixture.service.Probe(context.Background(), probe); err != nil {
+	if err := fixture.service.Probe(context.Background(), probe); !errors.Is(err, ErrAcquisitionNotReady) {
+		t.Fatalf("probe before fresh progress = %v, want ErrAcquisitionNotReady", err)
+	}
+	request := fixture.request(t, session, 0)
+	if err := fixture.service.CommitDelegation(context.Background(), request); !errors.Is(err, ErrAcquisitionNotReady) {
+		t.Fatalf("commit before fresh progress = %v, want ErrAcquisitionNotReady", err)
+	}
+	managed, err := fixture.service.runningSession(session.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.service.CommitDelegation(context.Background(), fixture.request(t, session, 0)); err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.service.Probe(context.Background(), probe); !errors.Is(err, ErrAlreadyDelegated) {
-		t.Fatalf("probe after final delegation error = %v", err)
+	managed.mu.Lock()
+	_, authorized := managed.authorizations[request.ID()]
+	managed.mu.Unlock()
+	if authorized {
+		t.Fatal("rejected delegation was retained in receiver memory")
 	}
 	if pipeline.buildCount() != 0 {
-		t.Fatalf("builds before observed window = %d, want 0", pipeline.buildCount())
-	}
-	status, err := fixture.storage.Status(context.Background())
-	if err != nil {
-		t.Fatalf("pre-observation delegation persisted window state: status=%+v err=%v", status, err)
+		t.Fatalf("builds before fresh progress = %d, want 0", pipeline.buildCount())
 	}
 
 	observed := update
 	observed.HasCurrentWindow = true
 	observed.CurrentWindowStartAt = time.Now()
-	if err = fixture.service.ApplyConsensusProgress(
+	if err := fixture.service.ApplyConsensusProgress(
 		context.Background(),
 		runtimeConsensusProgress(session, observed),
 	); err != nil {
 		t.Fatal(err)
 	}
+	if err := fixture.service.Probe(context.Background(), probe); err != nil {
+		t.Fatalf("probe after fresh progress: %v", err)
+	}
+	if err := fixture.service.CommitDelegation(context.Background(), request); err != nil {
+		t.Fatalf("commit after fresh progress: %v", err)
+	}
+	if err := fixture.service.CommitDelegation(context.Background(), request); err != nil {
+		t.Fatalf("idempotent commit after fresh progress: %v", err)
+	}
+	if err := fixture.service.Probe(context.Background(), probe); !errors.Is(err, ErrAlreadyDelegated) {
+		t.Fatalf("probe after final delegation error = %v, want ErrAlreadyDelegated", err)
+	}
 	artifact := runtimeAwaitArtifact(t, emitted)
 	if artifact.WindowID != (WindowID{SessionID: session.ID}) || artifact.Candidate.ID.Slot != 0 {
-		t.Fatalf("candidate after first observation = %+v", artifact)
+		t.Fatalf("candidate after fresh progress = %+v", artifact)
 	}
 }
 
@@ -2332,13 +2379,14 @@ func TestRuntimeCandidateDurabilityTimingAndSignatures(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	select {
-	case <-emitted:
-		t.Fatal("candidate was broadcast before the slot gate")
-	case <-time.After(50 * time.Millisecond):
-	}
-
+	// A shard candidate that carries a block leaves the moment its marker is
+	// durable; the slot gate is kept for empty candidates and the masterchain
+	// only (see broadcastAt). The emitter above has already checked the marker,
+	// so what is asserted here is that the gate did not hold the block back.
 	first := runtimeAwaitArtifact(t, emitted)
+	if !time.Now().Before(startAt) {
+		t.Fatal("the first candidate waited for the slot gate")
+	}
 	second := runtimeAwaitArtifact(t, emitted)
 	if first.Candidate.ID.Slot != 0 || second.Candidate.ID.Slot != 1 ||
 		second.Candidate.Parent != simplex.Parent(first.Candidate.ID) {
@@ -2396,18 +2444,29 @@ func TestRuntimeLogsCompletedBlockCollation(t *testing.T) {
 	})
 	defer fixture.close(t)
 
-	var output strings.Builder
-	fixture.service.log = zerolog.New(&output).Level(zerolog.InfoLevel)
 	session, update := fixture.session(81, 1, 4, time.Now())
 	fixture.prepare(t, session, update)
+	// Installed after preparation: activating the session logs its own line,
+	// and this test counts only the lines of the collation itself.
+	var output strings.Builder
+	fixture.service.log = zerolog.New(&output).Level(zerolog.InfoLevel)
 	if err := fixture.service.CommitDelegation(context.Background(), fixture.request(t, session, 4)); err != nil {
 		t.Fatal(err)
 	}
 	artifact := runtimeAwaitArtifact(t, emitted)
+	runtimeAwait(t, func() bool {
+		status, err := fixture.service.Status(context.Background())
 
+		return err == nil && status.ActiveWindows == 0
+	})
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("runtime log lines = %d, want built and emitted; output=%q", len(lines), output.String())
+	}
 	var event map[string]any
-	if err := json.Unmarshal([]byte(output.String()), &event); err != nil {
-		t.Fatalf("decode collation log: %v; output=%q", err, output.String())
+	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+		t.Fatalf("decode collation log: %v; output=%q", err, lines[0])
 	}
 	for field, want := range map[string]any{
 		"level":             "info",
@@ -2436,6 +2495,27 @@ func TestRuntimeLogsCompletedBlockCollation(t *testing.T) {
 	if event["block_root_hash"] == "" || event["block_file_hash"] == "" {
 		t.Fatalf("collation log has incomplete block identity: %v", event)
 	}
+	var emittedEvent map[string]any
+	if err := json.Unmarshal([]byte(lines[1]), &emittedEvent); err != nil {
+		t.Fatalf("decode emitted log: %v; output=%q", err, lines[1])
+	}
+	for field, want := range map[string]any{
+		"message":      "candidate emitted",
+		"slot":         float64(4),
+		"window_start": float64(4),
+		"window_end":   float64(5),
+		"is_empty":     false,
+		"block_seqno":  float64(artifact.Candidate.Block.SeqNo),
+		"replayed":     false,
+	} {
+		if got := emittedEvent[field]; got != want {
+			t.Fatalf("emitted log field %q = %v, want %v; event=%v", field, got, want, emittedEvent)
+		}
+	}
+	if emittedEvent["candidate_hash"] == "" || emittedEvent["block_root_hash"] == "" ||
+		emittedEvent["block_file_hash"] == "" {
+		t.Fatalf("emitted log has incomplete candidate identity: %v", emittedEvent)
+	}
 }
 
 func TestRuntimeLogsCompletedEmptyCandidate(t *testing.T) {
@@ -2448,8 +2528,6 @@ func TestRuntimeLogsCompletedEmptyCandidate(t *testing.T) {
 	})
 	defer fixture.close(t)
 
-	var output strings.Builder
-	fixture.service.log = zerolog.New(&output).Level(zerolog.InfoLevel)
 	session, update := fixture.session(82, 1, 4, time.Now())
 	update.CurrentBase = simplex.Parent(simplex.CandidateID{Slot: 3, Hash: [32]byte{0x52}})
 	emptyBlock := runtimeTestBlockID(session.Shard.Workchain, session.Shard.Shard, 18)
@@ -2457,6 +2535,10 @@ func TestRuntimeLogsCompletedEmptyCandidate(t *testing.T) {
 		return CandidateState{Block: emptyBlock, NextSeqno: emptyBlock.SeqNo + 1, BeforeSplit: true}, nil
 	}
 	fixture.prepare(t, session, update)
+	// Installed after preparation: activating the session logs its own line,
+	// and this test counts only the lines of the collation itself.
+	var output strings.Builder
+	fixture.service.log = zerolog.New(&output).Level(zerolog.InfoLevel)
 	if err := fixture.service.CommitDelegation(context.Background(), fixture.request(t, session, 4)); err != nil {
 		t.Fatal(err)
 	}
@@ -2467,10 +2549,26 @@ func TestRuntimeLogsCompletedEmptyCandidate(t *testing.T) {
 	if builds := pipeline.buildCount(); builds != 0 {
 		t.Fatalf("empty candidate ran %d block builds", builds)
 	}
+	runtimeAwait(t, func() bool {
+		status, err := fixture.service.Status(context.Background())
 
+		return err == nil && status.ActiveWindows == 0
+	})
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("empty runtime log lines = %d, want selected, built and emitted; output=%q", len(lines), output.String())
+	}
+	var selected map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &selected); err != nil {
+		t.Fatal(err)
+	}
+	if selected["message"] != "empty candidate selected" || selected["reason"] != "produce_policy" {
+		t.Fatalf("empty selection event = %v", selected)
+	}
 	var event map[string]any
-	if err := json.Unmarshal([]byte(output.String()), &event); err != nil {
-		t.Fatalf("decode empty collation log: %v; output=%q", err, output.String())
+	if err := json.Unmarshal([]byte(lines[1]), &event); err != nil {
+		t.Fatalf("decode empty collation log: %v; output=%q", err, lines[0])
 	}
 	for field, want := range map[string]any{
 		"message":        "block collated",
@@ -2485,6 +2583,14 @@ func TestRuntimeLogsCompletedEmptyCandidate(t *testing.T) {
 		if got := event[field]; got != want {
 			t.Fatalf("empty collation log field %q = %v, want %v; event=%v", field, got, want, event)
 		}
+	}
+	var emittedEvent map[string]any
+	if err := json.Unmarshal([]byte(lines[2]), &emittedEvent); err != nil {
+		t.Fatalf("decode empty emitted log: %v; output=%q", err, lines[1])
+	}
+	if emittedEvent["message"] != "candidate emitted" || emittedEvent["is_empty"] != true ||
+		emittedEvent["replayed"] != false {
+		t.Fatalf("empty emitted event = %v", emittedEvent)
 	}
 }
 
@@ -2751,12 +2857,21 @@ func TestRuntimePendingCandidateEndsWindowInsteadOfRebuilding(t *testing.T) {
 	}
 }
 
-func TestRuntimeRestartForgetsCurrentDelegationAndAcceptsFreshNextWindow(t *testing.T) {
+func TestRuntimeRestartRequiresFreshProgressBeforeNextDelegation(t *testing.T) {
 	storage := newRuntimeMemoryStorage()
 	first := newRuntimeFixture(t, 1, 1, nil, storage, nil)
-	session, update := first.session(68, 1, 0, time.Time{})
+	session, update := first.session(68, 4, 0, time.Time{})
 	update.HasCurrentWindow = false
 	first.prepare(t, session, update)
+	previous := update
+	previous.HasCurrentWindow = true
+	previous.CurrentWindowObservedSlot = 2
+	if err := first.service.ApplyConsensusProgress(
+		context.Background(),
+		runtimeConsensusProgress(session, previous),
+	); err != nil {
+		t.Fatal(err)
+	}
 	if err := first.service.CommitDelegation(
 		context.Background(),
 		first.request(t, session, 0),
@@ -2805,16 +2920,25 @@ func TestRuntimeRestartForgetsCurrentDelegationAndAcceptsFreshNextWindow(t *test
 		t.Fatalf("receiver recovered %d in-memory delegations, want zero", recoveredAuthorities)
 	}
 
+	probe := WindowPreparation{
+		SessionID:  session.ID,
+		SourceADNL: first.sourceADNL,
+		StartSlot:  4,
+	}
+	if err = second.Probe(context.Background(), probe); !errors.Is(err, ErrAcquisitionNotReady) {
+		t.Fatalf("recovered probe before fresh progress = %v, want ErrAcquisitionNotReady", err)
+	}
+	request := first.request(t, session, 4)
 	if err = second.CommitDelegation(
 		context.Background(),
-		first.request(t, session, 1),
-	); err != nil {
-		t.Fatalf("fresh next-window delegation after receiver restart: %v", err)
+		request,
+	); !errors.Is(err, ErrAcquisitionNotReady) {
+		t.Fatalf("recovered commit before fresh progress = %v, want ErrAcquisitionNotReady", err)
 	}
-	next := update
+	next := previous
 	next.HasCurrentWindow = true
-	next.CurrentWindowStart = 1
-	next.CurrentWindowObservedSlot = 1
+	next.CurrentWindowStart = 4
+	next.CurrentWindowObservedSlot = 4
 	next.CurrentWindowStartAt = time.Now()
 	if err = second.ApplyConsensusProgress(
 		context.Background(),
@@ -2822,9 +2946,18 @@ func TestRuntimeRestartForgetsCurrentDelegationAndAcceptsFreshNextWindow(t *test
 	); err != nil {
 		t.Fatal(err)
 	}
+	if err = second.Probe(context.Background(), probe); err != nil {
+		t.Fatalf("recovered probe after fresh progress: %v", err)
+	}
+	if err = second.CommitDelegation(context.Background(), request); err != nil {
+		t.Fatalf("fresh next-window delegation after receiver restart: %v", err)
+	}
+	if err = second.CommitDelegation(context.Background(), request); err != nil {
+		t.Fatalf("idempotent next-window delegation after receiver restart: %v", err)
+	}
 	artifact := runtimeAwaitArtifact(t, emitted)
-	if artifact.WindowID != (WindowID{SessionID: session.ID, StartSlot: 1}) ||
-		artifact.Candidate.ID.Slot != 1 {
+	if artifact.WindowID != (WindowID{SessionID: session.ID, StartSlot: 4}) ||
+		artifact.Candidate.ID.Slot != 4 {
 		t.Fatalf("fresh next-window candidate after receiver restart = %+v", artifact)
 	}
 }
@@ -2926,12 +3059,6 @@ func TestRuntimeFirstMidWindowProgressDoesNotProduce(t *testing.T) {
 	session, update := fixture.session(56, 4, 0, time.Time{})
 	update.HasCurrentWindow = false
 	fixture.prepare(t, session, update)
-	if err := fixture.service.CommitDelegation(
-		context.Background(),
-		fixture.request(t, session, 0),
-	); err != nil {
-		t.Fatal(err)
-	}
 
 	progress := ConsensusProgress{
 		SessionID: session.ID,
@@ -2945,6 +3072,12 @@ func TestRuntimeFirstMidWindowProgressDoesNotProduce(t *testing.T) {
 		},
 	}
 	if err := fixture.service.ApplyConsensusProgress(context.Background(), progress); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.service.CommitDelegation(
+		context.Background(),
+		fixture.request(t, session, 0),
+	); err != nil {
 		t.Fatal(err)
 	}
 	runtimeAwaitSessionWrite(t, fixture.service, session.ID)
@@ -3259,6 +3392,7 @@ func TestRuntimeProgressStorageFailureCanRetry(t *testing.T) {
 	session, update := fixture.session(59, 4, 0, time.Time{})
 	update.HasCurrentWindow = false
 	fixture.prepare(t, session, update)
+	fixture.forceProgressReady(t, session.ID)
 	if err := fixture.service.CommitDelegation(
 		context.Background(),
 		fixture.request(t, session, 0),
@@ -3444,6 +3578,7 @@ func TestRuntimeMasterchainWaitsWithEmptyCandidatesUntilConsensusFinalization(t 
 	}
 	managed.mu.Lock()
 	managed.progressReady = true
+	managed.progressApplied = true
 	managed.mu.Unlock()
 
 	if err = fixture.service.CommitDelegation(
@@ -3523,6 +3658,7 @@ func TestRuntimeConsensusFinalizationAllowsNextMasterchainBlock(t *testing.T) {
 	}
 	managed.mu.Lock()
 	managed.progressReady = true
+	managed.progressApplied = true
 	managed.mu.Unlock()
 	if err = service.CommitDelegation(context.Background(), fixture.request(t, session, 0)); err != nil {
 		t.Fatal(err)
@@ -4224,6 +4360,7 @@ func TestRuntimeOrdinaryUpdateCannotAdvanceSelectedConsensusBase(t *testing.T) {
 	}
 	managed.mu.Lock()
 	managed.progressReady = true
+	managed.progressApplied = true
 	managed.mu.Unlock()
 
 	next := cloneSessionUpdate(update)
@@ -4414,6 +4551,7 @@ func TestRuntimeCommittedUpdateForgetsStaleAuthorizationWithServiceContext(t *te
 	session, update := fixture.session(55, 1, 0, time.Time{})
 	update.HasCurrentWindow = false
 	fixture.prepare(t, session, update)
+	fixture.forceProgressReady(t, session.ID)
 	windowID := WindowID{SessionID: session.ID}
 	if err := fixture.service.CommitDelegation(
 		context.Background(),
@@ -4464,6 +4602,7 @@ func TestRuntimeStaleDelegationCleanupForgetsInMemoryAuthorization(t *testing.T)
 	session, update := fixture.session(53, 1, 0, time.Time{})
 	update.HasCurrentWindow = false
 	fixture.prepare(t, session, update)
+	fixture.forceProgressReady(t, session.ID)
 	windowID := WindowID{SessionID: session.ID}
 	if err := fixture.service.CommitDelegation(
 		context.Background(),
@@ -4547,7 +4686,7 @@ func TestRuntimeQueuedControlCallHonorsContext(t *testing.T) {
 	}
 }
 
-func TestRuntimeProductionBarrierDefersUpdateWithoutBlocking(t *testing.T) {
+func TestRuntimeProductionBarrierStagesAndCoalescesRoutineUpdate(t *testing.T) {
 	buildEntered := make(chan struct{}, 1)
 	releaseBuild := make(chan struct{})
 	pipeline := &runtimeTestPipeline{}
@@ -4572,27 +4711,276 @@ func TestRuntimeProductionBarrierDefersUpdateWithoutBlocking(t *testing.T) {
 		t.Fatal("build did not start")
 	}
 
-	next := update
-	next.TargetRate += time.Millisecond
-	result := make(chan error, 1)
-	go func() { result <- fixture.service.UpdateSession(context.Background(), next) }()
+	first := update
+	first.MasterchainBlock = runtimeTestBlockID(-1, -1<<63, update.MasterchainBlock.SeqNo+1)
+	firstResult := make(chan error, 1)
+	go func() { firstResult <- fixture.service.UpdateSession(context.Background(), first) }()
 	select {
-	case err := <-result:
-		if !errors.Is(err, ErrAcquisitionNotReady) {
-			t.Fatalf("update error = %v, want acquisition not ready", err)
+	case err := <-firstResult:
+		if !errors.Is(err, ErrSessionUpdateDeferred) {
+			t.Fatalf("first update error = %v, want session update deferred", err)
 		}
 	case <-time.After(200 * time.Millisecond):
 		close(releaseBuild)
-		<-result
-		t.Fatal("update blocked at the production barrier")
+		<-firstResult
+		t.Fatal("first update blocked at the production barrier")
+	}
+
+	second := first
+	second.MasterchainBlock = runtimeTestBlockID(-1, -1<<63, first.MasterchainBlock.SeqNo+1)
+	if err := fixture.service.UpdateSession(context.Background(), second); !errors.Is(err, ErrSessionUpdateDeferred) {
+		close(releaseBuild)
+		t.Fatalf("coalesced update error = %v, want session update deferred", err)
+	}
+	record, err := fixture.service.Session(context.Background(), session.ID)
+	if err != nil {
+		close(releaseBuild)
+		t.Fatal(err)
+	}
+	if !record.Update.Equal(update) {
+		close(releaseBuild)
+		t.Fatalf("staged update leaked before pipeline acceptance: %+v", record.Update)
 	}
 	close(releaseBuild)
 	runtimeAwait(t, func() bool {
-		status, _ := fixture.service.Status(context.Background())
-		return status.ActiveWindows == 0
+		record, readErr := fixture.service.Session(context.Background(), session.ID)
+
+		return readErr == nil && record.Update.Equal(second)
 	})
-	if err := fixture.service.UpdateSession(context.Background(), next); err != nil {
-		t.Fatalf("retry update: %v", err)
+	runtimeAwaitSessionWrite(t, fixture.service, session.ID)
+	pipeline.mu.Lock()
+	updates := pipeline.updated
+	pipeline.mu.Unlock()
+	if updates != 1 {
+		t.Fatalf("coalesced pipeline updates = %d, want 1", updates)
+	}
+}
+
+func TestRuntimeConsensusProgressFoldsDeferredRefresh(t *testing.T) {
+	advanceErr := errors.New("install selected consensus progress")
+	for _, test := range []struct {
+		name       string
+		seed       byte
+		advanceErr error
+	}{
+		{name: "accepted", seed: 52},
+		{name: "failed keeps pending", seed: 54, advanceErr: advanceErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			buildEntered := make(chan struct{}, 1)
+			buildCancelled := make(chan struct{}, 1)
+			releaseBuild := make(chan struct{})
+			advanced := make(chan ConsensusBaseUpdate, 1)
+			pipeline := &runtimeTestPipeline{}
+			pipeline.build = func(ctx context.Context, _ BuildRequest) (*Candidate, error) {
+				buildEntered <- struct{}{}
+				<-ctx.Done()
+				buildCancelled <- struct{}{}
+				<-releaseBuild
+
+				return nil, ctx.Err()
+			}
+			pipeline.advance = func(_ context.Context, request ConsensusBaseUpdate) error {
+				advanced <- request
+
+				return test.advanceErr
+			}
+			if test.advanceErr != nil {
+				// Keep the deferred worker from independently accepting the refresh
+				// after the failed combined attempt, so the failure invariant remains
+				// observable without stopping the worker by test-only hooks.
+				pipeline.update = func(context.Context, Session, SessionUpdate) error {
+					return ErrAcquisitionNotReady
+				}
+			}
+
+			fixture := newRuntimeFixture(t, 1, 1, pipeline, nil, nil)
+			defer fixture.close(t)
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(releaseBuild) }) }
+			defer release()
+
+			session, update := fixture.session(test.seed, 1, 0, time.Now())
+			update.TargetRate = 2 * time.Second
+			fixture.prepare(t, session, update)
+			if err := fixture.service.CommitDelegation(
+				context.Background(),
+				fixture.request(t, session, 0),
+			); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-buildEntered:
+			case <-time.After(time.Second):
+				t.Fatal("build did not start")
+			}
+
+			managed, err := fixture.service.runningSession(session.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			managed.policyMu.Lock()
+			baselineFinalized := managed.emptyPolicy.LastMCFinalizedSeqno
+			managed.policyMu.Unlock()
+
+			refresh := update
+			refresh.MasterchainBlock = runtimeTestBlockID(
+				update.MasterchainBlock.Workchain,
+				update.MasterchainBlock.Shard,
+				update.MasterchainBlock.SeqNo+1,
+			)
+			refresh.HasFinalizedBlock = true
+			refresh.FinalizedBlock = runtimeTestBlockID(
+				session.Shard.Workchain,
+				session.Shard.Shard,
+				session.CatchainSeqno+20,
+			)
+			if err = fixture.service.UpdateSession(context.Background(), refresh); !errors.Is(
+				err,
+				ErrSessionUpdateDeferred,
+			) {
+				t.Fatalf("routine refresh error = %v, want session update deferred", err)
+			}
+
+			progressUpdate := update
+			progressUpdate.CurrentWindowStart = 1
+			progressUpdate.CurrentWindowObservedSlot = 1
+			progressUpdate.CurrentWindowStartAt = time.Now()
+			progressResult := make(chan error, 1)
+			go func() {
+				progressResult <- fixture.service.ApplyConsensusProgress(
+					context.Background(),
+					runtimeConsensusProgress(session, progressUpdate),
+				)
+			}()
+			// The advancing progress owns controlMu and has cancelled the old
+			// producer. Releasing the build now makes it deterministically win the
+			// production barrier ahead of the deferred worker.
+			select {
+			case <-buildCancelled:
+			case <-time.After(time.Second):
+				t.Fatal("advancing progress did not cancel production")
+			}
+			release()
+			err = <-progressResult
+			if test.advanceErr == nil && err != nil {
+				t.Fatalf("combined progress: %v", err)
+			}
+			if test.advanceErr != nil && !errors.Is(err, test.advanceErr) {
+				t.Fatalf("combined progress error = %v, want %v", err, test.advanceErr)
+			}
+
+			combined := refresh
+			combined.CurrentWindowStart = progressUpdate.CurrentWindowStart
+			combined.CurrentWindowObservedSlot = progressUpdate.CurrentWindowObservedSlot
+			combined.CurrentWindowStartAt = progressUpdate.CurrentWindowStartAt
+			combined.CurrentBase = progressUpdate.CurrentBase
+			request := <-advanced
+			if !request.Update.Equal(combined) {
+				t.Fatalf("combined pipeline update = %+v, want %+v", request.Update, combined)
+			}
+
+			if test.advanceErr != nil {
+				record, readErr := fixture.service.Session(context.Background(), session.ID)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				managed.mu.Lock()
+				pending := managed.deferredUpdate
+				unavailable := managed.unavailable
+				managed.mu.Unlock()
+				if !record.Update.Equal(update) {
+					t.Fatalf("failed progress published update = %+v, want %+v", record.Update, update)
+				}
+				if pending == nil || !pending.Equal(refresh) {
+					t.Fatalf("failed progress pending refresh = %+v, want %+v", pending, refresh)
+				}
+				if unavailable {
+					t.Fatal("failed combined progress quarantined the session")
+				}
+				// The watermark is a masterchain observation, not a
+				// consequence of pipeline acceptance: it advances when the
+				// refresh is validated and staged, and a later progress
+				// failure does not retract it. That decoupling is the point —
+				// a refresh that only lands after the barrier is released
+				// arrives too late for the window it had to unblock. It cannot
+				// produce an invalid block either way, because the build
+				// re-checks the same registry rule against the masterchain
+				// view it actually stamps and degrades the slot when no view
+				// admits the chain.
+				managed.policyMu.Lock()
+				finalized := managed.emptyPolicy.LastMCFinalizedSeqno
+				managed.policyMu.Unlock()
+				if finalized != refresh.FinalizedBlock.SeqNo {
+					t.Fatalf(
+						"failed progress finalized watermark = %d, want the staged observation %d (baseline %d)",
+						finalized,
+						refresh.FinalizedBlock.SeqNo,
+						baselineFinalized,
+					)
+				}
+
+				return
+			}
+
+			runtimeAwait(t, func() bool {
+				managed.mu.Lock()
+				defer managed.mu.Unlock()
+
+				return managed.deferredUpdate == nil && !managed.deferredUpdateRunning
+			})
+			runtimeAwaitSessionWrite(t, fixture.service, session.ID)
+			record, readErr := fixture.storage.Session(context.Background(), session.ID)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !record.Update.Equal(combined) {
+				t.Fatalf("stored combined update = %+v, want %+v", record.Update, combined)
+			}
+			managed.mu.Lock()
+			unavailable := managed.unavailable
+			managed.mu.Unlock()
+			if unavailable {
+				t.Fatal("accepted combined progress quarantined the session")
+			}
+			managed.policyMu.Lock()
+			finalized := managed.emptyPolicy.LastMCFinalizedSeqno
+			managed.policyMu.Unlock()
+			if finalized != refresh.FinalizedBlock.SeqNo {
+				t.Fatalf(
+					"absorbed refresh finalized watermark = %d, want %d",
+					finalized,
+					refresh.FinalizedBlock.SeqNo,
+				)
+			}
+		})
+	}
+}
+
+func TestDeferredUpdateWorkerExitHandshakeKeepsConcurrentStage(t *testing.T) {
+	managed := newManagedCollatorSession(SessionRecord{}, true)
+	managed.deferredUpdateRunning = true
+	pending := SessionUpdate{SessionID: [32]byte{0x51}}
+	managed.deferredUpdate = sessionUpdatePointer(pending)
+
+	if managed.stopDeferredUpdateWorkerIfIdle() {
+		t.Fatal("worker exited while a staged update was present")
+	}
+	managed.mu.Lock()
+	running := managed.deferredUpdateRunning
+	managed.deferredUpdate = nil
+	managed.mu.Unlock()
+	if !running {
+		t.Fatal("worker cleared running while retaining staged work")
+	}
+	if !managed.stopDeferredUpdateWorkerIfIdle() {
+		t.Fatal("idle worker did not complete its exit handshake")
+	}
+	managed.mu.Lock()
+	running = managed.deferredUpdateRunning
+	managed.mu.Unlock()
+	if running {
+		t.Fatal("idle worker remained marked running")
 	}
 }
 
@@ -4762,6 +5150,90 @@ func TestRuntimeCancelledProductionAbandonsStuckStorageWrite(t *testing.T) {
 	}
 }
 
+// Once the pipeline has committed a candidate and its anti-equivocation marker
+// has landed, superseding the window may stop every later build but must not
+// suppress delivery of that already signed candidate. In particular, the
+// progress that opens the next window commonly arrives at the same instant the
+// previous window's last candidate is waiting for its broadcast slot.
+func TestRuntimeCommittedCandidateEmitsAcrossWindowCancellation(t *testing.T) {
+	const firstBlockBudget = 700 * time.Millisecond
+
+	committed := make(chan struct{})
+	var committedOnce sync.Once
+	pipeline := &runtimeTestPipeline{}
+	pipeline.commit = func(context.Context, CandidateCommit) error {
+		committedOnce.Do(func() { close(committed) })
+
+		return nil
+	}
+	emitted := make(chan CandidateArtifact, 1)
+	memory := newRuntimeMemoryStorage()
+	storage := &runtimeObservedCandidateSaveStorage{
+		runtimeMemoryStorage: memory,
+		accepted:             make(chan struct{}),
+	}
+	fixture := newRuntimeFixture(t, 1, 1, pipeline, memory, func(ctx context.Context, artifact CandidateArtifact) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		emitted <- artifact
+
+		return nil
+	})
+	fixture.service.opts.Storage = storage
+	defer fixture.close(t)
+
+	// The old schedule is intentionally five seconds ahead. A superseding
+	// progress must accelerate the already committed candidate rather than hold
+	// the progress barrier until that stale broadcast instant.
+	session, update := fixture.session(0x56, 1, 0, time.Now().Add(5*time.Second))
+	update.TargetRate = 10 * time.Second
+	fixture.prepare(t, session, update)
+	if err := fixture.service.CommitDelegation(
+		context.Background(),
+		fixture.request(t, session, 0),
+	); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-committed:
+	case <-time.After(time.Second):
+		t.Fatal("candidate was not committed")
+	}
+	select {
+	case <-storage.accepted:
+	case <-time.After(time.Second):
+		t.Fatal("candidate marker was not accepted")
+	}
+
+	openedAt := time.Now()
+	next := update
+	next.CurrentWindowStart = 1
+	next.CurrentWindowObservedSlot = 1
+	next.CurrentWindowStartAt = update.CurrentWindowStartAt.Add(update.TargetRate)
+	if err := fixture.service.ApplyConsensusProgress(
+		context.Background(),
+		runtimeConsensusProgress(session, next),
+	); err != nil {
+		t.Fatalf("consensus progress: %v", err)
+	}
+	if elapsed := time.Since(openedAt); elapsed > firstBlockBudget {
+		t.Fatalf("superseding progress held the production barrier for %s, budget %s",
+			elapsed, firstBlockBudget)
+	}
+
+	timer := time.NewTimer(time.Until(openedAt.Add(firstBlockBudget)))
+	defer timer.Stop()
+	select {
+	case artifact := <-emitted:
+		if artifact.Candidate.ID.Slot != 0 {
+			t.Fatalf("emitted slot = %d, want committed slot 0", artifact.Candidate.ID.Slot)
+		}
+	case <-timer.C:
+		t.Fatalf("committed candidate missed the %s delivery budget", firstBlockBudget)
+	}
+}
+
 // The other half of the marker contract: an in-process retry re-emits the slot
 // it already signed from memory. The payload never reaches disk, so this path
 // is the only thing keeping a retryable mid-window failure from ending the
@@ -4775,12 +5247,11 @@ func TestRuntimeRetriedWindowReemitsSignedSlotFromMemory(t *testing.T) {
 	// that fails after it has already signed a slot, and re-emits that slot from
 	// memory when it retries — is the same either way.
 	//
-	// Slot 1 fails its first TWO builds, and it takes two to reach the retry.
-	// The first is the pipelined successor slot 0 handed over, and the producer
-	// declines a successor that has already failed rather than adopting its
-	// error as the slot's own — that is the whole point of the viability check
-	// at adoption. The second is the build the producer then starts itself on
-	// schedule, and that one is the failure this test needs.
+	// Slot 1 fails its first two builds. The first is the pipelined successor
+	// slot 0 handed over; depending on goroutine scheduling, its result is either
+	// declined as already failed or adopted just before it reports the failure.
+	// The two legal orderings cause one or two retries, and both must replay the
+	// signed slot from memory rather than build it again.
 	var buildsMu sync.Mutex
 	buildsPerSlot := map[uint32]int{}
 	pipeline.build = func(_ context.Context, request BuildRequest) (*Candidate, error) {
@@ -4816,18 +5287,38 @@ func TestRuntimeRetriedWindowReemitsSignedSlotFromMemory(t *testing.T) {
 	}
 
 	signed := runtimeAwaitArtifact(t, emitted)
-	resumed := runtimeAwaitArtifact(t, emitted)
-	next := runtimeAwaitArtifact(t, emitted)
-	if signed.Candidate.ID.Slot != 0 || resumed.Candidate.ID.Slot != 0 || next.Candidate.ID.Slot != 1 {
-		t.Fatalf("emitted slots = %d, %d, %d, want 0, 0, 1",
-			signed.Candidate.ID.Slot, resumed.Candidate.ID.Slot, next.Candidate.ID.Slot)
+	if signed.Candidate.ID.Slot != 0 {
+		t.Fatalf("first emitted slot = %d, want 0", signed.Candidate.ID.Slot)
 	}
-	if resumed.Candidate.ID != signed.Candidate.ID {
-		t.Fatal("retry re-emitted a different candidate for a slot already signed")
+	var (
+		resumed []CandidateArtifact
+		next    CandidateArtifact
+	)
+
+collectReplays:
+	for attempts := 0; attempts < 3; attempts++ {
+		artifact := runtimeAwaitArtifact(t, emitted)
+		switch artifact.Candidate.ID.Slot {
+		case 0:
+			resumed = append(resumed, artifact)
+		case 1:
+			next = artifact
+			break collectReplays
+		default:
+			t.Fatalf("emitted slot = %d, want replayed 0 or next slot 1", artifact.Candidate.ID.Slot)
+		}
 	}
-	if !slices.Equal(resumed.BlockBOC, signed.BlockBOC) ||
-		!slices.Equal(resumed.CollatedData, signed.CollatedData) {
-		t.Fatal("retry re-emitted different bytes for a slot already signed")
+	if len(resumed) == 0 || next.Candidate.ID.Slot != 1 {
+		t.Fatalf("replays before slot 1 = %d, want at least one followed by slot 1", len(resumed))
+	}
+	for _, replay := range resumed {
+		if replay.Candidate.ID != signed.Candidate.ID {
+			t.Fatal("retry re-emitted a different candidate for a slot already signed")
+		}
+		if !slices.Equal(replay.BlockBOC, signed.BlockBOC) ||
+			!slices.Equal(replay.CollatedData, signed.CollatedData) {
+			t.Fatal("retry re-emitted different bytes for a slot already signed")
+		}
 	}
 	// Per slot, not in total: the retried slot is legitimately built twice — the
 	// attempt that failed and the one that succeeded — and what this asserts is
@@ -6058,5 +6549,60 @@ func TestCollationResultSeparatesNotReadyFromError(t *testing.T) {
 	})
 	if collated := stats.BlockStats().Collated.Shard; collated.Error != 1 {
 		t.Fatalf("genuine build failures recorded %+v, want one error", collated)
+	}
+}
+
+// TestRuntimeAdmitsDelegationBehindAPendingSessionWrite pins the difference
+// between "consensus progress has been applied to this session" and "production
+// may run against the current record right now". publishSessionWrite disarms
+// the second on every accepted session mutation until its storage callback
+// lands, and the delegated flow reaches CommitDelegation immediately after one:
+// LocalSessionBackend.HandleLeaderWindow calls UpdateSession and then
+// authorizeUpcomingWindow in the same breath. Refusing there dropped the window
+// without a trace — the caller logs the refusal at debug and marks the window
+// handled — so the admission reads the applied flag, which a write does not
+// touch, and only the launch gate keeps waiting for the callback.
+func TestRuntimeAdmitsDelegationBehindAPendingSessionWrite(t *testing.T) {
+	fixture := newRuntimeFixture(t, 1, 1, nil, nil, nil)
+	defer fixture.close(t)
+
+	session, update := fixture.session(63, 1, 0, time.Now())
+	fixture.prepare(t, session, update)
+	managed, err := fixture.service.runningSession(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed.mu.Lock()
+	managed.progressReady = false
+	managed.progressReadyAfterWrite = true
+	managed.sessionWritePending = true
+	managed.mu.Unlock()
+
+	probe := WindowPreparation{SessionID: session.ID, SourceADNL: fixture.sourceADNL, StartSlot: 1}
+	if err = fixture.service.Probe(context.Background(), probe); err != nil {
+		t.Fatalf("probe refused behind a pending session write: %v", err)
+	}
+	request := fixture.request(t, session, 1)
+	if err = fixture.service.CommitDelegation(context.Background(), request); err != nil {
+		t.Fatalf("delegation refused behind a pending session write: %v", err)
+	}
+	managed.mu.Lock()
+	_, authorized := managed.authorizations[request.ID()]
+	managed.mu.Unlock()
+	if !authorized {
+		t.Fatal("accepted delegation was not installed in receiver memory")
+	}
+
+	// The condition the gate exists for is untouched: a session serving a
+	// descriptor recovered from storage, which has never materialized consensus
+	// progress, still refuses.
+	managed.mu.Lock()
+	managed.progressApplied = false
+	managed.progressReady = true
+	managed.sessionWritePending = false
+	managed.mu.Unlock()
+	err = fixture.service.CommitDelegation(context.Background(), fixture.request(t, session, 2))
+	if !errors.Is(err, ErrAcquisitionNotReady) {
+		t.Fatalf("delegation before any consensus progress = %v, want ErrAcquisitionNotReady", err)
 	}
 }

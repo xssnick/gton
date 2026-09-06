@@ -121,9 +121,10 @@ func (c *collation) closureRecordsPredecessorReads() bool {
 //
 // After a split and after a merge this is redundant rather than wrong: those
 // predecessors are scanned whole before collation starts — filterOutQueue runs a
-// Filter with a full parseQueueEntry over every parent entry, and
-// cleanupMergedOutQueue an exhaustive queueCandidates scan — so every cell this
-// walk can reach is already recorded and the read set drops the repeat.
+// Filter that opens every parent entry's envelope and message root, which is
+// all the header-only leaf parse below reaches, and cleanupMergedOutQueue an
+// exhaustive queueCandidates scan — so every cell this walk can reach is already
+// recorded and the read set drops the repeat.
 //
 // This pass must not take a truncating budget. Its extent is not an input: the
 // bound is the one the block claims and the validator opens exactly that

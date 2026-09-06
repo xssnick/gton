@@ -194,7 +194,7 @@ func (o *ConsensusObserver) Start(
 	if handlers.Probe == nil || handlers.Commit == nil {
 		return errors.New("validator consensus observer: remote handlers are incomplete")
 	}
-	if events.Progressed == nil || events.Finalized == nil {
+	if events.Progressed == nil || events.Finalized == nil || events.Speculated == nil || events.Notarized == nil {
 		return errors.New("validator consensus observer: event handlers are incomplete")
 	}
 
@@ -487,11 +487,12 @@ func (o *ConsensusObserver) ActivateSession(
 		cancel()
 		runErr := <-returned
 		closeErr := runtime.Close()
+		retryable := startupErr != nil && closeErr == nil
 		session.mu.Lock()
 		session.runCancel = nil
 		session.pending = nil
 		session.pendingFinalized = nil
-		if startupErr != nil && closeErr == nil {
+		if retryable {
 			session.runtime = nil
 			session.phase = observerSessionPrepared
 		} else {
@@ -506,7 +507,13 @@ func (o *ConsensusObserver) ActivateSession(
 			return errors.Join(ctx.Err(), startupErr, runErr, closeErr)
 		}
 
-		return errors.Join(startupErr, runErr, closeErr)
+		resultErr := errors.Join(startupErr, runErr, closeErr)
+		if retryable && (errors.Is(startupErr, ErrBlockNotReady) ||
+			errors.Is(startupErr, ErrCandidateUnavailable)) {
+			return fmt.Errorf("%w: %w", collator.ErrAcquisitionNotReady, resultErr)
+		}
+
+		return resultErr
 	}
 
 	session.mu.Lock()
@@ -672,6 +679,7 @@ func (o *ConsensusObserver) BroadcastCandidate(
 	// per slot and throw the first one away, then reach the second by parsing both
 	// BOCs back into cells and re-serializing them to prove they were canonical.
 	generationTimeMS, generationTimeKnown := artifact.GenerationTimeMS()
+	blockRoot, _ := artifact.ValidationRoots()
 
 	return session.runtime.publishCandidate(ctx, &CandidateArtifact{
 		Candidate:           artifact.Candidate,
@@ -681,6 +689,9 @@ func (o *ConsensusObserver) BroadcastCandidate(
 		digested:            artifact.Digested(),
 		generationTimeMS:    generationTimeMS,
 		generationTimeKnown: generationTimeKnown,
+		validationRoots: &candidateValidationRoots{
+			block: blockRoot, builtSuccessor: artifact.BuiltSuccessor(),
+		},
 	})
 }
 
@@ -1013,6 +1024,17 @@ func (o *ConsensusObserver) prepareRuntime(
 		observeConsensusProgress: func(ctx context.Context, progress sessionConsensusProgress) error {
 			return o.handleProgress(ctx, session, progress)
 		},
+		observeSpeculation: func(ctx context.Context, window sessionSpeculativeWindow) error {
+			return o.handleSpeculation(ctx, session, window)
+		},
+		observeNotarization: func(id simplex.CandidateID, at time.Time) {
+			o.mu.RLock()
+			events, state := o.events, o.state
+			o.mu.RUnlock()
+			if state == consensusObserverRunning {
+				events.Notarized(config.Shard, id, at)
+			}
+		},
 	})
 	if err != nil {
 		return nil, errors.Join(
@@ -1180,6 +1202,41 @@ func (o *ConsensusObserver) handleProgress(
 	}
 }
 
+// handleSpeculation converts one session's bet into the collator capability and
+// hands it on. Unlike progress it is never stashed: a bet is only worth
+// anything before the window it predicts opens, and a session that is not yet
+// active has no producer to collect it.
+func (o *ConsensusObserver) handleSpeculation(
+	ctx context.Context,
+	session *observerSession,
+	window sessionSpeculativeWindow,
+) error {
+	// Same rule as handleProgress: the config is a whole-struct assignment
+	// guarded by session.mu, never a stable snapshot for this goroutine.
+	session.mu.Lock()
+	sessionID := session.config.SessionID
+	phase := session.phase
+	session.mu.Unlock()
+	if phase != observerSessionActive {
+		return nil
+	}
+
+	request, err := collatorSpeculativeWindow(sessionID, window)
+	if err != nil {
+		return fmt.Errorf("validator observer: convert speculative window: %w", err)
+	}
+
+	o.mu.RLock()
+	events := o.events
+	state := o.state
+	o.mu.RUnlock()
+	if state != consensusObserverRunning {
+		return collator.ErrClosed
+	}
+
+	return events.Speculated(ctx, request)
+}
+
 func (o *ConsensusObserver) handleFinalization(
 	ctx context.Context,
 	session *observerSession,
@@ -1248,8 +1305,32 @@ func (o *ConsensusObserver) flushProgress(
 	defer o.workersWG.Done()
 	defer session.progressWG.Done()
 
-	if err := o.deliverProgress(ctx, progress); err != nil {
+	if err := o.deliverRetrying(ctx, func() error {
+		return o.deliverProgress(ctx, progress)
+	}); err != nil {
 		runtime.fail(fmt.Errorf("validator consensus observer: flush startup progress: %w", err))
+	}
+}
+
+// deliverRetrying repeats one startup delivery while the collator answers with
+// a transient refusal.
+//
+// The refusals matter here in a way they do not on the runtime's own progress
+// path, which already retries them (observeWindowProgress). This flush is
+// started by ActivateSession and runs while the controller's reconcile still
+// holds the session lock that ActivateSession was called under, so the very
+// first delivery routinely meets a collator that answers "deferred" rather than
+// blocking behind that lock. Failing the runtime on it would take the session
+// down for a condition that clears in microseconds.
+func (o *ConsensusObserver) deliverRetrying(ctx context.Context, deliver func() error) error {
+	for {
+		err := deliver()
+		if err == nil || !isTransientProgressError(err) {
+			return err
+		}
+		if err = waitConsensusProgress(ctx, err); err != nil {
+			return err
+		}
 	}
 }
 
@@ -1263,7 +1344,10 @@ func (o *ConsensusObserver) flushFinalizations(
 	defer session.progressWG.Done()
 
 	for i := range finalizations {
-		if err := o.deliverFinalization(ctx, finalizations[i]); err != nil {
+		finalization := finalizations[i]
+		if err := o.deliverRetrying(ctx, func() error {
+			return o.deliverFinalization(ctx, finalization)
+		}); err != nil {
 			runtime.fail(fmt.Errorf("validator consensus observer: flush startup finalization: %w", err))
 
 			return

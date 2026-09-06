@@ -20,7 +20,7 @@ type resolverEventLog struct {
 	events []string
 }
 
-func TestStateResolverAcceptanceRetryDelayAndFlag(t *testing.T) {
+func TestStateResolverAcceptanceReusesPreparationOnRetry(t *testing.T) {
 	// A full retry cycle of the production constants is what this asserts, so it
 	// spends its second asleep rather than computing. The constants must not
 	// shrink — the assertions below are the pin on them — but such seconds need
@@ -33,16 +33,15 @@ func TestStateResolverAcceptanceRetryDelayAndFlag(t *testing.T) {
 	t.Parallel()
 	backend := newRuntimeTestBackend()
 	var mu sync.Mutex
-	var calls []struct {
-		at    time.Time
-		retry bool
+	var calls []time.Time
+	preparations := 0
+	backend.prepareAcceptance = func(_ context.Context, acceptance BlockAcceptance) (PreparedBlockAcceptance, error) {
+		preparations++
+		return &runtimeTestBlockAcceptance{backend: backend, acceptance: acceptance}, nil
 	}
-	backend.acceptance = func(_ context.Context, acceptance BlockAcceptance) error {
+	backend.acceptance = func(context.Context, BlockAcceptance) error {
 		mu.Lock()
-		calls = append(calls, struct {
-			at    time.Time
-			retry bool
-		}{at: time.Now(), retry: acceptance.Retry})
+		calls = append(calls, time.Now())
 		count := len(calls)
 		mu.Unlock()
 		if count == 1 {
@@ -63,10 +62,10 @@ func TestStateResolverAcceptanceRetryDelayAndFlag(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("accept calls = %d, want 2", len(calls))
 	}
-	if calls[0].retry || !calls[1].retry {
-		t.Fatalf("retry flags = [%v %v], want [false true]", calls[0].retry, calls[1].retry)
+	if preparations != 1 {
+		t.Fatalf("preparation count = %d, want 1", preparations)
 	}
-	if delay := calls[1].at.Sub(calls[0].at); delay < 950*time.Millisecond {
+	if delay := calls[1].Sub(calls[0]); delay < 950*time.Millisecond {
 		t.Fatalf("accept retry delay = %v, want approximately one second", delay)
 	}
 }
@@ -320,14 +319,102 @@ func TestStateResolverReplaysPersistedFinalizationOnce(t *testing.T) {
 	if err := resolver.finalize(context.Background(), artifact.Candidate.ID, certificate); err != nil {
 		t.Fatal(err)
 	}
-	if len(acceptances) != 1 || !acceptances[0].Replay || acceptances[0].Retry {
-		t.Fatalf("replayed acceptances = %+v, want one replay without retry", acceptances)
+	if len(acceptances) != 1 || !acceptances[0].Replay {
+		t.Fatalf("replayed acceptances = %+v, want one replay", acceptances)
 	}
 	if err := resolver.finalize(context.Background(), artifact.Candidate.ID, certificate); err != nil {
 		t.Fatal(err)
 	}
 	if len(acceptances) != 1 {
 		t.Fatalf("acceptance was replayed %d times, want exactly once", len(acceptances))
+	}
+}
+
+func TestStateResolverPersistsFinalizedCandidateForPeerlessRestart(t *testing.T) {
+	storage := newRuntimeTestStorage()
+	config, privateKey := runtimeTestConfig(resolverTestSessionTag, &runtimeTestJournal{})
+	artifact := runtimeOrdinaryArtifact(t, config, privateKey, 1, simplex.Genesis())
+	params := simplex.DefaultParams()
+	provider := &retryCandidateProvider{called: make(chan struct{}, 1)}
+
+	candidates := newResolverForTest(
+		storage,
+		provider,
+		1,
+		params,
+	)
+	candidates.session = config.StorageID
+	wire, _, err := candidates.codec.encodeForBroadcast(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = candidates.stage(artifact, wire); err != nil {
+		t.Fatal(err)
+	}
+	notarization := resolverTestSeal(t, simplex.NotarizeVote(artifact.Candidate.ID))
+	candidates.observeNotarization(artifact.Candidate.ID, notarization)
+
+	backend := newRuntimeTestBackend()
+	resolver := newStateResolver(
+		config.Shard,
+		config.StorageID,
+		storage,
+		backend,
+		candidates,
+		StoredSessionState{},
+		nil,
+		params,
+		config.Protocol.SlotsPerLeaderWindow,
+	)
+	if err = resolver.start(context.Background(), runtimeTestStart()); err != nil {
+		t.Fatal(err)
+	}
+	finalization := resolverTestSeal(t, simplex.FinalizeVote(artifact.Candidate.ID))
+	if err = resolver.finalize(context.Background(), artifact.Candidate.ID, finalization); err != nil {
+		t.Fatal(err)
+	}
+	resolver.close()
+	candidates.close()
+
+	if storage.saveCount() != 1 {
+		t.Fatalf("candidate saves = %d, want one finalization-owned write", storage.saveCount())
+	}
+
+	restartedProvider := &retryCandidateProvider{called: make(chan struct{}, 1)}
+	restartedCandidates := newRestoredResolverForTest(
+		storage,
+		restartedProvider,
+		1,
+		params,
+		StoredSessionState{CandidateIDs: []simplex.CandidateID{artifact.Candidate.ID}},
+	)
+	restartedCandidates.session = config.StorageID
+	restartedCandidates.observeNotarization(artifact.Candidate.ID, notarization)
+	restartedBackend := newRuntimeTestBackend()
+	restarted := newStateResolver(
+		config.Shard,
+		config.StorageID,
+		storage,
+		restartedBackend,
+		restartedCandidates,
+		StoredSessionState{Finalized: []simplex.CandidateID{artifact.Candidate.ID}},
+		[]simplex.VerifiedCertificate{finalization},
+		params,
+		config.Protocol.SlotsPerLeaderWindow,
+	)
+	t.Cleanup(func() {
+		restarted.close()
+		restartedCandidates.close()
+	})
+
+	if err = restarted.start(context.Background(), runtimeTestStart()); err != nil {
+		t.Fatalf("restart recovery without peers: %v", err)
+	}
+	if storage.saveCount() != 1 {
+		t.Fatalf("candidate saves after restart = %d, want idempotent one", storage.saveCount())
+	}
+	if _, requests, _ := restartedProvider.snapshot(); len(requests) != 0 {
+		t.Fatalf("peerless restart made candidate requests: %+v", requests)
 	}
 }
 
@@ -1256,7 +1343,7 @@ func TestStateResolverFinalizationReleasesAppliedStatesBelowWatermark(t *testing
 // The ancestry guard reaches back to the masterchain-visible finalized block,
 // which lags this session's own finalized slot, so it routinely asks for
 // candidates the finalization sweep has already released.
-func TestStateResolverAncestryReloadsReleasedAncestors(t *testing.T) {
+func TestStateResolverAncestryRetainsReleasedAncestorsWithoutPayloadReads(t *testing.T) {
 	storage := newRuntimeTestStorage()
 	runtime, privateKey := prepareRuntimeTest(
 		t,
@@ -1306,9 +1393,12 @@ func TestStateResolverAncestryReloadsReleasedAncestors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertAncestryStats(t, walk, len(artifacts), 0, len(artifacts), 0)
-	if storage.loadCount() != len(artifacts) {
-		t.Fatalf("candidate reloads = %d, want one per released ancestor", storage.loadCount())
+	assertAncestryStats(t, walk, len(artifacts), len(artifacts), 0, 0)
+	if storage.loadCount() != 0 {
+		t.Fatalf("candidate reloads = %d, want no payload reads for known ancestry", storage.loadCount())
+	}
+	if stats := runtime.candidates.cacheStats(); stats.Candidates != 0 || stats.Bytes != 0 {
+		t.Fatalf("ancestry repinned released payloads: %+v", stats)
 	}
 }
 
@@ -1652,9 +1742,8 @@ func TestRetentionFloorIgnoresSkippedSlots(t *testing.T) {
 	session := newLaggingSessionWithStride(t, length, 0, stride)
 	defer session.close()
 
-	// The producer states its requirement once: its window walked back to the
-	// only block the node has applied, at slot 0.
-	session.sweep(session.slotOf(tip))
+	// The producer states its requirement before the sweep: compact ancestry
+	// does not reload payloads that an earlier unconstrained sweep released.
 	session.walk(t, tip, 0)
 
 	// Consensus finalizes again at the tip, having skipped everything between.
@@ -1690,8 +1779,8 @@ func TestRetentionFloorIgnoresSkippedSlots(t *testing.T) {
 // The floor follows the producer, so a node that falls arbitrarily far behind
 // would pin arbitrarily much. What stops it is the session's memory budget, and
 // nothing else: once the retained payloads no longer fit, the sweeps prune
-// again and the walk pays storage reads, which is the right trade for a node
-// holding more than it is allowed to.
+// again. Compact ancestry must continue to work without restoring the payloads
+// that the budget just released.
 func TestRetentionFloorResumesPruningPastTheBudget(t *testing.T) {
 	for _, budget := range []struct {
 		name   string
@@ -1719,9 +1808,8 @@ func TestRetentionFloorResumesPruningPastTheBudget(t *testing.T) {
 			session.candidates.budget = budget.budget
 			session.candidates.mu.Unlock()
 
-			for slot := range tip + 1 {
-				session.sweep(uint32(slot))
-			}
+			// State the producer's floor while its payloads are still resident,
+			// then force the budget to choose which of them the sweep releases.
 			session.walk(t, tip, tip-lag)
 			session.sweep(uint32(tip))
 
@@ -1738,13 +1826,16 @@ func TestRetentionFloorResumesPruningPastTheBudget(t *testing.T) {
 					retained.Candidates, lag+1)
 			}
 
-			// Pruning past the walk is a cost, never a failure: the window still
-			// opens, out of storage.
+			// The compact identity survives pruning; opening the next window must
+			// neither read nor repin the payloads that exceeded the budget.
 			before, _ := session.counts()
 			walk := session.walk(t, tip, tip-lag)
 			after, _ := session.counts()
-			if after == before {
-				t.Fatal("the capped sweep released nothing the next window had to read back")
+			if after != before {
+				t.Fatalf("capped ancestry reloaded %d payloads", after-before)
+			}
+			if got := session.candidates.cacheStats(); got != retained {
+				t.Fatalf("capped ancestry changed payload retention: before %+v, after %+v", retained, got)
 			}
 			if walk.Visited != lag+1 {
 				t.Fatalf("the walk past the budget covered %d candidates, want %d",

@@ -65,27 +65,41 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 	if err != nil {
 		return ShardRequest{}, err
 	}
-	predecessorGenUtime, err := verifyShardPredecessors(managed.master, resolved.previous)
+	header, err := a.requestHeader(request)
 	if err != nil {
 		return ShardRequest{}, err
 	}
-	header, err := a.requestHeader(request)
+	predecessorGenUtime, refs, err := shardPredecessorRefs(resolved.previous)
+	if err != nil {
+		return ShardRequest{}, err
+	}
+	stepStarted = time.Now()
+	selected, err := a.selectShardMasterView(
+		ctx,
+		managed,
+		request.Session,
+		resolved.previous,
+		refs,
+		time.UnixMilli(int64(header.GenUtimeMS)),
+		seedingAllowedFor(request),
+	)
+	a.observeSubstage(chain, stage, "select_master_view", stepStarted)
 	if err != nil {
 		return ShardRequest{}, err
 	}
 	header, err = clampLocalHeaderTime(
 		header,
-		managed.master.context.Config.globalVersion,
-		max(predecessorGenUtime, managed.master.context.GenUtime),
+		selected.view.context.Config.globalVersion,
+		max(predecessorGenUtime, selected.view.context.GenUtime),
 	)
 	if err != nil {
 		return ShardRequest{}, err
 	}
 	beforeSplit, err := deriveBeforeSplit(
-		managed.master.context,
+		selected.view.context,
 		header,
 		request.Session.Shard,
-		managed.update.Registered,
+		selected.registered,
 	)
 	if err != nil {
 		return ShardRequest{}, err
@@ -110,7 +124,7 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 		if keyErr != nil {
 			return ShardRequest{}, keyErr
 		}
-		delta, installErr := a.installCandidateDeltaLocked(
+		installed, installErr := a.installCandidateDeltaLocked(
 			managed,
 			localResolvedChain{previous: pending.Previous, candidateTip: pending.CandidateTip},
 			pending.Root,
@@ -124,13 +138,13 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 		if installErr != nil {
 			return ShardRequest{}, installErr
 		}
-		a.collectPooledInternals(&hints, delta.Added)
+		a.collectPooledInternals(&hints, installed.delta.Added)
 	}
 	stepStarted = time.Now()
 	messages, err := a.acquireShardMessages(
 		ctx,
 		managed.branch,
-		managed.master,
+		selected.view,
 		request.Session.Shard,
 		resolved.previous,
 		resolved.queueBase,
@@ -149,7 +163,7 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 	result := ShardRequest{
 		Shard:               request.Session.Shard,
 		Previous:            resolved.previous[0],
-		Masterchain:         managed.master.context,
+		Masterchain:         selected.view.context,
 		Header:              header,
 		BeforeSplit:         beforeSplit,
 		RandSeed:            seed,
@@ -160,6 +174,7 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 		Internals:           messages.cut,
 		Neighbors:           messages.neighbors,
 		NeighborShardEndLT:  messages.shardEndLT,
+		MaxTransactions:     request.MaxTransactions,
 		accountPrewarmer:    a.accountPrewarmer,
 	}
 	if request.onSuccessor != nil {
@@ -170,13 +185,8 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 		// split decision, which is a fact about the masterchain view this build
 		// was acquired against.
 		result.successor = &successorPort{
-			offer:  request.onSuccessor,
-			revoke: request.revokeSuccessor,
-			// Without the session lock, deliberately: a revoke happens while the
-			// predecessor is rebuilding and must not stand in front of the commit
-			// that rebuild is racing towards. DropCandidate takes only the
-			// branch's own lock, and the branch pointer outlives the session.
-			discard:      func(root [32]byte) { managed.branch.DropCandidate(root) },
+			offer:        request.onSuccessor,
+			revoke:       request.revokeSuccessor,
 			previous:     clonePreviousBlocks(resolved.previous),
 			queueBase:    clonePreviousBlocks(resolved.queueBase),
 			candidateTip: cloneHashPointer(resolved.candidateTip),
@@ -188,7 +198,7 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 		second := resolved.previous[1]
 		result.Previous2 = &second
 	}
-	if managed.master.context.Config.capabilities&capFullCollatedData != 0 {
+	if selected.view.context.Config.capabilities&capFullCollatedData != 0 {
 		result.FullCollatedProofs = messages.proofs
 	}
 
@@ -581,24 +591,49 @@ func (a *LocalAcquisition) resolveBlock(
 	return previous, nil, nil
 }
 
-func verifyShardPredecessors(master *localMasterView, previous []PreviousBlock) (uint32, error) {
+// shardPredecessorRefs decodes every predecessor once and returns the newest
+// generation time together with the masterchain reference each one carries.
+//
+// The references are the reference collator's prev_mc_ref loop (cppnode
+// collator.cpp:663-667) and become the floor of the per-slot masterchain view
+// pick: a block may never reference a masterchain block older than the one its
+// own predecessor referenced. Decoding is separated from checking because the
+// check has to be repeated against each candidate view, while the decode is the
+// expensive half and is view-independent.
+func shardPredecessorRefs(previous []PreviousBlock) (uint32, []*tlb.ExtBlkRef, error) {
 	var genUtime uint32
+	refs := make([]*tlb.ExtBlkRef, len(previous))
 	for i := range previous {
 		var state tlb.ShardStateUnsplit
 		if err := parseExact(&state, previous[i].State); err != nil {
-			return 0, fmt.Errorf("%w: decode predecessor %d: %v", ErrInvalidInput, i, err)
+			return 0, nil, fmt.Errorf("%w: decode predecessor %d: %v", ErrInvalidInput, i, err)
 		}
 		var stats tlb.ShardStateStats
 		if err := parseExact(&stats, state.Stats); err != nil {
-			return 0, fmt.Errorf("%w: decode predecessor %d statistics: %v", ErrInvalidInput, i, err)
+			return 0, nil, fmt.Errorf("%w: decode predecessor %d statistics: %v", ErrInvalidInput, i, err)
 		}
-		if err := master.requirePredecessorMasterReference(previous[i].ID, stats.MasterRef); err != nil {
-			return 0, err
-		}
+		refs[i] = stats.MasterRef
 		genUtime = max(genUtime, state.GenUTime)
 	}
 
-	return genUtime, nil
+	return genUtime, refs, nil
+}
+
+// verifyShardPredecessorRefs is the second half: every predecessor's
+// masterchain reference must resolve, identically, inside the view this build
+// is about to stamp. A view that cannot resolve one is not a view this block
+// may name.
+func verifyShardPredecessorRefs(master *localMasterView, previous []PreviousBlock, refs []*tlb.ExtBlkRef) error {
+	if len(refs) != len(previous) {
+		return fmt.Errorf("%w: predecessor reference count does not match the chain", ErrInvalidInput)
+	}
+	for i := range previous {
+		if err := master.requirePredecessorMasterReference(previous[i].ID, refs[i]); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func blockRootKey(id ton.BlockIDExt) ([32]byte, error) {
@@ -971,20 +1006,22 @@ func (a *LocalAcquisition) recordCandidateLocked(
 	} else {
 		return fmt.Errorf("%w: candidate queue parent is unavailable", ErrAcquisitionNotReady)
 	}
-	delta, err := a.installCandidateDeltaLocked(
+	installed, err := a.installCandidateDeltaLocked(
 		managed, chain, derivation.root, built.ID, queueID, derivation.startLT, true, hints,
 	)
 	if err != nil {
 		return err
 	}
 	if err = a.messages.Complete(derivation.externals); err != nil {
-		managed.branch.DropCandidate(queueID)
+		if installed.ownership == msgpool.CandidateInstallAdded {
+			managed.branch.DropCandidate(queueID)
+		}
 
 		return fmt.Errorf("complete candidate external messages: %w", err)
 	}
 	managed.candidates[artifact.Candidate.ID] = state
 	managed.blocks[queueID] = state
-	a.collectPooledInternals(hints, delta.Added)
+	a.collectPooledInternals(hints, installed.delta.Added)
 	a.enqueueDispatchStatePrewarm(ctx, managed.dispatchPrewarmOwner(), built.ID, derivation.state)
 
 	return nil
@@ -1187,8 +1224,15 @@ func candidateSources(previous []PreviousBlock) []msgpool.CandidateSource {
 // that follows a speculative install would be rejected as a conflicting entry
 // rather than recognised as the same content.
 //
-// AddCandidate is content-idempotent, so the second call — the commit's — is a
-// no-op when a speculative install already put the identical node there.
+// AddOrReusePromotedCandidate is content-idempotent, so the second call — the
+// commit's — is a no-op when a speculative install already put the identical
+// node there. It also recognizes the exact linear Parent/Base promotion that
+// occurs when consensus applies that speculative predecessor.
+type candidateDeltaInstall struct {
+	delta     *msgpool.InternalsDelta
+	ownership msgpool.CandidateInstall
+}
+
 func (a *LocalAcquisition) installCandidateDeltaLocked(
 	managed *localAcquisitionSession,
 	chain localResolvedChain,
@@ -1198,12 +1242,7 @@ func (a *LocalAcquisition) installCandidateDeltaLocked(
 	startLT uint64,
 	seedAllowed bool,
 	hints *prewarmHints,
-) (*msgpool.InternalsDelta, error) {
-	if chain.candidateTip == nil {
-		if err := a.ensureCandidateBase(managed.branch, chain.previous, seedAllowed, hints); err != nil {
-			return nil, err
-		}
-	}
+) (candidateDeltaInstall, error) {
 	source := targetShardIdent(groups.ShardID{Workchain: id.Workchain, Shard: id.Shard})
 	delta, err := managed.branch.DeltaFromBlockRoot(
 		source,
@@ -1212,7 +1251,7 @@ func (a *LocalAcquisition) installCandidateDeltaLocked(
 		startLT,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("derive candidate message delta: %w", err)
+		return candidateDeltaInstall{}, fmt.Errorf("derive candidate message delta: %w", err)
 	}
 	request := msgpool.CandidateRequest{
 		ID:    queueID,
@@ -1224,11 +1263,29 @@ func (a *LocalAcquisition) installCandidateDeltaLocked(
 	} else {
 		request.Base = candidateSources(chain.previous)
 	}
-	if err = managed.branch.AddCandidate(request); err != nil {
-		return nil, fmt.Errorf("commit candidate message delta: %w", err)
+	// A pipelined successor can install this exact block while its selected
+	// predecessor is still represented as a candidate Parent. When consensus
+	// advances that predecessor to the applied frontier, a deterministic retry
+	// of the same slot resolves the same block as a Base transition instead.
+	if chain.candidateTip == nil {
+		if err = managed.branch.ReusePromotedCandidate(request); err == nil {
+			return candidateDeltaInstall{
+				delta:     delta,
+				ownership: msgpool.CandidateInstallReused,
+			}, nil
+		} else if !errors.Is(err, msgpool.ErrCandidateNotFound) {
+			return candidateDeltaInstall{}, fmt.Errorf("reuse candidate message delta: %w", err)
+		}
+		if err = a.ensureCandidateBase(managed.branch, chain.previous, seedAllowed, hints); err != nil {
+			return candidateDeltaInstall{}, err
+		}
+	}
+	ownership, err := managed.branch.AddOrReusePromotedCandidate(request)
+	if err != nil {
+		return candidateDeltaInstall{}, fmt.Errorf("commit candidate message delta: %w", err)
 	}
 
-	return delta, nil
+	return candidateDeltaInstall{delta: delta, ownership: ownership}, nil
 }
 
 // seedAllowed says whether this caller may fall back to rebuilding the source

@@ -8,27 +8,31 @@ import (
 	"github.com/xssnick/gton/service/validator/msgpool"
 )
 
-// A revoke names the block it handed over, and it has to. By the time one
-// arrives the slot may already hold a successor started from a later, valid
-// offer — the retry that caused the revoke will have produced one — and taking
-// that down would turn a recovered rebuild into a lost slot.
+// A revoke names both the offer attempt and the block it handed over. By the
+// time one arrives the slot may already hold a successor started from a later,
+// valid offer — the retry that caused the revoke will have produced one — and
+// taking that down would turn a recovered rebuild into a lost slot.
 func TestSuccessorSlotRevokesOnlyTheOfferItNames(t *testing.T) {
 	stale := [32]byte{1}
 	fresh := [32]byte{2}
+	token := &successorToken{}
 
 	var slot successorSlot
 	resident := &candidateBuildFuture{done: make(chan struct{}), cancel: func() {}}
 	close(resident.done)
-	if !slot.install(resident, fresh) {
+	if !slot.install(resident, fresh, token, nil) {
 		t.Fatal("the empty slot refused an install")
 	}
-	if taken := slot.takeIf(stale); taken != nil {
+	if taken := slot.takeIf(token, stale); taken != nil {
 		t.Fatal("a revoke naming one predecessor took down a successor started on another")
 	}
-	if taken := slot.takeIf(fresh); taken != resident {
+	if taken := slot.takeIf(&successorToken{}, fresh); taken != nil {
+		t.Fatal("a revoke from another offer took down the resident successor")
+	}
+	if taken := slot.takeIf(token, fresh); taken != resident {
 		t.Fatal("a revoke naming the resident predecessor did not take it")
 	}
-	if taken, _ := slot.take(); taken != nil {
+	if taken, _, _ := slot.take(); taken != nil {
 		t.Fatal("the slot still holds something after it was taken")
 	}
 }
@@ -43,10 +47,10 @@ func TestSuccessorSlotHoldsOneAndClosesForGood(t *testing.T) {
 	second := &candidateBuildFuture{done: make(chan struct{}), cancel: func() {}}
 	close(second.done)
 
-	if !slot.install(first, [32]byte{1}) {
+	if !slot.install(first, [32]byte{1}, &successorToken{}, nil) {
 		t.Fatal("the empty slot refused an install")
 	}
-	if slot.install(second, [32]byte{2}) {
+	if slot.install(second, [32]byte{2}, &successorToken{}, nil) {
 		t.Fatal("an occupied slot accepted a second successor")
 	}
 
@@ -54,36 +58,60 @@ func TestSuccessorSlotHoldsOneAndClosesForGood(t *testing.T) {
 	third := &candidateBuildFuture{done: make(chan struct{}), cancel: func() { stopped = true }}
 	close(third.done)
 	slot.take()
-	if !slot.install(third, [32]byte{3}) {
+	if !slot.install(third, [32]byte{3}, &successorToken{}, nil) {
 		t.Fatal("the emptied slot refused an install")
 	}
 	slot.close()
 	if !stopped {
 		t.Error("closing the slot left its successor running")
 	}
-	if slot.install(first, [32]byte{1}) {
+	if slot.install(first, [32]byte{1}, &successorToken{}, nil) {
 		t.Error("a closed slot accepted an install; the window is over and nobody will stop it")
 	}
 }
 
-// Withdrawing an offer must reach both halves and must happen once. The producer
-// half stops the doomed build; the acquisition half drops the queue node that
-// build installed for a predecessor no candidate will carry. A second revoke —
-// and there are several paths that can raise one — must do neither again.
-func TestRevokingAnOfferReachesBothHalvesExactlyOnce(t *testing.T) {
+// A retry keeps the slot seed, so it can reproduce the same predecessor root
+// before the old attempt's asynchronous revoke reaches the producer. The old
+// token must not cancel the replacement; root-only matching did exactly that.
+func TestSuccessorSlotRejectsDelayedSameRootRevoke(t *testing.T) {
+	root := [32]byte{0x44}
+	oldToken := &successorToken{}
+	newToken := &successorToken{}
+	old := &candidateBuildFuture{done: make(chan struct{}), cancel: func() {}}
+	close(old.done)
+	fresh := &candidateBuildFuture{done: make(chan struct{}), cancel: func() {}}
+	close(fresh.done)
+
+	var slot successorSlot
+	if !slot.install(old, root, oldToken, nil) {
+		t.Fatal("the empty slot refused the old attempt")
+	}
+	if taken := slot.takeIf(oldToken, root); taken != old {
+		t.Fatal("the old attempt could not retire itself")
+	}
+	if !slot.install(fresh, root, newToken, nil) {
+		t.Fatal("the replacement with the same root was refused")
+	}
+	if taken := slot.takeIf(oldToken, root); taken != nil {
+		t.Fatal("the delayed old revoke took down the same-root replacement")
+	}
+	if taken := slot.takeIf(newToken, root); taken != fresh {
+		t.Fatal("the replacement's own revoke did not take it down")
+	}
+}
+
+// Withdrawing an offer must stop the doomed build exactly once. Its speculative
+// queue node stays until Retain: deleting by root here is ABA-unsafe because a
+// deterministic retry can reuse the same block root before this asynchronous
+// callback returns.
+func TestRevokingAnOfferReachesTheProducerExactlyOnce(t *testing.T) {
 	var mu sync.Mutex
 	var revoked []PipelineHandoffOutcome
-	var discarded [][32]byte
 
 	port := &successorPort{
-		revoke: func(root [32]byte, outcome PipelineHandoffOutcome) {
+		revoke: func(_ *successorToken, root [32]byte, outcome PipelineHandoffOutcome) {
 			mu.Lock()
 			revoked = append(revoked, outcome)
-			mu.Unlock()
-		},
-		discard: func(root [32]byte) {
-			mu.Lock()
-			discarded = append(discarded, root)
 			mu.Unlock()
 		},
 	}
@@ -93,7 +121,7 @@ func TestRevokingAnOfferReachesBothHalvesExactlyOnce(t *testing.T) {
 	port.revokeOffered(PipelineHandoffAbandonedFailed)
 	time.Sleep(20 * time.Millisecond)
 	mu.Lock()
-	if len(revoked) != 0 || len(discarded) != 0 {
+	if len(revoked) != 0 {
 		t.Fatal("a port that never offered anything withdrew something")
 	}
 	mu.Unlock()
@@ -109,7 +137,7 @@ func TestRevokingAnOfferReachesBothHalvesExactlyOnce(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		mu.Lock()
-		landed := len(discarded) == 1
+		landed := len(revoked) == 1
 		mu.Unlock()
 		if landed {
 			break
@@ -126,9 +154,6 @@ func TestRevokingAnOfferReachesBothHalvesExactlyOnce(t *testing.T) {
 	defer mu.Unlock()
 	if len(revoked) != 1 || revoked[0] != PipelineHandoffAbandonedRetry {
 		t.Errorf("producer side saw %v, want exactly one abandoned_retry", revoked)
-	}
-	if len(discarded) != 1 || discarded[0] != root {
-		t.Errorf("acquisition side saw %v, want exactly one drop of the offered root", discarded)
 	}
 }
 
@@ -227,21 +252,16 @@ func TestOverlapIsMeasuredOnlyForAnAdoptedOffer(t *testing.T) {
 
 // The withdrawal must not run on the caller. Its caller is the predecessor's own
 // collation on the first line of a size-limit rebuild — the slot's last chance —
-// and the revoke half joins a build that may be inside a TVM execution. What it
-// must still guarantee is the order of its two halves: the queue node is dropped
-// only after the successor that would install it has stopped, or the message
-// branch is left holding a node for a block that never existed.
-func TestRevokingAnOfferDoesNotBlockTheCallerAndKeepsItsOrder(t *testing.T) {
+// and revoke joins a build that may be inside a TVM execution.
+func TestRevokingAnOfferDoesNotBlockTheCaller(t *testing.T) {
 	revokeEntered := make(chan struct{})
 	releaseRevoke := make(chan struct{})
-	discarded := make(chan struct{})
 
 	port := &successorPort{
-		revoke: func([32]byte, PipelineHandoffOutcome) {
+		revoke: func(*successorToken, [32]byte, PipelineHandoffOutcome) {
 			close(revokeEntered)
 			<-releaseRevoke
 		},
-		discard: func([32]byte) { close(discarded) },
 	}
 	port.noteOffered([32]byte{9})
 
@@ -263,18 +283,5 @@ func TestRevokingAnOfferDoesNotBlockTheCallerAndKeepsItsOrder(t *testing.T) {
 		t.Fatal("revokeOffered blocked its caller on the successor unwinding")
 	}
 
-	// The discard has not run: it waits for the revoke, which is what stops it
-	// from overtaking a build still installing the node it is about to drop.
-	select {
-	case <-discarded:
-		t.Fatal("the queue node was dropped before the successor had stopped")
-	case <-time.After(50 * time.Millisecond):
-	}
-
 	close(releaseRevoke)
-	select {
-	case <-discarded:
-	case <-time.After(2 * time.Second):
-		t.Fatal("the queue node was never dropped")
-	}
 }

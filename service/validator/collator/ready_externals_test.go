@@ -390,3 +390,48 @@ func addReadyExternal(t *testing.T, pool *msgpool.Pool, dst *address.Address, ta
 		t.Fatal(err)
 	}
 }
+
+// A full block skips the wait for externals, not the externals that are
+// ready. Here the block counts as full from its first byte and the stream
+// hands out one external at a time; every external the pool holds must still
+// be shipped, without a wait, before the stage stops for being full.
+func TestBuildShardWithReadyExternalsTakesEveryReadyExternalBeforeALoadedStop(t *testing.T) {
+	// A stream of capacity one: the opening take yields a single external and
+	// every further one has to be taken from the pool by the loop itself.
+	req, pool, stream := readyExternalFixture(t, externalAcceptCode(t), 1)
+	loaded := *req.Masterchain.Config
+	loaded.basechain.limits.bytes[LoadUnderload] = 1
+	loaded.basechain.limits.bytes[LoadNormal] = 1
+	req.Masterchain.Config = &loaded
+	const externals = 5
+	for i := uint64(1); i <= externals; i++ {
+		addReadyExternal(t, pool, readyExternalAddress(), i)
+	}
+
+	// A boundary no test should ever reach: a wait for it fails the wait
+	// assertion first.
+	waitUntil := time.Now().Add(time.Minute)
+	candidate, _, err := testBuilder().buildShardWithReadyExternals(
+		t.Context(),
+		req,
+		stream,
+		waitUntil,
+		waitUntil,
+		1,
+		time.Time{},
+		time.Time{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Stats.ExternalIncluded != externals {
+		t.Fatalf("externals included = %d, want all %d that were ready: stats %+v",
+			candidate.Stats.ExternalIncluded, externals, candidate.Stats)
+	}
+	if candidate.Stats.ExternalStop != ExternalStopLoaded {
+		t.Fatalf("external stop = %v, want the loaded stop once nothing more was ready", candidate.Stats.ExternalStop)
+	}
+	if candidate.Stats.ExternalWait != 0 {
+		t.Fatalf("external wait = %s, want none for a loaded block", candidate.Stats.ExternalWait)
+	}
+}

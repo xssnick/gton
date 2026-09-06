@@ -235,7 +235,24 @@ func ParseCandidateWrapped(data []byte) (*ConsensusCandidateWrapped, error) {
 // in BroadcastExtra; storage and resolver wires may instead use the wrapper
 // accepted by ParseCandidateWrapped.
 func ParseCandidateData(data []byte) (tl.Serializable, error) {
-	inner, rest, err := parseCandidateData(data)
+	return parseBareCandidateData(data, false)
+}
+
+// ParseCandidateDataNoCopy is ParseCandidateData over a buffer the caller
+// owns only for the duration of its own call, such as a transport buffer that
+// is handed to a receive callback. Every byte field of the result — the
+// compressed candidate, the signature, the parent hash, an empty candidate's
+// block hashes — aliases data instead of copying it, so a caller that keeps
+// any of them past the call copies that field itself. The private-overlay
+// receive path decodes the candidate before it returns and retains only the
+// signature and the ids, which is what makes the copy of the compressed
+// candidate — half a megabyte on a mainnet block — pure waste there.
+func ParseCandidateDataNoCopy(data []byte) (tl.Serializable, error) {
+	return parseBareCandidateData(data, true)
+}
+
+func parseBareCandidateData(data []byte, noCopy bool) (tl.Serializable, error) {
+	inner, rest, err := parseCandidateDataMode(data, noCopy)
 	if err != nil {
 		return nil, err
 	}
@@ -247,8 +264,18 @@ func ParseCandidateData(data []byte) (tl.Serializable, error) {
 }
 
 func parseCandidateData(data []byte) (tl.Serializable, []byte, error) {
+	return parseCandidateDataMode(data, false)
+}
+
+func parseCandidateDataMode(data []byte, noCopy bool) (tl.Serializable, []byte, error) {
 	var inner tl.Serializable
-	rest, err := tl.Parse(&inner, data, true)
+	var rest []byte
+	var err error
+	if noCopy {
+		rest, err = tl.ParseNoCopy(&inner, data, true)
+	} else {
+		rest, err = tl.Parse(&inner, data, true)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("simplex/tl: parse candidate data: %w", err)
 	}

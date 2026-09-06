@@ -118,12 +118,15 @@ type CandidateArtifact struct {
 	// held this candidate's parsed payload: the network decoder for a received
 	// candidate, this node's own builder for one it produced. On the way in they
 	// never leave prepareValidationCandidate; on the way out they are lent to the
-	// one validation the emission feeds and to nothing that outlives it, because
-	// they pin the block DAG and the whole collated proof set. Every holder that
+	// validation or observer state preparation the emission feeds. They pin the
+	// block DAG and the whole collated proof set. Every holder that
 	// keeps an artifact past that call must therefore keep what retained()
 	// returns instead of the artifact it was handed.
 	blockRoot     *cell.Cell
 	collatedRoots []*cell.Cell
+	// builtSuccessor is the same one-use handoff for a standalone observer,
+	// which need not reconstruct the state its own builder just produced.
+	builtSuccessor LiveSuccessorState
 
 	// generationTimeMS is the exact timestamp serialized into the consensus
 	// extra root. The known bit is provenance: only the sealed builder path can
@@ -144,6 +147,7 @@ type CandidateArtifact struct {
 func (a CandidateArtifact) retained() CandidateArtifact {
 	a.blockRoot = nil
 	a.collatedRoots = nil
+	a.builtSuccessor = LiveSuccessorState{}
 
 	return a
 }
@@ -158,6 +162,13 @@ func (a CandidateArtifact) retained() CandidateArtifact {
 // outside this package can claim a root belongs to bytes it does not.
 func (a CandidateArtifact) ValidationRoots() (*cell.Cell, []*cell.Cell) {
 	return a.blockRoot, a.collatedRoots
+}
+
+// BuiltSuccessor returns this process's sealed build result. It opens only for
+// the exact predecessor trees the builder used; consensus must still certify
+// the candidate before this state can become a selected parent.
+func (a CandidateArtifact) BuiltSuccessor() LiveSuccessorState {
+	return a.builtSuccessor
 }
 
 // GenerationTimeMS returns the exact millisecond timestamp carried by this
@@ -234,6 +245,22 @@ type SpeculativeWindowRequest struct {
 	Deadline time.Time
 }
 
+// SpeculativeSessionStartRequest asks for the first slot of a session's window
+// zero to be built before consensus has opened that window. The bet is placed
+// the moment the session is activated, so the build overlaps what remains of
+// the session's start — the network, the consensus engine and its observation
+// of window zero — instead of following it. The window's base is the session
+// genesis: a producer that opens window zero on the genesis adopts the build,
+// anything else drops it.
+type SpeculativeSessionStartRequest struct {
+	SessionID [32]byte
+	Leader    uint32
+	StartAt   time.Time
+	// Deadline bounds the bet: a window zero nobody has opened by then was lost
+	// to the committee's first-block timeout regardless.
+	Deadline time.Time
+}
+
 // SoftTimeoutAction is the explicit producer decision at
 // slotStart+TargetRate while the hard collation future is still running.
 type SoftTimeoutAction uint8
@@ -281,6 +308,11 @@ type BuildRequest struct {
 	// derives them from params_.soft_timeout. Restore requests leave it zero,
 	// which leaves those budgets inert.
 	BuildSoftDeadline time.Time
+	// MaxTransactions caps the transactions the build admits; zero leaves the
+	// block bounded by its limits alone. The producer sets it for the first slot
+	// of a leader window, whose block has to be notarized inside the committee's
+	// first-block timeout rather than inside a slot; see firstSlotTransactions.
+	MaxTransactions uint32
 	// speculative marks a build started before its leader window was observed
 	// and carries the predecessor it bet on. It is unexported because the only
 	// legitimate producer of one is this package's speculation entry point:
@@ -288,6 +320,21 @@ type BuildRequest struct {
 	// caller that could set this could make a build read a state consensus never
 	// selected.
 	speculative *speculativeBase
+	// crossWindowBet marks the other bet this package places: the first slot of
+	// the next window, started by the producer of the current one from its own
+	// handoff. It carries no speculativeBase because it does not guess a base —
+	// PreviousPending names it — but it is a wager just the same, dropped
+	// whenever consensus opens that window somewhere else. It exists as its own
+	// field because speculative is read by the acquisition layer to decide how a
+	// build finds its predecessor, and this build finds it the ordinary way.
+	crossWindowBet bool
+	// sessionStartAt marks the third bet: the first slot of window zero of a
+	// fresh session, started at activation before consensus has observed any
+	// window. It carries the instant the bet was placed, which is what the
+	// header is stamped with — the slot offset every other build derives its
+	// time from needs a window start, and this build has none. Unexported for
+	// the same reason speculative is: only SpeculateSessionStart may set it.
+	sessionStartAt time.Time
 	// PaceStartedAt is the instant this build was scheduled to begin. The
 	// CPU-bound split heuristic measures its spans from here rather than from
 	// the wall clock, so a build the producer starts ahead of its schedule
@@ -332,7 +379,7 @@ type BuildRequest struct {
 	onSuccessor func(SuccessorOffer)
 	// revokeSuccessor withdraws an offer this build already made, naming the
 	// predecessor root it named. Installed alongside onSuccessor.
-	revokeSuccessor func([32]byte, PipelineHandoffOutcome)
+	revokeSuccessor func(*successorToken, [32]byte, PipelineHandoffOutcome)
 }
 
 // CandidateCommit publishes one already durable candidate transition to the

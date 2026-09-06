@@ -38,9 +38,22 @@ import (
 const (
 	fullCollatedGoldenBlockBytes    = 270276
 	fullCollatedGoldenBlockSum      = "b4817ecd423702cf2ba6207ad06d068d4934f5b262a3b6208b0607de3dc0cdec"
-	fullCollatedGoldenCollatedBytes = 136037
-	fullCollatedGoldenCollatedSum   = "c4136c39914349f77a56b6dd729ad1087646ebaae9a0754963ede25c4c7a4912"
+	fullCollatedGoldenCollatedBytes = 134581
+	fullCollatedGoldenCollatedSum   = "c3ad9d3f95f764ec09ecd67d8237ae3fc44e86db91e470796825d21a7031fce7"
 )
+
+// PROVENANCE, collated half only (136037 / c4136c39… -> the value above, -1456
+// bytes; the block is untouched). The previous-state proof now prunes every leaf
+// the collation did not read, where it used to keep a RESIDENT unread leaf whole
+// (tonutils proof_usage.go, pruneUnloadedLeaves). That was
+// CellBuilder::create_pruned_branch's loaded-leaf rule applied to a predecessor
+// whose every cell is loaded; the reference collator's predecessor is
+// ExtCell-backed, so an unread leaf there is unloaded and pruned. Measured on the
+// stand (2026-09-03) as +15% collated data over the reference's sibling blocks
+// after two splits, with the blocks within 0.3%. The store-shaped arms of
+// payload_hint_mainnet_test.go, whose unread leaves were already lazy and
+// therefore pruned, did not move; the resident arms moved onto them byte for
+// byte, which is the residency independence this change buys.
 
 // PROVENANCE. Own-shard queue cleanup was returned to the reference
 // block-full/time gates and the mandatory drain was replaced by the

@@ -195,7 +195,11 @@ func runtimeCandidateWithBuiltRoots(request BuildRequest) (*Candidate, error) {
 	root := cell.BeginCell().MustStoreUInt(slot, 32).MustStoreUInt(0xb10c, 32).EndCell()
 	candidate.ID.RootHash = append([]byte(nil), root.Hash()...)
 	candidate.State = cell.BeginCell().MustStoreUInt(slot, 32).MustStoreUInt(0x57a7e, 32).EndCell()
-	candidate.StateUpdate = cell.BeginCell().MustStoreUInt(slot, 32).MustStoreUInt(0x11da7e, 32).EndCell()
+	update, err := cell.CreateMerkleUpdate(root, candidate.State)
+	if err != nil {
+		return nil, err
+	}
+	candidate.StateUpdate = update
 	candidate.built = newBuiltCandidate(
 		candidate.ID,
 		root,

@@ -587,7 +587,7 @@ func TestLocalFullProofProviderDoesNotTraceReplacedRegisteredSelfQueue(t *testin
 		proofViews:   registered,
 		messageViews: effective,
 	}
-	proofs, err := provider.BuildFullCollatedProofs(context.Background(), FullCollatedProofRequest{
+	built, err := provider.BuildFullCollatedProofs(context.Background(), FullCollatedProofRequest{
 		Previous:  request.Previous,
 		Neighbors: []Neighbor{localNeighbor(registeredView, target)},
 		QueueScan: &FullCollatedQueueScan{
@@ -599,6 +599,7 @@ func TestLocalFullProofProviderDoesNotTraceReplacedRegisteredSelfQueue(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	proofs := built.Roots
 	if len(proofs) != 1 {
 		t.Fatalf("registered zerostate proofs = %d, want 1", len(proofs))
 	}
@@ -854,7 +855,7 @@ func TestLocalNeighborProofTracesImportedMessageContents(t *testing.T) {
 		t.Fatal(err)
 	}
 	target := msgpool.ShardIdent{Workchain: message.Key.NextHop().Workchain, Shard: msgpool.ShardAll}
-	if err = traceInternalCut(
+	if _, err = traceInternalCut(
 		FullCollatedQueueScan{Target: target, LT: message.EnqueuedLT, Hash: message.Root.HashKey()},
 		[]*msgpool.InternalMessage{message},
 		map[msgpool.ShardIdent]*localNeighborView{source: view},
@@ -950,7 +951,7 @@ func TestLocalNeighborProofTracesProcessedQueuePrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	scan := FullCollatedQueueScan{Target: target, LT: bound.lt, Hash: bound.hash}
-	if err = traceInternalCut(
+	if _, err = traceInternalCut(
 		scan,
 		[]*msgpool.InternalMessage{messages[1]},
 		map[msgpool.ShardIdent]*localNeighborView{source: view},
@@ -1579,7 +1580,7 @@ func TestLocalFullCollatedSlotTwoAcceptsCandidateAddedInternals(t *testing.T) {
 	}
 	// Candidate-added entries are authenticated by their candidate predecessor,
 	// not by this older neighbor view.
-	if err = traceInternalCut(
+	if _, err = traceInternalCut(
 		FullCollatedQueueScan{
 			Target: msgpool.ShardIdent{Workchain: message.Key.NextHop().Workchain, Shard: msgpool.ShardAll},
 			LT:     message.EnqueuedLT,
@@ -1952,13 +1953,14 @@ func TestLocalFullProofProviderUsesStateProofForZerostateNeighbor(t *testing.T) 
 			proof:    cell.NewMerkleProofBuilder(root),
 		},
 	}}
-	proofs, err := provider.BuildFullCollatedProofs(context.Background(), FullCollatedProofRequest{
+	built, err := provider.BuildFullCollatedProofs(context.Background(), FullCollatedProofRequest{
 		Previous:  PreviousBlock{ID: testBlockID(0, -1<<63, 1, 0x31)},
 		Neighbors: []Neighbor{{Block: id, Shard: blockShardIdent(id)}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	proofs := built.Roots
 	if len(proofs) != 1 {
 		t.Fatalf("zerostate neighbor proofs = %d, want state proof only", len(proofs))
 	}

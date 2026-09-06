@@ -54,9 +54,18 @@ type speculativeBase struct {
 // installed and every later withdrawal goes there, to the successor it really
 // started.
 type speculativeHandoff struct {
-	mu     sync.Mutex
-	offer  *SuccessorOffer
-	revoke func([32]byte, PipelineHandoffOutcome)
+	mu         sync.Mutex
+	offer      *SuccessorOffer
+	accept     func(SuccessorOffer)
+	revoke     func(*successorToken, [32]byte, PipelineHandoffOutcome)
+	forwarding bool
+	withdrawal *speculativeWithdrawal
+}
+
+type speculativeWithdrawal struct {
+	token   *successorToken
+	root    [32]byte
+	outcome PipelineHandoffOutcome
 }
 
 // park stores the offer a speculative build made before any producer existed.
@@ -65,42 +74,83 @@ type speculativeHandoff struct {
 // one describing the block it went on to produce.
 func (h *speculativeHandoff) park(offer SuccessorOffer) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.revoke != nil {
-		// A producer is already collecting from this handoff, so this offer
-		// belongs to it rather than to the park. It cannot happen today; parking
-		// it anyway would strand it.
+	accept := h.accept
+	if accept == nil {
+		h.offer = &offer
+		h.mu.Unlock()
+
 		return
 	}
-	h.offer = &offer
+	// Adoption can win the race with the speculative build finishing. Mark the
+	// forwarding interval before dropping the lock so a concurrent withdrawal
+	// cannot overtake the producer installing the successor it names.
+	h.forwarding = true
+	h.mu.Unlock()
+
+	accept(offer)
+	h.finishForwarding()
 }
 
-// adopt hands whatever is parked to the producer and makes the producer's revoke
-// the one every later withdrawal reaches. Returns nil when the build made no
-// offer — a last-slot build, a build that failed before its handoff, or one
-// whose offer was already withdrawn.
-func (h *speculativeHandoff) adopt(revoke func([32]byte, PipelineHandoffOutcome)) *SuccessorOffer {
+// adopt installs both halves of the producer handoff before collecting a
+// parked offer. The accept half is load-bearing: the window may open before the
+// speculative build reaches its block-BOC branch, in which case park forwards
+// the later offer instead of dropping it.
+func (h *speculativeHandoff) adopt(
+	accept func(SuccessorOffer),
+	revoke func(*successorToken, [32]byte, PipelineHandoffOutcome),
+) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	offer := h.offer
-	h.offer, h.revoke = nil, revoke
+	h.offer, h.accept, h.revoke = nil, accept, revoke
+	if offer != nil {
+		h.forwarding = true
+	}
+	h.mu.Unlock()
+	if offer == nil {
+		return
+	}
 
-	return offer
+	accept(*offer)
+	h.finishForwarding()
 }
 
 // withdraw is the revoke the speculative build's port was given. Before a
 // producer adopts it only has to drop what is parked: nothing has been started
 // from the offer, so there is no successor to stop and no queue node to discard.
 // After adoption it forwards to the producer, which owns both.
-func (h *speculativeHandoff) withdraw(root [32]byte, outcome PipelineHandoffOutcome) {
+func (h *speculativeHandoff) withdraw(
+	token *successorToken,
+	root [32]byte,
+	outcome PipelineHandoffOutcome,
+) {
 	h.mu.Lock()
 	revoke := h.revoke
 	if revoke == nil {
 		h.offer = nil
+		h.mu.Unlock()
+
+		return
+	}
+	if h.forwarding {
+		h.withdrawal = &speculativeWithdrawal{token: token, root: root, outcome: outcome}
+		h.mu.Unlock()
+
+		return
 	}
 	h.mu.Unlock()
-	if revoke != nil {
-		revoke(root, outcome)
+
+	revoke(token, root, outcome)
+}
+
+func (h *speculativeHandoff) finishForwarding() {
+	h.mu.Lock()
+	h.forwarding = false
+	withdrawal := h.withdrawal
+	h.withdrawal = nil
+	revoke := h.revoke
+	h.mu.Unlock()
+	if withdrawal != nil {
+		revoke(withdrawal.token, withdrawal.root, withdrawal.outcome)
 	}
 }
 
@@ -119,7 +169,12 @@ func (h *speculativeHandoff) withdraw(root [32]byte, outcome PipelineHandoffOutc
 type speculativeProduction struct {
 	startSlot uint32
 	base      simplex.CandidateID
-	future    *candidateBuildFuture
+	// genesis marks a bet on window zero of a fresh session. Its base is the
+	// session genesis, not a candidate: the producer that opens window zero
+	// carries a parent that does not exist, and that absence is what the bet
+	// matches.
+	genesis bool
+	future  *candidateBuildFuture
 	// handoff is where this build parked its own successor offer, for the
 	// producer that collects the bet to start slot 1 from. See speculativeHandoff.
 	handoff *speculativeHandoff
@@ -135,6 +190,16 @@ type speculativeProduction struct {
 // settle reports the bet's outcome once. Every exit path calls it, so
 // speculative_started equals the sum of the outcomes below and a bet that
 // vanishes without one is a bug rather than a gap in the accounting.
+// matchesBase reports whether a window that opened on base is the window this
+// bet was placed for.
+func (s *speculativeProduction) matchesBase(base simplex.ParentID) bool {
+	if s.genesis {
+		return !base.Exists
+	}
+
+	return base.Exists && base.ID == s.base
+}
+
 func (s *speculativeProduction) settle(outcome PipelineHandoffOutcome) {
 	if s.report != nil {
 		s.report(outcome)
@@ -247,7 +312,7 @@ func (s *speculationSlot) takeMatching(
 	// had not opened, is not this slot's build. Adopting it would make its
 	// error the slot's error — see candidateBuildFuture.viable.
 	now := time.Now()
-	sameWindow := spec.startSlot == startSlot && base.Exists && base.ID == spec.base
+	sameWindow := spec.startSlot == startSlot && spec.matchesBase(base)
 	matched := sameWindow && spec.collectable(now)
 	s.current = nil
 	s.mu.Unlock()
@@ -289,7 +354,7 @@ func (s *speculationSlot) dropOutdated(startSlot uint32, base simplex.ParentID) 
 
 		return false
 	}
-	if spec.startSlot == startSlot && base.Exists && base.ID == spec.base {
+	if spec.startSlot == startSlot && spec.matchesBase(base) {
 		s.mu.Unlock()
 
 		return false
@@ -310,6 +375,25 @@ func (s *speculationSlot) dropOutdated(startSlot uint32, base simplex.ParentID) 
 // observed another base, and the producer that refused it — run in front of the
 // collation that replaces it, and a join there would put an arbitrary stall
 // between the window opening and its first block starting.
+// supersede drops the bet parked for startSlot on base so that a fresher bet
+// on the same window can take its place, and reports whether one was dropped.
+// The dropped bet is settled as superseded, not missed: it was not wrong, it
+// was replaced by a better guess before the window opened.
+func (s *speculationSlot) supersede(startSlot uint32, base simplex.CandidateID) bool {
+	s.mu.Lock()
+	spec := s.current
+	if spec == nil || spec.genesis || spec.startSlot != startSlot || spec.base != base {
+		s.mu.Unlock()
+		return false
+	}
+	s.current = nil
+	s.mu.Unlock()
+	spec.disarm()
+	spec.settle(PipelineHandoffSpeculativeSuperseded)
+	spec.abandon()
+	return true
+}
+
 func (s *speculativeProduction) abandon() {
 	s.future.abandon()
 }

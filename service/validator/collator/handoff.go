@@ -41,13 +41,13 @@ type successorPayload struct {
 // benchmarks, the golden fixtures, the verifier — on the sequential path.
 type successorPort struct {
 	offer func(SuccessorOffer)
-	// revoke tells the producer to drop what this port handed it. discard drops
-	// the queue node the successor's acquisition installed for the predecessor
-	// that no longer exists. Both are set by the acquisition layer; discard runs
-	// without the session lock, which is the point — a revoke happens while the
-	// predecessor is retrying and must not stand in front of its commit.
-	revoke  func([32]byte, PipelineHandoffOutcome)
-	discard func([32]byte)
+	token successorToken
+	// revoke tells the producer to stop the successor this port handed it.
+	// Candidate nodes installed while building that successor deliberately stay
+	// in the session branch until its next Retain boundary. Dropping one here by
+	// block root would be ABA-unsafe: a deterministic retry can already have
+	// reused the same root by the time this asynchronous revoke finishes.
+	revoke func(*successorToken, [32]byte, PipelineHandoffOutcome)
 	// chain is what the acquisition layer resolved for the block being built.
 	// The successor's own chain is derived from it at the handoff rather than
 	// re-resolved, because the state it would resolve against is not installed
@@ -135,11 +135,9 @@ func (p *successorPort) noteOffered(root [32]byte) {
 // The withdrawal runs on a goroutine of its own, because the caller is the
 // predecessor's own collation on the first line of a size-limit rebuild — the
 // slot's last chance — and the revoke joins a build that may be inside a TVM
-// execution or a store read. The two steps keep their order inside that
-// goroutine and must: the revoke does not return until the successor has
-// stopped, and the discard then drops the queue node that successor installed.
-// Reversing them, or letting the discard overtake a build still unwinding, would
-// leave the message branch holding a node for a block that never existed.
+// execution or a store read. The session's Retain transition later removes
+// abandoned speculative nodes together with every fork that did not become the
+// selected lineage.
 //
 // Nothing waits for it. A producer that reaches the slot before the withdrawal
 // does is already covered by the adoption check, which refuses a successor whose
@@ -159,15 +157,21 @@ func (p *successorPort) revokeOffered(outcome PipelineHandoffOutcome) {
 	if root == nil {
 		return
 	}
-	revoke, discard, revoked := p.revoke, p.discard, *root
+	revoke, token, revoked := p.revoke, &p.token, *root
 	go func() {
 		if revoke != nil {
-			revoke(revoked, outcome)
-		}
-		if discard != nil {
-			discard(revoked)
+			revoke(token, revoked, outcome)
 		}
 	}()
+}
+
+// successorToken identifies one concrete handoff attempt. The block root alone
+// cannot do that: retries deliberately reuse their slot seed and can reproduce
+// the same block byte-for-byte while an older asynchronous revoke is still
+// unwinding. The pointed-to byte keeps distinct live tokens at distinct
+// addresses (unlike pointers to zero-sized values).
+type successorToken struct {
+	_ byte
 }
 
 // SuccessorOffer is one predecessor handed to the producer before it exists as
@@ -178,6 +182,7 @@ func (p *successorPort) revokeOffered(outcome PipelineHandoffOutcome) {
 // merely stale, it describes a state that never existed.
 type SuccessorOffer struct {
 	successorPayload
+	token *successorToken
 
 	// adopt is how the producer tells the port a successor really started, which
 	// is the difference between an overlap and a declined offer.
@@ -215,12 +220,23 @@ type successorSlot struct {
 	mu     sync.Mutex
 	future *candidateBuildFuture
 	root   [32]byte
-	closed bool
+	token  *successorToken
+	// handoff is where the parked build's own successor offer waits, for a slot
+	// whose build outlives the producer that started it. The in-window slot
+	// leaves it nil: there the producer is still running and takes the offer
+	// directly.
+	handoff *speculativeHandoff
+	closed  bool
 }
 
 // install parks a started future. It reports false when the slot is closed or
 // already occupied, and the caller must then stop what it started.
-func (s *successorSlot) install(future *candidateBuildFuture, root [32]byte) bool {
+func (s *successorSlot) install(
+	future *candidateBuildFuture,
+	root [32]byte,
+	token *successorToken,
+	handoff *speculativeHandoff,
+) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.future != nil {
@@ -228,35 +244,37 @@ func (s *successorSlot) install(future *candidateBuildFuture, root [32]byte) boo
 	}
 	s.future = future
 	s.root = root
+	s.token = token
+	s.handoff = handoff
 
 	return true
 }
 
-// takeIf removes what is parked only if it was started on the named predecessor,
-// and reports whether it did. A revoke names the block it handed over, and a
-// port whose offer was already superseded must not take down the successor that
-// superseded it.
-func (s *successorSlot) takeIf(root [32]byte) *candidateBuildFuture {
+// takeIf removes what is parked only if it was started by the named handoff
+// attempt on the named predecessor. Both are required: a deterministic retry
+// can reproduce the same root while the old attempt's revoke is still in
+// flight, and that revoke must not take down the replacement.
+func (s *successorSlot) takeIf(token *successorToken, root [32]byte) *candidateBuildFuture {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.future == nil || s.root != root {
+	if s.future == nil || s.token != token || s.root != root {
 		return nil
 	}
 	future := s.future
-	s.future, s.root = nil, [32]byte{}
+	s.future, s.root, s.token, s.handoff = nil, [32]byte{}, nil, nil
 
 	return future
 }
 
 // take removes whatever is parked, with the predecessor root it was started on
 // so the caller can decide whether it still describes reality.
-func (s *successorSlot) take() (*candidateBuildFuture, [32]byte) {
+func (s *successorSlot) take() (*candidateBuildFuture, [32]byte, *speculativeHandoff) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	future, root := s.future, s.root
-	s.future, s.root = nil, [32]byte{}
+	future, root, handoff := s.future, s.root, s.handoff
+	s.future, s.root, s.token, s.handoff = nil, [32]byte{}, nil, nil
 
-	return future, root
+	return future, root, handoff
 }
 
 // close stops any resident future and refuses every later install. The producer
@@ -277,7 +295,7 @@ func (s *successorSlot) close() {
 func (s *successorSlot) closeCancelled() *candidateBuildFuture {
 	s.mu.Lock()
 	future := s.future
-	s.future, s.closed = nil, true
+	s.future, s.token, s.handoff, s.closed = nil, nil, nil, true
 	s.mu.Unlock()
 	if future != nil {
 		future.cancel()

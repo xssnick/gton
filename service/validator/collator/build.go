@@ -162,7 +162,30 @@ type collation struct {
 	// this pair, so the proof has to be widened to exactly this pair.
 	processedClaim   semanticMessageBound
 	processedClaimed bool
-	localCleanup     *localCleanupFrontier
+	// enqueueOnlyLatched is the reference's enqueue_only flag for generated
+	// messages: per block and only ever raised (collator.cpp:4843-4860). Every
+	// new-message pass ORs it in. It is separate from blockFull on purpose:
+	// blockFull is a limit latch that escalateToMediumMark legitimately clears
+	// so a backlogged block keeps delivering — but a pass that already
+	// ENQUEUED a self-directed message has fixed that message's lt in the
+	// outbound queue, and any immediate delivery afterwards advances the
+	// ProcessedInfo claim past it. Both validators refuse exactly that
+	// (validate-query.cpp:5204, semantic_verify_processed.go): "ProcessedInfo
+	// crosses a newly enqueued message". Measured on the stand as a
+	// self-rejected block: four self-directed enqueues at lt+2, thirteen
+	// immediate deliveries at lt+4, claim at lt+4.
+	enqueueOnlyLatched bool
+	// collatedCheapEstimate is the fixed collated cost known before execution:
+	// the consensus extra and the predecessor block proofs. The neighbour
+	// proofs are added to it once they exist.
+	collatedCheapEstimate uint64
+	// drainedClaimProvable says the block may claim the drained bound — that
+	// everything below the reference lt is processed — because the proof for it
+	// was affordable. It is true unless a budgeted queue scan came back short:
+	// with the capability off there is no proof to pay for, and with messages
+	// imported the bound is theirs and is owed in full either way.
+	drainedClaimProvable bool
+	localCleanup         *localCleanupFrontier
 	// claimedPrefix hands the cells cleanupClaimedLocalDequeues parsed over that
 	// same prefix to the closure, which is the only pass allowed to record them.
 	claimedPrefix claimedPrefixCells
@@ -273,37 +296,41 @@ func newCollation(init *collationInit) (*collation, error) {
 	}
 
 	c := &collation{
-		ctx:                 init.ctx,
-		builder:             init.builder,
-		req:                 init.request,
-		header:              init.header,
-		shard:               init.shard,
-		topology:            init.topology,
-		config:              init.config,
-		master:              init.master,
-		usage:               init.usage,
-		shardEndLT:          newShardEndLTResolver(init.request.neighborShardEndLT),
-		oldRoot:             init.oldRoot,
-		oldState:            init.oldState,
-		oldStats:            init.oldStats,
-		accountSources:      init.accountSources,
-		dispatchSources:     init.dispatchSources,
-		dispatchSourceCount: init.dispatchSourceCount,
-		blockCtx:            init.blockCtx,
-		limits:              init.limits,
-		hardLTDelta:         init.hardLTDelta,
-		queueSize:           init.queueSize,
-		oldQueueSize:        init.queueSize,
-		accounts:            accounts,
-		oldOutQueue:         oldOutQueue,
-		outQueue:            outQueue,
-		processed:           init.queueInfo.ProcInfo,
-		processedMinMC:      init.processedMinMC,
-		processedRecords:    init.processedRecords,
-		processedParsed:     true,
-		inMessages:          inMessages,
-		outMessages:         outMessages,
-		accountBlocks:       accountBlocks,
+		// True until a budgeted scan says otherwise: a block that imports
+		// messages, and a block built without the full-collated capability,
+		// both owe nothing extra for the bound they claim.
+		drainedClaimProvable: true,
+		ctx:                  init.ctx,
+		builder:              init.builder,
+		req:                  init.request,
+		header:               init.header,
+		shard:                init.shard,
+		topology:             init.topology,
+		config:               init.config,
+		master:               init.master,
+		usage:                init.usage,
+		shardEndLT:           newShardEndLTResolver(init.request.neighborShardEndLT),
+		oldRoot:              init.oldRoot,
+		oldState:             init.oldState,
+		oldStats:             init.oldStats,
+		accountSources:       init.accountSources,
+		dispatchSources:      init.dispatchSources,
+		dispatchSourceCount:  init.dispatchSourceCount,
+		blockCtx:             init.blockCtx,
+		limits:               init.limits,
+		hardLTDelta:          init.hardLTDelta,
+		queueSize:            init.queueSize,
+		oldQueueSize:         init.queueSize,
+		accounts:             accounts,
+		oldOutQueue:          oldOutQueue,
+		outQueue:             outQueue,
+		processed:            init.queueInfo.ProcInfo,
+		processedMinMC:       init.processedMinMC,
+		processedRecords:     init.processedRecords,
+		processedParsed:      true,
+		inMessages:           inMessages,
+		outMessages:          outMessages,
+		accountBlocks:        accountBlocks,
 		oldDispatchQueue: &tlb.DispatchQueueAugDict{
 			AugmentedDictionary: init.dispatchQueue.Copy(),
 		},
@@ -466,10 +493,19 @@ func (b *Builder) prepareShardPhases(
 }
 
 func (c *collation) finishShard() (*Candidate, error) {
-	timer := c.req.assembly.start(CollationStageProcessedInfo)
-	defer func() {
-		timer.stop()
-	}()
+	// The neighbour proofs are built here, after execution, against the bound
+	// the block is about to claim — the reference's order (create_collated_data
+	// -> prepare_proofs, collator.cpp:6228). Before the block decided what to
+	// import there was no such bound, only the message pool's offer, and paying
+	// for the whole of that offer up front is what made a backed-up shard
+	// produce blocks that were full before their first message.
+	timer := c.req.assembly.start(CollationStageBuildCollatedProofs)
+	if err := c.buildDeferredCollatedProofs(); err != nil {
+		return nil, err
+	}
+	timer.stop()
+
+	timer = c.req.assembly.start(CollationStageProcessedInfo)
 	if err := c.updateProcessedInfo(); err != nil {
 		return nil, err
 	}
@@ -666,10 +702,18 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 	if err != nil {
 		return nil, err
 	}
+	c.limits.maxTransactions = uint64(req.MaxTransactions)
 	if fullCollated {
-		if err = c.prepareFullCollatedProofs(); err != nil {
-			return nil, err
-		}
+		// The neighbour proofs are NOT built here. They are the expensive half
+		// of the collated payload — their queue walk is proportional to the
+		// inbound backlog — and building them before the block has admitted
+		// anything charges that cost against the block's own budget, so a
+		// backed-up shard produces blocks that are full before their first
+		// message. The reference builds its proofs at the end instead
+		// (create_collated_data -> prepare_proofs, collator.cpp:6228) and lets
+		// the same limit stop the walk and the collation together. We do the
+		// same in finishShard; what is charged here in the meantime is the last
+		// build's measured size, so admission still sees a collated cost.
 		fixedRoots := []*cell.Cell{consensusExtraRoot(req.Header.GenUtimeMS)}
 		for i := 0; i < c.previousCount(); i++ {
 			previous := c.previousAt(i)
@@ -685,12 +729,12 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 			}
 			fixedRoots = append(fixedRoots, c.previousBlockProofs[i])
 		}
-		fixedRoots = append(fixedRoots, c.fullCollatedProofs...)
 		fixedSize, err := collatedBOCSize(fixedRoots)
 		if err != nil {
 			return nil, fmt.Errorf("estimate fixed collated data: %w", err)
 		}
-		c.collatedFixedEstimate = fixedSize
+		c.collatedCheapEstimate = fixedSize
+		c.collatedFixedEstimate = fixedSize + uint64(c.builder.neighborProofHint(c.shard))
 		c.updateCollatedEstimate()
 	}
 
@@ -980,7 +1024,22 @@ func (c *collation) finish() (*Candidate, error) {
 	// when the same reads happen, not what they record, and byte identity of
 	// block and proof across the reorder is pinned by the full-collated
 	// goldens on both predecessor shapes.
-	c.usage.BeginDeferredRecording()
+	//
+	// Gated on the same predicate as the closure itself, because the window is
+	// a property of the whole read set and not of the closure's goroutine: it
+	// freezes the table for everything that runs inside the bracket, including
+	// buildStateAndBlockParts below. Where there is no closure to hide — the
+	// masterchain, which traceValidationClosure returns from immediately — the
+	// window has no beneficiary and only costs: the masterchain state build is
+	// the FIRST reader of the creator-statistics dictionary
+	// (updateBlockCreateStats, master_state.go), so with the table frozen those
+	// reads never reach it, the update's source graph cannot descend into the
+	// dictionary, and every untouched subtree is copied into the state update
+	// instead of pruned. Measured on the stand: 816 kB masterchain blocks
+	// against the reference's 12.7 kB, all of it state update.
+	if c.closureRecordsPredecessorReads() {
+		c.usage.BeginDeferredRecording()
+	}
 	closureSpan := time.Duration(0)
 	closureDone := make(chan error, 1)
 	go func() {
@@ -1648,16 +1707,55 @@ func (c *collation) buildCollatedRoots(consensusExtra, stateUpdate *cell.Cell) (
 	return roots, nil
 }
 
+// importedInternalMessages is the prefix of the acquired cut this block
+// actually took. The proof walk stops at the bound the block claims, so only
+// these messages can be found inside it — checking the whole cut against the
+// walk would report every message the block declined to import as missing from
+// its source, which is not a defect but the block limit doing its job.
+func (c *collation) importedInternalMessages() []*msgpool.InternalMessage {
+	all := c.req.internalMessages()
+	if c.internalsCursor >= len(all) {
+		return all
+	}
+	return all[:c.internalsCursor]
+}
+
+// buildDeferredCollatedProofs builds the neighbour proofs — for a shard from
+// finishShard, for the masterchain from finishMaster, both after the import
+// phase — and replaces the carried estimate with what they actually cost.
+// Anything the walk added to the read set is charged through the ordinary proof
+// estimator; only the fixed part moves here.
+func (c *collation) buildDeferredCollatedProofs() error {
+	if c.req.fullCollatedProofs == nil {
+		return nil
+	}
+	if err := c.prepareFullCollatedProofs(); err != nil {
+		return err
+	}
+	roots := make([]*cell.Cell, 0, len(c.fullCollatedProofs))
+	roots = append(roots, c.fullCollatedProofs...)
+	size, err := collatedBOCSize(roots)
+	if err != nil {
+		return fmt.Errorf("estimate neighbor collated proofs: %w", err)
+	}
+	c.builder.observeNeighborProofBytes(c.shard, int(min(size, uint64(math.MaxInt32))))
+	c.collatedFixedEstimate = c.collatedCheapEstimate + size
+	c.updateCollatedEstimate()
+
+	return nil
+}
+
 func (c *collation) prepareFullCollatedProofs() error {
 	if c.req.fullCollatedProofs == nil {
 		return nil
 	}
-	proofs, err := c.req.fullCollatedProofs.BuildFullCollatedProofs(c.ctx, FullCollatedProofRequest{
+	scan := c.fullCollatedQueueScan()
+	built, err := c.req.fullCollatedProofs.BuildFullCollatedProofs(c.ctx, FullCollatedProofRequest{
 		Previous:  c.req.previous,
 		Previous2: c.req.previous2,
 		Neighbors: c.req.neighbors,
-		Internals: c.req.internalMessages(),
-		QueueScan: c.fullCollatedQueueScan(),
+		Internals: c.importedInternalMessages(),
+		QueueScan: scan,
 	})
 	if err != nil {
 		return fmt.Errorf("build full collated neighbor proofs: %w", err)
@@ -1665,39 +1763,55 @@ func (c *collation) prepareFullCollatedProofs() error {
 	if err = c.ctx.Err(); err != nil {
 		return err
 	}
-	proofs, err = canonicalCollatedProofs(proofs)
+	proofs, err := canonicalCollatedProofs(built.Roots)
 	if err != nil {
 		return err
 	}
 	c.fullCollatedProofs = proofs
+	// A budgeted scan is the drained claim asking whether it can afford itself.
+	// The answer decides updateProcessedInfo: claim only what this proof covers.
+	if scan != nil && scan.Budget != 0 {
+		c.drainedClaimProvable = built.ScanExhausted
+	}
 
 	return nil
 }
 
+// fullCollatedQueueScan is the prefix the block's collated proof must cover: the
+// queue below the bound the block claims, which is exactly what the validator
+// walks (verifySourceProcessed). It is read after execution, so the bound is
+// what the block actually consumed rather than whatever the message pool
+// offered — the reference bounds its proof the same way, by what its merger
+// reached before the block limit stopped it.
 func (c *collation) fullCollatedQueueScan() *FullCollatedQueueScan {
-	messages := c.req.internalMessages()
-	if len(messages) != 0 {
-		last := messages[len(messages)-1]
-
-		return &FullCollatedQueueScan{
-			Target: c.shard,
-			LT:     last.EnqueuedLT,
-			Hash:   last.Root.HashKey(),
-		}
-	}
-	if c.req.internalsIncomplete() {
+	bound, ok := c.prospectiveProcessedBound()
+	if !ok {
+		// No claim, so the validator starts no scan and nothing is owed.
 		return nil
 	}
-	_, referenceEndLT := c.processedReference()
-	if referenceEndLT == 0 {
-		return nil
+	scan := &FullCollatedQueueScan{Target: c.shard, LT: bound.lt, Hash: bound.hash}
+	if bound.hash == processedInfinityHash && c.master == nil {
+		// The drained claim covers everything below the reference lt, which on a
+		// backed-up shard is the whole prefix, bought for zero imported
+		// messages. Budget it: if the walk does not finish, the claim is
+		// abandoned rather than paid for.
+		//
+		// The masterchain is exempt, and claims unconditionally as the reference
+		// does (update_processed_upto never drops a claim). The budget answers a
+		// shard's backlog, where the prefix is every message the shard's
+		// neighbours ever sent it; the masterchain's prefix is only what the
+		// shards enqueued to the masterchain itself and have not dequeued yet —
+		// a few entries in the ordinary case, and bounded by the shards' own
+		// cleanup even when it is not. Budgeting it would have no proof to save
+		// and a cost the shard case does not have: nearly every masterchain
+		// block imports nothing (7 of 13.6k a day on the stand), so a shard
+		// holding more than the budget of processed-but-undequeued entries would
+		// stop every one of those blocks from advancing ProcessedInfo, silently,
+		// until an import moved the bound the other way.
+		scan.Budget = drainedQueueScanBudget
 	}
 
-	return &FullCollatedQueueScan{
-		Target: c.shard,
-		LT:     referenceEndLT - 1,
-		Hash:   processedInfinityHash,
-	}
+	return scan
 }
 
 // trackAccountStorageProof charges growth of the account's shared storage-stat
@@ -1765,10 +1879,19 @@ func (c *collation) buildPreviousBlockStateProof(previous *PreviousBlock) (*cell
 		int64(block.BlockInfo.Shard.GetShardID()) != previous.ID.Shard {
 		return nil, fmt.Errorf("%w: previous block header differs from its block id", ErrInvalidInput)
 	}
-	if err := cell.ValidateMerkleUpdate(block.StateUpdate); err != nil {
-		return nil, fmt.Errorf("%w: invalid previous block state update: %v", ErrInvalidInput, err)
+	// Binding the update to the supplied state is the whole check, and it is one
+	// hash comparison. Walking the update to prove it internally consistent is
+	// work the reference does not do — create_block_state_proof loads the update
+	// cell and nothing more (cppnode/ton/validator/impl/proof.cpp:160-174) — and
+	// it is two full depth-first walks of the predecessor's update on every
+	// collation attempt. A malformed update cannot pass the comparison below:
+	// either it has no second reference, or its "to" side is not the state we
+	// were handed.
+	to, refErr := block.StateUpdate.PeekRef(1)
+	if refErr != nil {
+		return nil, fmt.Errorf("%w: previous block state update has no destination: %v", ErrInvalidInput, refErr)
 	}
-	if block.StateUpdate.MustPeekRef(1).HashKeyAt(0) != previous.State.WithoutTrace().HashKeyAt(0) {
+	if to.HashKeyAt(0) != previous.State.WithoutTrace().HashKeyAt(0) {
 		return nil, fmt.Errorf("%w: previous block state update does not produce the supplied state", ErrInvalidInput)
 	}
 
@@ -1920,6 +2043,7 @@ func (c *collation) handOffSuccessor(fileHash [32]byte, blockRoot *cell.Cell, pa
 	port.noteOffered(rootHash)
 	port.offer(SuccessorOffer{
 		adopt: port.noteAdopted,
+		token: &port.token,
 		successorPayload: successorPayload{
 			ID:           id,
 			Root:         blockRoot,

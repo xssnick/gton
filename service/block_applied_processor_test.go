@@ -236,6 +236,130 @@ func TestApplyBlockCanDeferBlockAppliedProcessor(t *testing.T) {
 	}
 }
 
+func TestArchiveShardApplyCollectsWithoutCallingProcessor(t *testing.T) {
+	previousBlock := testBlockID(0, topShard, 20)
+	nextBlock := testBlockID(0, topShard, 21)
+	masterBlock := testMasterBlockID(19)
+	previousRoot := testShardStateCell(t, previousBlock)
+	nextRoot := testShardStateCell(t, nextBlock)
+	masterRoot := cell.BeginCell().MustStoreUInt(19, 8).EndCell()
+
+	processorCalls := 0
+	svc := &SyncCoordinator{
+		status: newTestStatusTracker(nil, nil),
+		blockAppliedProcessor: &blockAppliedProcessorRunner{
+			log: zerolog.Nop(),
+			processor: blockAppliedProcessorFunc(func(context.Context, BlockAppliedEvent) error {
+				processorCalls++
+				return nil
+			}),
+			retryDelay: time.Millisecond,
+		},
+	}
+	window := &shardClientArchiveWindow{}
+	enableArchiveBlockAppliedEvents(t, window)
+	observerMeta := &blockAppliedObserverMeta{
+		InclusionMasterRef:   &masterBlock,
+		InclusionMasterState: masterRoot,
+		deferEvent: func(event BlockAppliedEvent) {
+			window.blockApplied.deferShard(masterBlock.SeqNo, event)
+		},
+	}
+
+	next, err := svc.applyArchiveShardBlock(
+		t.Context(),
+		nextBlock,
+		[]*storage.BlockState{{Block: previousBlock, Cell: previousRoot}},
+		PreparedBlock{
+			ID: nextBlock,
+			Meta: &storage.BlockMeta{
+				ID:       nextBlock,
+				PrevRefs: []ton.BlockIDExt{previousBlock},
+			},
+			StateUpdate: mustMerkleUpdateCell(t, previousRoot, nextRoot),
+		},
+		nil,
+		observerMeta,
+	)
+	if err != nil {
+		t.Fatalf("apply archive shard block: %v", err)
+	}
+	if processorCalls != 0 {
+		t.Fatalf("processor calls during archive shard apply = %d, want 0", processorCalls)
+	}
+	if next.Cell.HashKey(0) != nextRoot.HashKey(0) {
+		t.Fatalf("applied archive shard state hash = %x, want %x", next.Cell.HashKey(0), nextRoot.HashKey(0))
+	}
+
+	window.blockApplied.mu.Lock()
+	deferred := window.blockApplied.shards[masterBlock.SeqNo]
+	window.blockApplied.mu.Unlock()
+	if len(deferred) != 1 || deferred[0].Meta == nil || !deferred[0].Meta.ID.Equals(&nextBlock) {
+		t.Fatalf("deferred archive shard events = %+v, want %s", deferred, storage.FormatBlockRef(nextBlock))
+	}
+}
+
+func TestArchiveMasterApplyCollectsBeforePostApplyPublication(t *testing.T) {
+	downloaded := mustLoadFixtureDownloadedBlock(t)
+	prepared, err := (&SyncCoordinator{}).prepareDownloadedBlockForApply(*downloaded)
+	if err != nil {
+		t.Fatalf("prepare fixture masterchain block: %v", err)
+	}
+	previousRoot := prepared.StateUpdate.MustPeekRef(0)
+	current := &storage.BlockState{
+		Block: prepared.Meta.PrevRefs[0],
+		Cell:  previousRoot,
+	}
+	proof := &masterchainConsensusProof{
+		block:               prepared.ID,
+		prevRef:             current.Block,
+		stateUpdateFromHash: previousRoot.Virtualize(0).HashKeyAt(0),
+		hardforkChecked:     true,
+	}
+	// The fixture's key-block status is irrelevant to this observer test and
+	// would publish validator policy through a fully assembled p2p node.
+	prepared.Meta.Flags &^= storage.BlockMetaIsKeyBlock
+
+	processorCalls := 0
+	svc := &SyncCoordinator{
+		log:    zerolog.Nop(),
+		status: newTestStatusTracker(nil, nil),
+		blockAppliedProcessor: &blockAppliedProcessorRunner{
+			log: zerolog.Nop(),
+			processor: blockAppliedProcessorFunc(func(context.Context, BlockAppliedEvent) error {
+				processorCalls++
+				return nil
+			}),
+			retryDelay: time.Millisecond,
+		},
+	}
+	svc.broadcastValidatorCache.shardTopView = &shardTopValidationView{
+		masterchain:   &storage.BlockState{Block: prepared.ID},
+		stateRootHash: cell.Hash{0xff},
+	}
+	window := &shardClientArchiveWindow{}
+	enableArchiveBlockAppliedEvents(t, window)
+	observerMeta := &blockAppliedObserverMeta{deferEvent: window.blockApplied.deferMaster}
+
+	_, _, _, err = svc.applyArchiveMasterBlock(t.Context(), current, &prepared, proof, nil, observerMeta)
+	if !errors.Is(err, errShardTopValidationViewConflict) {
+		t.Fatalf("archive master post-apply publication error = %v, want %v", err, errShardTopValidationViewConflict)
+	}
+	if processorCalls != 0 {
+		t.Fatalf("processor calls during archive master apply = %d, want 0", processorCalls)
+	}
+
+	window.blockApplied.mu.Lock()
+	deferred := window.blockApplied.masters
+	window.blockApplied.mu.Unlock()
+	if len(deferred) != 1 || deferred[0].Meta == nil || !deferred[0].Meta.ID.Equals(&prepared.ID) {
+		t.Fatalf("deferred archive master events = %+v, want %s", deferred, storage.FormatBlockRef(prepared.ID))
+	}
+	if deferred[0].CurrentState == nil {
+		t.Fatal("deferred archive master event has no applied state")
+	}
+}
+
 func TestNextSyncProcessesCommittedBlockEventsMasterFirst(t *testing.T) {
 	master := testBlockID(-1, topShard, 30)
 	shard := testBlockID(0, topShard, 31)

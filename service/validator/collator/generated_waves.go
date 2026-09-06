@@ -147,6 +147,12 @@ func (c *collation) generatedWaveParallelism(enqueueOnly bool) int {
 }
 
 func (c *collation) processNewMessagesInWaves(enqueueOnly bool, workers int) error {
+	enqueueOnly = enqueueOnly || c.enqueueOnlyLatched
+	defer func() {
+		if enqueueOnly {
+			c.enqueueOnlyLatched = true
+		}
+	}()
 	c.generatedWaves.start(c, 1)
 
 	for c.new.Len() > 0 {
@@ -468,6 +474,7 @@ func (c *collation) retireGeneratedPlan(plan *generatedPlan, enqueueOnly *bool) 
 	c.limits.extraOutMsgs--
 	if c.blockFull || c.haveUnprocessedDispatchQueue {
 		*enqueueOnly = true
+		c.enqueueOnlyLatched = true
 	}
 
 	switch plan.item.parsed.MsgType {

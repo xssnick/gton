@@ -36,7 +36,7 @@ func TestSlotBuildRequestFillsEveryScheduledField(t *testing.T) {
 	parent := simplex.ParentID{Exists: true}
 	parent.ID.Slot = 11
 
-	request := slotBuildRequest(session, record, window, 12, parent, previous)
+	request := slotBuildRequest(session, record, window, 12, parent, previous, adaptiveTransactionCeiling, time.Time{})
 
 	if got, want := request.PaceStartedAt, buildStartTime(record, 12); !got.Equal(want) {
 		t.Errorf("PaceStartedAt = %v, want the scheduled build start %v", got, want)
@@ -56,7 +56,7 @@ func TestSlotBuildRequestFillsEveryScheduledField(t *testing.T) {
 	// the swap deletes the external phase's deadline outright.
 	masterRecord := record
 	masterRecord.Session.Shard = groups.ShardID{Workchain: -1, Shard: -1 << 63}
-	master := slotBuildRequest(session, masterRecord, window, 12, parent, previous)
+	master := slotBuildRequest(session, masterRecord, window, 12, parent, previous, adaptiveTransactionCeiling, time.Time{})
 	if got, want := master.ExternalWaitUntil, externalWaitUntil(masterRecord, 12); !got.Equal(want) {
 		t.Errorf("masterchain ExternalWaitUntil = %v, want %v", got, want)
 	}
@@ -84,9 +84,19 @@ func TestSlotBuildRequestFillsEveryScheduledField(t *testing.T) {
 			continue
 		case "speculative":
 			// A build started before its window was observed, which by definition
-			// has no scheduled slot to derive anything from: SpeculateSelfWindow
+			// has no scheduled slot to derive anything from: SpeculateWindow
 			// builds its own request and every instant in it comes from the
 			// estimate the bet was placed with.
+			continue
+		case "crossWindowBet":
+			// The other bet, for the first slot of the next window: also not a
+			// scheduled slot of this one. offerNextWindow builds its own request
+			// and extrapolates the schedule a window further.
+			continue
+		case "sessionStartAt":
+			// The third bet, window zero of a fresh session: placed at
+			// activation by SpeculateSessionStart, which builds its own request
+			// and stamps it with the instant the bet was placed.
 			continue
 		}
 		if value.Field(i).IsZero() {
@@ -161,5 +171,64 @@ func TestSeedingIsRefusedExactlyForBuildsBesideAnUnfinishedBlock(t *testing.T) {
 				t.Fatalf("seedingAllowedFor = %v, want %v", got, test.allowed)
 			}
 		})
+	}
+}
+
+// A slot whose schedule is already in the past — the window opened late — must
+// not ship an underloaded block sooner than one target rate after the
+// producer's previous emission: the floor extends the wait, the process bound
+// and the soft deadline together, and only ever forwards. A floor before the
+// schedule changes nothing, and the masterchain, which never waits for
+// externals, keeps its zero wait.
+func TestSlotBuildRequestSpacesAnUnderloadedSlotFromThePreviousEmission(t *testing.T) {
+	record := SessionRecord{
+		Update: SessionUpdate{
+			CurrentWindowStart:   10,
+			CurrentWindowStartAt: time.Unix(1_700_000_000, 0),
+			TargetRate:           400 * time.Millisecond,
+		},
+	}
+	window := productionWindow{Leader: 3}
+	window.ID.StartSlot = 10
+	session := ActivatedSession{}
+	parent := simplex.ParentID{Exists: true}
+
+	scheduled := slotBuildRequest(session, record, window, 12, parent, &CandidateArtifact{}, 300, time.Time{})
+	// The previous candidate left two seconds after the slot's own start: the
+	// schedule is stale, the floor is that emission plus a rate.
+	late := scheduled.ExternalWaitUntil.Add(2 * time.Second)
+	spaced := slotBuildRequest(session, record, window, 12, parent, &CandidateArtifact{}, 300, late)
+	if !spaced.ExternalWaitUntil.Equal(late) || !spaced.ExternalProcessUntil.Equal(late) {
+		t.Fatalf("wait/process = %v/%v, want the floor %v", spaced.ExternalWaitUntil, spaced.ExternalProcessUntil, late)
+	}
+	if want := late.Add(record.Update.TargetRate); !spaced.BuildSoftDeadline.Equal(want) {
+		t.Fatalf("soft deadline = %v, want one rate past the floor %v", spaced.BuildSoftDeadline, want)
+	}
+	if !spaced.PaceStartedAt.Equal(scheduled.PaceStartedAt) {
+		t.Fatal("the pace start is the schedule's and must not move with the floor")
+	}
+
+	// A floor before the schedule leaves the schedule alone.
+	early := slotBuildRequest(session, record, window, 12, parent, &CandidateArtifact{}, 300, scheduled.ExternalWaitUntil.Add(-time.Second))
+	if !early.ExternalWaitUntil.Equal(scheduled.ExternalWaitUntil) || !early.BuildSoftDeadline.Equal(scheduled.BuildSoftDeadline) {
+		t.Fatal("a floor before the schedule must not change the schedule")
+	}
+
+	masterRecord := record
+	masterRecord.Session.Shard = groups.ShardID{Workchain: -1, Shard: -1 << 63}
+	master := slotBuildRequest(session, masterRecord, window, 12, parent, &CandidateArtifact{}, 300, late)
+	if !master.ExternalWaitUntil.IsZero() {
+		t.Fatalf("masterchain ExternalWaitUntil = %v, want zero: the masterchain never waits for externals", master.ExternalWaitUntil)
+	}
+
+	// The producer's floor is its previous emission plus a rate, and nothing
+	// before the first emission.
+	producer := &windowProducer{record: record}
+	if !producer.underloadedNotBefore().IsZero() {
+		t.Fatal("a producer that has emitted nothing has no floor")
+	}
+	producer.lastEmittedAt = time.Unix(1_700_000_100, 0)
+	if got, want := producer.underloadedNotBefore(), producer.lastEmittedAt.Add(400*time.Millisecond); !got.Equal(want) {
+		t.Fatalf("floor = %v, want one rate after the previous emission %v", got, want)
 	}
 }

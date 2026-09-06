@@ -12,7 +12,7 @@ func TestLoadConfigFileResolvesPaths(t *testing.T) {
 	path := filepath.Join(directory, "lab.json")
 	data := `{
   "run_root":"runs",
-  "nodes":[{"name":"go-0","kind":"go","log_path":"logs/go.jsonl","tmux_session":"go-0","start_command":["{binary}"]}],
+  "nodes":[{"name":"go-0","kind":"go","roles":["producer"],"log_path":"logs/go.jsonl","tmux_session":"go-0","start_command":["{binary}"]}],
   "load":{"binary":"bin/load","node_config":"node.json","lite_address":"127.0.0.1:7445","state_path":"states/{sender}.json","sender_count":10,"rate":30,"duration":"1m","drain":"10s","settle":"2s","topology_timeout":"10m"},
   "deploy":{"target_binary":"bin/node","health_timeout":"1m"},
   "conditions":{}
@@ -40,9 +40,62 @@ func TestValidateRunRequiresSenderPlaceholder(t *testing.T) {
 	cfg := Config{Load: LoadConfig{
 		Binary: "load", NodeConfig: "node.json", LiteAddress: "127.0.0.1:1",
 		StatePath: "shared.json", SenderCount: 2, Rate: 1,
-		Duration: Duration{Duration: 1},
+		Duration: Duration{Duration: 1}, Drain: Duration{Duration: 1},
 	}}
 	if err := cfg.ValidateRun(); err == nil || !strings.Contains(err.Error(), "{sender}") {
 		t.Fatalf("ValidateRun error = %v", err)
+	}
+}
+
+func TestValidateRequiresExplicitNodeRolesAndCandidateFlowRoles(t *testing.T) {
+	valid := Config{
+		RunRoot: "runs",
+		Nodes: []NodeConfig{
+			{Name: "go", Kind: "go", Roles: []string{nodeRoleProducer}, LogPath: "go.log", ProcessMatch: "go"},
+			{Name: "cpp", Kind: "cpp", Roles: []string{nodeRoleValidator, nodeRoleFinalizer}, LogPath: "cpp.log", ProcessMatch: "cpp"},
+		},
+		Conditions: ConditionsConfig{CandidateFlows: []CandidateFlowConfig{{
+			Producer: "go", Validators: []string{"cpp"}, Finalizers: []string{"cpp"},
+		}}},
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid config: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{
+			name: "missing node role",
+			cfg: Config{RunRoot: "runs", Nodes: []NodeConfig{{
+				Name: "go", Kind: "go", LogPath: "go.log", ProcessMatch: "go",
+			}}},
+			want: "requires at least one role",
+		},
+		{
+			name: "validator target lacks validator role",
+			cfg: Config{
+				RunRoot: "runs",
+				Nodes: []NodeConfig{
+					{Name: "go", Kind: "go", Roles: []string{nodeRoleProducer}, LogPath: "go.log", ProcessMatch: "go"},
+					{Name: "cpp", Kind: "cpp", Roles: []string{nodeRoleFinalizer}, LogPath: "cpp.log", ProcessMatch: "cpp"},
+				},
+				Conditions: ConditionsConfig{CandidateFlows: []CandidateFlowConfig{{
+					Producer: "go", Validators: []string{"cpp"}, Finalizers: []string{"cpp"},
+				}}},
+			},
+			want: "is not a validator node",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }

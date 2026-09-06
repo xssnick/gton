@@ -35,13 +35,14 @@ const (
 var ErrTemplateIncomplete = errors.New("genesis template contains placeholders")
 
 type Spec struct {
-	FormatVersion int                           `json:"format_version"`
-	GlobalID      int32                         `json:"global_id"`
-	GenesisTime   uint32                        `json:"genesis_time"`
-	Validators    []Validator                   `json:"validators"`
-	Consensus     Consensus                     `json:"consensus"`
-	DHTNodes      []liteclient.DHTNode          `json:"dht_static_nodes"`
-	Liteservers   []liteclient.LiteserverConfig `json:"liteservers"`
+	FormatVersion     int                           `json:"format_version"`
+	GlobalID          int32                         `json:"global_id"`
+	GenesisTime       uint32                        `json:"genesis_time"`
+	Validators        []Validator                   `json:"validators"`
+	Consensus         Consensus                     `json:"consensus"`
+	ValidatorRegistry *ValidatorRegistry            `json:"validator_registry,omitempty"`
+	DHTNodes          []liteclient.DHTNode          `json:"dht_static_nodes"`
+	Liteservers       []liteclient.LiteserverConfig `json:"liteservers"`
 }
 
 type Validator struct {
@@ -51,13 +52,21 @@ type Validator struct {
 }
 
 type Consensus struct {
-	TargetBlockRateMS    uint32 `json:"target_block_rate_ms"`
-	SlotsPerLeaderWindow uint32 `json:"slots_per_leader_window"`
-	FirstBlockTimeoutMS  uint32 `json:"first_block_timeout_ms"`
-	MasterGroupLifetime  uint32 `json:"master_group_lifetime_seconds"`
-	ShardGroupLifetime   uint32 `json:"shard_group_lifetime_seconds"`
-	ShardValidators      uint32 `json:"shard_validators"`
-	ProtocolVersion      uint8  `json:"protocol_version"`
+	TargetBlockRateMS     uint32 `json:"target_block_rate_ms"`
+	SlotsPerLeaderWindow  uint32 `json:"slots_per_leader_window"`
+	FirstBlockTimeoutMS   uint32 `json:"first_block_timeout_ms"`
+	MasterGroupLifetime   uint32 `json:"master_group_lifetime_seconds"`
+	ShardGroupLifetime    uint32 `json:"shard_group_lifetime_seconds"`
+	MasterchainValidators uint32 `json:"masterchain_validators,omitempty"`
+	ShardValidators       uint32 `json:"shard_validators"`
+	ProtocolVersion       uint8  `json:"protocol_version"`
+}
+
+// ValidatorRegistry enables the on-chain mapping used by validators to
+// advertise dedicated collator ADNL identities. Omit it on networks where
+// validators collate their own blocks.
+type ValidatorRegistry struct {
+	MaxCollatorsPerValidator uint32 `json:"max_collators_per_validator"`
 }
 
 type validatedSpec struct {
@@ -81,13 +90,14 @@ func DefaultSpec() Spec {
 			{PublicKey: "<validator-3-ed25519-public-key-base64>", ADNLID: "<validator-3-adnl-id-base64>", Weight: defaultValidatorWeight},
 		},
 		Consensus: Consensus{
-			TargetBlockRateMS:    200,
-			SlotsPerLeaderWindow: 4,
-			FirstBlockTimeoutMS:  700,
-			MasterGroupLifetime:  250,
-			ShardGroupLifetime:   250,
-			ShardValidators:      3,
-			ProtocolVersion:      3,
+			TargetBlockRateMS:     200,
+			SlotsPerLeaderWindow:  4,
+			FirstBlockTimeoutMS:   700,
+			MasterGroupLifetime:   250,
+			ShardGroupLifetime:    250,
+			MasterchainValidators: 3,
+			ShardValidators:       3,
+			ProtocolVersion:       3,
 		},
 		DHTNodes: []liteclient.DHTNode{
 			{
@@ -187,11 +197,17 @@ func validateSpec(spec Spec) (validatedSpec, error) {
 	if consensus.MasterGroupLifetime == 0 || consensus.ShardGroupLifetime == 0 {
 		return validatedSpec{}, errors.New("consensus group lifetimes must be positive")
 	}
+	if consensus.MasterchainValidators > uint32(len(validators)) {
+		return validatedSpec{}, fmt.Errorf("consensus.masterchain_validators must not exceed %d", len(validators))
+	}
 	if consensus.ShardValidators == 0 || consensus.ShardValidators > uint32(len(validators)) {
 		return validatedSpec{}, fmt.Errorf("consensus.shard_validators must be between 1 and %d", len(validators))
 	}
 	if consensus.ProtocolVersion != 3 {
 		return validatedSpec{}, fmt.Errorf("consensus.protocol_version must be 3, got %d", consensus.ProtocolVersion)
+	}
+	if spec.ValidatorRegistry != nil && spec.ValidatorRegistry.MaxCollatorsPerValidator == 0 {
+		return validatedSpec{}, errors.New("validator_registry.max_collators_per_validator must be positive")
 	}
 	if len(spec.DHTNodes) == 0 {
 		return validatedSpec{}, errors.New("dht_static_nodes must contain at least one signed bootstrap descriptor")

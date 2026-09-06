@@ -289,6 +289,10 @@ type overlayPeer struct {
 	broadcastPeer  overlay.BroadcastPeer
 	release        func()
 
+	// prioritySend is raised while this node's own candidate symbol is being
+	// written to the peer; relay writes to the peer defer to it.
+	prioritySend quicPrioritySendLatch
+
 	// Lock-free counters feeding the persistent peer cache: srcScore counts
 	// first-accepted broadcasts delivered by this peer, outboundOK marks that
 	// the peer answered an outbound query of ours (cache eligibility).

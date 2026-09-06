@@ -55,12 +55,16 @@ type BlockAccepterOptions struct {
 }
 
 type preparedBlockAcceptance struct {
+	accepter       *BlockAccepter
+	resolveView    BlockAcceptanceViewResolver
 	block          p2p.DownloadedBlock
-	parsed         *tlb.Block
-	proofRoot      *cell.Cell
+	link           acceptedProofLink
 	signatures     *blockproof.ValidatorSignatureSet
 	signaturesCell *cell.Cell
+	state          *ChainState
 	final          bool
+	public         bool
+	published      bool
 }
 
 type acceptedValidatorSetLoader struct {
@@ -124,50 +128,46 @@ func NewBlockAccepter(options BlockAccepterOptions) (*BlockAccepter, error) {
 	}, nil
 }
 
-// Accept validates the acceptance evidence, constructs the interoperable
-// proof form, durably retains shard proof links, and hands the block to the
-// best-effort local ingress. It does not wait for node application or network
-// delivery. resolveView is consulted only for a finalized shard block and only
-// after local submission and publication, so a chain view that is not ready yet
-// can never suppress the single network publication of that block.
-func (a *BlockAccepter) Accept(
-	ctx context.Context,
-	acceptance BlockAcceptance,
-	resolveView BlockAcceptanceViewResolver,
-) error {
+// Submit hands the prepared block to local ingress and the live view before
+// publishing it. The node submission is asynchronous, so a retry repeats local
+// ingress but never the network publication.
+func (p *preparedBlockAcceptance) Submit(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	prepared, err := a.prepare(acceptance)
-	if err != nil {
-		return err
-	}
-	if err = ctx.Err(); err != nil {
-		return err
-	}
-
-	a.node.SubmitBlockLocally(prepared.block)
-	// Immediately after local submission and before anything can wait on it. The
-	// submission is asynchronous by design, so without this the block and its
-	// state are invisible to every local reader until the shard client applies
-	// the block — which for a shard block means waiting for a masterchain block
-	// that carries this shard top.
-	a.publishAcceptedState(acceptance, prepared)
-	if !acceptance.Retry && !acceptance.Replay && a.publisher != nil {
+	a := p.accepter
+	a.node.SubmitBlockLocally(p.block)
+	a.publishAcceptedState(p)
+	if !p.published && a.publisher != nil {
 		a.publisher.PublishAcceptedBlock(AcceptedBlockPublication{
 			SessionID:  a.sessionID,
-			Block:      prepared.block,
-			Signatures: prepared.signatures,
-			Public: a.localValidator != nil &&
-				acceptance.Candidate.Candidate.Leader == a.localValidator.Index,
+			Block:      p.block,
+			Signatures: p.signatures,
+			Public:     p.public,
 		})
 	}
-	if a.shard.IsMasterchain() || !prepared.final {
+	p.published = true
+
+	return nil
+}
+
+// Describe runs after the handoff succeeds. It retains only the proof link,
+// header, metadata and final signatures while waiting on the node, so a pending
+// shard description does not pin the candidate payload or its full state.
+func (p *preparedBlockAcceptance) Describe(ctx context.Context) error {
+	p.block = p2p.DownloadedBlock{}
+	p.state = nil
+	p.signatures = nil
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if p.accepter.shard.IsMasterchain() || !p.final {
 		return nil
 	}
 
-	return a.buildShardTopDescription(ctx, resolveView, prepared)
+	return p.accepter.buildShardTopDescription(ctx, p.resolveView, p)
 }
 
 // publishAcceptedState hands the accepted block and the state this session
@@ -188,6 +188,15 @@ func (a *BlockAccepter) Accept(
 //     top description, and that read is the other half of the acceptance retry
 //     loop. The bytes are the ones just submitted, so what the store will hold
 //     later is byte-identical.
+//
+// The publication is also what advances the validator's internal-message pool
+// (liveview.Store.ObserveAcceptedBlockStates, Service.onAcceptedBlockState): the
+// pool mirrors this shard's out-queue for its neighbours, and until this it moved
+// only on the node's applied-block hook, about a second after acceptance under
+// load. The observer runs on this goroutine after the state is installed, so the
+// pool never names a source position whose state the live view cannot serve, and
+// the later apply of the same block is a no-op there. Its cost is the applied
+// hook's own bookkeeping (~0.4 ms for a 250-message block on the delta path).
 //
 // WHAT IS NOT PUBLISHED. Nothing without a state: a block on its own would be
 // pinned in the live view until its flush with no bound of its own. Nothing on
@@ -212,16 +221,13 @@ func (a *BlockAccepter) Accept(
 // node serves it, and neither has to have completed for losing this publication to
 // be merely slow. Nothing here may be used to justify a change that does depend on
 // local durability having happened by this point, because it has not.
-func (a *BlockAccepter) publishAcceptedState(
-	acceptance BlockAcceptance,
-	prepared *preparedBlockAcceptance,
-) {
-	if a.shard.IsMasterchain() || acceptance.state == nil {
+func (a *BlockAccepter) publishAcceptedState(prepared *preparedBlockAcceptance) {
+	if a.shard.IsMasterchain() || prepared.state == nil {
 		return
 	}
 
 	block := prepared.block.ID
-	state, err := acceptance.state.acceptedTipState(block)
+	state, err := prepared.state.acceptedTipState(block)
 	if err != nil {
 		a.log.Debug().
 			Err(err).
@@ -254,13 +260,36 @@ func (a *BlockAccepter) publishAcceptedState(
 	}
 }
 
-func (a *BlockAccepter) prepare(acceptance BlockAcceptance) (*preparedBlockAcceptance, error) {
+// Prepare validates the certificate binding and block, constructs the proof
+// once, and captures the inputs needed by Submit and Describe. resolveView is
+// consulted only by Describe, after local submission and publication.
+func (a *BlockAccepter) Prepare(
+	ctx context.Context,
+	acceptance BlockAcceptance,
+	resolveView BlockAcceptanceViewResolver,
+) (*preparedBlockAcceptance, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	if err := a.validate(acceptance); err != nil {
 		return nil, err
 	}
 
 	blockID := acceptance.Candidate.Candidate.Block
-	blockRoot, parsed, err := parseAcceptedBlock(blockID, acceptance.Candidate.BlockBOC)
+	blockBOC := acceptance.Candidate.BlockBOC
+	var residentRoot *cell.Cell
+	if state := acceptance.state; state != nil && len(state.tips) == 1 {
+		tip := &state.tips[0]
+		// The tip's immutable root was decoded or built from these exact bytes.
+		// Matching both the full ID and the BOC keeps an unrelated resident state
+		// from bypassing wire validation. The equality check is O(1) when the
+		// candidate and its successor share the same backing buffer, as usual.
+		if sameBlockID(tip.ID, blockID) && bytes.Equal(tip.BlockBOC, blockBOC) {
+			residentRoot = tip.Block
+		}
+	}
+	blockRoot, parsed, err := parseAcceptedBlock(blockID, blockBOC, residentRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -320,6 +349,12 @@ func (a *BlockAccepter) prepare(acceptance BlockAcceptance) (*preparedBlockAccep
 	}
 
 	prepared := &preparedBlockAcceptance{
+		accepter:    a,
+		resolveView: resolveView,
+		state:       acceptance.state,
+		published:   acceptance.Replay,
+		public: a.localValidator != nil &&
+			acceptance.Candidate.Candidate.Leader == a.localValidator.Index,
 		block: p2p.DownloadedBlock{
 			ID:                    blockID,
 			Kind:                  acceptedBlockKind,
@@ -333,8 +368,12 @@ func (a *BlockAccepter) prepare(acceptance BlockAcceptance) (*preparedBlockAccep
 			VerifiedRootHash:      true,
 			SignaturesVerifiedKey: verifiedKey,
 		},
-		parsed:     parsed,
-		proofRoot:  proofRoot,
+		link: acceptedProofLink{
+			block:     blockID,
+			proofRoot: proofRoot,
+			header:    parsed.BlockInfo,
+			meta:      meta,
+		},
 		signatures: signatures,
 		final:      acceptance.Certificate.Vote().Kind == simplex.VoteFinalize,
 	}
@@ -478,14 +517,21 @@ func (a *BlockAccepter) buildProof(
 func parseAcceptedBlock(
 	id ton.BlockIDExt,
 	blockBOC []byte,
+	root *cell.Cell,
 ) (*cell.Cell, *tlb.Block, error) {
 	if len(blockBOC) == 0 {
 		return nil, nil, errors.New("validator block acceptance: block boc is empty")
 	}
 
-	root, err := cell.FromBOC(blockBOC)
-	if err != nil {
-		return nil, nil, fmt.Errorf("validator block acceptance: parse block boc: %w", err)
+	// Replay and acceptance without a matching resident tip still decode the
+	// original wire. A supplied root is only a decode reuse: all identity,
+	// digest, TL-B and header checks below remain mandatory on either path.
+	var err error
+	if root == nil {
+		root, err = cell.FromBOC(blockBOC)
+		if err != nil {
+			return nil, nil, fmt.Errorf("validator block acceptance: parse block boc: %w", err)
+		}
 	}
 	if !cellHashEquals(root, id.RootHash) {
 		return nil, nil, fmt.Errorf("validator block acceptance: root hash mismatch for %s", storage.FormatBlockRef(id))

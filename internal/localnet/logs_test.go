@@ -249,6 +249,13 @@ func TestParseJSONBlockAndSessionStop(t *testing.T) {
 	if !ok || event.Kind != "block_collated" || event.Seqno != 42 || event.CandidateHash != "aabb" || event.Leader != "3" {
 		t.Fatalf("event = %+v, parsed=%t", event, ok)
 	}
+	event, ok = parseLogLine(node, []byte(`{"level":"info","message":"candidate emitted","session_id":"ABCD","workchain":0,"shard":-9223372036854775808,"block_seqno":42,"slot":0,"window_start":0,"window_end":4,"leader":3,"candidate_hash":"AABB","block_root_hash":"CCDD","block_file_hash":"EEFF","replayed":true}`))
+	if !ok || event.Kind != "candidate_emitted" || event.Slot == nil || *event.Slot != 0 ||
+		event.WindowStart == nil || *event.WindowStart != 0 || event.WindowEnd == nil || *event.WindowEnd != 4 ||
+		event.SessionID != "ABCD" || event.CandidateHash != "aabb" || event.BlockRootHash != "ccdd" ||
+		event.BlockFileHash != "eeff" || !event.Replayed {
+		t.Fatalf("emission = %+v, parsed=%t", event, ok)
+	}
 
 	if _, ok = parseLogLine(node, []byte(`{"message":"validator session stopped"}`)); ok {
 		t.Fatal("benign session stop classified as an event")
@@ -268,13 +275,140 @@ func TestParseColoredLifecycleAndCPPEvents(t *testing.T) {
 
 	cpp := "Published event CandidateGenerated {candidate=Candidate{id={17, AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=, ?}, parent=null, block=BlockCandidate{id=(0,4000000000000000,9):AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB}}}"
 	event, ok = parseLogLine(NodeConfig{Name: "cpp", Kind: "cpp"}, []byte(cpp))
-	if !ok || event.Kind != "block_collated" || event.CandidateHash != "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" || event.Seqno != 9 || event.BlockRootHash != strings.Repeat("a", 64) || event.BlockFileHash != strings.Repeat("b", 64) {
+	if !ok || event.Kind != "candidate_emitted" || event.Slot == nil || *event.Slot != 17 || event.CandidateHash != "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" || event.Seqno != 9 || event.BlockRootHash != strings.Repeat("a", 64) || event.BlockFileHash != strings.Repeat("b", 64) {
 		t.Fatalf("C++ candidate = %+v, parsed=%t", event, ok)
+	}
+	trace := "Published event TraceEvent {event=CandidateReceived{id={17, AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=, ?}, parent=consensus genesis, block_id=(0,4000000000000000,9):AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB}}"
+	event, ok = parseLogLine(NodeConfig{Name: "cpp", Kind: "cpp"}, []byte(trace))
+	if !ok || event.Kind != "block_validated" || event.Slot == nil || *event.Slot != 17 || event.CandidateHash != "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" || event.BlockRootHash != strings.Repeat("a", 64) || event.BlockFileHash != strings.Repeat("b", 64) {
+		t.Fatalf("C++ trace candidate = %+v, parsed=%t", event, ok)
 	}
 
 	event, ok = parseLogLine(NodeConfig{Name: "cpp", Kind: "cpp"}, []byte("REJECT: invalid candidate"))
 	if !ok || event.Kind != "hard_error" {
 		t.Fatalf("C++ reject = %+v, parsed=%t", event, ok)
+	}
+}
+
+func TestCandidateEmissionStatsDeduplicateByNodeSessionSlotAndHash(t *testing.T) {
+	slot := uint32(17)
+	events := []Event{
+		{Node: "go", Kind: "block_collated", SessionID: "session-a", Slot: &slot, CandidateHash: "candidate"},
+		{Node: "go", Kind: "candidate_emitted", SessionID: "session-a", Slot: &slot, CandidateHash: "candidate"},
+		{Node: "go", Kind: "candidate_emitted", SessionID: "session-a", Slot: &slot, CandidateHash: "candidate", Replayed: true},
+	}
+	otherSlot := slot + 1
+	events = append(events,
+		Event{Node: "go", Kind: "candidate_emitted", SessionID: "session-a", Slot: &otherSlot, CandidateHash: "candidate"},
+		Event{Node: "go", Kind: "candidate_emitted", SessionID: "session-b", Slot: &slot, CandidateHash: "candidate"},
+		Event{Node: "cpp", Kind: "candidate_emitted", Slot: &slot, CandidateHash: "candidate"},
+		Event{Node: "cpp", Kind: "candidate_emitted", Slot: &slot, CandidateHash: "candidate", Replayed: true},
+	)
+
+	var stats logStats
+	for _, event := range events {
+		stats.add(event)
+	}
+	if stats.Collated != 1 || stats.Emitted != 4 {
+		t.Fatalf("collated=%d emitted=%d, want built=1 unique emissions=4", stats.Collated, stats.Emitted)
+	}
+}
+
+func TestBlockStatsDeduplicateValidationAndFinalizationEvidence(t *testing.T) {
+	slot := uint32(17)
+	base := Event{
+		Node: "cpp", Slot: &slot, CandidateHash: "candidate",
+		BlockRootHash: "ROOT", BlockFileHash: "FILE",
+	}
+	otherFile := base
+	otherFile.BlockFileHash = "other-file"
+	otherFile.CandidateHash = "other-candidate"
+	otherNode := base
+	otherNode.Node = "cpp-2"
+	fallback := Event{Node: "cpp", Slot: &slot, CandidateHash: "fallback"}
+
+	var stats logStats
+	for _, event := range []Event{
+		withEventKind(base, "block_validated"),
+		withEventKind(base, "block_validated"),
+		withEventKind(otherFile, "block_validated"),
+		withEventKind(otherNode, "block_validated"),
+		withEventKind(fallback, "block_validated"),
+		withEventKind(fallback, "block_validated"),
+		withEventKind(base, "block_finalized"),
+		withEventKind(base, "block_finalized"),
+		withEventKind(otherFile, "block_finalized"),
+	} {
+		stats.add(event)
+	}
+	if stats.Validated != 4 || stats.Finalized != 2 {
+		t.Fatalf("validated=%d finalized=%d, want unique per-node block/fallback identities 4/2", stats.Validated, stats.Finalized)
+	}
+}
+
+func TestBlockStatsBridgeBlockAndFallbackIdentitiesInEitherOrder(t *testing.T) {
+	slot := uint32(23)
+	candidateOnly := Event{Node: "cpp", Kind: "block_validated", Slot: &slot, CandidateHash: "candidate"}
+	blockAndCandidate := candidateOnly
+	blockAndCandidate.BlockRootHash = "root"
+	blockAndCandidate.BlockFileHash = "file"
+	blockOnly := Event{Node: "cpp", Kind: "block_validated", BlockRootHash: "root", BlockFileHash: "file"}
+
+	for _, events := range [][]Event{
+		{candidateOnly, blockAndCandidate, blockOnly},
+		{blockOnly, blockAndCandidate, candidateOnly},
+	} {
+		var stats logStats
+		for _, event := range events {
+			stats.add(event)
+		}
+		if stats.Validated != 1 {
+			t.Fatalf("validated=%d for events %+v, want one identity bridged by the complete signal", stats.Validated, events)
+		}
+	}
+}
+
+func TestCollatedBlocksCountCompletedRetryBuilds(t *testing.T) {
+	slot := uint32(9)
+	build := Event{
+		Node: "go", Kind: "block_collated", SessionID: "session", Slot: &slot,
+		CandidateHash: "candidate", BlockRootHash: "root", BlockFileHash: "file",
+	}
+
+	var stats logStats
+	stats.add(build)
+	stats.add(build)
+	if stats.Collated != 2 {
+		t.Fatalf("collated=%d, want both completed build attempts", stats.Collated)
+	}
+}
+
+func withEventKind(event Event, kind string) Event {
+	event.Kind = kind
+
+	return event
+}
+
+func TestCPPFinalizeBlockCountsOnlyPublishedEvent(t *testing.T) {
+	node := NodeConfig{Name: "cpp", Kind: "cpp"}
+	block := "(0,4000000000000000,9):" + strings.Repeat("A", 64) + ":" + strings.Repeat("B", 64)
+	lines := []string{
+		"Published event FinalizeBlock {block=" + block + "}",
+		"Response for validator::consensus::FinalizeBlock@0xdeadbeef is ready",
+	}
+
+	var stats logStats
+	parsed := 0
+	for _, line := range lines {
+		event, ok := parseLogLine(node, []byte(line))
+		if !ok {
+			continue
+		}
+		parsed++
+		stats.add(event)
+	}
+	if parsed != 1 || stats.Finalized != 1 {
+		t.Fatalf("parsed=%d finalized=%d, want one published finalization", parsed, stats.Finalized)
 	}
 }
 
@@ -303,5 +437,81 @@ func TestAcceptanceConsensusContinuesIsAdvisory(t *testing.T) {
 	stats.add(Event{Kind: "advisory_warning"})
 	if stats.AdvisoryWarnings != 1 || stats.HardErrors != 0 {
 		t.Fatalf("stats = %+v", stats)
+	}
+}
+
+func TestOperationalFailuresKeepCategories(t *testing.T) {
+	tests := []struct {
+		name     string
+		line     string
+		kind     string
+		category string
+	}{
+		{
+			name:     "deferred session preparation",
+			line:     `{"message":"validator session preparation failed","error":"validator runtime: load genesis chain state: validator runtime: block is not ready for acceptance: exact state metadata for block 8124 is unavailable"}`,
+			kind:     "advisory_warning",
+			category: "session_preparation_deferred",
+		},
+		{
+			name:     "terminal session preparation",
+			line:     `{"message":"validator session preparation failed","error":"validator runtime: corrupt consensus journal"}`,
+			kind:     "hard_error",
+			category: "session_preparation_failed",
+		},
+		{
+			name:     "apply retry",
+			line:     `{"message":"block applied processor failed, retrying","error":"local production is still running"}`,
+			kind:     "advisory_warning",
+			category: "block_apply_retry",
+		},
+		{
+			name:     "skipped producer window",
+			line:     `{"message":"local producer rejected consensus progress; skipping window","error":"session not found"}`,
+			kind:     "hard_error",
+			category: "producer_window_skipped",
+		},
+		{
+			name:     "superseded collation",
+			line:     `{"message":"block collation failed","error":"context canceled"}`,
+			kind:     "advisory_warning",
+			category: "block_collation_canceled",
+		},
+		{
+			// The collator wraps this error on every path that raises it and tests
+			// for it with errors.Is, so the classifier has to recognise it wrapped
+			// or it counts an ordinary supersession as a hard error.
+			name:     "wrapped superseded collation",
+			line:     `{"message":"block collation failed","error":"open ready external stream: context canceled"}`,
+			kind:     "advisory_warning",
+			category: "block_collation_canceled",
+		},
+		{
+			name:     "collation failed",
+			line:     `{"message":"block collation failed","error":"commit candidate state failed"}`,
+			kind:     "hard_error",
+			category: "block_collation_failed",
+		},
+		{
+			name:     "session cancellation remains terminal",
+			line:     `{"message":"validator session preparation failed","error":"context canceled"}`,
+			kind:     "hard_error",
+			category: "session_preparation_failed",
+		},
+		{
+			name:     "near miss readiness text remains terminal",
+			line:     `{"message":"validator session preparation failed","error":"storage block is not ready for acceptance"}`,
+			kind:     "hard_error",
+			category: "session_preparation_failed",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			event, ok := parseLogLine(NodeConfig{Name: "go", Kind: "go"}, []byte(test.line))
+			if !ok || event.Kind != test.kind || event.Category != test.category {
+				t.Fatalf("event=%+v parsed=%t", event, ok)
+			}
+		})
 	}
 }

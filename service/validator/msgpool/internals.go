@@ -105,6 +105,9 @@ type InternalsDelta struct {
 var (
 	// ErrNotFound reports that an internal-message source is not tracked.
 	ErrNotFound = errors.New("msgpool: internals source not found")
+	// ErrCandidateNotFound reports that a private branch has no candidate with
+	// the requested content identity.
+	ErrCandidateNotFound = errors.New("msgpool: internals candidate not found")
 
 	// ErrCutNotReady: a requested source position is ahead of the tracked
 	// run — the barrier case, retry once more blocks were fed.
@@ -187,6 +190,19 @@ type CandidateRequest struct {
 	Base   []CandidateSource
 	Delta  *InternalsDelta
 }
+
+// CandidateInstall reports whether one AddOrReusePromotedCandidate call owns a
+// newly installed node. A caller may roll back CandidateInstallAdded if its
+// surrounding transaction fails, but must serialize that rollback with every
+// descendant install: DropCandidate also removes the named node's descendants.
+// CandidateInstallReused belongs to an earlier speculative or committed path
+// and must remain untouched.
+type CandidateInstall uint8
+
+const (
+	CandidateInstallAdded CandidateInstall = iota + 1
+	CandidateInstallReused
+)
 
 // candidateDelta is a speculative destination-chain delta keyed by candidate
 // root hash.

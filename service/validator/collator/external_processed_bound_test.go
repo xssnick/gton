@@ -320,6 +320,14 @@ func collateWithWaves(
 //     a predecessor block.
 //
 // Even with all of that the payoff is the (account, lt) set, not the bytes.
+//
+// PROVENANCE, collated halves of both arms (1197 / a4559892… -> 1233 /
+// 7d94b878…, 1363 / bd11b15e… -> 1399 / 22144fa4…; blocks unchanged). The
+// previous-state proof now prunes every leaf the collation did not read instead
+// of keeping a resident one whole (tonutils proof_usage.go, pruneUnloadedLeaves;
+// measured on the stand as +15% collated data over the reference on post-split
+// blocks). On these two zerostate-shaped fixtures the only such leaf is smaller
+// than the 36-byte pruned branch that now stands for it, hence +36 bytes each.
 func assertBoundGolden(t *testing.T, candidate *Candidate, blockLen int, blockSum string, collatedLen int, collatedSum string) {
 	t.Helper()
 
@@ -426,7 +434,7 @@ func TestExternalTransactionLTClearsProcessedBoundAcrossExternalWaves(t *testing
 
 	assertBoundGolden(t, candidate,
 		5127, "155e13ff18cb2edb383b80848478a040a6d643c8e24cfcb601902ba2d2bcdadd",
-		1197, "a4559892625dcd80bcc5be3ff1e3d962009e598c6da98c85665ae2527b3f2f4f")
+		1233, "7d94b878c3a59ec18364dad6ce9452e27f9a139d4d7ac6b8ca53bc61b50d74e1")
 	assertBoundCandidateIsProofBacked(t, req, candidate)
 }
 
@@ -530,7 +538,7 @@ func TestExternalTransactionLTClearsBoundAdvancedByAnImportedMessage(t *testing.
 
 	assertBoundGolden(t, candidate,
 		5214, "218980f4c7192987efe0082d613c5a95cb380eac07b38b40b7223da08be91f0c",
-		1363, "bd11b15e6546b12ee4bea1530a4c3654af1c7439b6d7a2b09a2c561cdc5e526c")
+		1399, "22144fa4a9f0c03037bfc8b50ec7ad86133c047e9075016c2d0c62f9d05c2dd5")
 	assertBoundCandidateIsProofBacked(t, req, candidate)
 }
 
