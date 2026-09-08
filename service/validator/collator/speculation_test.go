@@ -1317,3 +1317,69 @@ func TestSessionStartBetStampsItsHeaderWithoutAWindow(t *testing.T) {
 		t.Fatal("a windowless build without the session-start instant must be refused")
 	}
 }
+
+func TestAdoptedSpeculationConflictRetriesCurrentWindow(t *testing.T) {
+	probe := newSpeculationProbe()
+	release := make(chan struct{})
+	pipeline := &runtimeTestPipeline{}
+	pipeline.build = func(ctx context.Context, request BuildRequest) (*Candidate, error) {
+		probe.note(request)
+		if request.speculative != nil {
+			select {
+			case <-release:
+				return nil, ErrSessionConflict
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return runtimeBuiltCandidate(request), nil
+	}
+	emitted := make(chan CandidateArtifact, 4)
+	fixture := newSpeculationFixture(t, pipeline, func(_ context.Context, artifact CandidateArtifact) error {
+		emitted <- artifact
+		return nil
+	})
+	defer fixture.close(t)
+	baseID, base := fixture.candidate(t, fixture.windowSize-1, 0xea)
+	if err := fixture.speculate(t, base, fixture.windowSize); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-probe.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("speculative build never started")
+	}
+	fixture.openWindow(t, fixture.windowSize, baseID, base)
+	managed, err := fixture.service.runningSession(fixture.session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, _, pending := managed.speculation.pending(); !pending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("window did not adopt the in-flight speculation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	artifact := runtimeAwaitArtifact(t, emitted)
+	if artifact.Candidate.ID.Slot != fixture.windowSize || artifact.Candidate.Parent != simplex.Parent(baseID) {
+		t.Fatalf("unexpected recovered candidate: %+v", artifact.Candidate)
+	}
+	slots, speculative := probe.snapshot()
+	firstSlotBuilds := 0
+	for i, slot := range slots {
+		if slot == fixture.windowSize {
+			firstSlotBuilds++
+			if firstSlotBuilds == 2 && speculative[i] {
+				t.Fatal("retried the stale speculative request")
+			}
+		}
+	}
+	if firstSlotBuilds != 2 {
+		t.Fatalf("first slot builds = %d, want failed speculation and current-window build", firstSlotBuilds)
+	}
+}

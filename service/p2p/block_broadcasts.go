@@ -1004,7 +1004,7 @@ func (b *BlockBroadcasts) publicationCertificate(
 	// and signs CertificateId even when a V2 value was supplied on the wire.
 	toSign, err := tl.Serialize(overlay.CertificateId{
 		OverlayID: overlayID[:],
-		Node:      b.node.localID[:],
+		Node:      sub.node.localID[:],
 		ExpireAt:  expireAt,
 		MaxSize:   maxOverlayPayloadSize,
 	}, true)

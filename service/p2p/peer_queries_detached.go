@@ -3,10 +3,12 @@ package p2p
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
+	"github.com/xssnick/tonutils-go/tl"
 )
 
 var errDetachedUnknownOverlay = errors.New("query for an overlay this node does not serve")
@@ -37,6 +39,20 @@ func (n *Node) detachedSubscription(pooled *pooledPeer, overlayID []byte) *overl
 // safe to keep only a small live set: a peer we did not attach must still be
 // served, otherwise it stops considering us a usable neighbour.
 func (n *Node) serveDetachedADNLQuery(pooled *pooledPeer, msg *adnl.MessageQuery) error {
+	if parts, ok := msg.Data.([]tl.Serializable); ok && len(parts) == 2 {
+		if query, ok := parts[0].(overlay.QueryWithExtra); ok {
+			header, err := quicOverlayHeaderFromExtra(query.Overlay, query.Extra)
+			if err != nil {
+				return err
+			}
+			// The same signed membership envelope is used over ADNL and QUIC.
+			sub, err := n.quicSubscription(header, pooled.id, time.Now())
+			if err != nil {
+				return err
+			}
+			return sub.serveDetachedADNLQuery(pooled, msg, parts[1])
+		}
+	}
 	unwrapped, overlayID := overlay.UnwrapQuery(msg.Data)
 	sub := n.detachedSubscription(pooled, overlayID)
 	if sub == nil {

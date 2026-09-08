@@ -204,6 +204,7 @@ type Options struct {
 	ListenAddr                string
 	ExternalIP                net.IP
 	ExternalPort              uint16
+	PrivateNetwork            *PrivateNetworkOptions
 	DHTPrivateKey             ed25519.PrivateKey
 	DHTListenAddr             string
 	StateFilesDir             string

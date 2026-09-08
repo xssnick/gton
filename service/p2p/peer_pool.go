@@ -319,13 +319,11 @@ func (p *peerPool) wrapPeerLocked(peer adnl.Peer, id PeerID) (*pooledPeer, bool,
 
 	wrapper := overlay.CreateExtendedADNL(peer)
 	wrapper.SetBroadcastReceiverResolver(p.broadcastReceiverResolver)
-	if p.customMessage != nil {
-		// Non-overlay ADNL messages fall through to this handler; without it
-		// they are dropped before anything sees them.
-		wrapper.SetCustomMessageHandler(p.customMessage)
-	}
-	baseRLDP := rldp.NewClientV2(wrapper)
-	rldpClient := overlay.CreateExtendedRLDP(baseRLDP)
+	baseRLDP := rldp.NewClientV2(peerRLDPTransport{
+		ADNLWrapper:   wrapper,
+		customMessage: p.customMessage,
+	})
+	rldpClient := overlay.CreateExtendedRLDP(pooledRLDP{RLDP: baseRLDP, adnl: wrapper})
 
 	pooled := &pooledPeer{
 		id:              id,
@@ -343,6 +341,11 @@ func (p *peerPool) wrapPeerLocked(peer adnl.Peer, id PeerID) (*pooledPeer, bool,
 	// the wrappers drop them as "unregistered overlay", so an unattached peer
 	// gets neither blocks nor Pong and evicts us as unreliable.
 	if p.detachedQuery != nil {
+		// The overlay wrapper recognizes legacy overlay.query only. Certified
+		// FastSync queries carry overlay.queryWithExtra and reach this handler.
+		wrapper.SetQueryHandler(func(msg *adnl.MessageQuery) error {
+			return p.detachedQuery.adnl(pooled, msg)
+		})
 		wrapper.SetOnUnknownOverlayQuery(func(msg *adnl.MessageQuery) error {
 			return p.detachedQuery.adnl(pooled, msg)
 		})
@@ -649,4 +652,38 @@ func (p *peerPool) overlaySnapshot() []*pooledPeer {
 		list = append(list, peer)
 	}
 	return list
+}
+
+// peerRLDPTransport demultiplexes plain ADNL messages at the RLDP boundary.
+// RLDP installs its handler during construction; installing the application's
+// handler on ADNL beforehand would silently replace it and lose certificates.
+type peerRLDPTransport struct {
+	*overlay.ADNLWrapper
+	customMessage func(*adnl.MessageCustom) error
+}
+
+// The overlay library enables RLDP message delivery only when GetADNL returns
+// its concrete ADNL wrapper. Keep that identity while intercepting RLDP's
+// handler installation through peerRLDPTransport above.
+type pooledRLDP struct {
+	*rldp.RLDP
+	adnl *overlay.ADNLWrapper
+}
+
+func (p pooledRLDP) GetADNL() rldp.ADNL {
+	return p.adnl
+}
+
+func (p peerRLDPTransport) SetCustomMessageHandler(handler func(*adnl.MessageCustom) error) {
+	p.ADNLWrapper.SetCustomMessageHandler(func(msg *adnl.MessageCustom) error {
+		switch msg.Data.(type) {
+		case rldp.MessagePart, rldp.MessagePartV2, rldp.Confirm, rldp.ConfirmV2, rldp.Complete, rldp.CompleteV2:
+			return handler(msg)
+		default:
+			if p.customMessage != nil {
+				return p.customMessage(msg)
+			}
+			return nil
+		}
+	})
 }

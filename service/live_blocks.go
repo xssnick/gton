@@ -69,6 +69,30 @@ func (s *SyncCoordinator) publishLiveBlockArtifacts(downloaded PreparedBlock, st
 // update applies to the resident predecessor and retains only the destination
 // cells, instead of walking or serializing the complete resulting state.
 func (s *SyncCoordinator) publishInternalNonfinalShardBlock(block VerifiedBlock) {
+	// Recovery can accept a shard block without retaining its full state. Its
+	// proof must still be readable by the next shard-top description, otherwise
+	// registration waits for a proof that ordinary apply only publishes AFTER
+	// registration. These artifacts are bounded independently of a future flush.
+	if s.liveBlockCache != nil {
+		var proofs []storage.LiveBlockProofArtifact
+		if len(block.ProofBOC) > 0 {
+			for _, kind := range storage.StoredProofKindsForServedBlock(block.ID, block.IsLink, block.Meta.Has(storage.BlockMetaIsKeyBlock)) {
+				proofs = append(proofs, storage.LiveBlockProofArtifact{Kind: kind, Data: block.ProofBOC})
+			}
+		}
+		if err := s.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockCacheArtifacts{
+			Block:     block.ID,
+			BlockData: block.BlockBOC,
+			Meta:      liveBlockArtifactMeta(block.ID, block.Meta, block.BlockBOC, proofs),
+			Proofs:    proofs,
+			Transient: true,
+		}); err != nil {
+			s.log.Debug().Err(err).
+				Str("block", storage.FormatBlockRef(block.ID)).
+				Msg("skip internal shard block artifacts")
+		}
+	}
+
 	if s.liveState == nil || !s.liveState.NonfinalBlockCacheEnabled() {
 		return
 	}

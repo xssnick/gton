@@ -308,7 +308,7 @@ func (s *overlaySubscription) runPeerRebroadcastLoop(ctx context.Context, peer *
 			return
 		}
 		if req.expiredInQueue(time.Now()) {
-			s.node.noteRebroadcastDropped(req)
+			s.node.chainNode().noteRebroadcastDropped(req)
 			s.log.Debug().
 				Str("kind", req.kind).
 				Str("queue", req.queueName()).
@@ -320,16 +320,16 @@ func (s *overlaySubscription) runPeerRebroadcastLoop(ctx context.Context, peer *
 		}
 
 		if s.rebroadcastToPeer(ctx, peer, req) {
-			s.node.noteRebroadcastSent(req)
+			s.node.chainNode().noteRebroadcastSent(req)
 		} else {
-			s.node.noteRebroadcastDropped(req)
+			s.node.chainNode().noteRebroadcastDropped(req)
 		}
 	}
 }
 
 func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	if s.customRebroadcastUnsupported(req.kind) {
-		s.node.noteRebroadcastDropped(req)
+		s.node.chainNode().noteRebroadcastDropped(req)
 		s.log.Debug().
 			Str("kind", req.kind).
 			Str("queue", req.queueName()).
@@ -337,31 +337,31 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 		return false
 	}
 	if s.customBlockRebroadcastBlocked(req.kind) {
-		s.node.noteRebroadcastDropped(req)
+		s.node.chainNode().noteRebroadcastDropped(req)
 		s.log.Debug().
 			Str("kind", req.kind).
 			Str("queue", req.queueName()).
 			Msg("dropping custom block rebroadcast because local node is not a block sender")
 		return false
 	}
-	if !s.node.canAcceptBroadcast(req.kind, req.local) {
-		s.node.noteRebroadcastDropped(req)
+	if !s.node.chainNode().canAcceptBroadcast(req.kind, req.local) {
+		s.node.chainNode().noteRebroadcastDropped(req)
 		s.log.Debug().
 			Str("kind", req.kind).
 			Str("queue", req.queueName()).
 			Msg("dropping rebroadcast request because broadcast admission is closed")
 		return false
 	}
-	if !s.node.allowRebroadcast(&req) {
+	if !s.node.chainNode().allowRebroadcast(&req) {
 		return false
 	}
 	candidates := s.rebroadcastCandidatesForRequest(req)
 	if len(candidates) == 0 {
-		s.node.noteRebroadcastDropped(req)
+		s.node.chainNode().noteRebroadcastDropped(req)
 		return false
 	}
 	if err := req.materializePayload(); err != nil {
-		s.node.noteRebroadcastDropped(req)
+		s.node.chainNode().noteRebroadcastDropped(req)
 		s.log.Debug().
 			Err(err).
 			Str("kind", req.kind).
@@ -372,7 +372,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 
 	payloadLen := req.payloadLen()
 	if payloadLen == 0 || payloadLen > maxOverlayPayloadSize {
-		s.node.noteRebroadcastDropped(req)
+		s.node.chainNode().noteRebroadcastDropped(req)
 		s.log.Debug().
 			Str("kind", req.kind).
 			Str("queue", req.queueName()).
@@ -388,7 +388,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	if plan.mode == rebroadcastModeSimple && req.simple == nil {
 		msg, err := s.node.buildSimpleBroadcast(req.payload, plan.flags)
 		if err != nil {
-			s.node.noteRebroadcastDropped(req)
+			s.node.chainNode().noteRebroadcastDropped(req)
 			s.log.Debug().
 				Err(err).
 				Str("kind", req.kind).
@@ -408,7 +408,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 			overlay.WithBroadcastFECSymbolSize(rebroadcastFECSymbolSize),
 		)
 		if err != nil {
-			s.node.noteRebroadcastDropped(req)
+			s.node.chainNode().noteRebroadcastDropped(req)
 			s.log.Debug().
 				Err(err).
 				Str("kind", req.kind).
@@ -450,7 +450,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 		return true
 	}
 
-	s.node.noteRebroadcastDropped(req)
+	s.node.chainNode().noteRebroadcastDropped(req)
 	s.log.Debug().
 		Str("kind", req.kind).
 		Str("queue", req.queueName()).
@@ -552,19 +552,19 @@ func (s *overlaySubscription) rebroadcastPreferredCandidateIDs(req rebroadcastRe
 func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest) int {
 	if req.kind == "tonNode.externalMessageBroadcast" || req.kind == "tonNode.ihrMessageBroadcast" {
 		if s.spec.floodsWholeRoster() {
-			if s.node.rebroadcastLagged() {
+			if s.node.chainNode().rebroadcastLagged() {
 				return laggedExternalFanout
 			}
 			return s.peerLimit()
 		}
 		if req.local {
-			fanout := s.node.effectiveLocalExternalFanout()
-			if s.node.rebroadcastLagged() {
+			fanout := s.node.chainNode().effectiveLocalExternalFanout()
+			if s.node.chainNode().rebroadcastLagged() {
 				return laggedLocalExternalFanout(fanout)
 			}
 			return fanout
 		}
-		if s.node.rebroadcastLagged() {
+		if s.node.chainNode().rebroadcastLagged() {
 			return laggedExternalFanout
 		}
 		return externalRebroadcastFanout
@@ -572,7 +572,7 @@ func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest
 	if s.spec.floodsWholeRoster() {
 		return s.peerLimit()
 	}
-	if s.node.rebroadcastQuiet.Load() {
+	if s.node.chainNode().rebroadcastQuiet.Load() {
 		return quietRebroadcastFanout
 	}
 	return rebroadcastFanout
@@ -716,7 +716,7 @@ func (s *overlaySubscription) rebroadcastSimpleToPeer(ctx context.Context, peer 
 }
 
 func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest, plan rebroadcastPlan) bool {
-	releaseBackpressure, ok := s.node.waitRebroadcastFECBackpressure(ctx, peer, req)
+	releaseBackpressure, ok := s.node.chainNode().waitRebroadcastFECBackpressure(ctx, peer, req)
 	if !ok {
 		return false
 	}
@@ -743,7 +743,7 @@ func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *ov
 
 	pace := time.Duration(0)
 	if s.spec.pacesFECBursts() {
-		pace = s.node.fastSyncBroadcastFECPace
+		pace = s.node.chainNode().fastSyncBroadcastFECPace
 	}
 	err := sendFastFECToPeer(
 		ctx,

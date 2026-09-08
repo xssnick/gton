@@ -76,6 +76,7 @@ type LiveBlockCacheBlock struct {
 	meta            *BlockMeta
 	proofs          map[ServedProofKind][]byte
 	artifactFlushed bool
+	transient       bool
 }
 
 type liveBlockCacheNext struct {
@@ -89,6 +90,9 @@ type LiveBlockCacheArtifacts struct {
 	Meta            *BlockMeta
 	Proofs          []LiveBlockProofArtifact
 	ArtifactFlushed bool
+	// Transient artifacts may be evicted before a flush. Use this for accepted
+	// shard blocks awaiting masterchain registration: they may never be applied.
+	Transient bool
 }
 
 type CachedBlockData struct {
@@ -122,11 +126,12 @@ func (c *LiveBlockCache) PublishLiveBlockArtifacts(artifacts LiveBlockCacheArtif
 	c.publishMu.Lock()
 	defer c.publishMu.Unlock()
 
-	block := &LiveBlockCacheBlock{id: artifacts.Block}
+	block := &LiveBlockCacheBlock{id: artifacts.Block, transient: artifacts.Transient}
 	entry := c.entries[key]
 	if entry != nil {
 		loaded, _ := c.blocks.Load(key)
 		*block = *loaded.(*LiveBlockCacheBlock)
+		block.transient = block.transient && artifacts.Transient
 	}
 	block.artifactFlushed = block.artifactFlushed || artifacts.ArtifactFlushed
 	if len(artifacts.BlockData) > 0 {
@@ -418,7 +423,7 @@ func (c *LiveBlockCache) evictLocked() {
 }
 
 func liveBlockCacheBlockEvictable(block *LiveBlockCacheBlock) bool {
-	if block == nil || block.artifactFlushed {
+	if block == nil || block.artifactFlushed || block.transient {
 		return true
 	}
 	return len(block.data) == 0 && len(block.proofs) == 0

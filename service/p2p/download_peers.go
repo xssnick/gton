@@ -167,7 +167,7 @@ func (s *overlaySubscription) probeBlockFull(ctx context.Context, block ton.Bloc
 	if err != nil {
 		return nil, err
 	}
-	s.node.observeDownloadedBlockReceived(ctx, downloaded)
+	s.node.chainNode().observeDownloadedBlockReceived(ctx, downloaded)
 	return downloaded, nil
 }
 
@@ -196,7 +196,7 @@ func (s *overlaySubscription) downloadBlockFullFromPeer(ctx context.Context, req
 		return DownloadedBlock{}, err
 	}
 
-	downloaded, err := s.node.decodeDownloadedBlock(ctx, resp)
+	downloaded, err := s.node.chainNode().decodeDownloadedBlock(ctx, resp)
 	if err != nil {
 		return DownloadedBlock{}, err
 	}
@@ -280,7 +280,7 @@ func (s *overlaySubscription) probeNextFull(ctx context.Context, prev ton.BlockI
 	if err != nil {
 		return nil, err
 	}
-	s.node.observeDownloadedBlockReceived(ctx, downloaded)
+	s.node.chainNode().observeDownloadedBlockReceived(ctx, downloaded)
 	return downloaded, nil
 }
 
@@ -358,7 +358,7 @@ func (s *overlaySubscription) downloadNextFullFromPeers(ctx context.Context, cha
 		return nil, err
 	}
 	block := res.value
-	s.node.observeDownloadedBlockReceived(ctx, &block)
+	s.node.chainNode().observeDownloadedBlockReceived(ctx, &block)
 	return &block, nil
 }
 
@@ -386,7 +386,7 @@ func (s *overlaySubscription) downloadNextFullFromPeer(ctx context.Context, chai
 		return DownloadedBlock{}, err
 	}
 
-	block, err := s.node.decodeDownloadedBlock(ctx, resp)
+	block, err := s.node.chainNode().decodeDownloadedBlock(ctx, resp)
 	if err != nil {
 		return DownloadedBlock{}, err
 	}
@@ -591,7 +591,7 @@ func (s *overlaySubscription) downloadFullFromPeers(ctx context.Context, request
 	if err != nil {
 		return nil, err
 	}
-	s.node.observeDownloadedBlockReceived(ctx, downloaded)
+	s.node.chainNode().observeDownloadedBlockReceived(ctx, downloaded)
 	return downloaded, nil
 }
 

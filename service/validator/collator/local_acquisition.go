@@ -715,6 +715,21 @@ func validateAcquisitionGroup(
 	return nil
 }
 
+// A speculative predecessor can rotate the committee before the node applies
+// it and retires the old runtime. Match the immutable runtime to that exact
+// predecessor before building or voting, as C++ check_cur_validator_set does.
+func requireMasterSession(session ActivatedSession, snapshot *groups.Snapshot) error {
+	active, err := activeMasterSession(snapshot)
+	if err != nil {
+		return err
+	}
+	if active.ID != session.ID || active.ValidatorSetHash != session.ValidatorSetHash {
+		return fmt.Errorf("%w: masterchain predecessor validator session differs from the consensus session", ErrInvalidInput)
+	}
+
+	return requireSameSessionIdentity(session, active)
+}
+
 // requireSameSessionIdentity compares the fields a running session may never
 // see change under it: shard, catchain seqno, genesis, minimum masterchain
 // block and every roster entry. They are exactly the fields the candidate

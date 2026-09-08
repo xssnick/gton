@@ -178,6 +178,8 @@ type Node struct {
 	subscriptionsMx          sync.RWMutex
 	subscriptions            map[string]*overlaySubscription
 	privateOverlays          *PrivateOverlayRegistry
+	privateNetwork           *Node
+	primaryNetwork           *Node
 	fastSyncSubscriptions    map[FastSyncShard]*overlaySubscription
 	publicBroadcastReceivers atomic.Pointer[publicBroadcastReceiverSnapshot]
 	plumtreePolicy           atomic.Pointer[PlumtreePolicy]
@@ -223,6 +225,11 @@ type Node struct {
 
 func New(opts Options) (*Node, error) {
 	logger := logutil.WithComponent(opts.Logger, "p2p")
+	if opts.PrivateNetwork != nil {
+		if err := validatePrivateNetworkOptions(opts); err != nil {
+			return nil, err
+		}
+	}
 	if rldp.MaxFECDataSize < persistentStateChunkAnswerMax {
 		rldp.MaxFECDataSize = persistentStateChunkAnswerMax
 	}
@@ -289,15 +296,6 @@ func New(opts Options) (*Node, error) {
 	}
 	if opts.PeerStorage == nil {
 		return nil, fmt.Errorf("peer storage is required")
-	}
-	fastSyncCertificates, err := loadFastSyncCertificates(
-		context.Background(),
-		opts.FastSyncCertificateStorage,
-		localID,
-		time.Now(),
-	)
-	if err != nil {
-		return nil, err
 	}
 	liveBlockCache := opts.LiveBlockCache
 	if liveBlockCache == nil {
@@ -390,7 +388,6 @@ func New(opts Options) (*Node, error) {
 		stateCellImportSlot:           make(chan struct{}, 1),
 		stateSplitPartDecodeSlot:      make(chan struct{}, 1),
 		customOverlays:                append([]CustomOverlayConfig(nil), opts.CustomOverlays...),
-		fastSyncCertificates:          fastSyncCertificates,
 	}
 	node.SetPlumtreePolicy(PlumtreePolicy{})
 	node.privateOverlays = newPrivateOverlayRegistry(node)
@@ -405,6 +402,26 @@ func New(opts Options) (*Node, error) {
 	node.pool.detachedQuery = &detachedQueryHandlers{
 		adnl: node.serveDetachedADNLQuery,
 		rldp: node.serveDetachedRLDPQuery,
+	}
+	if opts.PrivateNetwork != nil {
+		node.privateNetwork, err = newPrivateNetwork(*opts.PrivateNetwork, logger)
+		if err != nil {
+			return nil, err
+		}
+		node.privateNetwork.primaryNetwork = node
+	}
+	certificateNode := node
+	if node.privateNetwork != nil {
+		certificateNode = node.privateNetwork
+		node.fastSyncCertificateStorage = nil
+		certificateNode.fastSyncCertificateStorage = opts.FastSyncCertificateStorage
+	}
+	certificateNode.fastSyncCertificates, err = loadFastSyncCertificates(
+		context.Background(), certificateNode.fastSyncCertificateStorage,
+		certificateNode.localID, time.Now(),
+	)
+	if err != nil {
+		return nil, err
 	}
 	return node, nil
 }

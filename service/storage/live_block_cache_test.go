@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"testing"
 
@@ -478,5 +479,46 @@ func assertLiveBlockCacheMatchesModel(t *testing.T, step int, cache *LiveBlockCa
 				t.Fatalf("step %d heap order is invalid at index %d", step, idx)
 			}
 		}
+	}
+}
+
+func TestLiveBlockCacheBoundsTransientArtifactsAndPinsAppliedBlocks(t *testing.T) {
+	for _, applyFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("applyFirst=%t", applyFirst), func(t *testing.T) {
+			cache := NewLiveBlockCache(2)
+			applied := testLiveBlockCacheBlockID(1)
+			proof := []byte{0x21}
+			publish := func(block ton.BlockIDExt, transient bool) {
+				t.Helper()
+				if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
+					Block: block, BlockData: []byte{0x11}, Transient: transient,
+					Proofs: []LiveBlockProofArtifact{{Kind: ServedProofBlockLink, Data: proof}},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			publish(applied, !applyFirst)
+			publish(applied, applyFirst)
+			for seqno := uint32(2); seqno <= 5; seqno++ {
+				publish(testLiveBlockCacheBlockID(seqno), true)
+			}
+			if len(cache.entries) != 2 {
+				t.Fatalf("cache has %d entries, want 2", len(cache.entries))
+			}
+			if _, err := cache.BlockProof(context.Background(), ServedProofBlockLink, testLiveBlockCacheBlockID(2)); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("old transient proof error = %v, want not found", err)
+			}
+			if _, err := cache.BlockProof(context.Background(), ServedProofBlockLink, testLiveBlockCacheBlockID(5)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := cache.BlockProof(context.Background(), ServedProofBlockLink, applied); err != nil {
+				t.Fatalf("applied proof evicted before flush: %v", err)
+			}
+			cache.MarkBlockFlushed(applied)
+			publish(testLiveBlockCacheBlockID(6), true)
+			if _, err := cache.BlockProof(context.Background(), ServedProofBlockLink, applied); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("flushed proof error = %v, want not found", err)
+			}
+		})
 	}
 }

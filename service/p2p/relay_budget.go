@@ -111,10 +111,10 @@ type budgetedRelayPeer struct {
 func (p budgetedRelayPeer) ID() []byte { return p.peer.ID() }
 
 func (p budgetedRelayPeer) admit(size int) bool {
-	if p.sub.node.relayEgress.allow(time.Now(), size+relayEgressPartOverheadBytes) {
+	if p.sub.node.chainNode().relayEgress.allow(time.Now(), size+relayEgressPartOverheadBytes) {
 		return true
 	}
-	p.sub.node.noteBroadcastDrop(p.sub.spec.Name, relayEgressDropKind, relayEgressDropReason)
+	p.sub.node.chainNode().noteBroadcastDrop(p.sub.spec.Name, relayEgressDropKind, relayEgressDropReason)
 	return false
 }
 
@@ -153,7 +153,7 @@ func (p budgetedRelayPeer) SendPreparedBroadcastMessage(ctx context.Context, msg
 // budgetRelayPeers wraps the sampled relay targets of a public overlay so the
 // FEC parts forwarded to them draw on the node's relay budget.
 func (s *overlaySubscription) budgetRelayPeers(relay []overlay.BroadcastPeer) []overlay.BroadcastPeer {
-	if s.node.relayEgress == nil || len(relay) == 0 {
+	if s.node.chainNode().relayEgress == nil || len(relay) == 0 {
 		return relay
 	}
 	budgeted := make([]overlay.BroadcastPeer, len(relay))

@@ -4174,6 +4174,13 @@ func (p *windowProducer) runSlot(slot uint32) error {
 	p.future.stop()
 	p.future = nil
 	if result.err != nil {
+		if (finishedFuture.request.speculative != nil || finishedFuture.request.crossWindowBet) &&
+			errors.Is(result.err, ErrSessionConflict) {
+			// The window can advance acquisition before an adopted speculation
+			// enters it. Its old update then conflicts, but the current window
+			// remains valid. Retry ordinary production with its current inputs.
+			return fmt.Errorf("%w: adopted speculative build used an outdated session update", ErrAcquisitionNotReady)
+		}
 		if errors.Is(result.err, errCollationMustBeEmpty) && p.parent.Exists {
 			// ResolveCandidateState answers out of the session's own candidate
 			// map and reads no masterchain view, so it still resolves the

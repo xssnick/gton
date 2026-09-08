@@ -49,6 +49,7 @@ type cliCommands struct {
 	version                bool
 	lsPubkey               bool
 	adnlID                 bool
+	consensusADNLID        bool
 	validatorControlPubkey bool
 	dhtDescriptor          bool
 	skipConfigCheck        bool
@@ -88,7 +89,7 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	cfg, created, err := loadNodeConfig(
 		context.Background(),
 		startOpts.ConfigFile,
-		commands.lsPubkey || commands.adnlID || commands.validatorControlPubkey || commands.dhtDescriptor,
+		commands.lsPubkey || commands.adnlID || commands.consensusADNLID || commands.validatorControlPubkey || commands.dhtDescriptor,
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -111,7 +112,14 @@ func Run(extensions ...hooks.ExtensionFactory) {
 		return
 	}
 	if commands.adnlID {
-		if err = writeADNLID(os.Stdout, cfg, startOpts.ConfigFile); err != nil {
+		if err = writeADNLID(os.Stdout, cfg.ADNL, startOpts.ConfigFile); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if commands.consensusADNLID {
+		if err = writeADNLID(os.Stdout, consensusADNL(cfg), startOpts.ConfigFile); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
@@ -284,7 +292,7 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 			return 1
 		}
 
-		collationIdentity, err = configureCollatorIdentity(cfg.ADNL.Key)
+		collationIdentity, err = configureCollatorIdentity(cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			return 1
@@ -326,6 +334,13 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 			return 1
 		}
 		validatorOpts.Extension.Keys = validatorKeys
+		if cfg.ConsensusADNL != nil && cfg.ConsensusADNL.Enabled {
+			if err = validateValidatorADNL(validatorKeys.Entries(), collationIdentity.keyID, time.Now()); err != nil {
+				logger.Error().Err(err).Msg("validator ADNL configuration conflicts with active signing keys")
+				return 1
+			}
+		}
+
 		poolLog := logger.With().Str("component", "validator").Str("subcomponent", "msgpool").Logger()
 		validatorOpts.Runtime.Messages.Logger = &poolLog
 		validatorRuntime, runtimeErr := validator.NewRuntime(validatorOpts.Runtime)
@@ -496,6 +511,7 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 	globalConfigFileFlag := flags.String("global-config-file", "", "override ton.global_config_path from node config")
 	lsPubkeyFlag := flags.Bool("ls-pubkey", false, "print liteserver public key in base64 and exit")
 	adnlIDFlag := flags.Bool("adnl-id", false, "print ADNL id derived from adnl.key in base64 and exit")
+	consensusADNLIDFlag := flags.Bool("consensus-adnl-id", false, "print the validator/collator ADNL id in base64 and exit")
 	validatorControlPubkeyFlag := flags.Bool(
 		"validator-control-pubkey",
 		false,
@@ -530,11 +546,12 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 		version:                *versionFlag,
 		lsPubkey:               *lsPubkeyFlag,
 		adnlID:                 *adnlIDFlag,
+		consensusADNLID:        *consensusADNLIDFlag,
 		validatorControlPubkey: *validatorControlPubkeyFlag,
 		dhtDescriptor:          *dhtDescriptorFlag,
 		skipConfigCheck:        *skipConfigCheckFlag,
 	}
-	if commands.version || commands.lsPubkey || commands.adnlID || commands.validatorControlPubkey || commands.dhtDescriptor {
+	if commands.version || commands.lsPubkey || commands.adnlID || commands.consensusADNLID || commands.validatorControlPubkey || commands.dhtDescriptor {
 		return startOpts, commands, nil
 	}
 	if *archivePrefetchWindowsFlag < 0 {
@@ -699,8 +716,8 @@ func writeLiteServerPublicKey(out io.Writer, cfg nodeconfig.Config, path string)
 	return nil
 }
 
-func writeADNLID(out io.Writer, cfg nodeconfig.Config, path string) error {
-	adnlSeed := cfg.ADNL.Key
+func writeADNLID(out io.Writer, cfg nodeconfig.ADNL, path string) error {
+	adnlSeed := cfg.Key
 	if len(adnlSeed) == 0 {
 		return fmt.Errorf("ADNL key is missing in %s", path)
 	}

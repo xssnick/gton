@@ -152,7 +152,7 @@ func (n *Node) resolvePublicBroadcastReceiver(id []byte) (*overlay.BroadcastRece
 func (s *overlaySubscription) handleReceivedBroadcast(msg tl.Serializable, info overlay.BroadcastInfo) overlay.BroadcastDisposition {
 	delivery, ok := broadcastDelivery(info.Delivery)
 	if !ok {
-		s.node.noteBroadcastDrop(s.spec.Name, broadcastKindLabel(msg), "invalid_delivery")
+		s.node.chainNode().noteBroadcastDrop(s.spec.Name, broadcastKindLabel(msg), "invalid_delivery")
 		return overlay.BroadcastDispositionIgnore
 	}
 
@@ -172,15 +172,15 @@ func (s *overlaySubscription) handleReceivedBroadcast(msg tl.Serializable, info 
 		active = s.isActive()
 	}
 	kind := broadcastKindLabel(msg)
-	s.node.noteBroadcast("received", s.spec.Name, kind, delivery)
+	s.node.chainNode().noteBroadcast("received", s.spec.Name, kind, delivery)
 
 	sourcePeerID, err := NewPeerID(info.SourceID)
 	if err != nil {
-		s.node.noteBroadcastDrop(s.spec.Name, kind, "invalid_source")
+		s.node.chainNode().noteBroadcastDrop(s.spec.Name, kind, "invalid_source")
 		return overlay.BroadcastDispositionIgnore
 	}
 	if info.DecodeTime > 0 {
-		s.node.observeBroadcastPipelineStageDuration(
+		s.node.chainNode().observeBroadcastPipelineStageDuration(
 			broadcastPipelineStageFECDecode,
 			kind,
 			delivery,

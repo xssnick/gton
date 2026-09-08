@@ -377,10 +377,18 @@ func parseTextLog(node NodeConfig, line string) (Event, bool) {
 		return event, true
 	}
 	if strings.Contains(line, "CandidateReceived") {
-		event.Kind = "block_validated"
+		event.Kind = "candidate_received"
 		fillCPPBlockID(&event, line)
 		fillCPPCandidateIdentity(&event, line)
 		return event, true
+	}
+	// ValidationFinished is also emitted for rejected candidates. The local
+	// notarize vote is published only after successful validation and storage.
+	if strings.Contains(line, "Published event") && strings.Contains(line, "BroadcastVote") &&
+		strings.Contains(line, "NotarizeVote{id={") {
+		event.Kind = "block_validated"
+		fillCPPCandidateIdentity(&event, line)
+		return event, event.CandidateHash != ""
 	}
 	if category := advisoryWarningCategory(line, event.Error); category != "" {
 		event.Kind = "advisory_warning"
@@ -437,6 +445,10 @@ func fillCPPCandidateIdentity(event *Event, line string) {
 	start := strings.Index(line, marker)
 	if start < 0 {
 		marker = "CandidateReceived{id={"
+		start = strings.Index(line, marker)
+	}
+	if start < 0 {
+		marker = "NotarizeVote{id={"
 		start = strings.Index(line, marker)
 	}
 	if start < 0 {

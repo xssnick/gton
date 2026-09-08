@@ -401,7 +401,7 @@ func newValidatorStackFactory(composition validatorStackComposition) hooks.Exten
 
 			return nil, errors.Join(
 				fmt.Errorf(
-					"validator composition: node ADNL identity %x differs from configured collator identity %x",
+					"validator composition: private network ADNL identity %x differs from configured collator identity %x",
 					manager.LocalADNLID(),
 					composition.localADNLID,
 				),

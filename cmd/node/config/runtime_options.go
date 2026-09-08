@@ -385,12 +385,22 @@ func p2pOptionsFromConfig(cfg Config) (p2p.Options, error) {
 	}
 
 	if rawAddr := strings.TrimSpace(cfg.ADNL.ExternalAddr); rawAddr != "" {
-		ip, port, err := parseExternalAddr(rawAddr)
+		ip, port, err := parseExternalAddr(rawAddr, "adnl.external_addr")
 		if err != nil {
 			return p2p.Options{}, err
 		}
 		opts.ExternalIP = ip
 		opts.ExternalPort = port
+	}
+
+	if cfg.ConsensusADNL != nil && cfg.ConsensusADNL.Enabled {
+		opts.PrivateNetwork, err = privateNetworkOptionsFromConfig(cfg)
+		if err != nil {
+			return p2p.Options{}, err
+		}
+		if err = validateConsensusExternalEndpoints(opts); err != nil {
+			return p2p.Options{}, err
+		}
 	}
 
 	opts.CustomOverlays, err = customOverlaysFromConfig(cfg.CustomOverlays)
@@ -575,20 +585,20 @@ func privateKeyFromSeed(seed []byte, field string) (ed25519.PrivateKey, error) {
 	return ed25519.NewKeyFromSeed(seed), nil
 }
 
-func parseExternalAddr(raw string) (net.IP, uint16, error) {
+func parseExternalAddr(raw string, field string) (net.IP, uint16, error) {
 	host, portStr, err := net.SplitHostPort(raw)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid adnl.external_addr %q: %w", raw, err)
+		return nil, 0, fmt.Errorf("invalid %s %q: %w", field, raw, err)
 	}
 
 	ip := net.ParseIP(host)
 	if ip == nil {
-		return nil, 0, fmt.Errorf("invalid adnl.external_addr %q: invalid ip %q", raw, host)
+		return nil, 0, fmt.Errorf("invalid %s %q: invalid ip %q", field, raw, host)
 	}
 
 	port, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil || port == 0 {
-		return nil, 0, fmt.Errorf("invalid adnl.external_addr %q: invalid port %q", raw, portStr)
+		return nil, 0, fmt.Errorf("invalid %s %q: invalid port %q", field, raw, portStr)
 	}
 
 	return ip, uint16(port), nil

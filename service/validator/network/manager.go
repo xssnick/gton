@@ -28,15 +28,16 @@ var (
 	// ErrSessionInactive reports ingress or an operation outside SessionNetwork.Run.
 	ErrSessionInactive = errors.New("validator network: session is inactive")
 	// ErrLocalADNLUnavailable reports a session which does not contain the one
-	// ADNL identity configured for this node.
+	// ADNL identity configured for this private network.
 	ErrLocalADNLUnavailable = errors.New("validator network: local ADNL identity is unavailable")
 	// ErrUnsupportedBroadcastMode rejects an inbound candidate which did not
 	// arrive over private-overlay two-step FEC.
 	ErrUnsupportedBroadcastMode = errors.New("validator network: candidate broadcast mode is unsupported")
 )
 
-// ManagerOptions binds the validator protocol endpoint to the node's one ADNL
-// identity and its dynamic private-overlay registry.
+// ManagerOptions binds the validator protocol endpoint to one ADNL identity
+// through its private-overlay registry. Block publication uses the node's
+// ordinary network even when private overlays have a dedicated transport.
 type ManagerOptions struct {
 	PrivateOverlays  *p2p.PrivateOverlayRegistry
 	BlockBroadcasts  *p2p.BlockBroadcasts
@@ -95,8 +96,8 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 	}, nil
 }
 
-// LocalADNLID returns the one configured node identity shared by ordinary
-// validator sessions and standalone collation.
+// LocalADNLID returns the private network identity shared by validator sessions
+// and standalone collation.
 func (m *Manager) LocalADNLID() [32]byte {
 	return m.localADNLID
 }

@@ -376,6 +376,122 @@ func TestLoadEnablesValidator(t *testing.T) {
 	}
 }
 
+func TestLoadConsensusADNL(t *testing.T) {
+	seed := testSeed(3)
+	path := writeTestConfig(t, `{"consensus_adnl":{"enabled":true,"key":"`+
+		base64.StdEncoding.EncodeToString(seed)+
+		`","listen_addr":"0.0.0.0:30305","external_addr":"203.0.113.10:30305"}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConsensusADNL == nil || !cfg.ConsensusADNL.Enabled {
+		t.Fatal("consensus ADNL configuration was not loaded")
+	}
+	if !bytes.Equal(cfg.ConsensusADNL.Key, seed) {
+		t.Fatal("unexpected consensus ADNL seed")
+	}
+	if cfg.ConsensusADNL.ListenAddr != "0.0.0.0:30305" ||
+		cfg.ConsensusADNL.ExternalAddr != "203.0.113.10:30305" {
+		t.Fatal("unexpected consensus ADNL endpoints")
+	}
+
+	if err = write(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.ConsensusADNL == nil || !reloaded.ConsensusADNL.Enabled ||
+		!bytes.Equal(reloaded.ConsensusADNL.Key, seed) {
+		t.Fatal("consensus ADNL seed was not preserved when saving the config")
+	}
+}
+
+func TestLoadConsensusADNLOmitted(t *testing.T) {
+	path := writeTestConfig(t, `{"validator":{"enabled":true}}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConsensusADNL != nil {
+		t.Fatal("old configuration must retain the primary ADNL identity")
+	}
+
+	if err = write(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(`"consensus_adnl"`)) {
+		t.Fatal("saving an old configuration unexpectedly adds consensus_adnl")
+	}
+}
+
+func TestLoadConsensusADNLDoesNotDefaultEnabledBlock(t *testing.T) {
+	path := writeTestConfig(t, `{"consensus_adnl":{"enabled":true}}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConsensusADNL == nil {
+		t.Fatal("explicit enabled consensus ADNL configuration was discarded")
+	}
+	if _, err = cfg.RuntimeOptions(gton.DefaultNodeOptions()); err == nil {
+		t.Fatal("explicit enabled consensus ADNL configuration must fail validation")
+	}
+}
+
+func TestLoadConsensusADNLDisabled(t *testing.T) {
+	type testCase struct {
+		name      string
+		json      string
+		wantBlock bool
+	}
+	for _, tc := range []testCase{
+		{name: "legacy omission", json: `{}`},
+		{name: "null", json: `{"consensus_adnl":null}`},
+		{name: "empty block", json: `{"consensus_adnl":{}}`, wantBlock: true},
+		{name: "explicit disable", json: `{"consensus_adnl":{"enabled":false}}`, wantBlock: true},
+		{
+			name:      "omitted enable ignores invalid fields",
+			json:      `{"consensus_adnl":{"key":"AQ==","listen_addr":"invalid","external_addr":"invalid"}}`,
+			wantBlock: true,
+		},
+		{
+			name: "explicit disable ignores invalid fields",
+			json: `{"consensus_adnl":{"enabled":false,"key":"AQ==",` +
+				`"listen_addr":"invalid","external_addr":"invalid"}}`,
+			wantBlock: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeTestConfig(t, tc.json))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (cfg.ConsensusADNL != nil) != tc.wantBlock {
+				t.Fatalf("consensus block present = %t, want %t", cfg.ConsensusADNL != nil, tc.wantBlock)
+			}
+			if cfg.ConsensusADNL != nil && cfg.ConsensusADNL.Enabled {
+				t.Fatal("consensus network was enabled without enabled:true")
+			}
+
+			runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+			if err != nil {
+				t.Fatalf("disabled consensus network was validated: %v", err)
+			}
+			if runtimeOpts.Node.P2P.PrivateNetwork != nil {
+				t.Fatal("disabled consensus network changed the primary transport mode")
+			}
+		})
+	}
+}
+
 func TestLoadRejectsValidatorKeysInConfig(t *testing.T) {
 	path := writeTestConfig(t, `{"validator":{"enabled":true,"keys":[]}}`)
 
@@ -971,6 +1087,26 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if len(cfg.DHT.Key) != ed25519.SeedSize {
 		t.Fatal("expected generated DHT key")
 	}
+	if cfg.ConsensusADNL == nil || cfg.ConsensusADNL.Enabled {
+		t.Fatal("generated config must include a disabled consensus ADNL network")
+	}
+	if len(cfg.ConsensusADNL.Key) != ed25519.SeedSize {
+		t.Fatal("expected generated consensus ADNL key")
+	}
+	if bytes.Equal(cfg.ConsensusADNL.Key, cfg.ADNL.Key) || bytes.Equal(cfg.ConsensusADNL.Key, cfg.DHT.Key) {
+		t.Fatal("generated consensus ADNL must have an independent key")
+	}
+	if cfg.ConsensusADNL.ListenAddr != defaultConsensusADNLListen ||
+		cfg.ConsensusADNL.ExternalAddr != "203.0.113.20:30305" {
+		t.Fatal("unexpected generated consensus ADNL addresses")
+	}
+	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("generated runtime options: %v", err)
+	}
+	if runtimeOpts.Node.P2P.PrivateNetwork != nil {
+		t.Fatal("generated disabled consensus block changed runtime transport mode")
+	}
 	if len(cfg.Lite.Key) != ed25519.SeedSize {
 		t.Fatal("expected generated liteserver key")
 	}
@@ -1155,6 +1291,9 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 		!bytes.Contains(data, []byte(`"collator": {`)) {
 		t.Fatal("generated config should contain validator and collator sections")
 	}
+	if !bytes.Contains(data, []byte("\"consensus_adnl\": {\n    \"enabled\": false,")) {
+		t.Fatal("generated config must persist the explicit disabled consensus ADNL block")
+	}
 	if bytes.Contains(data, []byte(`"enable_validator"`)) {
 		t.Fatal("generated config should not contain the legacy enable_validator field")
 	}
@@ -1172,6 +1311,10 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if !bytes.Equal(loaded.ADNL.Key, cfg.ADNL.Key) {
 		t.Fatal("generated config was not persisted")
 	}
+	if loaded.ConsensusADNL == nil || loaded.ConsensusADNL.Enabled ||
+		!bytes.Equal(loaded.ConsensusADNL.Key, cfg.ConsensusADNL.Key) {
+		t.Fatal("generated disabled consensus ADNL identity was not persisted")
+	}
 	if loaded.TON.GlobalConfigPath != wantGlobalConfigPath {
 		t.Fatalf("unexpected persisted global config path %q", loaded.TON.GlobalConfigPath)
 	}
@@ -1186,6 +1329,21 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if loaded.TON.SyncBackpressureWindows != DefaultSyncBackpressureWindows {
 		t.Fatalf("unexpected persisted sync_backpressure_windows %d", loaded.TON.SyncBackpressureWindows)
+	}
+}
+
+func TestGenerateConsensusADNLUsesFreshSeed(t *testing.T) {
+	externalIP := func(context.Context) (string, error) { return "203.0.113.20", nil }
+	first, err := generate(t.Context(), externalIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := generate(t.Context(), externalIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(first.ConsensusADNL.Key, second.ConsensusADNL.Key) {
+		t.Fatal("independent configs reused the same consensus ADNL key")
 	}
 }
 

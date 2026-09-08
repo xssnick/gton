@@ -198,11 +198,10 @@ func (p *preparedBlockAcceptance) Describe(ctx context.Context) error {
 // the later apply of the same block is a no-op there. Its cost is the applied
 // hook's own bookkeeping (~0.4 ms for a 250-message block on the delta path).
 //
-// WHAT IS NOT PUBLISHED. Nothing without a state: a block on its own would be
-// pinned in the live view until its flush with no bound of its own. Nothing on
-// the masterchain, which liveview refuses. Nothing when the state is absent,
-// which is the replay-after-restart case — there the reader waits as before, and
-// the catch-up that repopulates the store is what ends the wait.
+// This full-state publication excludes masterchain blocks and replayed blocks
+// without a retained state. Local shard ingress separately publishes bounded,
+// transient block/proof artifacts even without a state, so the next shard-top
+// description can resolve its proof chain before masterchain registration.
 //
 // A failure here — and equally a restart that loses the publication — is logged
 // and swallowed, because the publication is a latency improvement over a path that

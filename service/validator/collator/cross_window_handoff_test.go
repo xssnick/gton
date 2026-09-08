@@ -102,7 +102,9 @@ func TestLastSlotHandsOffIntoTheNextDelegatedWindow(t *testing.T) {
 	var base simplex.CandidateID
 	for {
 		slot, parked, exists := managed.speculation.pending()
-		if exists {
+		// Parking the speculation precedes scheduling its build goroutine.
+		// Wait for both events before inspecting the recorded build request.
+		if exists && len(builds.forSlot(2)) > 0 {
 			startSlot, base = slot, parked
 
 			break

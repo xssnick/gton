@@ -14,10 +14,21 @@ type collatorIdentity struct {
 	keyID [32]byte
 }
 
-func configureCollatorIdentity(seed []byte) (collatorIdentity, error) {
+// consensusADNL selects the identity shared by validator and collator roles.
+// A disabled or absent dedicated network retains the released node-identity mode.
+func consensusADNL(cfg nodeconfig.Config) nodeconfig.ADNL {
+	if cfg.ConsensusADNL != nil && cfg.ConsensusADNL.Enabled {
+		return cfg.ConsensusADNL.ADNL
+	}
+
+	return cfg.ADNL
+}
+
+func configureCollatorIdentity(cfg nodeconfig.Config) (collatorIdentity, error) {
+	seed := consensusADNL(cfg).Key
 	if len(seed) != ed25519.SeedSize {
 		return collatorIdentity{}, fmt.Errorf(
-			"adnl.key must contain a %d-byte Ed25519 seed for collation",
+			"consensus ADNL key must contain a %d-byte Ed25519 seed for collation",
 			ed25519.SeedSize,
 		)
 	}

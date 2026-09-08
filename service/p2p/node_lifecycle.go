@@ -153,6 +153,11 @@ func (n *Node) start(ctx context.Context) (bool, error) {
 	if err = n.checkQUICServer(); err != nil {
 		return true, err
 	}
+	if n.privateNetwork != nil {
+		if err = n.startPrivateNetwork(runCtx); err != nil {
+			return true, err
+		}
+	}
 
 	for _, sub := range subscriptions {
 		n.startSubscription(sub)
@@ -349,6 +354,9 @@ func (n *Node) completeShutdown(
 		}
 
 		n.stopAcceptingInbound()
+		if n.privateNetwork != nil {
+			n.privateNetwork.stopPrivateNetwork()
+		}
 
 		if gatewayStarted {
 			if n.dhtClient != nil {

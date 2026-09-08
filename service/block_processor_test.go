@@ -1,7 +1,9 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/xssnick/gton/service/blocksync"
@@ -10,6 +12,39 @@ import (
 
 	"github.com/rs/zerolog"
 )
+
+func TestInternalShardProofReadableBeforeStateAndMasterchainApply(t *testing.T) {
+	for _, nonfinal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("nonfinal=%t", nonfinal), func(t *testing.T) {
+			downloaded := testBroadcastShardBlock(t, 402)
+			downloaded.ProofBOC = []byte{0x51, 0x52}
+			downloaded.IsLink = true
+			cache := storage.NewLiveBlockCache(2)
+			coordinator := &SyncCoordinator{
+				log:               zerolog.Nop(),
+				liveBlockCache:    cache,
+				shardPrepareQueue: make(chan shardPrepareRequest, 1),
+			}
+			if nonfinal {
+				coordinator.liveState = &internalNonfinalPublisher{}
+			}
+			if err := coordinator.processSyncedBlock(context.Background(), blocksync.SyncedBlock{
+				Downloaded: *downloaded,
+				Internal:   true,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			proof, err := cache.BlockProof(context.Background(), storage.ServedProofBlockLink, downloaded.ID)
+			if err != nil || !bytes.Equal(proof, downloaded.ProofBOC) {
+				t.Fatalf("accepted proof = %x, %v, want %x before apply", proof, err, downloaded.ProofBOC)
+			}
+			data, err := cache.BlockData(context.Background(), downloaded.ID)
+			if err != nil || !bytes.Equal(data, downloaded.BlockBOC) {
+				t.Fatalf("accepted data = %x, %v", data, err)
+			}
+		})
+	}
+}
 
 type internalNonfinalPublisher struct {
 	testLiveCheckpointFlusher

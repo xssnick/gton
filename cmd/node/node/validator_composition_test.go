@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 	"github.com/xssnick/gton/service/hooks"
 	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/validator"
@@ -572,7 +573,9 @@ func TestStandaloneCollatorCompositionBuildsCompleteExtension(t *testing.T) {
 func compositionCollatorIdentity(t *testing.T, fill byte) collatorIdentity {
 	t.Helper()
 
-	identity, err := configureCollatorIdentity(bytes.Repeat([]byte{fill}, ed25519.SeedSize))
+	identity, err := configureCollatorIdentity(nodeconfig.Config{
+		ADNL: nodeconfig.ADNL{Key: bytes.Repeat([]byte{fill}, ed25519.SeedSize)},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

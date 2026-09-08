@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 	"github.com/xssnick/gton/service/validator"
 	"github.com/xssnick/gton/service/validator/groups"
+	"github.com/xssnick/gton/service/validator/keyring"
 )
 
 type validatorControlClient struct {
@@ -28,6 +30,24 @@ type validatorOptions struct {
 	Control   validatorControlOptions
 	Extension validator.Options
 	Runtime   validator.SharedRuntimeOptions
+}
+
+func validateValidatorADNL(entries []keyring.KeyInfo, localID [32]byte, now time.Time) error {
+	for _, entry := range entries {
+		if !entry.Permanent || !entry.HasADNL ||
+			int64(entry.PermanentExpireAt) <= now.Unix() || int64(entry.ADNLExpireAt) <= now.Unix() {
+			continue
+		}
+		if entry.ADNLID != localID {
+			return fmt.Errorf(
+				"validator key %x is still bound to ADNL %x, but consensus_adnl.key selects %x; "+
+					"preserve the active ADNL seed when moving it to the dedicated network",
+				entry.ID, entry.ADNLID, localID,
+			)
+		}
+	}
+
+	return nil
 }
 
 func configureValidator(cfg nodeconfig.Validator, maximalVerticalSeqno uint32) (validatorOptions, error) {

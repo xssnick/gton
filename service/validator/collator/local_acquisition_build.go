@@ -278,6 +278,9 @@ func (a *LocalAcquisition) AcquireMaster(ctx context.Context, request BuildReque
 			return MasterRequest{}, err
 		}
 	}
+	if err = requireMasterSession(request.Session, master.context.Groups); err != nil {
+		return MasterRequest{}, fmt.Errorf("%w: masterchain predecessor belongs to another session: %v", ErrAcquisitionNotReady, err)
+	}
 	header, err = clampLocalHeaderTime(
 		header,
 		master.context.Config.globalVersion,

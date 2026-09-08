@@ -133,7 +133,7 @@ func planCustomRebroadcast(kind string, payloadLen int) rebroadcastPlan {
 func (s *overlaySubscription) checkCustomTwoStepBroadcastSource(info overlay.BroadcastPrecheckInfo) error {
 	sourceID, err := NewPeerID(info.SourceID)
 	if err != nil {
-		s.node.noteBroadcastDrop(s.spec.Name, twoStepBroadcastKind, "invalid_source")
+		s.node.chainNode().noteBroadcastDrop(s.spec.Name, twoStepBroadcastKind, "invalid_source")
 		return err
 	}
 
@@ -144,7 +144,7 @@ func (s *overlaySubscription) checkCustomTwoStepBroadcastSource(info overlay.Bro
 		return nil
 	}
 
-	s.node.noteBroadcastDrop(s.spec.Name, twoStepBroadcastKind, "unauthorized_sender")
+	s.node.chainNode().noteBroadcastDrop(s.spec.Name, twoStepBroadcastKind, "unauthorized_sender")
 	return fmt.Errorf("custom overlay broadcast source %s is not configured", sourceID.String())
 }
 
@@ -192,7 +192,7 @@ func (s *overlaySubscription) runTwoStepRebroadcastLoop(ctx context.Context, que
 			return
 		}
 		if req.expiredInQueue(time.Now()) {
-			s.node.noteRebroadcastDropped(req)
+			s.node.chainNode().noteRebroadcastDropped(req)
 			s.log.Debug().
 				Str("kind", req.kind).
 				Str("queue", req.queueName()).
@@ -201,16 +201,16 @@ func (s *overlaySubscription) runTwoStepRebroadcastLoop(ctx context.Context, que
 		}
 
 		if s.sendTwoStepRebroadcast(ctx, req) {
-			s.node.noteRebroadcastSent(req)
+			s.node.chainNode().noteRebroadcastSent(req)
 		} else {
-			s.node.noteRebroadcastDropped(req)
+			s.node.chainNode().noteRebroadcastDropped(req)
 		}
 	}
 }
 
 func (s *overlaySubscription) enqueueTwoStepRebroadcast(req rebroadcastRequest) bool {
 	if len(s.twoStepCandidates(req.sourcePeerID)) == 0 {
-		s.node.noteRebroadcastDropped(req)
+		s.node.chainNode().noteRebroadcastDropped(req)
 		s.log.Debug().
 			Str("kind", req.kind).
 			Str("queue", req.queueName()).
@@ -220,7 +220,7 @@ func (s *overlaySubscription) enqueueTwoStepRebroadcast(req rebroadcastRequest) 
 
 	queue, ok := s.initTwoStepQueue()
 	if !ok {
-		s.node.noteRebroadcastDropped(req)
+		s.node.chainNode().noteRebroadcastDropped(req)
 		return false
 	}
 
@@ -229,7 +229,7 @@ func (s *overlaySubscription) enqueueTwoStepRebroadcast(req rebroadcastRequest) 
 		return true
 	}
 
-	s.node.noteRebroadcastDropped(req)
+	s.node.chainNode().noteRebroadcastDropped(req)
 	s.log.Debug().
 		Str("kind", req.kind).
 		Str("queue", req.queueName()).

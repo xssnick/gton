@@ -92,7 +92,7 @@ func (s *overlaySubscription) serveNextBlocksFull(
 			return nil, err
 		}
 
-		full, err := s.node.localNextServedBlockFull(ctx, current)
+		full, err := s.node.chainNode().localNextServedBlockFull(ctx, current)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr

@@ -4,9 +4,48 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"testing"
+	"time"
 
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
+	"github.com/xssnick/gton/service/validator/keyring"
 )
+
+func TestValidateValidatorADNL(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	localID := [32]byte{1}
+	active := keyring.KeyInfo{
+		ID: [32]byte{2}, Permanent: true, HasADNL: true,
+		ADNLID: localID, PermanentExpireAt: uint32(now.Unix() + 100),
+		ADNLExpireAt: uint32(now.Unix() + 100),
+	}
+	type testCase struct {
+		name      string
+		entry     keyring.KeyInfo
+		wantError bool
+	}
+	other := active
+	other.ADNLID = [32]byte{3}
+	expiredPermanent := other
+	expiredPermanent.PermanentExpireAt = uint32(now.Unix())
+	expiredADNL := other
+	expiredADNL.ADNLExpireAt = uint32(now.Unix())
+	unbound := other
+	unbound.HasADNL = false
+	for _, test := range []testCase{
+		{name: "preserved identity", entry: active},
+		{name: "active different identity", entry: other, wantError: true},
+		{name: "expired signing key", entry: expiredPermanent},
+		{name: "expired ADNL binding", entry: expiredADNL},
+		{name: "unbound key", entry: unbound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateValidatorADNL([]keyring.KeyInfo{test.entry}, localID, now)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validate ADNL = %v, want error %v", err, test.wantError)
+			}
+		})
+	}
+}
 
 func TestConfigureValidatorDisabled(t *testing.T) {
 	t.Parallel()

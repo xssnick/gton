@@ -55,6 +55,8 @@ const (
 	defaultADNLPort                         = 30303
 	defaultADNLListen                       = "0.0.0.0:30303"
 	defaultDHTListen                        = "0.0.0.0:30304"
+	defaultConsensusADNLPort                = 30305
+	defaultConsensusADNLListen              = "0.0.0.0:30305"
 	privateKeySeedSize                      = 32
 	externalIPHTTPClient                    = 5 * time.Second
 	globalConfigHTTPClient                  = 30 * time.Second
@@ -83,6 +85,7 @@ var ErrConfigMissingWithExistingStorage = errors.New("config file is missing whi
 type Config struct {
 	TON                       TON             `json:"ton"`
 	ADNL                      ADNL            `json:"adnl"`
+	ConsensusADNL             *ConsensusADNL  `json:"consensus_adnl,omitempty"`
 	DHT                       DHT             `json:"dht"`
 	Lite                      Lite            `json:"liteserver"`
 	HTTPAPI                   HTTPAPI         `json:"http_api"`
@@ -116,8 +119,8 @@ type ValidatorControlClient struct {
 	Permissions uint32 `json:"permissions"`
 }
 
-// Collator configures the independent standalone delegated collator. It
-// shares the node ADNL identity but does not serve the local validator mode.
+// Collator configures the independent standalone delegated collator. It uses
+// consensus_adnl when enabled and does not serve the local validator mode.
 type Collator struct {
 	Enabled            bool                       `json:"enabled"`
 	ValidatorAllowlist CollatorValidatorAllowlist `json:"validator_allowlist"`
@@ -145,6 +148,11 @@ type ADNL struct {
 	Key          []byte `json:"key"`
 	ListenAddr   string `json:"listen_addr"`
 	ExternalAddr string `json:"external_addr"`
+}
+
+type ConsensusADNL struct {
+	Enabled bool `json:"enabled"`
+	ADNL
 }
 
 type DHT struct {
@@ -375,6 +383,11 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		return Config{}, fmt.Errorf("generate ADNL key: %w", err)
 	}
 
+	consensusADNLSeed, err := generateSeed()
+	if err != nil {
+		return Config{}, fmt.Errorf("generate consensus ADNL key: %w", err)
+	}
+
 	dhtSeed, err := generateSeed()
 	if err != nil {
 		return Config{}, fmt.Errorf("generate DHT key: %w", err)
@@ -404,9 +417,8 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		return Config{}, fmt.Errorf("resolve storage dir: %w", err)
 	}
 
-	// Everything except the generated keys, listen/external addresses, the
-	// resolved paths and the decoded cell cache entry count matches
-	// defaultConfig() exactly.
+	// Generated keys, network addresses, the disabled consensus network,
+	// resolved paths and decoded cell cache entry count differ from defaultConfig.
 	cfg := defaultConfig()
 	// defaultConfig leaves this zero so that Load can tell "absent" from
 	// "written by the operator"; see the note there. A config file we create
@@ -418,6 +430,13 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		Key:          adnlSeed,
 		ListenAddr:   defaultADNLListen,
 		ExternalAddr: net.JoinHostPort(externalIP, strconv.Itoa(defaultADNLPort)),
+	}
+	cfg.ConsensusADNL = &ConsensusADNL{
+		ADNL: ADNL{
+			Key:          consensusADNLSeed,
+			ListenAddr:   defaultConsensusADNLListen,
+			ExternalAddr: net.JoinHostPort(externalIP, strconv.Itoa(defaultConsensusADNLPort)),
+		},
 	}
 	cfg.DHT = DHT{
 		Key:        dhtSeed,

@@ -68,7 +68,7 @@ func newPlumtreeRuntime(sub *overlaySubscription) (*plumtreeRuntime, error) {
 			CanOriginate: true,
 			Now:          time.Now,
 		},
-		sub.node.plumtreeBudget,
+		sub.node.chainNode().plumtreeBudget,
 		sub,
 		newPlumtreeSignatureVerifier(
 			policySource,
@@ -436,7 +436,7 @@ func (r *plumtreeRuntime) deliver(delivery plumtreeDelivery) error {
 		return fmt.Errorf("parse Plumtree payload: %w", err)
 	}
 
-	r.sub.node.noteBroadcast(
+	r.sub.node.chainNode().noteBroadcast(
 		"received",
 		r.sub.spec.Name,
 		broadcastKindLabel(message),

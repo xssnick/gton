@@ -75,6 +75,7 @@ Supported flags:
 | `--global-config-file <path>` | Override `ton.global_config_path` from the node config. |
 | `--ls-pubkey` | Print the liteserver public key (base64) and exit. |
 | `--adnl-id` | Print the ADNL id derived from `adnl.key` (base64) and exit. |
+| `--consensus-adnl-id` | Print the ADNL id used by the validator and collator (base64) and exit. |
 | `--validator-control-pubkey` | Print the boxed validator-control server public key in base64 and exit. |
 | `--dht-descriptor` | Print this node's signed public DHT descriptor as JSON and exit. |
 | `--version` | Print the build version and exit. |
@@ -372,6 +373,55 @@ Simplified example:
 | `key` | Base64-encoded Ed25519 seed for the ADNL key. Generated automatically. |
 | `listen_addr` | Local address for the p2p ADNL listener. Empty value switches p2p to client mode. |
 | `external_addr` | Public `ip:port` announced to other peers. |
+
+### `consensus_adnl`
+
+Dedicated network shared by the validator and standalone collator. Generated
+configs always include this block with `enabled: false`, a random independent
+key, and the detected public IP. With `enabled: false` or an omitted block,
+both roles use `adnl.key` and the ordinary P2P listener. Old configs without
+the block remain unchanged; an omitted `enabled` also means `false`.
+
+```json
+"consensus_adnl": {
+  "enabled": false,
+  "key": "<base64-encoded 32-byte Ed25519 seed>",
+  "listen_addr": "0.0.0.0:30305",
+  "external_addr": "203.0.113.10:30305"
+}
+```
+
+Set `enabled: true` to use the dedicated network. Its key and both addresses
+are required and validated only when enabled. The key must differ from the
+ordinary ADNL and DHT keys. The dedicated network has its own ADNL/RLDP
+connections, consensus overlays and identity-bound FastSync overlays; QUIC listens on the
+ADNL port plus 1000 (31305 in this example). Both dedicated ports use UDP and
+must be reachable at the advertised address. With NAT, forward both ports;
+the advertised QUIC port is also the advertised ADNL port plus 1000.
+Collisions with the ordinary ADNL, QUIC and DHT listeners or advertised
+endpoints are rejected.
+
+Public/custom overlays continue through the ordinary network. FastSync block
+synchronization, publication and membership certificates use the dedicated
+identity, matching the validator/collator registration. Both transports share
+the process DHT, blockchain state and broadcast processing; no second
+synchronizer is started. Full-node queries on the dedicated listener require
+FastSync membership. Changes take effect on restart.
+
+Use `./gton-node --config config.json --consensus-adnl-id` for validator
+elections and collator registration. `--adnl-id` continues to print the ordinary
+node identity. The validator-control `getConfig` and `addValidatorAdnlAddress`
+use the selected consensus identity.
+
+To move an existing validator to the dedicated port while preserving its
+identity, move its existing `adnl.key` seed into `consensus_adnl.key` and assign
+a new seed to `adnl.key`, then set `consensus_adnl.enabled: true`. Update
+memberships and certificates tied to the ordinary node identity as needed.
+This preserves validator key bindings and
+session storage; the feature changes no database format. A conflicting,
+unexpired validator key binding causes startup to fail with the affected IDs.
+Choosing a new consensus identity requires the corresponding election or
+collator registration; editing JSON does not rewrite existing key bindings.
 
 ### `dht`
 

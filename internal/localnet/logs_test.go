@@ -280,13 +280,40 @@ func TestParseColoredLifecycleAndCPPEvents(t *testing.T) {
 	}
 	trace := "Published event TraceEvent {event=CandidateReceived{id={17, AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=, ?}, parent=consensus genesis, block_id=(0,4000000000000000,9):AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB}}"
 	event, ok = parseLogLine(NodeConfig{Name: "cpp", Kind: "cpp"}, []byte(trace))
-	if !ok || event.Kind != "block_validated" || event.Slot == nil || *event.Slot != 17 || event.CandidateHash != "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" || event.BlockRootHash != strings.Repeat("a", 64) || event.BlockFileHash != strings.Repeat("b", 64) {
+	if !ok || event.Kind != "candidate_received" || event.Slot == nil || *event.Slot != 17 || event.CandidateHash != "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" || event.BlockRootHash != strings.Repeat("a", 64) || event.BlockFileHash != strings.Repeat("b", 64) {
 		t.Fatalf("C++ trace candidate = %+v, parsed=%t", event, ok)
 	}
 
 	event, ok = parseLogLine(NodeConfig{Name: "cpp", Kind: "cpp"}, []byte("REJECT: invalid candidate"))
 	if !ok || event.Kind != "hard_error" {
 		t.Fatalf("C++ reject = %+v, parsed=%t", event, ok)
+	}
+}
+
+func TestCPPValidationRequiresLocalNotarizeVote(t *testing.T) {
+	node := NodeConfig{Name: "cpp", Kind: "cpp"}
+	id := "{17, AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=, ?}"
+	var stats logStats
+	for _, line := range []string{
+		"Published event TraceEvent {event=CandidateReceived{id=" + id + "}}",
+		"Published event TraceEvent {event=ValidationFinished{id=" + id + "}}",
+	} {
+		if event, ok := parseLogLine(node, []byte(line)); ok {
+			stats.add(event)
+		}
+	}
+	if stats.Validated != 0 {
+		t.Fatal("receiving or finishing a potentially rejected candidate counted as validation")
+	}
+	line := "Published event BroadcastVote {vote=NotarizeVote{id=" + id + "}}"
+	event, ok := parseLogLine(node, []byte(line))
+	if !ok || event.Kind != "block_validated" || event.Slot == nil || *event.Slot != 17 ||
+		event.CandidateHash != "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" {
+		t.Fatalf("notarize event = %+v, parsed=%t", event, ok)
+	}
+	stats.add(event)
+	if stats.Validated != 1 {
+		t.Fatalf("successful validations = %d, want 1", stats.Validated)
 	}
 }
 

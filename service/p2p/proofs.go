@@ -245,7 +245,7 @@ func (s *overlaySubscription) downloadProofFromPeer(ctx context.Context, peer *o
 		return ProofDownload{}, ErrBlockNotAvailable
 	}
 	if err = validateDownloadedProof(block, data, isLink, keyBlock); err != nil {
-		if !s.node.IsHardfork(block) {
+		if !s.node.chainNode().IsHardfork(block) {
 			return ProofDownload{}, err
 		}
 		if hardforkErr := validateDownloadedHardforkProof(block, data, isLink, keyBlock); hardforkErr != nil {

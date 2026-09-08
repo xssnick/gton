@@ -337,6 +337,9 @@ func (a *LocalAcquisition) ValidateCandidate(
 		if viewErr != nil {
 			return ValidationResult{}, viewErr
 		}
+		if err = requireMasterSession(request.Session, master.context.Groups); err != nil {
+			return ValidationResult{}, err
+		}
 		started, waited = a.validationStageStarted(), inputWait.duration
 		err = prepared.bindConfig(ctx, master.context.Config)
 		a.observeValidationWork(chain, ValidationCoreStageDecode, started, waited, inputWait.duration)

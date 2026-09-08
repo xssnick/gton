@@ -333,6 +333,10 @@ func greatestCommonDivisor(left, right int) int {
 }
 
 func (n *Node) SetFastSyncOverlays(state FastSyncState) error {
+	if n.privateNetwork != nil {
+		n = n.privateNetwork
+	}
+
 	n.fastSyncStateMx.Lock()
 	defer n.fastSyncStateMx.Unlock()
 
@@ -344,7 +348,7 @@ func (n *Node) SetFastSyncOverlays(state FastSyncState) error {
 // fastSyncStateMx so that a certificate import and a masterchain apply cannot
 // reconcile concurrently.
 func (n *Node) applyFastSyncOverlaysLocked(state FastSyncState) error {
-	if len(n.zeroStateFileHash) == 0 {
+	if len(n.chainNode().zeroStateFileHash) == 0 {
 		return nil
 	}
 
@@ -483,7 +487,7 @@ func (n *Node) fastSyncDesiredShards(
 		if candidate.Workchain == -1 {
 			continue
 		}
-		depth := n.monitorMinSplitDepthForWorkchain(candidate.Workchain)
+		depth := n.chainNode().monitorMinSplitDepthForWorkchain(candidate.Workchain)
 		if prefixLen > depth {
 			ancestor, err := sharddomain.Ancestor(candidate.Shard, depth)
 			if err != nil {
@@ -504,14 +508,14 @@ func (n *Node) buildFastSyncOverlaySpec(
 	plumtreeEnabled bool,
 ) (overlaySpec, error) {
 	var zeroHash FastSyncFileHash
-	if len(n.zeroStateFileHash) != len(zeroHash) {
+	if len(n.chainNode().zeroStateFileHash) != len(zeroHash) {
 		return overlaySpec{}, fmt.Errorf(
 			"zero-state file hash length is %d, want %d",
-			len(n.zeroStateFileHash),
+			len(n.chainNode().zeroStateFileHash),
 			len(zeroHash),
 		)
 	}
-	copy(zeroHash[:], n.zeroStateFileHash)
+	copy(zeroHash[:], n.chainNode().zeroStateFileHash)
 
 	identity := NewFastSyncOverlayIdentity(zeroHash, shard)
 	// No FixedNodeIDs: acceptsPeerID answers from the live membership runtime
@@ -825,16 +829,18 @@ func (s *overlaySubscription) exchangeFastSyncRandomPeers(
 
 	var response overlay.NodesV2
 	// cppnode keeps overlay peer discovery on OverlayManager's ADNL path;
-	// only the FastSync application query sender is QUIC-backed.
-	err = peer.overlay.Query(
-		queryCtx,
+	// only the FastSync application query sender is QUIC-backed. Both use
+	// the membership envelope: a new collator is not enrolled at the peer yet.
+	wire, err := s.quicEnvelope.Query(
 		overlay.GetRandomPeersV2{
 			Peers: overlay.NodesV2{
 				Nodes: []overlay.NodeV2{local},
 			},
 		},
-		&response,
 	)
+	if err == nil {
+		err = peer.overlay.ADNLWrapper.Query(queryCtx, tl.Raw(wire), &response)
+	}
 	if err != nil {
 		s.log.Debug().
 			Err(err).
@@ -946,6 +952,10 @@ func (n *Node) readyFastSyncQuerySubscription(
 func (n *Node) fastSyncSubscriptionForBlock(
 	block ton.BlockIDExt,
 ) (*overlaySubscription, error) {
+	if n.privateNetwork != nil {
+		n = n.privateNetwork
+	}
+
 	depth, err := sharddomain.PrefixLength(block.Shard)
 	if err != nil {
 		return nil, fmt.Errorf("invalid fast-sync block shard %d:%016x: %w", block.Workchain, uint64(block.Shard), err)

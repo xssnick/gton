@@ -245,7 +245,7 @@ func TestFastSyncWarmupPromotesLearnedPeerBeforeExchange(t *testing.T) {
 		req tl.Serializable,
 		result tl.Serializable,
 	) error {
-		if _, ok := testOverlayQueryPayload(req).(overlay.GetRandomPeersV2); !ok {
+		if _, ok := testFastSyncADNLQueryPayload(t, req).(overlay.GetRandomPeersV2); !ok {
 			return fmt.Errorf("unexpected ADNL overlay query %T", req)
 		}
 
@@ -267,11 +267,12 @@ func TestFastSyncWarmupPromotesLearnedPeerBeforeExchange(t *testing.T) {
 		return nil
 	}
 	sub := &overlaySubscription{
-		node:     &Node{},
-		spec:     overlaySpec{Kind: overlayKindFastSync},
-		log:      discardLogger(),
-		peers:    map[PeerID]*overlayPeer{remoteID: peer},
-		fastSync: runtime,
+		node:         &Node{},
+		spec:         overlaySpec{Kind: overlayKindFastSync},
+		log:          discardLogger(),
+		peers:        map[PeerID]*overlayPeer{remoteID: peer},
+		fastSync:     runtime,
+		quicEnvelope: testFastSyncQueryEnvelope(t),
 	}
 
 	sub.warmupFastSyncPeer(context.Background(), peer)
@@ -314,7 +315,7 @@ func TestFastSyncRandomPeersRejectsOversizedResponseBeforeLearning(t *testing.T)
 		req tl.Serializable,
 		result tl.Serializable,
 	) error {
-		if _, ok := testOverlayQueryPayload(req).(overlay.GetRandomPeersV2); !ok {
+		if _, ok := testFastSyncADNLQueryPayload(t, req).(overlay.GetRandomPeersV2); !ok {
 			return fmt.Errorf("unexpected ADNL overlay query %T", req)
 		}
 
@@ -329,11 +330,12 @@ func TestFastSyncRandomPeersRejectsOversizedResponseBeforeLearning(t *testing.T)
 		return nil
 	}
 	sub := &overlaySubscription{
-		node:     &Node{},
-		spec:     overlaySpec{Kind: overlayKindFastSync},
-		log:      discardLogger(),
-		peers:    map[PeerID]*overlayPeer{remoteID: peer},
-		fastSync: runtime,
+		node:         &Node{},
+		spec:         overlaySpec{Kind: overlayKindFastSync},
+		log:          discardLogger(),
+		peers:        map[PeerID]*overlayPeer{remoteID: peer},
+		fastSync:     runtime,
+		quicEnvelope: testFastSyncQueryEnvelope(t),
 	}
 
 	sub.exchangeFastSyncRandomPeers(context.Background(), peer)
@@ -670,4 +672,30 @@ func TestFastSyncLivenessIsNotSeededWithoutTransports(t *testing.T) {
 	if len(sub.fastSync.aliveRoots) != 1 {
 		t.Fatalf("connected validator was not seeded: %d alive", len(sub.fastSync.aliveRoots))
 	}
+}
+
+func testFastSyncQueryEnvelope(t *testing.T) *quicOverlayEnvelope {
+	t.Helper()
+	envelope, err := newQUICOverlayEnvelope(make([]byte, PeerIDSize), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return envelope
+}
+
+func testFastSyncADNLQueryPayload(t *testing.T, req tl.Serializable) tl.Serializable {
+	t.Helper()
+	wire, ok := req.(tl.Raw)
+	if !ok {
+		t.Fatalf("FastSync ADNL query is %T, want serialized membership envelope", req)
+	}
+	_, body, err := parseQUICQueryEnvelope(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query, err := parseOneQUICOverlayObject(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return query
 }

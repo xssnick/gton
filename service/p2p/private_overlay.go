@@ -132,6 +132,9 @@ func newPrivateOverlayRegistry(node *Node) *PrivateOverlayRegistry {
 }
 
 func (n *Node) PrivateOverlays() *PrivateOverlayRegistry {
+	if n.privateNetwork != nil {
+		return n.privateNetwork.privateOverlays
+	}
 	return n.privateOverlays
 }
 

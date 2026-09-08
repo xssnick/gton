@@ -41,7 +41,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "max by (instance) (${metric_namespace}_sync_lag_seconds{job=~\"$job\", instance=~\"$instance\", chain=\"masterchain\", shard=\"masterchain\"})",
@@ -134,7 +134,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "max by (instance) (${metric_namespace}_sync_gap_blocks{job=~\"$job\", instance=~\"$instance\"})",
@@ -220,7 +220,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance) (rate(${metric_namespace}_liteserver_queries_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -305,7 +305,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance) (rate(${metric_namespace}_liteserver_queries_total{job=~\"$job\", instance=~\"$instance\", error_code!=\"0\"}[$__rate_interval])) / clamp_min(sum by (instance) (rate(${metric_namespace}_liteserver_queries_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])), 0.000001)",
@@ -391,7 +391,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_generation{job=~\"$job\", instance=~\"$instance\"})",
@@ -473,7 +473,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "max by (instance, task) (${metric_namespace}_service_background_task{job=~\"$job\", instance=~\"$instance\"})",
@@ -551,7 +551,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "max by (instance) (${metric_namespace}_sync_recent_tps{job=~\"$job\", instance=~\"$instance\"})",
@@ -636,7 +636,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "max by (instance, chain, shard) (${metric_namespace}_sync_lag_seconds{job=~\"$job\", instance=~\"$instance\"})",
@@ -721,7 +721,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "max by (instance, chain, shard) (${metric_namespace}_sync_gap_blocks{job=~\"$job\", instance=~\"$instance\"})",
@@ -806,7 +806,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, pipeline, chain, origin) (rate(${metric_namespace}_sync_block_origins_total{job=~\"$job\", instance=~\"$instance\", result=\"success\", pipeline!=\"blocksync\"}[$__rate_interval]))",
@@ -894,7 +894,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, pipeline, chain, source, result) (rate(${metric_namespace}_sync_blocks_total{job=~\"$job\", instance=~\"$instance\", result!=\"success\"}[$__rate_interval]))",
@@ -983,7 +983,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline, chain, source) (rate(${metric_namespace}_sync_block_download_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\"}[$__rate_interval])))",
@@ -1047,12 +1047,12 @@
         }
       }
     },
-    "panel-57": {
+    "panel-55": {
       "kind": "Panel",
       "spec": {
-        "id": 57,
-        "title": "Master+shards obtain p95",
-        "description": "Critical-path obtain time per master transition. The shards stage records the union of shard download intervals so parallel requests are not summed.",
+        "id": 55,
+        "title": "Block prepare latency p95",
+        "description": "",
         "links": [],
         "data": {
           "kind": "QueryGroup",
@@ -1068,49 +1068,11 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
-                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline) (rate(${metric_namespace}_sync_master_shards_obtain_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", stage=\"master\"}[$__rate_interval])))",
-                      "legendFormat": "{{instance}} {{pipeline}} master p95"
-                    }
-                  }
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "B",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline) (rate(${metric_namespace}_sync_master_shards_obtain_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", stage=\"shards\"}[$__rate_interval])))",
-                      "legendFormat": "{{instance}} {{pipeline}} shards p95"
-                    }
-                  }
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "C",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline) (rate(${metric_namespace}_sync_master_shards_obtain_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", stage=\"master\"}[$__rate_interval]))) + on (instance, pipeline) histogram_quantile(0.95, sum by (le, instance, pipeline) (rate(${metric_namespace}_sync_master_shards_obtain_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", stage=\"shards\"}[$__rate_interval])))",
-                      "legendFormat": "{{instance}} {{pipeline}} master+shards p95"
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline, chain, shard) (rate(${metric_namespace}_sync_block_prepare_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{pipeline}} {{chain}}/{{shard}} p95"
                     }
                   }
                 }
@@ -1191,7 +1153,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline, chain) (rate(${metric_namespace}_sync_block_apply_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", pipeline!=\"blocksync\"}[$__rate_interval])))",
@@ -1276,7 +1238,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.95, sum by (le, instance, mode) (rate(${metric_namespace}_sync_persist_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
@@ -1295,7 +1257,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.95, sum by (le, instance, mode) (rate(${metric_namespace}_sync_persist_queue_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
@@ -1380,7 +1342,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, mode, result) (rate(${metric_namespace}_sync_checkpoints_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -1447,6 +1409,129 @@
         }
       }
     },
+    "panel-57": {
+      "kind": "Panel",
+      "spec": {
+        "id": 57,
+        "title": "Master+shards obtain p95",
+        "description": "Critical-path obtain time per master transition. The shards stage records the union of shard download intervals so parallel requests are not summed.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline) (rate(${metric_namespace}_sync_master_shards_obtain_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", stage=\"master\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{pipeline}} master p95"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "B",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline) (rate(${metric_namespace}_sync_master_shards_obtain_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", stage=\"shards\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{pipeline}} shards p95"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "C",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline) (rate(${metric_namespace}_sync_master_shards_obtain_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", stage=\"master\"}[$__rate_interval]))) + on (instance, pipeline) histogram_quantile(0.95, sum by (le, instance, pipeline) (rate(${metric_namespace}_sync_master_shards_obtain_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\", stage=\"shards\"}[$__rate_interval])))",
+                      "legendFormat": "{{instance}} {{pipeline}} master+shards p95"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "s"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
     "panel-58": {
       "kind": "Panel",
       "spec": {
@@ -1468,7 +1553,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.95, sum by (le, instance, mode, stage) (rate(${metric_namespace}_sync_checkpoint_stage_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
@@ -1553,7 +1638,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, method) (rate(${metric_namespace}_liteserver_queries_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -1642,7 +1727,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, method, error_code, reason) (rate(${metric_namespace}_liteserver_queries_total{job=~\"$job\", instance=~\"$instance\", error_code!=\"0\"}[$__rate_interval]))",
@@ -1731,7 +1816,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.95, sum by (le, instance, method) (rate(${metric_namespace}_liteserver_query_handler_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
@@ -1816,7 +1901,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.99, sum by (le, instance, method) (rate(${metric_namespace}_liteserver_query_handler_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
@@ -1901,7 +1986,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "${metric_namespace}_liteserver_inflight_queries{job=~\"$job\", instance=~\"$instance\"}",
@@ -1986,7 +2071,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.95, sum by (le, instance, method) (rate(${metric_namespace}_liteserver_query_wait_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
@@ -2071,7 +2156,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "${metric_namespace}_p2p_overlay_peers{job=~\"$job\", instance=~\"$instance\"}",
@@ -2155,7 +2240,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "${metric_namespace}_p2p_overlay_neighbours{job=~\"$job\", instance=~\"$instance\"}",
@@ -2239,7 +2324,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "100 * ${metric_namespace}_p2p_queue_items{job=~\"$job\", instance=~\"$instance\"} / clamp_min(${metric_namespace}_p2p_queue_max_items{job=~\"$job\", instance=~\"$instance\"}, 1)",
@@ -2258,7 +2343,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "100 * ${metric_namespace}_blocksync_queue_items{job=~\"$job\", instance=~\"$instance\"} / clamp_min(${metric_namespace}_blocksync_queue_capacity{job=~\"$job\", instance=~\"$instance\"}, 1)",
@@ -2343,7 +2428,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "${metric_namespace}_p2p_queue_bytes{job=~\"$job\", instance=~\"$instance\"}",
@@ -2428,7 +2513,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, queue) (rate(${metric_namespace}_p2p_queue_dropped_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -2447,7 +2532,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, queue) (rate(${metric_namespace}_blocksync_queue_dropped_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -2466,7 +2551,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, queue) (rate(${metric_namespace}_p2p_rebroadcast_dropped_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -2551,1277 +2636,11 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "${metric_namespace}_blocksync_chains{job=~\"$job\", instance=~\"$instance\"}",
                       "legendFormat": "{{instance}} {{state}}"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "short"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-35": {
-      "kind": "Panel",
-      "spec": {
-        "id": 35,
-        "title": "Cell DB disk bytes",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_disk_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} {{generation}}"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "bytes"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-36": {
-      "kind": "Panel",
-      "spec": {
-        "id": 36,
-        "title": "Cell DB live bytes",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_live_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} {{generation}}"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "bytes"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-37": {
-      "kind": "Panel",
-      "spec": {
-        "id": 37,
-        "title": "L0 pressure",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_l0_files{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} {{generation}} L0 files"
-                    }
-                  }
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "B",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_l0_sublevels{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} {{generation}} L0 sublevels"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "short"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-38": {
-      "kind": "Panel",
-      "spec": {
-        "id": 38,
-        "title": "Compaction bytes",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_compaction_debt_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} {{generation}} debt"
-                    }
-                  }
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "B",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_compaction_in_progress_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} {{generation}} in progress"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "bytes"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-39": {
-      "kind": "Panel",
-      "spec": {
-        "id": 39,
-        "title": "Memtable bytes",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_memtable_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
-                      "legendFormat": "{{instance}} {{generation}}"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "bytes"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-40": {
-      "kind": "Panel",
-      "spec": {
-        "id": 40,
-        "title": "Block cache hit ratio",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "sum by (instance, generation) (rate(${metric_namespace}_storage_cell_db_cache_requests_total{job=~\"$job\", instance=~\"$instance\", result=\"hit\"}[$__rate_interval])) / clamp_min(sum by (instance, generation) (rate(${metric_namespace}_storage_cell_db_cache_requests_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])), 0.000001)",
-                      "legendFormat": "{{instance}} {{generation}}"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "min"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "percentunit"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-41": {
-      "kind": "Panel",
-      "spec": {
-        "id": 41,
-        "title": "Cell IO rate",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "sum by (instance, generation) (rate(${metric_namespace}_storage_cell_db_read_cells_total{job=~\"$job\", instance=~\"$instance\", shard=\"total\"}[$__rate_interval]))",
-                      "legendFormat": "{{instance}} {{generation}} read"
-                    }
-                  }
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "B",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "sum by (instance, generation) (rate(${metric_namespace}_storage_cell_db_written_cells_total{job=~\"$job\", instance=~\"$instance\", shard=\"total\"}[$__rate_interval]))",
-                      "legendFormat": "{{instance}} {{generation}} write"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "ops"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-42": {
-      "kind": "Panel",
-      "spec": {
-        "id": 42,
-        "title": "Cell DB read amplification",
-        "description": "Read amplification by cell DB generation and shard.",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "max by (instance, generation, shard) (${metric_namespace}_storage_cell_db_read_amp{job=~\"$job\", instance=~\"$instance\", shard!=\"total\"})",
-                      "legendFormat": "{{instance}} {{generation}} shard={{shard}}"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "short"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-49": {
-      "kind": "Panel",
-      "spec": {
-        "id": 49,
-        "title": "Archive package bytes",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "max by (instance) (${metric_namespace}_storage_archive_package_bytes{job=~\"$job\", instance=~\"$instance\"})",
-                      "legendFormat": "{{instance}} archive packages"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "bytes"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-50": {
-      "kind": "Panel",
-      "spec": {
-        "id": 50,
-        "title": "Persistent state bytes",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "max by (instance) (${metric_namespace}_storage_persistent_state_bytes{job=~\"$job\", instance=~\"$instance\"})",
-                      "legendFormat": "{{instance}} persistent states"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "bytes"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-44": {
-      "kind": "Panel",
-      "spec": {
-        "id": 44,
-        "title": "Process CPU cores",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "rate(process_cpu_seconds_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])",
-                      "legendFormat": "{{instance}}"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "short"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-45": {
-      "kind": "Panel",
-      "spec": {
-        "id": 45,
-        "title": "Memory",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "process_resident_memory_bytes{job=~\"$job\", instance=~\"$instance\"}",
-                      "legendFormat": "{{instance}} rss"
-                    }
-                  }
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "B",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "go_memstats_heap_alloc_bytes{job=~\"$job\", instance=~\"$instance\"}",
-                      "legendFormat": "{{instance}} heap alloc"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "bytes"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-46": {
-      "kind": "Panel",
-      "spec": {
-        "id": 46,
-        "title": "Goroutines",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "go_goroutines{job=~\"$job\", instance=~\"$instance\"}",
-                      "legendFormat": "{{instance}}"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull",
-                  "max"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "short"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-47": {
-      "kind": "Panel",
-      "spec": {
-        "id": 47,
-        "title": "File descriptors",
-        "description": "",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "process_open_fds{job=~\"$job\", instance=~\"$instance\"}",
-                      "legendFormat": "{{instance}} open fds"
                     }
                   }
                 }
@@ -3902,11 +2721,118 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, overlay, kind, delivery) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"accepted\"}[$__rate_interval]))",
                       "legendFormat": "{{instance}} {{overlay}} {{kind}} {{delivery}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  }
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "ops"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-48": {
+      "kind": "Panel",
+      "spec": {
+        "id": 48,
+        "title": "Queue rebroadcast / overlay relay rate",
+        "description": "App-level rebroadcast queue sends by TL type and overlay-level relay sends by delivery path. FEC relay sends are FEC parts, not decoded TL broadcast kinds.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, overlay, kind, delivery) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"queue_rebroadcasted\"}[$__rate_interval]))",
+                      "legendFormat": "queue {{instance}} {{overlay}} {{kind}} {{delivery}}"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "B",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, overlay, delivery) (rate(${metric_namespace}_p2p_broadcast_relay_sent_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+                      "legendFormat": "relay {{instance}} {{overlay}} {{delivery}}"
                     }
                   }
                 }
@@ -3990,7 +2916,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, overlay, kind, delivery) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"received\"}[$__rate_interval]))",
@@ -4078,7 +3004,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, overlay, source) (rate(${metric_namespace}_p2p_plumtree_fec_parts_received_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -4163,7 +3089,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, overlay, type) (rate(${metric_namespace}_p2p_plumtree_messages_received_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -4227,201 +3153,6 @@
         }
       }
     },
-    "panel-48": {
-      "kind": "Panel",
-      "spec": {
-        "id": 48,
-        "title": "Queue rebroadcast / overlay relay rate",
-        "description": "App-level rebroadcast queue sends by TL type and overlay-level relay sends by delivery path. FEC relay sends are FEC parts, not decoded TL broadcast kinds.",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "sum by (instance, overlay, kind, delivery) (rate(${metric_namespace}_p2p_broadcasts_total{job=~\"$job\", instance=~\"$instance\", direction=\"queue_rebroadcasted\"}[$__rate_interval]))",
-                      "legendFormat": "queue {{instance}} {{overlay}} {{kind}} {{delivery}}"
-                    }
-                  }
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "B",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "sum by (instance, overlay, delivery) (rate(${metric_namespace}_p2p_broadcast_relay_sent_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
-                      "legendFormat": "relay {{instance}} {{overlay}} {{delivery}}"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true,
-                  "stacking": {
-                    "group": "A",
-                    "mode": "normal"
-                  }
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "ops"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
-    "panel-56": {
-      "kind": "Panel",
-      "spec": {
-        "id": 56,
-        "title": "Dropped broadcast rate",
-        "description": "Inbound P2P broadcasts dropped before acceptance by overlay, TL type, and reason. Existing seen/dedupe guards report repeated payloads as reason=seen.",
-        "links": [],
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "refId": "A",
-                  "hidden": false,
-                  "query": {
-                    "kind": "DataQuery",
-                    "group": "prometheus",
-                    "version": "v0",
-                    "datasource": {
-                      "name": "$datasource"
-                    },
-                    "spec": {
-                      "expr": "sum by (instance, overlay, kind, reason) (rate(${metric_namespace}_p2p_broadcast_dropped_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
-                      "legendFormat": "{{instance}} {{overlay}} {{kind}} {{reason}}"
-                    }
-                  }
-                }
-              }
-            ],
-            "transformations": [],
-            "queryOptions": {}
-          }
-        },
-        "vizConfig": {
-          "kind": "VizConfig",
-          "group": "timeseries",
-          "version": "12.3.1",
-          "spec": {
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            },
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "custom": {
-                  "drawStyle": "line",
-                  "fillOpacity": 10,
-                  "lineWidth": 1,
-                  "showPoints": "never",
-                  "spanNulls": true,
-                  "stacking": {
-                    "group": "A",
-                    "mode": "normal"
-                  }
-                },
-                "mappings": [],
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    }
-                  ]
-                },
-                "unit": "ops"
-              },
-              "overrides": []
-            }
-          }
-        }
-      }
-    },
     "panel-51": {
       "kind": "Panel",
       "spec": {
@@ -4443,7 +3174,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "${metric_namespace}_p2p_fec_receiver_active_streams{job=~\"$job\", instance=~\"$instance\"}",
@@ -4462,7 +3193,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "${metric_namespace}_p2p_fec_receiver_delivered_cache_items{job=~\"$job\", instance=~\"$instance\"}",
@@ -4547,7 +3278,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "${metric_namespace}_p2p_fec_receiver_active_bytes{job=~\"$job\", instance=~\"$instance\"}",
@@ -4632,7 +3363,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, overlay) (rate(${metric_namespace}_p2p_fec_receiver_dropped_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -4651,7 +3382,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, overlay) (rate(${metric_namespace}_p2p_fec_receiver_evicted_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -4740,7 +3471,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, overlay) (rate(${metric_namespace}_p2p_fec_receiver_completed_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -4759,7 +3490,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, overlay) (rate(${metric_namespace}_p2p_fec_receiver_delivered_cache_hits_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -4827,12 +3558,12 @@
         }
       }
     },
-    "panel-55": {
+    "panel-56": {
       "kind": "Panel",
       "spec": {
-        "id": 55,
-        "title": "Block prepare latency p95",
-        "description": "",
+        "id": 56,
+        "title": "Dropped broadcast rate",
+        "description": "Inbound P2P broadcasts dropped before acceptance by overlay, TL type, and reason. Existing seen/dedupe guards report repeated payloads as reason=seen.",
         "links": [],
         "data": {
           "kind": "QueryGroup",
@@ -4848,11 +3579,11 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
-                      "expr": "histogram_quantile(0.95, sum by (le, instance, pipeline, chain, shard) (rate(${metric_namespace}_sync_block_prepare_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\", result=\"success\"}[$__rate_interval])))",
-                      "legendFormat": "{{instance}} {{pipeline}} {{chain}}/{{shard}} p95"
+                      "expr": "sum by (instance, overlay, kind, reason) (rate(${metric_namespace}_p2p_broadcast_dropped_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{overlay}} {{kind}} {{reason}}"
                     }
                   }
                 }
@@ -4870,8 +3601,7 @@
             "options": {
               "legend": {
                 "calcs": [
-                  "lastNotNull",
-                  "max"
+                  "lastNotNull"
                 ],
                 "displayMode": "table",
                 "placement": "bottom",
@@ -4892,7 +3622,11 @@
                   "fillOpacity": 10,
                   "lineWidth": 1,
                   "showPoints": "never",
-                  "spanNulls": true
+                  "spanNulls": true,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  }
                 },
                 "mappings": [],
                 "thresholds": {
@@ -4904,7 +3638,7 @@
                     }
                   ]
                 },
-                "unit": "s"
+                "unit": "ops"
               },
               "overrides": []
             }
@@ -4933,7 +3667,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.95, sum by (le, instance, stage, delivery, kind, result) (rate(${metric_namespace}_p2p_broadcast_pipeline_stage_duration_seconds_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
@@ -4997,6 +3731,913 @@
         }
       }
     },
+    "panel-35": {
+      "kind": "Panel",
+      "spec": {
+        "id": 35,
+        "title": "Cell DB disk bytes",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_disk_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-36": {
+      "kind": "Panel",
+      "spec": {
+        "id": 36,
+        "title": "Cell DB live bytes",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_live_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-37": {
+      "kind": "Panel",
+      "spec": {
+        "id": 37,
+        "title": "L0 pressure",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_l0_files{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}} L0 files"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "B",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_l0_sublevels{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}} L0 sublevels"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-38": {
+      "kind": "Panel",
+      "spec": {
+        "id": 38,
+        "title": "Compaction bytes",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_compaction_debt_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}} debt"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "B",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_compaction_in_progress_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}} in progress"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-39": {
+      "kind": "Panel",
+      "spec": {
+        "id": 39,
+        "title": "Memtable bytes",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "max by (instance, generation) (${metric_namespace}_storage_cell_db_memtable_bytes{job=~\"$job\", instance=~\"$instance\", shard=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-40": {
+      "kind": "Panel",
+      "spec": {
+        "id": 40,
+        "title": "Block cache hit ratio",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, generation) (rate(${metric_namespace}_storage_cell_db_cache_requests_total{job=~\"$job\", instance=~\"$instance\", result=\"hit\"}[$__rate_interval])) / clamp_min(sum by (instance, generation) (rate(${metric_namespace}_storage_cell_db_cache_requests_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])), 0.000001)",
+                      "legendFormat": "{{instance}} {{generation}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "min"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "percentunit"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-41": {
+      "kind": "Panel",
+      "spec": {
+        "id": 41,
+        "title": "Cell IO rate",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, generation) (rate(${metric_namespace}_storage_cell_db_read_cells_total{job=~\"$job\", instance=~\"$instance\", shard=\"total\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{generation}} read"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "B",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "sum by (instance, generation) (rate(${metric_namespace}_storage_cell_db_written_cells_total{job=~\"$job\", instance=~\"$instance\", shard=\"total\"}[$__rate_interval]))",
+                      "legendFormat": "{{instance}} {{generation}} write"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "ops"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-42": {
+      "kind": "Panel",
+      "spec": {
+        "id": 42,
+        "title": "Cell DB read amplification",
+        "description": "Read amplification by cell DB generation and shard.",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "max by (instance, generation, shard) (${metric_namespace}_storage_cell_db_read_amp{job=~\"$job\", instance=~\"$instance\", shard!=\"total\"})",
+                      "legendFormat": "{{instance}} {{generation}} shard={{shard}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-49": {
+      "kind": "Panel",
+      "spec": {
+        "id": 49,
+        "title": "Archive package bytes",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "max by (instance) (${metric_namespace}_storage_archive_package_bytes{job=~\"$job\", instance=~\"$instance\"})",
+                      "legendFormat": "{{instance}} archive packages"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-50": {
+      "kind": "Panel",
+      "spec": {
+        "id": 50,
+        "title": "Persistent state bytes",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "max by (instance) (${metric_namespace}_storage_persistent_state_bytes{job=~\"$job\", instance=~\"$instance\"})",
+                      "legendFormat": "{{instance}} persistent states"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
     "panel-60": {
       "kind": "Panel",
       "spec": {
@@ -5018,7 +4659,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "sum by (instance, layer) (rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
@@ -5082,6 +4723,365 @@
         }
       }
     },
+    "panel-44": {
+      "kind": "Panel",
+      "spec": {
+        "id": 44,
+        "title": "Process CPU cores",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "rate(process_cpu_seconds_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])",
+                      "legendFormat": "{{instance}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-45": {
+      "kind": "Panel",
+      "spec": {
+        "id": 45,
+        "title": "Memory",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "process_resident_memory_bytes{job=~\"$job\", instance=~\"$instance\"}",
+                      "legendFormat": "{{instance}} rss"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "B",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "go_memstats_heap_alloc_bytes{job=~\"$job\", instance=~\"$instance\"}",
+                      "legendFormat": "{{instance}} heap alloc"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-46": {
+      "kind": "Panel",
+      "spec": {
+        "id": 46,
+        "title": "Goroutines",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "go_goroutines{job=~\"$job\", instance=~\"$instance\"}",
+                      "legendFormat": "{{instance}}"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
+    "panel-47": {
+      "kind": "Panel",
+      "spec": {
+        "id": 47,
+        "title": "File descriptors",
+        "description": "",
+        "links": [],
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "refId": "A",
+                  "hidden": false,
+                  "query": {
+                    "kind": "DataQuery",
+                    "group": "prometheus",
+                    "version": "v0",
+                    "datasource": {
+                      "name": "${datasource}"
+                    },
+                    "spec": {
+                      "expr": "process_open_fds{job=~\"$job\", instance=~\"$instance\"}",
+                      "legendFormat": "{{instance}} open fds"
+                    }
+                  }
+                }
+              }
+            ],
+            "transformations": [],
+            "queryOptions": {}
+          }
+        },
+        "vizConfig": {
+          "kind": "VizConfig",
+          "group": "timeseries",
+          "version": "12.3.1",
+          "spec": {
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull",
+                  "max"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            },
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "custom": {
+                  "drawStyle": "line",
+                  "fillOpacity": 10,
+                  "lineWidth": 1,
+                  "showPoints": "never",
+                  "spanNulls": true
+                },
+                "mappings": [],
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": 0
+                    }
+                  ]
+                },
+                "unit": "short"
+              },
+              "overrides": []
+            }
+          }
+        }
+      }
+    },
     "panel-64": {
       "kind": "Panel",
       "spec": {
@@ -5103,7 +5103,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.95, sum by (le, instance, chain, origin) (rate(${metric_namespace}_collator_candidate_size_bytes_bucket{job=~\"$job\", instance=~\"$instance\", part=\"block\"}[$__rate_interval])))",
@@ -5188,7 +5188,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.95, sum by (le, instance, chain, origin) (rate(${metric_namespace}_collator_candidate_size_bytes_bucket{job=~\"$job\", instance=~\"$instance\", part=\"collated\"}[$__rate_interval])))",
@@ -5273,7 +5273,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.95, sum by (le, instance, chain, origin) (rate(${metric_namespace}_collator_candidate_transactions_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
@@ -5358,7 +5358,7 @@
                     "group": "prometheus",
                     "version": "v0",
                     "datasource": {
-                      "name": "$datasource"
+                      "name": "${datasource}"
                     },
                     "spec": {
                       "expr": "histogram_quantile(0.95, sum by (le, instance, chain, origin, kind) (rate(${metric_namespace}_collator_candidate_messages_bucket{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])))",
@@ -6411,7 +6411,7 @@
           "group": "prometheus",
           "version": "v0",
           "datasource": {
-            "name": "$datasource"
+            "name": "${datasource}"
           },
           "spec": {
             "__legacyStringValue": "label_values(${metric_namespace}_liteserver_inflight_queries, job)"
@@ -6445,7 +6445,7 @@
           "group": "prometheus",
           "version": "v0",
           "datasource": {
-            "name": "$datasource"
+            "name": "${datasource}"
           },
           "spec": {
             "__legacyStringValue": "label_values(${metric_namespace}_liteserver_inflight_queries{job=~\"$job\"}, instance)"

@@ -166,7 +166,7 @@ func (p *overlayPeer) awaitPrioritySend(ctx context.Context) {
 	if result == prioritySendNotWaited {
 		return
 	}
-	p.node.observeBroadcastPipelineStageDuration(
+	p.node.chainNode().observeBroadcastPipelineStageDuration(
 		prioritySendWaitStage,
 		prioritySendWaitKind,
 		prioritySendWaitDelivery,

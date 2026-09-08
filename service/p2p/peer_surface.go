@@ -145,7 +145,7 @@ func (n *Node) runAnnounceLoop(ctx context.Context) {
 			}
 			delay := publicAnnounceEvery
 			if err := n.announceSelf(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, context.Canceled) {
-				n.log.Warn().Err(err).Msg("failed to announce ordinary-node surface")
+				n.log.Warn().Err(err).Msg("failed to announce ADNL address and overlays")
 				delay = publicAnnounceRetryDelay
 			}
 			timer.Reset(delay)

@@ -18,6 +18,26 @@ default namespace is `gton`, so metric names use the `gton_` prefix unless
 configured otherwise. Histograms expose the standard Prometheus `_bucket`,
 `_sum`, and `_count` series. Counters expose a `_total` suffix.
 
+## Grafana dashboards
+
+Choose the file for the Grafana screen you are using:
+
+| Dashboard | V2 JSON Model editor | Dashboards → New → Import |
+| --- | --- | --- |
+| Node | [metrics.json](metrics.json) | [metrics_calssic.json](metrics_calssic.json) |
+| Validator | [validator_metrics.json](validator_metrics.json) | [validator_metrics_calssic.json](validator_metrics_calssic.json) |
+| Collator | [collator_metrics.json](collator_metrics.json) | [collator_metrics_calssic.json](collator_metrics_calssic.json) |
+
+The root files use V2 with `annotations`, `elements`, `layout`, `timeSettings`,
+and `variables`. After applying a model, select the Prometheus source that
+scrapes GTON in the dashboard's **Data source** variable.
+
+The `*_calssic.json` files use Classic with an explicit Prometheus import input,
+including support for Grafana versions with incompatible V2 import handling.
+They contain the same panels and queries. The import selection initializes the
+**Data source** variable; panels and job/instance filters follow that variable.
+Update both formats together when changing dashboard content.
+
 ## Liteserver
 
 These metrics describe inbound liteserver query load, latency, and result mix.

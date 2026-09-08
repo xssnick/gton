@@ -114,6 +114,8 @@ func TestBuildReportDeduplicatesNodeBlockCountersAndPreservesRawEvents(t *testin
 	lines := strings.Join([]string{
 		"Published event CandidateReceived {candidate=Candidate{id={17, " + candidate + ", ?}, parent=consensus genesis, block=BlockCandidate{id=" + block + "}}}",
 		"Published event TraceEvent {event=CandidateReceived{id={17, " + candidate + ", ?}, parent=consensus genesis, block_id=" + block + "}}",
+		"Published event BroadcastVote {vote=NotarizeVote{id={17, " + candidate + ", ?}}}",
+		"Published event BroadcastVote {vote=NotarizeVote{id={17, " + candidate + ", ?}}}",
 		"Published event FinalizeBlock {block=" + block + "}",
 		"Published event FinalizeBlock {block=" + block + "}",
 	}, "\n") + "\n"
@@ -139,7 +141,7 @@ func TestBuildReportDeduplicatesNodeBlockCountersAndPreservesRawEvents(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Events != 4 || len(summary.Nodes) != 1 || summary.Nodes[0].ValidatedBlocks != 1 ||
+	if summary.Events != 6 || len(summary.Nodes) != 1 || summary.Nodes[0].ValidatedBlocks != 1 ||
 		summary.Nodes[0].FinalizedBlocks != 1 {
 		t.Fatalf("summary = %+v", summary)
 	}
@@ -147,7 +149,7 @@ func TestBuildReportDeduplicatesNodeBlockCountersAndPreservesRawEvents(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(string(rawEvents), "\n") != 4 ||
+	if strings.Count(string(rawEvents), "\n") != 6 ||
 		strings.Count(string(rawEvents), `"kind":"block_validated"`) != 2 ||
 		strings.Count(string(rawEvents), `"kind":"block_finalized"`) != 2 {
 		t.Fatalf("events.ndjson lost raw duplicate evidence: %s", rawEvents)

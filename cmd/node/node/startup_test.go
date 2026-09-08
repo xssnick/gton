@@ -91,6 +91,16 @@ func TestParseNodeFlagsValidatorControlPubkey(t *testing.T) {
 	}
 }
 
+func TestParseNodeFlagsConsensusADNLID(t *testing.T) {
+	_, commands, err := parseNodeFlags([]string{"--consensus-adnl-id"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !commands.consensusADNLID || commands.adnlID {
+		t.Fatalf("consensus ADNL ID command = %+v", commands)
+	}
+}
+
 func TestParseNodeFlagsGenesisOverridesAndDHTDescriptor(t *testing.T) {
 	options, commands, err := parseNodeFlags([]string{
 		"--data-dir", "seeded-data",
@@ -146,7 +156,7 @@ func TestWriteADNLID(t *testing.T) {
 	cfg := nodeconfig.Config{ADNL: nodeconfig.ADNL{Key: seed}}
 
 	var out bytes.Buffer
-	if err := writeADNLID(&out, cfg, "config.json"); err != nil {
+	if err := writeADNLID(&out, cfg.ADNL, "config.json"); err != nil {
 		t.Fatalf("write ADNL id: %v", err)
 	}
 
