@@ -219,6 +219,10 @@ func validateMasterShardActivation(
 	if !currencyZero(item.fields.fees) {
 		return fmt.Errorf("new shard %s has non-zero collected fees", formatShardRegistryKey(key))
 	}
+	if !currencyZero(item.fields.created) {
+		return fmt.Errorf("new shard %s has non-zero created funds", formatShardRegistryKey(key))
+	}
+
 	return nil
 }
 

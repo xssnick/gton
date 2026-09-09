@@ -93,7 +93,7 @@ func TestFullCollatedDeferredMessageVerifiesOnProofs(t *testing.T) {
 	verification.Previous.State = narrowedStateRoot(t, req.Previous.State)
 	verification.Neighbors = collatedNeighborQueues(t, req, candidate)
 
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify deferring candidate on its own proofs: %v", err)
 	}
 }

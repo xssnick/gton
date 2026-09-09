@@ -102,6 +102,7 @@ func (f *speculativeLineageFixture) betRequest(t *testing.T) BuildRequest {
 	candidate := simplex.CandidateID{Slot: 3, Hash: [32]byte{0x5b}}
 	base, err := NewSelectedBaseState(
 		sessionID, candidate, f.b1.ID, f.b1.BlockBOC, candidateBlock(t, f.b1), f.b1.State,
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)

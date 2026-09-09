@@ -148,54 +148,6 @@ func (s LiveSuccessorState) Over(combined *cell.Cell, parents ...*cell.Cell) (*c
 	return s.root, true
 }
 
-// LiveSuccessorOf packages the successor of one caller's own predecessors as the
-// carry-back token, by PERFORMING that apply here.
-//
-// It exists because the consumer of the token — the validator's
-// validatedCandidateState — has a branch that only runs when a token opens, and
-// that branch is where the "one materialization per block" property of the whole
-// lineage is established. Covering it needs a token that opens, and the session
-// producer above cannot be reached without a full masterchain fixture, so the
-// consumer's own package had no way to exercise its own branch at all.
-//
-// It does not widen what a token means, which is the only thing that matters here.
-// The token's guarantee is "this root is the successor of the trees named in it,
-// and Over releases it to nobody else": established above by having applied the
-// update to the caller's predecessors, and established here by doing exactly the
-// same apply over exactly the parents named. A caller passing a proof-backed
-// parent gets a token that opens for that proof-backed parent and for nothing
-// else — and a ChainState root is never one, because newChainState refuses a proof
-// root and every other producer of one is an apply over a full parent. So the
-// property the unexported fields protect is preserved by construction rather than
-// by the absence of this function.
-//
-// combined is the caller's single root over parents: the parent itself for one
-// predecessor, and the merged root for two.
-func LiveSuccessorOf(
-	prepared *cell.PreparedMerkleUpdate,
-	combined *cell.Cell,
-	parents ...*cell.Cell,
-) (LiveSuccessorState, error) {
-	if prepared == nil || combined == nil || len(parents) == 0 {
-		return LiveSuccessorState{}, fmt.Errorf("%w: live successor needs an update and a predecessor", ErrInvalidInput)
-	}
-	for i := range parents {
-		if parents[i] == nil {
-			return LiveSuccessorState{}, fmt.Errorf("%w: live successor predecessor %d is absent", ErrInvalidInput, i)
-		}
-	}
-	root, err := prepared.ApplyTo(combined)
-	if err != nil {
-		return LiveSuccessorState{}, err
-	}
-
-	return LiveSuccessorState{
-		root:    root,
-		parents: append([]*cell.Cell(nil), parents...),
-		source:  combined.HashKeyAt(0),
-	}, nil
-}
-
 // ValidatedSuccessor is the transition a semantically verified candidate
 // asserts, in a form that can be replayed onto any materialization of the same
 // predecessor.
@@ -305,6 +257,9 @@ func (a *LocalAcquisition) ValidateCandidate(
 		return ValidationResult{}, err
 	}
 	header := &prepared.verified.block.BlockInfo
+	if err = verifyCandidateGenerationTime(header.GenUtime, time.Now()); err != nil {
+		return ValidationResult{}, err
+	}
 	genUtime := time.Unix(int64(header.GenUtime), 0)
 	started, waited = a.validationStageStarted(), inputWait.duration
 	base, err := a.validationMasterView(ctx, request.Session, request.Update, genUtime, readMode)

@@ -545,7 +545,7 @@ func TestMasterVerificationReusesTheAcquiredPredecessorState(t *testing.T) {
 		Semantics: testCandidateTransitionVerifier,
 		Candidate: candidate,
 	}
-	if err = VerifyMasterCandidate(t.Context(), request); err != nil {
+	if err = verifyMasterCandidateForTest(t.Context(), request); err != nil {
 		t.Fatalf("verify baseline candidate: %v", err)
 	}
 

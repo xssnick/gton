@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/validator/collator"
 	"github.com/xssnick/gton/service/validator/simplex"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
@@ -286,39 +285,29 @@ func TestFinalizedChainStateLoadAsksTheBackendToWait(t *testing.T) {
 	}
 }
 
-// MAJOR 3, the deeper problem: the carry-back branch of validatedCandidateState —
-// the branch whose pointer comparison the entire "one materialization" argument
-// rests on — was never exercised in the package that owns it. Over was called 25
-// times in this suite and every call had an empty Live, so every one took the
-// fallback apply.
-//
-// This drives the branch with a REAL token: collator.LiveSuccessorOf performs the
-// apply over this state's own full parent and packages the result the way the
-// verifier does, so what is being tested is the production Over, the production
-// pointer comparison and the production carry-back — not a stand-in.
-//
-// The strongest assertion is the pending handle. It belongs to ANOTHER ChainState,
-// so successorOf refuses it: if the carry-back branch did not run, the fallback
-// would take that handle and the call would fail. A green result is therefore proof
-// that the root came back through Over rather than from a second apply.
+// The real builder's token must reach the validator's carry-back branch. A
+// pending handle owned by another ChainState makes a fallback apply fail, so
+// successful advancement proves the token prevented a second state apply.
 func TestValidatedCandidateStateCarriesBackTheLiveSuccessor(t *testing.T) {
-	fixture := newLiveSuccessorFixture(t, 0x70)
-	state, artifact := fixture.state(t, 0x70)
-
-	live, err := collator.LiveSuccessorOf(fixture.prepared, state.root, state.tipStates()...)
-	if err != nil {
-		t.Fatalf("build the live successor over this state's own parent: %v", err)
-	}
+	fixture := newBuiltSuccessorFixture(t)
+	state, artifact := fixture.parent, fixture.artifact
+	live := fixture.live
 	carried, opened := live.Over(state.root, state.tipStates()...)
 	if !opened {
 		t.Fatal("the token does not open for the state it was built over, so the fixture is wrong")
 	}
 
-	successor := fixture.successorOf(artifact)
-	successor.Live = live
+	prepared, err := cell.PrepareMerkleUpdatePlanned(fixture.update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := CandidateSuccessor{
+		BlockRoot: artifact.validationRoots.block, StateUpdate: fixture.update,
+		Prepared: prepared, StateHash: fixture.expected.HashKeyAt(0), Live: live,
+	}
 	// A handle on another state: the fallback apply cannot use it, so reaching the
 	// fallback is a failure rather than a silent duplicate walk.
-	foreign := (&ChainState{shard: state.shard, root: fixture.parent}).pendingSuccessor(context.Background())
+	foreign := (&ChainState{shard: state.shard, root: fixture.parent.root}).pendingSuccessor(context.Background())
 
 	next, err := state.validatedCandidateState(artifact, successor, foreign)
 	if err != nil {
@@ -330,21 +319,21 @@ func TestValidatedCandidateStateCarriesBackTheLiveSuccessor(t *testing.T) {
 	if tips := next.tipStates(); len(tips) != 1 || tips[0] != carried {
 		t.Fatal("the successor tip is not the carried-back root")
 	}
-	// FULL, and a hash check cannot tell: a narrow successor has the same hash.
-	bits, err := untouchedLeafBits(next.root)
-	if err != nil {
-		t.Fatalf("walk the untouched subtree of the carried-back successor: %v", err)
+	// Every cell of the resulting state must remain readable, including subtrees
+	// omitted from the update. Comparing hashes alone cannot detect pruning.
+	if countSuccessorPrunedCells(t, fixture.update) == 0 {
+		t.Fatal("fixture update has no omitted subtree, so it cannot test full state retention")
 	}
-	if bits != fixture.untouchedBit {
-		t.Fatalf("untouched leaf of the carried-back successor = %#x, want %#x", bits, fixture.untouchedBit)
+	if countSuccessorPrunedCells(t, next.root) != 0 {
+		t.Fatal("successor contains a pruned subtree")
 	}
 
 	// THE CONTROL, and the reason the carry-back is safe at all: the token opens for
 	// the trees it was built over and for nothing else. A parent of equal content but
 	// another materialization is refused, which is what keeps a proof-backed root out
 	// of the lineage — it has the same hash as the full one.
-	twin := cell.BeginCell().MustStoreBuilder(fixture.parent.ToBuilder()).EndCell()
-	if twin.HashKeyAt(0) != fixture.parent.HashKeyAt(0) {
+	twin := cell.BeginCell().MustStoreBuilder(fixture.parent.root.ToBuilder()).EndCell()
+	if twin.HashKeyAt(0) != fixture.parent.root.HashKeyAt(0) {
 		t.Fatal("the twin parent is not the same content, so it does not test identity")
 	}
 	if _, refused := live.Over(twin, twin); refused {
@@ -369,4 +358,32 @@ func TestValidatedCandidateStateCarriesBackTheLiveSuccessor(t *testing.T) {
 	if errors.Is(err, ErrCandidateRejected) {
 		t.Fatal("a local bookkeeping failure was classified as a candidate rejection")
 	}
+}
+
+func countSuccessorPrunedCells(t *testing.T, root *cell.Cell) int {
+	t.Helper()
+
+	var pruned int
+	seen := make(map[*cell.Cell]struct{})
+	pending := []*cell.Cell{root}
+	for len(pending) != 0 {
+		node := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if _, visited := seen[node]; visited {
+			continue
+		}
+		seen[node] = struct{}{}
+		if node.GetType() == cell.PrunedCellType {
+			pruned++
+		}
+		for i := range int(node.RefsNum()) {
+			child, err := node.PeekRef(i)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending = append(pending, child)
+		}
+	}
+
+	return pruned
 }

@@ -64,7 +64,7 @@ func TestBuildMasterEndToEnd(t *testing.T) {
 	if first.CreatedBy != fixture.request.CreatedBy || len(first.Externals) != 0 {
 		t.Fatal("candidate metadata changed")
 	}
-	if err = VerifyMasterCandidate(context.Background(), MasterVerificationRequest{
+	if err = verifyMasterCandidateForTest(context.Background(), MasterVerificationRequest{
 		Previous:  fixture.request.Previous,
 		Config:    fixture.request.Config,
 		Groups:    fixture.request.Groups,
@@ -201,7 +201,7 @@ func TestBuildMasterSetsLoadHistoryWishes(t *testing.T) {
 	if block.BlockInfo.WantSplit || !block.BlockInfo.WantMerge {
 		t.Fatalf("masterchain load wishes: split=%t merge=%t", block.BlockInfo.WantSplit, block.BlockInfo.WantMerge)
 	}
-	if err = VerifyMasterCandidate(context.Background(), MasterVerificationRequest{
+	if err = verifyMasterCandidateForTest(context.Background(), MasterVerificationRequest{
 		Previous:  fixture.request.Previous,
 		Config:    fixture.request.Config,
 		Groups:    fixture.request.Groups,
@@ -361,7 +361,7 @@ func masterBuildRoundTrip(
 	if err != nil {
 		t.Fatalf("build masterchain candidate: %v", err)
 	}
-	if err = VerifyMasterCandidate(context.Background(), MasterVerificationRequest{
+	if err = verifyMasterCandidateForTest(context.Background(), MasterVerificationRequest{
 		Previous:  fixture.request.Previous,
 		Config:    fixture.request.Config,
 		Groups:    fixture.request.Groups,

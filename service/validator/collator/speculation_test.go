@@ -440,6 +440,7 @@ func TestSpeculativeChainResolvesTheCarriedBaseWithoutTheSession(t *testing.T) {
 		built.BlockBOC,
 		candidateBlock(t, built),
 		built.State,
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)

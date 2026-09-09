@@ -559,7 +559,7 @@ func TestSemanticVerifierBuildsMasterchainExecutionContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorder := &recordingCandidateTransitionVerifier{}
-	if err = VerifyMasterCandidate(context.Background(), MasterVerificationRequest{
+	if err = verifyMasterCandidateForTest(context.Background(), MasterVerificationRequest{
 		Previous:           fixture.request.Previous,
 		Config:             fixture.request.Config,
 		Groups:             fixture.request.Groups,
@@ -835,7 +835,7 @@ func semanticPreparedShardReplay(tb testing.TB, req ShardRequest) *semanticRepla
 	verification := shardVerificationRequest(req, candidate)
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = recorder
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		tb.Fatalf("prepare shard transition: %v", err)
 	}
 	replay, err := newSemanticReplay(context.Background(), NewSemanticVerifier(tvm.NewTVM()), recorder.transition)

@@ -44,23 +44,23 @@ func TestVerifyShardCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	verification := shardVerificationRequest(req, candidate)
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify valid shard candidate: %v", err)
 	}
 	missingSemantics := verification
 	missingSemantics.Semantics = nil
-	if err = VerifyShardCandidate(context.Background(), missingSemantics); err == nil ||
+	if err = verifyShardCandidateForTest(context.Background(), missingSemantics); err == nil ||
 		!strings.Contains(err.Error(), "transition verifier is absent") {
 		t.Fatalf("VerifyShardCandidate missing semantic verifier error = %v", err)
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err = VerifyShardCandidate(cancelled, verification); !errors.Is(err, context.Canceled) {
+	if err = verifyShardCandidateForTest(cancelled, verification); !errors.Is(err, context.Canceled) {
 		t.Fatalf("VerifyShardCandidate cancelled context error = %v", err)
 	}
 	missingConfig := verification
 	missingConfig.Masterchain.Config = nil
-	if err = VerifyShardCandidate(context.Background(), missingConfig); err == nil ||
+	if err = verifyShardCandidateForTest(context.Background(), missingConfig); err == nil ||
 		!strings.Contains(err.Error(), "verification config is absent") {
 		t.Fatalf("VerifyShardCandidate nil config error = %v", err)
 	}
@@ -145,7 +145,7 @@ func TestVerifyShardCandidate(t *testing.T) {
 
 			changed := verification
 			changed.Candidate = tampered
-			err := VerifyShardCandidate(context.Background(), changed)
+			err := verifyShardCandidateForTest(context.Background(), changed)
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("VerifyShardCandidate error = %v, want containing %q", err, test.wantErr)
 			}
@@ -165,7 +165,7 @@ func TestVerifyShardCandidate(t *testing.T) {
 		)
 		changed := verification
 		changed.Candidate = prefixed
-		if verifyErr := VerifyShardCandidate(context.Background(), changed); verifyErr != nil {
+		if verifyErr := verifyShardCandidateForTest(context.Background(), changed); verifyErr != nil {
 			t.Fatalf("verify candidate with reordered collated roots: %v", verifyErr)
 		}
 	})
@@ -188,7 +188,7 @@ func TestVerifyShardCandidate(t *testing.T) {
 		)
 		unique := verification
 		unique.Candidate = withUniqueProof
-		if verifyErr := VerifyShardCandidate(context.Background(), unique); verifyErr == nil ||
+		if verifyErr := verifyShardCandidateForTest(context.Background(), unique); verifyErr == nil ||
 			!strings.Contains(verifyErr.Error(), "predecessor block proof is absent") {
 			t.Fatalf("unbound full collated proof error = %v", verifyErr)
 		}
@@ -200,7 +200,7 @@ func TestVerifyShardCandidate(t *testing.T) {
 		)
 		changed := verification
 		changed.Candidate = tampered
-		if verifyErr := VerifyShardCandidate(context.Background(), changed); verifyErr == nil ||
+		if verifyErr := verifyShardCandidateForTest(context.Background(), changed); verifyErr == nil ||
 			!strings.Contains(verifyErr.Error(), "duplicate collated proof virtual root") {
 			t.Fatalf("duplicate proof error = %v", verifyErr)
 		}
@@ -211,7 +211,7 @@ func TestVerifyShardCandidate(t *testing.T) {
 		blockConfig.maxBlockBytes = uint32(len(candidate.BlockBOC) - 1)
 		oversizedBlock := verification
 		oversizedBlock.Masterchain.Config = &blockConfig
-		if verifyErr := VerifyShardCandidate(context.Background(), oversizedBlock); !errors.Is(verifyErr, ErrSizeLimit) {
+		if verifyErr := verifyShardCandidateForTest(context.Background(), oversizedBlock); !errors.Is(verifyErr, ErrSizeLimit) {
 			t.Fatalf("oversized block error = %v", verifyErr)
 		}
 
@@ -219,7 +219,7 @@ func TestVerifyShardCandidate(t *testing.T) {
 		collatedConfig.maxCollatedBytes = uint32(len(candidate.CollatedData) - 1)
 		oversizedCollated := verification
 		oversizedCollated.Masterchain.Config = &collatedConfig
-		if verifyErr := VerifyShardCandidate(context.Background(), oversizedCollated); !errors.Is(verifyErr, ErrSizeLimit) {
+		if verifyErr := verifyShardCandidateForTest(context.Background(), oversizedCollated); !errors.Is(verifyErr, ErrSizeLimit) {
 			t.Fatalf("oversized collated data error = %v", verifyErr)
 		}
 	})
@@ -377,7 +377,7 @@ func TestVerifyShardCandidateWithTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = VerifyShardCandidate(context.Background(), shardVerificationRequest(req, candidate)); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), shardVerificationRequest(req, candidate)); err != nil {
 		t.Fatalf("verify candidate with descriptors and account block: %v", err)
 	}
 }
@@ -609,13 +609,13 @@ func TestVerifyShardCandidateUsesMechanicalMergeRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	verification := shardVerificationRequest(fixture.req, candidate)
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify valid merge candidate: %v", err)
 	}
 
 	withoutSecondRequest := verification
 	withoutSecondRequest.Previous2 = nil
-	withoutSecond := VerifyShardCandidate(context.Background(), withoutSecondRequest)
+	withoutSecond := verifyShardCandidateForTest(context.Background(), withoutSecondRequest)
 	if withoutSecond == nil {
 		t.Fatal("merge candidate verified without its second predecessor")
 	}
@@ -625,7 +625,7 @@ func TestVerifyShardCandidateUsesMechanicalMergeRoot(t *testing.T) {
 	swapped := verification
 	swapped.Previous = swappedFirst
 	swapped.Previous2 = &swappedSecond
-	if err = VerifyShardCandidate(context.Background(), swapped); err == nil {
+	if err = verifyShardCandidateForTest(context.Background(), swapped); err == nil {
 		t.Fatal("merge candidate verified with swapped predecessor order")
 	}
 
@@ -640,7 +640,7 @@ func TestVerifyShardCandidateUsesMechanicalMergeRoot(t *testing.T) {
 	})
 	tamperedRequest := verification
 	tamperedRequest.Candidate = tampered
-	err = VerifyShardCandidate(context.Background(), tamperedRequest)
+	err = verifyShardCandidateForTest(context.Background(), tamperedRequest)
 	if err == nil || !strings.Contains(err.Error(), "does not apply to predecessor") {
 		t.Fatalf("merge update rooted at one child error = %v", err)
 	}
@@ -649,18 +649,18 @@ func TestVerifyShardCandidateUsesMechanicalMergeRoot(t *testing.T) {
 func TestVerifyMasterCandidate(t *testing.T) {
 	request := newVerificationMasterCandidate(t)
 	candidate := request.Candidate
-	if err := VerifyMasterCandidate(context.Background(), request); err != nil {
+	if err := verifyMasterCandidateForTest(context.Background(), request); err != nil {
 		t.Fatalf("verify valid master candidate: %v", err)
 	}
 	missingSemantics := request
 	missingSemantics.Semantics = nil
-	if err := VerifyMasterCandidate(context.Background(), missingSemantics); err == nil ||
+	if err := verifyMasterCandidateForTest(context.Background(), missingSemantics); err == nil ||
 		!strings.Contains(err.Error(), "transition verifier is absent") {
 		t.Fatalf("VerifyMasterCandidate missing semantic verifier error = %v", err)
 	}
 	missingConfig := request
 	missingConfig.Config = nil
-	if err := VerifyMasterCandidate(context.Background(), missingConfig); err == nil ||
+	if err := verifyMasterCandidateForTest(context.Background(), missingConfig); err == nil ||
 		!strings.Contains(err.Error(), "verification config is absent") {
 		t.Fatalf("VerifyMasterCandidate nil config error = %v", err)
 	}
@@ -678,7 +678,7 @@ func TestVerifyMasterCandidate(t *testing.T) {
 		)
 		verification := request
 		verification.Candidate = prefixed
-		if err = VerifyMasterCandidate(context.Background(), verification); err != nil {
+		if err = verifyMasterCandidateForTest(context.Background(), verification); err != nil {
 			t.Fatalf("verify master candidate with top block descriptor set: %v", err)
 		}
 	})
@@ -693,7 +693,7 @@ func TestVerifyMasterCandidate(t *testing.T) {
 		rewriteVerificationCollatedData(t, prefixed, append([]*cell.Cell{unknown}, roots...)...)
 		verification := request
 		verification.Candidate = prefixed
-		if err = VerifyMasterCandidate(context.Background(), verification); err != nil {
+		if err = verifyMasterCandidateForTest(context.Background(), verification); err != nil {
 			t.Fatalf("verify master candidate with unknown collated root: %v", err)
 		}
 	})
@@ -713,7 +713,7 @@ func TestVerifyMasterCandidate(t *testing.T) {
 		)
 		verification := request
 		verification.Candidate = prefixed
-		err = VerifyMasterCandidate(context.Background(), verification)
+		err = verifyMasterCandidateForTest(context.Background(), verification)
 		if err == nil || !strings.Contains(err.Error(), "invalid descriptor reference") {
 			t.Fatalf("VerifyMasterCandidate malformed descriptor set error = %v", err)
 		}
@@ -724,7 +724,7 @@ func TestVerifyMasterCandidate(t *testing.T) {
 		tampered.ID.Workchain = 0
 		verification := request
 		verification.Candidate = tampered
-		if err := VerifyMasterCandidate(context.Background(), verification); err == nil {
+		if err := verifyMasterCandidateForTest(context.Background(), verification); err == nil {
 			t.Fatal("master candidate verified with a basechain id")
 		}
 	})
@@ -734,7 +734,7 @@ func TestVerifyMasterCandidate(t *testing.T) {
 		rewriteVerificationMasterBlock(t, tampered, nil)
 		verification := request
 		verification.Candidate = tampered
-		err := VerifyMasterCandidate(context.Background(), verification)
+		err := verifyMasterCandidateForTest(context.Background(), verification)
 		if err == nil || !strings.Contains(err.Error(), "has no masterchain block extra") {
 			t.Fatalf("VerifyMasterCandidate error = %v", err)
 		}
@@ -753,7 +753,7 @@ func TestVerifyMasterCandidate(t *testing.T) {
 		})
 		verification := request
 		verification.Candidate = tampered
-		err = VerifyMasterCandidate(context.Background(), verification)
+		err = verifyMasterCandidateForTest(context.Background(), verification)
 		if err == nil || !strings.Contains(err.Error(), "does not apply to predecessor") {
 			t.Fatalf("VerifyMasterCandidate error = %v", err)
 		}
@@ -978,14 +978,14 @@ func TestVerifyStateTransitionPinsBothEndpoints(t *testing.T) {
 	verification := shardVerificationRequest(req, candidate)
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("genuine candidate rejected: %v", err)
 	}
 
 	// A predecessor the update was not built from must fail the source pin.
 	tampered := verification
 	tampered.Previous.State = strangerState
-	err = VerifyShardCandidate(context.Background(), tampered)
+	err = verifyShardCandidateForTest(context.Background(), tampered)
 	if err == nil {
 		t.Fatal("candidate accepted against a foreign predecessor state")
 	}
@@ -999,7 +999,7 @@ func TestVerifyStateTransitionPinsBothEndpoints(t *testing.T) {
 	forged := *candidate
 	forged.State = strangerState
 	tampered.Candidate = &forged
-	err = VerifyShardCandidate(context.Background(), tampered)
+	err = verifyShardCandidateForTest(context.Background(), tampered)
 	if err == nil {
 		t.Fatal("candidate accepted with a state its update does not produce")
 	}

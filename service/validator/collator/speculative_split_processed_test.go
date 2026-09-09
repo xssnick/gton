@@ -218,7 +218,7 @@ func TestFullCollatedSpeculativeSplitQueuePrefixRequiresExactImports(t *testing.
 		t.Fatalf("later-only candidate stats = %+v, want one import and the early message retained", badCandidate.Stats)
 	}
 	badVerification := serializedFullCollatedVerification(t, badRequest, badCandidate)
-	err = VerifyShardCandidate(context.Background(), badVerification)
+	err = verifyShardCandidateForTest(context.Background(), badVerification)
 	if !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), "no exact InMsg") {
 		t.Fatalf("later-only ProcessedInfo error = %v, want missing exact InMsg", err)
 	}
@@ -283,7 +283,7 @@ func verifySerializedFullCollatedCandidate(t *testing.T, req ShardRequest, candi
 	t.Helper()
 
 	verification := serializedFullCollatedVerification(t, req, candidate)
-	if err := VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err := verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify serialized full-collated candidate: %v", err)
 	}
 }

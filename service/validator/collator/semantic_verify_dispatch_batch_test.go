@@ -22,6 +22,7 @@ type semanticDispatchBatchAccount struct {
 
 type semanticDispatchBatchFixture struct {
 	old, candidate *tlb.DispatchQueueAugDict
+	outQueue       *tlb.OutMsgQueueAugDict
 	in             []semanticInDescriptorEntry
 	out            []semanticOutDescriptorEntry
 }
@@ -212,7 +213,11 @@ func newSemanticDispatchBatchFixture(t testing.TB, accounts []semanticDispatchBa
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := &semanticDispatchBatchFixture{old: old, candidate: candidate}
+	outQueue, err := tlb.NewOutMsgQueueAugDict()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &semanticDispatchBatchFixture{old: old, candidate: candidate, outQueue: outQueue}
 	for _, account := range accounts {
 		remaining := make(map[uint64]*semanticEnvelope)
 		for _, lt := range account.old {
@@ -247,8 +252,8 @@ func (f *semanticDispatchBatchFixture) validation() *semanticQueueValidation {
 	return &semanticQueueValidation{
 		replay:    &semanticReplay{ctx: context.Background(), candidate: candidate, transition: CandidateTransition{Config: &Config{capabilities: capDeferMessages}}},
 		target:    msgpool.ShardIdent{Workchain: 0, Shard: msgpool.ShardAll},
-		old:       tlb.OutMsgQueueInfo{Extra: &tlb.OutMsgQueueExtra{DispatchQueue: f.old}},
-		candidate: &tlb.OutMsgQueueInfo{Extra: &tlb.OutMsgQueueExtra{DispatchQueue: f.candidate}},
+		old:       tlb.OutMsgQueueInfo{OutQueue: f.outQueue, Extra: &tlb.OutMsgQueueExtra{DispatchQueue: f.old}},
+		candidate: &tlb.OutMsgQueueInfo{OutQueue: f.outQueue, Extra: &tlb.OutMsgQueueExtra{DispatchQueue: f.candidate}},
 		dispatch:  &tlb.DispatchQueueAugDict{AugmentedDictionary: f.old.Copy()},
 		inOrder:   f.in, outOrder: f.out,
 	}

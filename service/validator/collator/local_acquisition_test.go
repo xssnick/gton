@@ -678,7 +678,7 @@ func TestLocalMasterMessagesIgnoreUnselectedReadyViews(t *testing.T) {
 	acquisition := &LocalAcquisition{
 		messages: pool,
 		configs: localConfigCache{
-			entries: make(map[cell.Hash]localPreparedConfig),
+			entries: make(map[localConfigKey]localPreparedConfig),
 		},
 	}
 	master, err := acquisition.masterView(fixture.request.Previous, fixture.oldState, fixture.request.Groups)
@@ -2202,6 +2202,7 @@ func TestLocalAdvanceConsensusBaseUsesSelectedStateWithoutStoreRead(t *testing.T
 		built.BlockBOC,
 		candidateBlock(t, built),
 		built.State,
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -2446,7 +2447,7 @@ func TestLocalMasterProjectionChainsAcrossSpeculativeSlots(t *testing.T) {
 	acquisition := &LocalAcquisition{
 		groups: tracker,
 		configs: localConfigCache{
-			entries: make(map[cell.Hash]localPreparedConfig),
+			entries: make(map[localConfigKey]localPreparedConfig),
 		},
 	}
 	base, err := acquisition.masterView(fixture.request.Previous, fixture.oldState, fixture.request.Groups)
@@ -2530,7 +2531,7 @@ func TestLocalMasterProjectionAllowsSpeculativeSessionRotation(t *testing.T) {
 	acquisition := &LocalAcquisition{
 		groups: &localAcquisitionTestGroups{projected: &rotated},
 		configs: localConfigCache{
-			entries: make(map[cell.Hash]localPreparedConfig),
+			entries: make(map[localConfigKey]localPreparedConfig),
 		},
 	}
 	base, err := acquisition.masterView(fixture.request.Previous, fixture.oldState, fixture.request.Groups)

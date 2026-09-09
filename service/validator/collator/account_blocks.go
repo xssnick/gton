@@ -20,12 +20,6 @@ type accountBlockEntry struct {
 	key   [32]byte
 	block tlb.AccountBlock
 
-	// decodeErr is the AccountBlock decode failure the structural pass raises,
-	// deferred instead of raised on the index-less rebuild — see
-	// buildAccountBlockIndexDeferred. It is always nil on an index built for a
-	// candidate, because that build stops at the failure.
-	decodeErr error
-
 	// exactErr is what loadExactSlice would have returned for this entry. The
 	// structural pass decodes with tlb.LoadFromCell, which tolerates trailing
 	// data; both semantic consumers reject it, and each words the rejection
@@ -61,12 +55,10 @@ type accountBlockIndex struct {
 	keyed bool
 }
 
-// find returns the entry for key, or false when the index cannot answer for it:
-// a nil or degraded index, or a key the walk did not see. Both callers treat
-// false as "take the path you took before this index existed", which is what
-// makes "the index cannot change any verdict" provable rather than argued.
+// find returns the entry for key when the structural index can answer for it.
+// A non-keyed index or an absent key requires the caller to query the dictionary.
 func (i *accountBlockIndex) find(key [32]byte) (*accountBlockEntry, bool) {
-	if i == nil || !i.keyed {
+	if !i.keyed {
 		return nil, false
 	}
 	// Hand-rolled rather than slices.BinarySearchFunc: that one takes the
@@ -104,29 +96,6 @@ func (i *accountBlockIndex) find(key [32]byte) (*accountBlockEntry, bool) {
 // and dropped before the next one; the lane projection and every find() run only
 // once the slice is final.
 func buildAccountBlockIndex(blocks *tlb.ShardAccountBlocksAugDict) (*accountBlockIndex, error) {
-	return buildAccountBlockIndexWith(blocks, false)
-}
-
-// buildAccountBlockIndexDeferred is the same walk with the two verdicts above
-// recorded rather than raised, and the walk stopping at the first of them.
-//
-// It exists for the one caller that rebuilds an index the structural pass never
-// produced: decodeAccountLanes on a replay assembled without a structural
-// verifier. For that caller the strict form would be wrong, not merely stricter.
-// Before the index existed, that walk decoded entries itself and turned an
-// undecodable one into a lane failure ranked by account key like any other, and
-// it never looked at transaction augmentations at all — those belong to the
-// structural pass, which such a replay by definition did not run. Raising here
-// would give a candidate a different rejection, with different words and a
-// different rank, depending on how the replay around it was assembled.
-func buildAccountBlockIndexDeferred(blocks *tlb.ShardAccountBlocksAugDict) (*accountBlockIndex, error) {
-	return buildAccountBlockIndexWith(blocks, true)
-}
-
-func buildAccountBlockIndexWith(
-	blocks *tlb.ShardAccountBlocksAugDict,
-	deferVerdicts bool,
-) (*accountBlockIndex, error) {
 	iterator, err := blocks.IteratorExtra(false, false)
 	if err != nil {
 		return nil, err
@@ -147,21 +116,13 @@ func buildAccountBlockIndexWith(
 		// loadExactSlice, so a failure aborts here and trailing data does not.
 		value := item.Value
 		if err = tlb.LoadFromCell(&entry.block, &value); err != nil {
-			if !deferVerdicts {
-				return nil, err
-			}
-			// entry.block is now partial, so nothing below may read it. The walk
-			// ends here, which is where the pre-index walk ended too.
-			entry.decodeErr = err
-			return index, nil
+			return nil, err
 		}
 		if value.BitsLeft() != 0 || value.RefsNum() != 0 {
 			entry.exactErr = fmt.Errorf("trailing data: %d bits, %d refs", value.BitsLeft(), value.RefsNum())
 		}
-		if !deferVerdicts {
-			if err = verifyAccountTransactions(&entry.block); err != nil {
-				return nil, err
-			}
+		if err = verifyAccountTransactions(&entry.block); err != nil {
+			return nil, err
 		}
 		entry.updateErr = parseExact(&entry.update, entry.block.StateUpdate)
 

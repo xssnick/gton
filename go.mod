@@ -11,9 +11,9 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/rs/zerolog v1.35.1
 	github.com/xssnick/raptorq v1.5.2
-	github.com/xssnick/tonutils-go v1.18.1-0.20260906170022-677cbed9b78e
-	golang.org/x/crypto v0.55.0
-	golang.org/x/sys v0.47.0
+	github.com/xssnick/tonutils-go v1.18.1-0.20260909110616-6ba94a7ea83a
+	golang.org/x/crypto v0.57.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
@@ -49,7 +49,7 @@ require (
 	github.com/xssnick/quic-go-ton v0.0.0-20260707110703-14f3237f97b9 // indirect
 	golang.org/x/exp v0.0.0-20260508232706-74f9aab9d74a // indirect
 	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect

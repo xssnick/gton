@@ -113,7 +113,7 @@ func verifyMasterCandidateOnItsCollatedProofs(t *testing.T, fixture fullMasterFi
 		Semantics:          NewSemanticVerifier(tvm.NewTVM()),
 		Candidate:          candidate,
 	}
-	if err = VerifyMasterCandidate(context.Background(), verification); err != nil {
+	if err = verifyMasterCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify the masterchain candidate on its collated proofs: %v", err)
 	}
 }

@@ -222,7 +222,7 @@ func TestGeneratedMasterStateIsAcceptedByValidatorTracker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare generated execution config: %v", err)
 	}
-	if _, err = collator.PrepareConfig(executionConfig); err != nil {
+	if _, err = collator.PrepareConfig(executionConfig, configAddress); err != nil {
 		t.Fatalf("prepare generated collator config: %v", err)
 	}
 }
@@ -443,7 +443,7 @@ func TestGeneratedStateBuildsFirstMasterchainBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	preparedConfig, err := collator.PrepareConfig(executionConfig)
+	preparedConfig, err := collator.PrepareConfig(executionConfig, configAddress)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +550,7 @@ func TestGeneratedStateBuildsFirstMasterchainBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare persisted generated execution config: %v", err)
 	}
-	lazyConfig, err := collator.PrepareConfig(lazyExecutionConfig)
+	lazyConfig, err := collator.PrepareConfig(lazyExecutionConfig, configAddress)
 	if err != nil {
 		t.Fatalf("prepare persisted generated collator config: %v", err)
 	}

@@ -13,14 +13,13 @@ var errConfigAddressAbsent = errors.New("config address is absent")
 
 const validatorRegistryConfigConstructor = uint64(0x3601163e)
 
-var hardMandatoryConfigParameters = [...]uint32{
+var hardMandatoryConfigParameters = [...]int32{
 	18, 20, 21, 22, 23, 24, 25, 28, 34,
 }
 
-// validateMasterConfigData checks the configuration parts represented by
-// tonutils. Every outer value must be an exact reference,
-// known positive parameters are decoded by their protocol type, and both the
-// old and resulting mandatory parameter sets are enforced.
+// validateMasterConfigData requires exact references and validates every known
+// positive parameter against its TL-B schema, then enforces both the old and
+// resulting mandatory parameter sets.
 func validateMasterConfigData(
 	root *cell.Cell,
 	accountID []byte,
@@ -34,36 +33,40 @@ func validateMasterConfigData(
 	if dict.GetKeySize() != 32 || dict.IsEmpty() {
 		return fmt.Errorf("%w: config parameter dictionary is empty or has a wrong key size", ErrInvalidInput)
 	}
-	items, err := dict.LoadAll()
-	if err != nil {
-		return fmt.Errorf("%w: load config parameters: %v", ErrInvalidInput, err)
-	}
-	present := make(map[uint32]struct{}, len(items))
-	raw := tlb.BlockchainConfig{Root: root}
-	for i := range items {
-		key, loadErr := items[i].Key.LoadInt(32)
-		if loadErr != nil || items[i].Key.BitsLeft() != 0 {
-			return fmt.Errorf("%w: config parameter %d key is malformed", ErrInvalidInput, i)
+	present := make(map[int32]struct{})
+	// The plain dictionary iterator validates fork shape as well as labels.
+	// LoadAll also handles augmented trees and permits fork payloads here.
+	err := dict.ForEachBorrowed(false, false, func(item cell.DictItemView) error {
+		key, loadErr := item.Key.LoadInt(32)
+		if loadErr != nil {
+			return fmt.Errorf("%w: config parameter key is malformed", ErrInvalidInput)
 		}
-		parameter, loadErr := items[i].Value.LoadRefCell()
-		if loadErr != nil || items[i].Value.BitsLeft() != 0 || items[i].Value.RefsNum() != 0 {
+		parameter, loadErr := item.Value.LoadRefCell()
+		if loadErr != nil || item.Value.BitsLeft() != 0 || item.Value.RefsNum() != 0 {
 			return fmt.Errorf("%w: config parameter %d is not an exact reference", ErrInvalidInput, key)
 		}
-		if key < 0 {
-			continue
-		}
-		id := uint32(key)
+		id := int32(key)
 		present[id] = struct{}{}
-		if id == tlb.ConfigParamConfigAddress {
+
+		// Negative parameters have arbitrary values, but may still be named
+		// by either mandatory set (Config::unpack_param_dict uses int32 IDs).
+		if id < 0 {
+			return nil
+		}
+		if id == 0 {
 			address, addressErr := exactBits256(parameter)
 			if addressErr != nil || !relaxAddress && !bytes.Equal(address, accountID) {
 				return fmt.Errorf("%w: config parameter 0 does not name its contract", ErrInvalidInput)
 			}
-			continue
+			return nil
 		}
-		if err = validateKnownConfigParameter(raw, id); err != nil {
+		if err := validateKnownConfigParameter(parameter, uint32(id)); err != nil {
 			return fmt.Errorf("%w: config parameter %d: %v", ErrInvalidInput, id, err)
 		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("%w: config dictionary: %v", ErrInvalidInput, err)
 	}
 
 	for _, id := range hardMandatoryConfigParameters {
@@ -71,7 +74,7 @@ func validateMasterConfigData(
 			return fmt.Errorf("%w: mandatory config parameter %d is absent", ErrInvalidInput, id)
 		}
 	}
-	if err = requireConfigMandatorySet(raw, present); err != nil {
+	if err = requireConfigMandatorySet(tlb.BlockchainConfig{Root: root}, present); err != nil {
 		return err
 	}
 	if oldRoot != nil {
@@ -106,7 +109,7 @@ func exactBits256(root *cell.Cell) ([]byte, error) {
 	return value, nil
 }
 
-func requireConfigMandatorySet(raw tlb.BlockchainConfig, present map[uint32]struct{}) error {
+func requireConfigMandatorySet(raw tlb.BlockchainConfig, present map[int32]struct{}) error {
 	parameter, err := raw.GetParam(tlb.ConfigParamMandatoryParams)
 	if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
 		return nil
@@ -118,271 +121,18 @@ func requireConfigMandatorySet(raw tlb.BlockchainConfig, present map[uint32]stru
 	if dict.GetKeySize() != 32 {
 		return fmt.Errorf("%w: mandatory config set has a wrong key size", ErrInvalidInput)
 	}
-	items, err := dict.LoadAll()
-	if err != nil {
-		return fmt.Errorf("%w: load mandatory config set: %v", ErrInvalidInput, err)
-	}
-	for i := range items {
-		id, loadErr := items[i].Key.LoadUInt(32)
-		if loadErr != nil || items[i].Key.BitsLeft() != 0 ||
-			items[i].Value.BitsLeft() != 0 || items[i].Value.RefsNum() != 0 {
-			return fmt.Errorf("%w: mandatory config entry %d is malformed", ErrInvalidInput, i)
+	err = dict.ForEachBorrowed(false, false, func(item cell.DictItemView) error {
+		id, loadErr := item.Key.LoadInt(32)
+		if loadErr != nil || item.Value.BitsLeft() != 0 || item.Value.RefsNum() != 0 {
+			return fmt.Errorf("mandatory config entry is malformed")
 		}
-		if _, exists := present[uint32(id)]; !exists {
-			return fmt.Errorf("%w: declared mandatory config parameter %d is absent", ErrInvalidInput, id)
+		if _, exists := present[int32(id)]; !exists {
+			return fmt.Errorf("declared mandatory config parameter %d is absent", id)
 		}
-	}
-	return nil
-}
-
-func validateKnownConfigParameter(raw tlb.BlockchainConfig, id uint32) (err error) {
-	switch id {
-	case tlb.ConfigParamElectorAddress,
-		tlb.ConfigParamMinterAddress,
-		tlb.ConfigParamFeeCollectorAddress,
-		tlb.ConfigParamDNSRootAddress:
-		var parameter *cell.Cell
-		parameter, err = raw.GetParam(id)
-		if err == nil {
-			_, err = exactBits256(parameter)
-		}
-	case tlb.ConfigParamBurningConfig:
-		_, err = raw.GetBurningConfig()
-	case tlb.ConfigParamExtraCurrencyMintPrices:
-		_, err = raw.GetExtraCurrencyMintPrices()
-	case tlb.ConfigParamExtraCurrencyToMint:
-		_, err = raw.GetExtraCurrencyToMint()
-	case tlb.ConfigParamGlobalVersion:
-		_, err = raw.GetGlobalVersion()
-	case tlb.ConfigParamMandatoryParams:
-		_, err = raw.GetMandatoryParams()
-	case tlb.ConfigParamCriticalParams:
-		_, err = raw.GetCriticalParams()
-	case tlb.ConfigParamConfigVotingSetup:
-		_, err = raw.GetConfigVotingSetup()
-	case tlb.ConfigParamWorkchains:
-		_, err = raw.GetWorkchains()
-	case tlb.ConfigParamComplaintPricing:
-		_, err = raw.GetComplaintPricing()
-	case tlb.ConfigParamBlockCreateFees:
-		_, err = raw.GetBlockCreateFees()
-	case tlb.ConfigParamValidatorElectionTimings:
-		_, err = raw.GetValidatorElectionTimings()
-	case tlb.ConfigParamValidatorCountLimits:
-		_, err = raw.GetValidatorCountLimits()
-	case tlb.ConfigParamValidatorStakeLimits:
-		_, err = raw.GetValidatorStakeLimits()
-	case tlb.ConfigParamStoragePrices:
-		_, err = raw.GetStoragePrices(0)
-	case tlb.ConfigParamGlobalID:
-		_, err = raw.GetGlobalID()
-	case tlb.ConfigParamGasPricesMasterchain:
-		_, err = raw.GetGasPrices(true)
-	case tlb.ConfigParamGasPricesBasechain:
-		_, err = raw.GetGasPrices(false)
-	case tlb.ConfigParamBlockLimitsMasterchain:
-		_, err = raw.GetBlockLimits(true)
-	case tlb.ConfigParamBlockLimitsBasechain:
-		_, err = raw.GetBlockLimits(false)
-	case tlb.ConfigParamMsgForwardPricesMasterchain:
-		_, err = raw.GetMsgForwardPrices(true)
-	case tlb.ConfigParamMsgForwardPricesBasechain:
-		_, err = raw.GetMsgForwardPrices(false)
-	case tlb.ConfigParamCatchainConfig:
-		_, err = raw.GetCatchainConfig()
-	case tlb.ConfigParamConsensusConfig:
-		_, err = raw.GetConsensusConfig()
-	case tlb.ConfigParamNewConsensusConfig:
-		_, err = raw.GetNewConsensusConfig()
-	case tlb.ConfigParamFundamentalSMCAddresses:
-		_, err = raw.GetFundamentalSmartContractAddresses()
-	case tlb.ConfigParamPrevValidators:
-		_, err = raw.GetPrevValidators()
-	case tlb.ConfigParamPrevTempValidators:
-		_, err = raw.GetPrevTempValidators()
-	case tlb.ConfigParamCurrentValidators:
-		_, err = raw.GetCurrentValidators()
-	case tlb.ConfigParamCurrentTempValidators:
-		_, err = raw.GetCurrentTempValidators()
-	case tlb.ConfigParamNextValidators:
-		_, err = raw.GetNextValidators()
-	case tlb.ConfigParamNextTempValidators:
-		_, err = raw.GetNextTempValidators()
-	case tlb.ConfigParamValidatorTempKeys:
-		_, err = raw.GetValidatorTempKeys()
-	case tlb.ConfigParamMisbehaviourPunishment:
-		_, err = raw.GetMisbehaviourPunishmentConfig()
-	case tlb.ConfigParamSizeLimits:
-		_, err = raw.GetSizeLimitsConfig()
-	case tlb.ConfigParamSuspendedAddressList:
-		_, err = raw.GetSuspendedAddressList()
-	case tlb.ConfigParamPrecompiledContracts:
-		_, err = raw.GetPrecompiledContractsConfig()
-	case 46:
-		// ConfigParam 46 is not modelled by tonutils yet. Current testnet uses
-		// ValRegistryConfig from crypto/block/block.tlb.
-		err = validateValidatorRegistryConfigParameter(raw)
-	case 71, 72, 73:
-		err = validateOracleBridgeParameter(raw, id)
-	case 79, 80, 81, 82:
-		// The bridge ids are not modelled by tonutils, so they are listed by
-		// number. 79/80/81 are the ETH/BNB/Polygon JettonBridgeParams of
-		// crypto/block/block.tlb:780-782 at ton c7da81d4 (2023-03-23), all three
-		// accepted by ConfigParam::get_tag there; 82 is newer than that checkout
-		// and cannot be re-derived from it, so it stays on trust.
-		// Anything not listed here fails the whole masterchain block, so this set
-		// must be widened whenever governance introduces a parameter upstream
-		// already accepts.
-		err = validateJettonBridgeParameter(raw, id)
-	default:
-		return fmt.Errorf("unsupported positive parameter")
-	}
-	return err
-}
-
-func validateValidatorRegistryConfigParameter(raw tlb.BlockchainConfig) error {
-	parameter, err := raw.GetParam(46)
+		return nil
+	})
 	if err != nil {
-		return err
-	}
-	var loader cell.Slice
-	err = parameter.BeginParseInto(&loader)
-	if err != nil {
-		return err
-	}
-	constructor, err := loader.LoadUInt(32)
-	if err != nil {
-		return err
-	}
-	if constructor != validatorRegistryConfigConstructor {
-		return fmt.Errorf("unsupported validator registry constructor #%08x", constructor)
-	}
-	if err = loader.SkipBits(256); err != nil {
-		return err
-	}
-	if _, err = loader.LoadUInt(32); err != nil {
-		return err
-	}
-	hasNewCodeHash, err := loader.LoadBoolBit()
-	if err != nil {
-		return err
-	}
-	if hasNewCodeHash {
-		if err = loader.SkipBits(256); err != nil {
-			return err
-		}
-	}
-	if loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
-		return fmt.Errorf("validator registry parameter has trailing data")
-	}
-	return nil
-}
-
-func validateOracleBridgeParameter(raw tlb.BlockchainConfig, id uint32) error {
-	parameter, err := raw.GetParam(id)
-	if err != nil {
-		return err
-	}
-	var loader cell.Slice
-	err = parameter.BeginParseInto(&loader)
-	if err != nil {
-		return err
-	}
-	if err = loader.SkipBits(512); err != nil {
-		return err
-	}
-	oracles, err := loader.LoadDict(256)
-	if err != nil {
-		return err
-	}
-	if err = loader.SkipBits(256); err != nil {
-		return err
-	}
-	if loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
-		return fmt.Errorf("oracle bridge parameter has trailing data")
-	}
-	return validateOracleDictionary(oracles)
-}
-
-func validateJettonBridgeParameter(raw tlb.BlockchainConfig, id uint32) error {
-	parameter, err := raw.GetParam(id)
-	if err != nil {
-		return err
-	}
-	var loader cell.Slice
-	err = parameter.BeginParseInto(&loader)
-	if err != nil {
-		return err
-	}
-	version, err := loader.LoadUInt(8)
-	if err != nil {
-		return err
-	}
-	if err = loader.SkipBits(512); err != nil {
-		return err
-	}
-	oracles, err := loader.LoadDict(256)
-	if err != nil {
-		return err
-	}
-	if _, err = loader.LoadUInt(8); err != nil {
-		return err
-	}
-	switch version {
-	case 0:
-		if _, err = loader.LoadBigCoins(); err != nil {
-			return err
-		}
-	case 1:
-		prices, loadErr := loader.LoadRefCell()
-		if loadErr != nil {
-			return loadErr
-		}
-		if err = validateJettonBridgePrices(prices); err != nil {
-			return err
-		}
-		if err = loader.SkipBits(256); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("unknown jetton bridge version %d", version)
-	}
-	if loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
-		return fmt.Errorf("jetton bridge parameter has trailing data")
-	}
-	return validateOracleDictionary(oracles)
-}
-
-func validateJettonBridgePrices(root *cell.Cell) error {
-	var loader cell.Slice
-	err := root.BeginParseInto(&loader)
-	if err != nil {
-		return err
-	}
-	for range 6 {
-		if _, err = loader.LoadBigCoins(); err != nil {
-			return err
-		}
-	}
-	if loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
-		return fmt.Errorf("jetton bridge prices have trailing data")
-	}
-	return nil
-}
-
-func validateOracleDictionary(dict *cell.Dictionary) error {
-	if dict.GetKeySize() != 256 {
-		return fmt.Errorf("oracle dictionary has a wrong key size")
-	}
-	items, err := dict.LoadAll()
-	if err != nil {
-		return err
-	}
-	for i := range items {
-		if items[i].Key.BitsLeft() != 256 || items[i].Key.RefsNum() != 0 ||
-			items[i].Value.BitsLeft() != 256 || items[i].Value.RefsNum() != 0 {
-			return fmt.Errorf("oracle dictionary entry %d is malformed", i)
-		}
+		return fmt.Errorf("%w: mandatory config set: %v", ErrInvalidInput, err)
 	}
 	return nil
 }

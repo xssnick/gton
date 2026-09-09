@@ -200,6 +200,66 @@ func TestValidateMasterShardLayoutAcceptsWorkchainActivation(t *testing.T) {
 	}
 }
 
+func TestValidateMasterShardLayoutRejectsActivationWithCreatedFunds(t *testing.T) {
+	empty := &ShardRegistry{
+		leaves:   make(map[shardRegistryKey]shardRegistryLeaf),
+		accepted: make(map[shardRegistryKey]shardRegistryLeaf),
+	}
+	config := masterShardFSMTestConfig(t, map[int32]masterShardFSMTestWorkchain{
+		0: {active: true, maxSplit: 2, rootFill: 0x51, fileFill: 0xa4},
+	})
+	activation := masterShardLayoutTestActivationRegistry(t, 0x51, 0xa4)
+	workchains := masterShardTestWorkchainMap(t, config)
+
+	type testCase struct {
+		name     string
+		nano     uint64
+		extra    uint64
+		withFees bool
+	}
+	tests := []testCase{
+		{name: "TON with empty ShardFees", nano: 1},
+		{name: "extra currency with empty ShardFees", extra: 1},
+		{name: "TON with matching ShardFees", nano: 1, withFees: true},
+		{name: "extra currency with matching ShardFees", extra: 1, withFees: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := masterShardLayoutTestClone(t, activation, func(_ shardRegistryKey, fields *shardDescriptorFields) {
+				fields.created = semanticTestCurrency(t, test.nano, test.extra)
+			})
+
+			var feeLeaves map[shardRegistryKey]shardRegistryLeaf
+			if test.withFees {
+				feeLeaves = candidate.leaves
+			}
+			fees := masterShardFeesTestDictionary(t, feeLeaves)
+			// Activation has no imported top. Both an omitted fee entry and an
+			// entry matching the descriptor pass ShardFees validation, so the
+			// activation check must independently enforce zero funds_created.
+			if _, err := validateMasterShardFees(masterShardFeesValidationInput{
+				fees:          fees,
+				newRegistry:   candidate,
+				newBlockSeqno: 5,
+			}); err != nil {
+				t.Fatalf("validate activation ShardFees: %v", err)
+			}
+
+			err := validateMasterShardLayout(masterShardLayoutValidationInput{
+				oldRegistry:   empty,
+				newRegistry:   candidate,
+				workchains:    workchains,
+				now:           100,
+				startLT:       1_000,
+				newBlockSeqno: 5,
+			})
+			if !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), "non-zero created funds") {
+				t.Fatalf("activation validation error = %v, want non-zero created funds rejection", err)
+			}
+		})
+	}
+}
+
 func TestValidateMasterShardLayoutAcceptsVerifiedLinearUpdate(t *testing.T) {
 	oldBlock := masterShardTestBlock(0, shard.Root, 90, 0x90)
 	oldHashes := masterShardTestHashes(t, masterShardTestWorkchain{

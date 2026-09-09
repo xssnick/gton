@@ -224,7 +224,7 @@ func NewLocalAcquisition(options LocalAcquisitionOptions) (*LocalAcquisition, er
 		externalLimit:          options.ExternalLimit,
 		maxExternalAttempts:    options.MaxExternalAttempts,
 		dispatch:               dispatch,
-		configs:                localConfigCache{log: options.Logger, entries: make(map[cell.Hash]localPreparedConfig)},
+		configs:                localConfigCache{log: options.Logger, entries: make(map[localConfigKey]localPreparedConfig)},
 		blocks:                 localBlockCache{entries: make(map[[32]byte]*localBlockSource)},
 		sessions:               make(map[[32]byte]*localAcquisitionSession),
 	}, nil

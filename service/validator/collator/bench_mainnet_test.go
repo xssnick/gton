@@ -776,7 +776,7 @@ func BenchmarkVerifyMainnetHeavy(b *testing.B) {
 	verification := shardVerificationRequest(req, candidate)
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		b.Fatalf("verify heavy mainnet candidate: %v", err)
 	}
 	ctx := context.Background()
@@ -784,7 +784,7 @@ func BenchmarkVerifyMainnetHeavy(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if err := VerifyShardCandidate(ctx, verification); err != nil {
+		if err := verifyShardCandidateForTest(ctx, verification); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -1006,7 +1006,7 @@ func BenchmarkVerifyMainnetHeavyFixture(b *testing.B) {
 	verification := shardVerificationRequest(req, candidate)
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		b.Fatalf("verify heavy fixture candidate: %v", err)
 	}
 	ctx := context.Background()
@@ -1014,7 +1014,7 @@ func BenchmarkVerifyMainnetHeavyFixture(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if err := VerifyShardCandidate(ctx, verification); err != nil {
+		if err := verifyShardCandidateForTest(ctx, verification); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -1171,7 +1171,7 @@ func benchmarkVerifyMainnetCollated(b *testing.B, repeat int) {
 	verification := shardVerificationRequest(req, candidate)
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		// This used to fail, and not because of the fixture: six accounts in
 		// this block carry a storage-stat dictionary and every one of them
 		// transacts between two and sixteen times, while the collated proof of
@@ -1188,7 +1188,7 @@ func benchmarkVerifyMainnetCollated(b *testing.B, repeat int) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if err := VerifyShardCandidate(ctx, verification); err != nil {
+		if err := verifyShardCandidateForTest(ctx, verification); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -1248,7 +1248,7 @@ func BenchmarkVerifyMainnet(b *testing.B) {
 	verification := shardVerificationRequest(req, candidate)
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		b.Fatalf("verify mainnet candidate: %v", err)
 	}
 	ctx := context.Background()
@@ -1256,7 +1256,7 @@ func BenchmarkVerifyMainnet(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if err := VerifyShardCandidate(ctx, verification); err != nil {
+		if err := verifyShardCandidateForTest(ctx, verification); err != nil {
 			b.Fatal(err)
 		}
 	}

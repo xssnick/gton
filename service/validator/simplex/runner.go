@@ -176,6 +176,16 @@ func (r *Runner) takeBatch() (queue []func(), stopped, more bool) {
 	}
 
 	n := min(len(r.priority)+len(r.queue), runnerBatchSize)
+	if len(r.priority) == 0 {
+		queue = r.queue[:n]
+		if n == len(r.queue) {
+			r.queue = nil
+		} else {
+			r.queue = r.queue[n:]
+		}
+
+		return queue, false, len(r.queue) != 0
+	}
 	if n <= len(r.priority) {
 		queue = r.priority[:n]
 		if n == len(r.priority) {

@@ -67,7 +67,7 @@ func TestAfterMergeFullCollatedProofCarriesChangedAccount(t *testing.T) {
 	narrowedSecond.State = narrowedStateRoot(t, req.Previous2.State)
 	verification.Previous2 = &narrowedSecond
 	verification.Neighbors = collatedNeighborQueues(t, req, candidate)
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify full-collated merge candidate on its own proof: %v", err)
 	}
 }
@@ -117,7 +117,7 @@ func TestDestroyedAccountFinishUsesCanonicalDiffProof(t *testing.T) {
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
 	verification.Previous.State = narrowedStateRoot(t, req.Previous.State)
 	verification.Neighbors = collatedNeighborQueues(t, req, candidate)
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify destroyed-account candidate on canonical diff proof: %v", err)
 	}
 }

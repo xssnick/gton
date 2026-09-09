@@ -659,12 +659,13 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 	}
 	hardLTDelta := limits.ltDelta[3]
 	blockCtx, err := req.Masterchain.Config.execution.NewBlockContext(tvm.BlockOptions{
-		Now:        header.GenUtime,
-		BlockLT:    int64(header.StartLt),
-		RandSeed:   req.RandSeed[:],
-		PrevBlocks: req.Masterchain.PrevBlocks,
-		GlobalID:   oldState.GlobalID,
-		Libraries:  req.Masterchain.Libraries,
+		ConfigAddress: &req.Masterchain.Config.configAddress,
+		Now:           header.GenUtime,
+		BlockLT:       int64(header.StartLt),
+		RandSeed:      req.RandSeed[:],
+		PrevBlocks:    req.Masterchain.PrevBlocks,
+		GlobalID:      oldState.GlobalID,
+		Libraries:     req.Masterchain.Libraries,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("prepare transaction context: %w", err)
@@ -780,7 +781,7 @@ func (b *Builder) makeHeader(req ShardRequest, predecessor *preparedPredecessor)
 	if topology.target.WorkchainID != 0 {
 		return tlb.BlockHeader{}, fmt.Errorf("%w: only basechain blocks are supported", ErrUnsupported)
 	}
-	if err := verifyBasechainWorkchain(req.Masterchain.Config, req.Header.GenUtime); err != nil {
+	if err := verifyBasechainWorkchain(req.Masterchain.Config, req.Masterchain.GenUtime); err != nil {
 		return tlb.BlockHeader{}, err
 	}
 

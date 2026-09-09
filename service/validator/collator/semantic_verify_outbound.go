@@ -84,6 +84,9 @@ func (v *semanticQueueValidation) verifyOutQueueChanges() error {
 				return fmt.Errorf("transit outbound message %x: %w", hash, err)
 			}
 		case semanticOutDequeue:
+			if v.replay.transition.Config.capabilities&capShortDequeue != 0 {
+				return fmt.Errorf("%w: full dequeue outbound message %x while short dequeue capability is enabled", ErrInvalidInput, hash)
+			}
 			entry, err := v.verifyDequeued(descriptor.envelope.next, hash, descriptor.envelope.root.HashKey())
 			if err != nil {
 				return fmt.Errorf("dequeue outbound message %x: %w", hash, err)
@@ -92,6 +95,9 @@ func (v *semanticQueueValidation) verifyOutQueueChanges() error {
 				return err
 			}
 		case semanticOutDequeueShort:
+			if v.replay.transition.Config.capabilities&capShortDequeue == 0 {
+				return fmt.Errorf("%w: short dequeue outbound message %x while short dequeue capability is disabled", ErrInvalidInput, hash)
+			}
 			entry, err := v.verifyDequeued(descriptor.next, hash, cell.Hash(descriptor.envelopeHash))
 			if err != nil {
 				return fmt.Errorf("short dequeue outbound message %x: %w", hash, err)

@@ -274,21 +274,6 @@ func TestAccountBlockIndexFallsBackWhenNotKeyed(t *testing.T) {
 		keyed.replayedAccounts.RootCell().HashKey(); got != want {
 		t.Fatalf("fallback replayed account root %x, indexed %x", got, want)
 	}
-
-	// A nil index is the same fallback one step further out: it is what a replay
-	// assembled without the structural verifier has.
-	absent := semanticMultiAccountReplay(t, 6)
-	absent.accountBlockIndex = nil
-	if err := absent.precheckAccountUpdates(); err != nil {
-		t.Fatalf("precheck without an index: %v", err)
-	}
-	if err := absent.verifyAccounts(); err != nil {
-		t.Fatalf("replay without an index: %v", err)
-	}
-	if got, want := absent.replayedAccounts.RootCell().HashKey(),
-		keyed.replayedAccounts.RootCell().HashKey(); got != want {
-		t.Fatalf("index-less replayed account root %x, indexed %x", got, want)
-	}
 }
 
 // bumpCurrencyCollection re-encodes a CurrencyCollection with one more nanoton,
@@ -497,7 +482,7 @@ func TestVerifyAccountBlocksRejectsForgedAugmentations(t *testing.T) {
 // state-update reference dropped. tlb.LoadFromCell fails on it, while the
 // account-block augmentation still computes — AugShardAccountBlocks.LeafExtra
 // reads no further than the transaction dictionary — so the entry can be
-// inserted into a self-consistent dictionary and reach the replay.
+// inserted into a self-consistent dictionary and reach the structural decode.
 func accountBlockCellWithoutStateUpdate(t *testing.T, key [32]byte, block *tlb.AccountBlock) *cell.Cell {
 	t.Helper()
 
@@ -524,14 +509,7 @@ func accountBlockCellWithoutStateUpdate(t *testing.T, key [32]byte, block *tlb.A
 	return builder.EndCell()
 }
 
-// A replay assembled without a structural verifier rebuilds the index itself.
-// That rebuild must reach the same verdict the walk it replaced reached, or the
-// same candidate is rejected in different words, and at a different rank, purely
-// because of how the replay around it was put together. An undecodable account
-// block is the case that tells the two apart: the structural pass raises it, and
-// the pre-index lane walk recorded it against its account key like any replay
-// failure.
-func TestIndexlessReplayRanksUndecodableAccountBlockAsALane(t *testing.T) {
+func TestVerifyAccountBlocksRejectsUndecodableAccountBlock(t *testing.T) {
 	replay := semanticMultiAccountReplay(t, 3)
 	target := replay.accountBlockIndex.entries[1].key
 	block := replay.accountBlockIndex.entries[1].block
@@ -546,29 +524,14 @@ func TestIndexlessReplayRanksUndecodableAccountBlockAsALane(t *testing.T) {
 		t.Fatal("the tampered account block still decodes, so this proves nothing")
 	}
 
-	replay.accountBlocks = tampered
-	replay.candidate.accountBlocks = tampered
-	replay.accountBlockIndex = nil
-	replay.candidate.accountBlockIndex = nil
-
-	lanes, err := replay.decodeAccountLanes()
+	if !tampered.ValidateAll() {
+		t.Fatal("removing the state update changed the account-block augmentation")
+	}
+	root, err := tampered.ToCell()
 	if err != nil {
-		t.Fatalf("index-less projection raised instead of ranking: %v", err)
+		t.Fatal(err)
 	}
-	if len(lanes) != 2 {
-		t.Fatalf("projection produced %d lanes, want the walk to stop at the second account", len(lanes))
-	}
-	if lanes[0].err != nil {
-		t.Fatalf("the account before the tampered one failed: %v", lanes[0].err)
-	}
-	want := fmt.Sprintf("decode semantic account block %x", target)
-	if lanes[1].err == nil || !errors.Is(lanes[1].err, ErrInvalidInput) ||
-		!strings.Contains(lanes[1].err.Error(), want) {
-		t.Fatalf("lane error = %v, want one containing %q", lanes[1].err, want)
-	}
-
-	if err = replay.verifyAccounts(); err == nil || !errors.Is(err, ErrInvalidInput) ||
-		!strings.Contains(err.Error(), want) {
-		t.Fatalf("verifyAccounts error = %v, want one containing %q", err, want)
+	if _, _, err = verifyAccountBlocks(root); err == nil {
+		t.Fatalf("structural verification accepted an undecodable account block: %v", err)
 	}
 }

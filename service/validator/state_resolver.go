@@ -10,6 +10,7 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 
+	"github.com/xssnick/gton/service/validator/collator"
 	"github.com/xssnick/gton/service/validator/groups"
 	"github.com/xssnick/gton/service/validator/simplex"
 )
@@ -87,6 +88,11 @@ type stateFlight struct {
 	cancelErr error
 	expires   time.Time
 	timer     *time.Timer
+
+	// prepared is allocated only when an observer warm-up asks to speculate.
+	// Ordinary readers wait on done, which remains gated by notarization.
+	prepared       chan struct{}
+	preparedResult ResolvedState
 }
 
 type finalizedState struct {
@@ -321,6 +327,18 @@ func cloneSessionStart(start SessionStart) SessionStart {
 }
 
 func (r *stateResolver) resolve(ctx context.Context, id simplex.ParentID) (ResolvedState, error) {
+	return r.resolveWithPreparation(ctx, id, nil)
+}
+
+// resolveWithPreparation lets an observer warm-up use the prepared successor
+// before its certificate arrives. The callback runs in this waiter, which
+// keeps the shared flight alive until certification, expiry, or cancellation.
+// Completed cache hits do not replay the speculative offer.
+func (r *stateResolver) resolveWithPreparation(
+	ctx context.Context,
+	id simplex.ParentID,
+	onPrepared func(ResolvedState),
+) (ResolvedState, error) {
 	for {
 		r.mu.Lock()
 		if r.isClosed {
@@ -363,17 +381,41 @@ func (r *stateResolver) resolve(ctx context.Context, id simplex.ParentID) (Resol
 			go r.resolveLoop(flightCtx, id, flight)
 		}
 		flight.waiters++
+		var prepared <-chan struct{}
+		if onPrepared != nil {
+			if flight.prepared == nil {
+				flight.prepared = make(chan struct{})
+				if flight.preparedResult.State != nil {
+					close(flight.prepared)
+				}
+			}
+			prepared = flight.prepared
+		}
 		r.mu.Unlock()
 
-		select {
-		case <-ctx.Done():
-			r.releaseStateWaiter(id, flight)
+		for {
+			select {
+			case <-ctx.Done():
+				r.releaseStateWaiter(id, flight)
 
-			return ResolvedState{}, ctx.Err()
-		case <-flight.done:
-			r.releaseStateWaiter(id, flight)
+				return ResolvedState{}, ctx.Err()
+			case <-prepared:
+				r.mu.Lock()
+				usable := !r.isClosed && flight.cancelErr == nil && (!flight.finished || flight.err == nil)
+				r.mu.Unlock()
+				if usable && ctx.Err() == nil {
+					onPrepared(flight.preparedResult)
+				}
+				onPrepared = nil
+				prepared = nil
+			case <-flight.done:
+				if onPrepared != nil && flight.err == nil && ctx.Err() == nil {
+					onPrepared(flight.result)
+				}
+				r.releaseStateWaiter(id, flight)
 
-			return flight.result, flight.err
+				return flight.result, flight.err
+			}
 		}
 	}
 }
@@ -757,7 +799,7 @@ func (r *stateResolver) resolveLoop(
 ) {
 	defer r.wg.Done()
 
-	result, err := r.resolveInner(ctx, id)
+	result, err := r.resolveInner(ctx, id, flight)
 	r.mu.Lock()
 	if flight.finished {
 		r.mu.Unlock()
@@ -771,7 +813,11 @@ func (r *stateResolver) resolveLoop(
 	r.mu.Unlock()
 }
 
-func (r *stateResolver) resolveInner(ctx context.Context, id simplex.ParentID) (ResolvedState, error) {
+func (r *stateResolver) resolveInner(
+	ctx context.Context,
+	id simplex.ParentID,
+	flight *stateFlight,
+) (ResolvedState, error) {
 	if !id.Exists {
 		r.mu.Lock()
 		genesis := r.genesis
@@ -800,13 +846,22 @@ func (r *stateResolver) resolveInner(ctx context.Context, id simplex.ParentID) (
 		return r.resolveCandidateState(ctx, id.ID, resolution.Candidate)
 	}
 
-	// Only observers speculate on an unvalidated payload. Keep the computed
-	// state inside this flight until the committee certifies it: neither a
-	// window nor finalization can read it through resolve before that edge.
+	// Only observers speculate on an unvalidated payload. The warm-up may
+	// offer this successor to the producer, while ordinary window and
+	// finalization readers remain behind this flight's certificate gate.
 	result, err := r.resolveCandidateState(ctx, id.ID, artifact)
 	if err != nil {
 		return ResolvedState{}, err
 	}
+	r.mu.Lock()
+	if !flight.finished && flight.cancelErr == nil {
+		flight.preparedResult = result
+		if flight.prepared != nil {
+			close(flight.prepared)
+		}
+	}
+	r.mu.Unlock()
+
 	// The shared flight's ordinary lifetime bounds both computation and this
 	// wait. A shorter speculative timer could cancel a certified resolution
 	// that a newly opened window has already joined.
@@ -1460,6 +1515,79 @@ func (r *stateResolver) acceptedCandidateState(
 	}
 
 	return resolved
+}
+
+// speculativeAncestorBlocks borrows only resident, certified ancestor block
+// roots. Candidate and state locks are never nested, and no missing candidate
+// or state is resolved here. Empty candidates reuse their ordinary block; the
+// candidate-hop bound also limits a run of empty aliases while taking this
+// best-effort snapshot. The selected-base constructor checks every block edge.
+func (r *stateResolver) speculativeAncestorBlocks(id simplex.CandidateID, selected *ChainState) []*cell.Cell {
+	if selected == nil || len(selected.tips) != 1 {
+		return nil
+	}
+	lastBlock := selected.tips[0].ID
+	r.candidates.mu.Lock()
+	entry := r.candidates.entries[id]
+	if r.candidates.closed || entry == nil || entry.lineage == nil || !entry.lineage.matches(lastBlock) {
+		r.candidates.mu.Unlock()
+
+		return nil
+	}
+	parent := entry.lineage.parent
+	r.candidates.mu.Unlock()
+
+	var roots []*cell.Cell
+	for hops := 0; parent.Exists && len(roots) < collator.MaxSpeculativeLineageBlocks-1 && hops < collator.MaxSpeculativeLineageBlocks; hops++ {
+		if parent.ID.Slot >= id.Slot {
+			break
+		}
+		r.candidates.mu.Lock()
+		entry = r.candidates.entries[parent.ID]
+		if r.candidates.closed || entry == nil || entry.lineage == nil ||
+			entry.notarization.IsZero() || entry.notarization.Vote() != simplex.NotarizeVote(parent.ID) {
+			r.candidates.mu.Unlock()
+
+			break
+		}
+		lineage := entry.lineage
+		r.candidates.mu.Unlock()
+		if !lineage.matches(lastBlock) {
+			if lineage.workchain != lastBlock.Workchain || lineage.shard != lastBlock.Shard ||
+				lastBlock.SeqNo == 0 || lineage.seqno != lastBlock.SeqNo-1 {
+				break
+			}
+			block := ton.BlockIDExt{
+				Workchain: lineage.workchain, Shard: lineage.shard, SeqNo: lineage.seqno,
+				RootHash: lineage.rootHash[:], FileHash: lineage.fileHash[:],
+			}
+			state := r.acceptedCandidateState(parent.ID, block)
+			if state == nil || len(state.tips) != 1 || state.tips[0].Block == nil {
+				break
+			}
+			if roots == nil {
+				roots = make([]*cell.Cell, 0, collator.MaxSpeculativeLineageBlocks-1)
+			}
+			roots = append(roots, state.tips[0].Block)
+			lastBlock = block
+		}
+		id, parent = parent.ID, lineage.parent
+	}
+	if !parent.Exists && len(roots) < collator.MaxSpeculativeLineageBlocks-1 {
+		r.mu.Lock()
+		genesis := r.genesis
+		closed := r.isClosed
+		r.mu.Unlock()
+		if !closed && genesis != nil && len(genesis.tips) == 1 && genesis.tips[0].Block != nil {
+			tip := genesis.tips[0]
+			if tip.ID.Workchain == lastBlock.Workchain && tip.ID.Shard == lastBlock.Shard &&
+				lastBlock.SeqNo != 0 && tip.ID.SeqNo == lastBlock.SeqNo-1 {
+				roots = append(roots, tip.Block)
+			}
+		}
+	}
+
+	return roots
 }
 
 // acceptBlock prepares one acceptance and submits it on the finalization chain,

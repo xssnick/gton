@@ -221,7 +221,7 @@ func BenchmarkVerifyFixture(b *testing.B) {
 			verification := shardVerificationRequest(req, candidate)
 			verification.NeighborShardEndLT = req.NeighborShardEndLT
 			verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-			if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+			if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 				b.Fatalf("verify %s fixture candidate: %v", profile.name, err)
 			}
 			ctx := context.Background()
@@ -229,7 +229,7 @@ func BenchmarkVerifyFixture(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				if err := VerifyShardCandidate(ctx, verification); err != nil {
+				if err := verifyShardCandidateForTest(ctx, verification); err != nil {
 					b.Fatal(err)
 				}
 			}

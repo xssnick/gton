@@ -44,6 +44,7 @@ func loadMasterCandidateState(
 		)
 	}
 	if state.previousExtra.ConfigParams.Config.Params == nil ||
+		!bytes.Equal(state.previousExtra.ConfigParams.ConfigAddr, config.configAddress[:]) ||
 		state.previousExtra.ConfigParams.Config.Params.AsCell().HashKey() != config.execution.Root().HashKey() {
 		return masterCandidateState{}, fmt.Errorf(
 			"%w: verification config differs from predecessor state", ErrInvalidInput,

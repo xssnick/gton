@@ -253,6 +253,57 @@ func TestRunnerPrioritizesCandidateWorkOverDirectMessageBacklog(t *testing.T) {
 	}
 }
 
+func TestRunnerOrdinaryBatchesKeepOrderWhilePosting(t *testing.T) {
+	runner := NewRunner(&Engine{})
+	var order []int
+	for i := range runnerBatchSize + 3 {
+		runner.post(func() { order = append(order, i) })
+	}
+
+	batch, stopped, more := runner.takeBatch()
+	if stopped || !more || len(batch) != runnerBatchSize {
+		t.Fatalf("first batch len=%d stopped=%t more=%t", len(batch), stopped, more)
+	}
+	// New work must neither overwrite the detached batch nor overtake the tail.
+	runner.post(func() { order = append(order, runnerBatchSize+3) })
+	for _, work := range batch {
+		work()
+	}
+
+	batch, stopped, more = runner.takeBatch()
+	if stopped || more || len(batch) != 4 {
+		t.Fatalf("second batch len=%d stopped=%t more=%t", len(batch), stopped, more)
+	}
+	for _, work := range batch {
+		work()
+	}
+	if len(order) != runnerBatchSize+4 {
+		t.Fatalf("executed %d callbacks, want %d", len(order), runnerBatchSize+4)
+	}
+	for i, got := range order {
+		if got != i {
+			t.Fatalf("callback %d executed at position %d", got, i)
+		}
+	}
+}
+
+func BenchmarkRunnerOrdinaryTakeBatch(b *testing.B) {
+	for _, count := range []int{1, runnerBatchSize} {
+		b.Run(fmt.Sprintf("callbacks=%d", count), func(b *testing.B) {
+			queued := make([]func(), count)
+			runner := &Runner{}
+			b.ReportAllocs()
+			for b.Loop() {
+				runner.queue = queued
+				batch, _, _ := runner.takeBatch()
+				if len(batch) != count {
+					b.Fatal("incomplete batch")
+				}
+			}
+		})
+	}
+}
+
 // TestRunnerTimerUnderContinuousPosts verifies the same fairness property for
 // consensus timers. The first voter timeout must cast a skip even while every
 // processed task immediately posts another one.

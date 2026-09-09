@@ -297,7 +297,7 @@ func BenchmarkVerifyShard(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				if err := VerifyShardCandidate(ctx, workload.verification); err != nil {
+				if err := verifyShardCandidateForTest(ctx, workload.verification); err != nil {
 					b.Fatal(err)
 				}
 			}

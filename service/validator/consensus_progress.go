@@ -36,6 +36,7 @@ func collatorConsensusProgress(
 		tip.BlockBOC,
 		tip.Block,
 		tip.State,
+		nil,
 	)
 	if err != nil {
 		return collator.ConsensusProgress{}, err
@@ -66,6 +67,7 @@ func collatorSpeculativeWindow(
 		tip.BlockBOC,
 		tip.Block,
 		tip.State,
+		window.Ancestors,
 	)
 	if err != nil {
 		return collator.SpeculativeWindowRequest{}, err

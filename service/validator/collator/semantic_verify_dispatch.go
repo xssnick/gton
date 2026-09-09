@@ -252,8 +252,12 @@ func (v *semanticQueueValidation) verifyDispatchOrder(changes map[[32]byte]*sema
 		}
 	}
 
-	if v.old.Extra == nil || v.old.Extra.OutQueueSize == nil ||
-		v.queueSize > v.replay.transition.Config.deferOutQueueSizeLimit {
+	if v.old.Extra == nil || v.queueSize > v.replay.transition.Config.deferOutQueueSizeLimit {
+		return nil
+	}
+	// An empty queue proves size zero even when an older state omits the
+	// stored count (ValidateQuery::prepare_out_msg_queue_size).
+	if v.old.Extra.OutQueueSize == nil && !v.old.OutQueue.IsEmpty() {
 		return nil
 	}
 	if v.everyDispatchAccountAdvanced(processedAccounts) {

@@ -68,7 +68,7 @@ func TestSemanticVerifierRejectsQueueEnqueuedLTBelowEmittedLT(t *testing.T) {
 	controlVerification := shardVerificationRequest(req, control)
 	controlVerification.NeighborShardEndLT = req.NeighborShardEndLT
 	controlVerification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-	if err = VerifyShardCandidate(context.Background(), controlVerification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), controlVerification); err != nil {
 		t.Fatalf("verify untampered enqueued lt: %v", err)
 	}
 
@@ -150,7 +150,7 @@ func TestSemanticVerifierRejectsQueueEnqueuedLTBelowEmittedLT(t *testing.T) {
 	verification := shardVerificationRequest(req, tampered)
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-	err = VerifyShardCandidate(context.Background(), verification)
+	err = verifyShardCandidateForTest(context.Background(), verification)
 	if !errors.Is(err, ErrInvalidInput) ||
 		!strings.Contains(err.Error(), "enqueued lt is below the message emitted lt") {
 		t.Fatalf("enqueued lt below emitted lt error = %v, want invalid input naming the emitted lt", err)

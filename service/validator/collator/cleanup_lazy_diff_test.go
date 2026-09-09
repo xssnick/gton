@@ -562,7 +562,7 @@ func TestLazyCleanupProofStillReplaysCleanup(t *testing.T) {
 		Candidate:          candidate,
 	}
 	verification.Previous.State = narrowedStateRoot(t, req.Previous.State)
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("lazily collated candidate does not replay on its own proofs: %v", err)
 	}
 
@@ -613,7 +613,7 @@ func TestLazyCleanupProofStillReplaysCleanup(t *testing.T) {
 		Candidate:          stopped,
 	}
 	stoppedVerification.Previous.State = narrowedStateRoot(t, stoppedReq.Previous.State)
-	if err = VerifyShardCandidate(context.Background(), stoppedVerification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), stoppedVerification); err != nil {
 		t.Fatalf("a truncated candidate does not replay on its own proofs: %v", err)
 	}
 	t.Logf("nothing deliverable: collated data lazy %d B, eager %d B (%.1f%% smaller)",
@@ -645,7 +645,7 @@ func TestLazyCleanupProofStillReplaysCleanup(t *testing.T) {
 			Candidate:          partial,
 		}
 		partialVerification.Previous.State = narrowedStateRoot(t, partialReq.Previous.State)
-		if err = VerifyShardCandidate(context.Background(), partialVerification); err != nil {
+		if err = verifyShardCandidateForTest(context.Background(), partialVerification); err != nil {
 			t.Fatalf("a partially cleaned candidate does not replay on its own proofs: %v", err)
 		}
 		t.Logf("partial drain: dequeued %d of %d, collated data %d B",

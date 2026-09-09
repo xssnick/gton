@@ -455,7 +455,7 @@ func (a *LocalAcquisition) resolveChain(
 		// nodes lets the cut resolve through CandidateTip — the pipelined
 		// successor's route — instead. When the base is already applied the
 		// lineage is empty and the plain pin-at-cut resolution below is right.
-		queueBase, lineage, err := a.ensureSpeculativeLineageLocked(ctx, managed, base)
+		queueBase, lineage, err := a.ensureSpeculativeLineageLocked(ctx, managed, base, spec.state.ancestors)
 		if err != nil {
 			return localResolvedChain{}, err
 		}
@@ -1334,13 +1334,6 @@ func (a *LocalAcquisition) ensureCandidateBase(
 	return nil
 }
 
-// speculativeLineageCap bounds the parent walk from a bet's base down to the
-// applied frontier. The frontier normally trails the base by the apply lag —
-// two to four blocks — so sixteen is not a tuning knob but a statement that a
-// node further behind than that has no business betting: its bet would be built
-// over a lineage the pool has not confirmed for six-plus seconds.
-const speculativeLineageCap = 16
-
 // ensureSpeculativeLineageLocked makes a bet's base a regular candidate node of
 // the session's message branch, so the bet's acquisition can take the exact
 // same route a pipelined successor takes: CandidateTip into the branch's
@@ -1372,6 +1365,7 @@ func (a *LocalAcquisition) ensureSpeculativeLineageLocked(
 	ctx context.Context,
 	managed *localAcquisitionSession,
 	base PreviousBlock,
+	ancestors []PreviousBlock,
 ) ([]PreviousBlock, bool, error) {
 	source := targetShardIdent(groups.ShardID{Workchain: base.ID.Workchain, Shard: base.ID.Shard})
 
@@ -1397,8 +1391,22 @@ func (a *LocalAcquisition) ensureSpeculativeLineageLocked(
 		}
 		return false, nil
 	}
+	resolve := func(id ton.BlockIDExt) (PreviousBlock, error) {
+		for _, ancestor := range ancestors {
+			if sameBlockID(ancestor.ID, id) {
+				return ancestor, nil
+			}
+		}
+		// A partial resident snapshot may stop before the pool's frontier.
+		// Existing acquisition-owned blocks and the applied store still serve
+		// that suffix, as they do for bets without a carried lineage.
+		block, _, err := a.resolveBlock(ctx, managed, id)
+
+		return block, err
+	}
 
 	var links []lineageLink
+	depth := 0
 	currentID := base.ID
 	currentBlock := &base
 	var root PreviousBlock
@@ -1422,15 +1430,16 @@ func (a *LocalAcquisition) ensureSpeculativeLineageLocked(
 			break
 		}
 		uncommitted = true
-		if len(links) == speculativeLineageCap {
+		if depth == MaxSpeculativeLineageBlocks {
 			return nil, false, fmt.Errorf(
 				"%w: speculative lineage runs more than %d blocks past the applied frontier",
-				ErrAcquisitionNotReady, speculativeLineageCap)
+				ErrAcquisitionNotReady, MaxSpeculativeLineageBlocks)
 		}
+		depth++
 		// Above the frontier: this block must become (or already be) a
 		// candidate node, and only now is its body worth resolving.
 		if currentBlock == nil {
-			resolved, _, resolveErr := a.resolveBlock(ctx, managed, currentID)
+			resolved, resolveErr := resolve(currentID)
 			if resolveErr != nil {
 				return nil, false, fmt.Errorf("%w: resolve speculative lineage block %d: %v",
 					ErrAcquisitionNotReady, currentID.SeqNo, resolveErr)
@@ -1470,7 +1479,13 @@ func (a *LocalAcquisition) ensureSpeculativeLineageLocked(
 					root = PreviousBlock{ID: cloneBlockID(parentID)}
 					break
 				}
-				parentBlock, _, resolveErr := a.resolveBlock(ctx, managed, parentID)
+				if depth == MaxSpeculativeLineageBlocks {
+					return nil, false, fmt.Errorf(
+						"%w: speculative lineage runs more than %d blocks past the applied frontier",
+						ErrAcquisitionNotReady, MaxSpeculativeLineageBlocks)
+				}
+				depth++
+				parentBlock, resolveErr := resolve(parentID)
 				if resolveErr != nil {
 					return nil, false, fmt.Errorf("%w: resolve speculative lineage block %d: %v",
 						ErrAcquisitionNotReady, parentID.SeqNo, resolveErr)

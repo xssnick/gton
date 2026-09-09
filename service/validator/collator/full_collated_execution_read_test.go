@@ -110,7 +110,7 @@ func TestFullCollatedProofCoversCellsReachedOnlyThroughTheMachine(t *testing.T) 
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
 	verification.Neighbors = collatedNeighborQueues(t, req, candidate)
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify candidate: %v", err)
 	}
 }

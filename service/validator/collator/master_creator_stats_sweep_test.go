@@ -143,7 +143,7 @@ func TestBuildMasterSweepProducesAVerifiableBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build masterchain candidate: %v", err)
 	}
-	if err = VerifyMasterCandidate(context.Background(), MasterVerificationRequest{
+	if err = verifyMasterCandidateForTest(context.Background(), MasterVerificationRequest{
 		Previous:  fixture.request.Previous,
 		Config:    fixture.request.Config,
 		Groups:    fixture.request.Groups,

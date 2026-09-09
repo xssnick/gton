@@ -769,9 +769,9 @@ func newStandaloneCollatorFactory(
 			return nil, fmt.Errorf("collator composition: create backend: %w", err)
 		}
 		// One feed per pool: the controller owns its destination projection and
-		// the extension drives it per applied block. A standalone collator that
-		// skipped this reads its neighbours' out-queues out of state on every
-		// window entry instead of off runs kept at the head.
+		// the extension feeds accepted and applied blocks. Without this, the
+		// collator reads its neighbours' out-queues out of state on every window
+		// entry instead of off runs kept at the head.
 		feed := msgpool.NewFeed(msgpool.FeedOptions{
 			Pool:      composition.runtime.Messages,
 			Logger:    log,

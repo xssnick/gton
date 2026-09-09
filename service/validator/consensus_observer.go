@@ -21,8 +21,9 @@ import (
 
 // ConsensusObserverNetwork owns the process-wide delegated-collation endpoint
 // and every session transport used by a standalone collator or observer.
-// PrepareSession creates an inactive overlay exactly once and returns its
-// session-scoped transport. Run is started later by the session runtime.
+// PrepareSession creates an inactive overlay and returns its session-scoped
+// transport. A retired overlay can be prepared again with a fresh transport.
+// Run is started later by the session runtime.
 // Implementations must make UpdateSession, RetireSession, and Close
 // idempotent and must join their receiver goroutines before returning from
 // Close or from the SessionNetwork.Run call cancelled by retirement.
@@ -105,8 +106,8 @@ type ConsensusObserver struct {
 }
 
 type observerSession struct {
-	lifecycleMu sync.Mutex
-	mu          sync.Mutex
+	lifecycle chan struct{}
+	mu        sync.Mutex
 
 	descriptor       collator.ConsensusObserverSession
 	config           SessionConfig
@@ -119,6 +120,10 @@ type observerSession struct {
 	terminal         error
 	runCancel        context.CancelFunc
 	watchDone        chan struct{}
+	restartCancel    context.CancelFunc
+	restartDone      chan struct{}
+	restartUpdate    *collator.ConsensusObserverSession
+	retireRequested  bool
 	pending          *collator.ConsensusProgress
 	pendingFinalized []collator.ConsensusFinalization
 
@@ -279,6 +284,7 @@ func (o *ConsensusObserver) RecoverSessions(ctx context.Context) ([][32]byte, er
 	ids := make([][32]byte, 0, len(recovered))
 	for id, storageID := range recovered {
 		o.sessions[id] = &observerSession{
+			lifecycle: make(chan struct{}, 1),
 			config: SessionConfig{
 				SessionID: id,
 				StorageID: storageID,
@@ -397,8 +403,36 @@ func (o *ConsensusObserver) ActivateSession(
 		return err
 	}
 
-	session.lifecycleMu.Lock()
-	defer session.lifecycleMu.Unlock()
+	session.mu.Lock()
+	retiring := session.retireRequested
+	restarting := session.restartCancel != nil
+	terminal := session.terminal
+	activationConflict := session.activation != nil && !session.activation.Equal(activation)
+	session.mu.Unlock()
+	if retiring {
+		return collator.ErrSessionRetired
+	}
+	if activationConflict {
+		return collator.ErrSessionConflict
+	}
+	if restarting {
+		return fmt.Errorf("%w: observer runtime restarting: %w", collator.ErrAcquisitionNotReady, terminal)
+	}
+
+	if err = session.lockLifecycle(ctx); err != nil {
+		return err
+	}
+	defer session.unlockLifecycle()
+
+	return o.activateSession(ctx, session, activation)
+}
+
+// activateSession requires the session lifecycle lock.
+func (o *ConsensusObserver) activateSession(
+	ctx context.Context,
+	session *observerSession,
+	activation collator.SessionActivation,
+) error {
 	o.mu.RLock()
 	state := o.state
 	o.mu.RUnlock()
@@ -438,6 +472,13 @@ func (o *ConsensusObserver) ActivateSession(
 	session.mu.Unlock()
 
 	if runtime == nil {
+		if resetErr := o.replaceSessionNetwork(ctx, session); resetErr != nil {
+			session.mu.Lock()
+			session.phase = observerSessionPrepared
+			session.mu.Unlock()
+
+			return resetErr
+		}
 		var prepareErr error
 		runtime, prepareErr = o.prepareRuntime(ctx, session)
 		if prepareErr != nil {
@@ -501,6 +542,7 @@ func (o *ConsensusObserver) ActivateSession(
 			if wasCancelled {
 				session.terminal = errors.Join(ctx.Err(), session.terminal)
 			}
+			o.scheduleRestart(lifetime, session)
 		}
 		session.mu.Unlock()
 		if wasCancelled {
@@ -556,16 +598,41 @@ func (o *ConsensusObserver) UpdateSession(
 		return err
 	}
 
-	session.lifecycleMu.Lock()
-	defer session.lifecycleMu.Unlock()
+	session.mu.Lock()
+	if session.retireRequested {
+		session.mu.Unlock()
+		return collator.ErrSessionRetired
+	}
+	if session.restartCancel != nil {
+		if !session.descriptor.Overlay.Session.Equal(descriptor.Overlay.Session) ||
+			session.config.Protocol != input.config.Protocol || session.limits != input.limits {
+			session.mu.Unlock()
+			return collator.ErrSessionConflict
+		}
+		// Recovery may be waiting for remote artifacts. Accept the latest MC
+		// projection immediately and apply it before making the runtime available.
+		session.restartUpdate = &descriptor
+		session.mu.Unlock()
+		return nil
+	}
+	session.mu.Unlock()
 
+	if err = session.lockLifecycle(ctx); err != nil {
+		return err
+	}
+	defer session.unlockLifecycle()
+
+	return o.updateSession(ctx, session, descriptor, input)
+}
+
+func (o *ConsensusObserver) updateSession(
+	ctx context.Context,
+	session *observerSession,
+	descriptor collator.ConsensusObserverSession,
+	input observerRuntimeInput,
+) error {
 	session.mu.Lock()
 	switch session.phase {
-	case observerSessionFailed:
-		terminal := session.terminal
-		session.mu.Unlock()
-
-		return terminal
 	case observerSessionRetiring, observerSessionRetired:
 		session.mu.Unlock()
 
@@ -585,6 +652,21 @@ func (o *ConsensusObserver) UpdateSession(
 
 		return collator.ErrSessionConflict
 	}
+	if session.phase == observerSessionFailed {
+		if session.restartCancel == nil {
+			terminal := session.terminal
+			session.mu.Unlock()
+			return terminal
+		}
+		// The recovery worker owns the transport/runtime replacement. Keep the
+		// latest desired state for its next attempt without delaying MC apply.
+		session.descriptor = descriptor
+		session.state = cloneSessionState(input.state)
+		session.config = input.config
+		session.mu.Unlock()
+
+		return nil
+	}
 	if session.descriptor.Equal(descriptor) {
 		session.mu.Unlock()
 
@@ -603,31 +685,30 @@ func (o *ConsensusObserver) UpdateSession(
 		return nil
 	}
 
-	// lifecycleMu excludes competing session lifecycle mutations while the
+	// The lifecycle lock excludes competing session lifecycle mutations while the
 	// external calls run. session.mu must remain free: Runtime.Update serializes
 	// its commit with progress observation, whose callback re-enters this session.
 	// Holding it here would invert session.mu and runtime.lifecycleMu; holding it
 	// over network I/O would stall the same progress for no additional invariant.
 	session.mu.Unlock()
 	if updateNetwork {
-		if err = o.network.UpdateSession(ctx, descriptor.Overlay); err != nil {
+		if err := o.network.UpdateSession(ctx, descriptor.Overlay); err != nil {
 			return fmt.Errorf("validator consensus observer: update network session: %w", err)
 		}
 	}
 	if updateRuntime {
-		if err = runtime.Update(ctx, input.state); err != nil {
-			return fmt.Errorf("validator consensus observer: update runtime: %w", err)
+		if err := runtime.Update(ctx, input.state); err != nil {
+			session.mu.Lock()
+			failed := session.phase == observerSessionFailed
+			session.mu.Unlock()
+			if !failed && !errors.Is(err, ErrSessionRuntimeClosed) {
+				return fmt.Errorf("validator consensus observer: update runtime: %w", err)
+			}
 		}
 	}
 
 	session.mu.Lock()
-	if session.phase == observerSessionFailed {
-		terminal := session.terminal
-		session.mu.Unlock()
-
-		return terminal
-	}
-	if session.runtime != runtime {
+	if session.phase != observerSessionFailed && session.runtime != runtime {
 		session.mu.Unlock()
 
 		return collator.ErrSessionUnavailable
@@ -658,9 +739,9 @@ func (o *ConsensusObserver) BroadcastCandidate(
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.phase == observerSessionFailed {
-		return session.terminal
+		return fmt.Errorf("%w: observer runtime restarting: %w", collator.ErrSessionUnavailable, session.terminal)
 	}
-	if session.phase != observerSessionActive || session.runtime == nil {
+	if session.restartCancel != nil || session.phase != observerSessionActive || session.runtime == nil {
 		return collator.ErrSessionUnavailable
 	}
 	windowSize := session.config.Protocol.SlotsPerLeaderWindow
@@ -704,8 +785,21 @@ func (o *ConsensusObserver) RetireSession(ctx context.Context, id [32]byte) erro
 		return err
 	}
 
-	session.lifecycleMu.Lock()
-	defer session.lifecycleMu.Unlock()
+	session.mu.Lock()
+	session.retireRequested = true
+	if session.restartCancel != nil {
+		session.restartCancel()
+	}
+	restartDone := session.restartDone
+	session.mu.Unlock()
+	if err = waitObserverRestart(ctx, restartDone); err != nil {
+		return err
+	}
+
+	if err = session.lockLifecycle(ctx); err != nil {
+		return err
+	}
+	defer session.unlockLifecycle()
 	o.mu.RLock()
 	state := o.state
 	o.mu.RUnlock()
@@ -821,7 +915,9 @@ func (o *ConsensusObserver) Close(ctx context.Context) error {
 
 	var closeErr error
 	for _, session := range sessions {
-		session.lifecycleMu.Lock()
+		if err := session.lockLifecycle(ctx); err != nil {
+			return fmt.Errorf("validator consensus observer: close: %w", err)
+		}
 		session.mu.Lock()
 		if session.phase != observerSessionRetired {
 			session.phase = observerSessionRetiring
@@ -847,9 +943,9 @@ func (o *ConsensusObserver) Close(ctx context.Context) error {
 				session.mu.Unlock()
 			}
 		}
-		session.lifecycleMu.Unlock()
+		session.unlockLifecycle()
 	}
-	// The closing state prevents new session lookups. Taking every lifecycleMu
+	// The closing state prevents new session lookups. Taking every lifecycle lock
 	// above also drains activations that already held a session pointer, so no
 	// worker can be added once this wait begins.
 	if workersErr := waitObserverWorkers(ctx, &o.workersWG); workersErr != nil {
@@ -931,7 +1027,7 @@ func (o *ConsensusObserver) lockSession(id [32]byte) (*observerSession, bool, er
 		return session, false, nil
 	}
 
-	session := &observerSession{phase: observerSessionPreparing}
+	session := &observerSession{lifecycle: make(chan struct{}, 1), phase: observerSessionPreparing}
 	session.mu.Lock()
 	o.sessions[id] = session
 	o.mu.Unlock()
@@ -1376,6 +1472,7 @@ func (o *ConsensusObserver) watchRuntime(
 	// must observe the cancellation as early as possible.
 	runCancel()
 	closeErr := runtime.Close()
+	lifetime, lifetimeErr := o.runningContext()
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.runtime != runtime {
@@ -1383,7 +1480,7 @@ func (o *ConsensusObserver) watchRuntime(
 		// own runCancel; neither field belongs to this run anymore.
 		return
 	}
-	if session.phase == observerSessionRetiring || session.phase == observerSessionRetired {
+	if session.retireRequested || session.phase == observerSessionRetiring || session.phase == observerSessionRetired {
 		return
 	}
 	if runErr == nil {
@@ -1394,6 +1491,11 @@ func (o *ConsensusObserver) watchRuntime(
 	session.runCancel = nil
 	if closeErr == nil {
 		session.runtime = nil
+	}
+	o.log.Warn().Err(session.terminal).Hex("session_id", session.config.SessionID[:]).
+		Dur("retry_after", sessionRestartDelay).Msg("consensus observer runtime stopped; restarting")
+	if lifetimeErr == nil {
+		o.scheduleRestart(lifetime, session)
 	}
 }
 
@@ -1418,4 +1520,182 @@ func cloneObserverActivation(activation collator.SessionActivation) collator.Ses
 	activation.MinMasterchain = *activation.MinMasterchain.Copy()
 
 	return activation
+}
+
+// lockLifecycle is cancellable so shutdown can time out while recovery drains
+// a session transport. Its channel is initialized with the session inventory.
+func (s *observerSession) lockLifecycle(ctx context.Context) error {
+	select {
+	case s.lifecycle <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *observerSession) unlockLifecycle() {
+	<-s.lifecycle
+}
+
+func waitObserverRestart(ctx context.Context, done <-chan struct{}) error {
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// replaceSessionNetwork replaces the single-use transport endpoint, preserving
+// the durable observer namespace and the controller's delegated producer.
+// The lifecycle lock excludes Update and retirement while it is replaced.
+func (o *ConsensusObserver) replaceSessionNetwork(ctx context.Context, session *observerSession) error {
+	if err := o.network.RetireSession(ctx, session.config.SessionID); err != nil {
+		return fmt.Errorf("validator consensus observer: reset network session: %w", err)
+	}
+	session.network = nil
+	network, err := o.network.PrepareSession(ctx, session.descriptor.Overlay)
+	if err != nil {
+		return fmt.Errorf("validator consensus observer: reopen network session: %w", err)
+	}
+	if network == nil {
+		return errors.New("validator consensus observer: network returned no session transport")
+	}
+	session.network = network
+	return nil
+}
+
+// restartSession owns retries after an activated runtime dies. Retrying on a
+// timer also covers unavailable recovery artifacts without feeding failures
+// into the applied-block hook. No retry deletes the session journal.
+func (o *ConsensusObserver) restartSession(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	session *observerSession,
+	done chan struct{},
+) {
+	defer o.workersWG.Done()
+	defer close(done)
+	defer cancel()
+	defer func() {
+		session.mu.Lock()
+		if session.restartDone == done {
+			session.restartCancel = nil
+		}
+		session.mu.Unlock()
+	}()
+
+	for {
+		timer := time.NewTimer(sessionRestartDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if err := session.lockLifecycle(ctx); err != nil {
+			return
+		}
+		err := o.restartSessionAttempt(ctx, session)
+		session.mu.Lock()
+		for err == nil && session.phase == observerSessionActive {
+			if session.restartUpdate == nil {
+				// Transfer ownership to the new run's watcher atomically with the
+				// final queued-update check.
+				session.restartCancel = nil
+				session.terminal = nil
+				session.mu.Unlock()
+				session.unlockLifecycle()
+				return
+			}
+			session.mu.Unlock()
+			err = o.applyRestartUpdates(ctx, session)
+			session.mu.Lock()
+		}
+		if err != nil {
+			session.phase = observerSessionFailed
+			session.terminal = err
+		}
+		sessionID := session.config.SessionID
+		session.mu.Unlock()
+		session.unlockLifecycle()
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			o.log.Warn().Err(err).Hex("session_id", sessionID[:]).
+				Dur("retry_after", sessionRestartDelay).Msg("consensus observer restart failed; retrying")
+		}
+	}
+}
+
+func (o *ConsensusObserver) restartSessionAttempt(ctx context.Context, session *observerSession) error {
+	session.mu.Lock()
+	runtime := session.runtime
+	watchDone := session.watchDone
+	activation := *session.activation
+	session.mu.Unlock()
+	if runtime != nil {
+		if err := runtime.Close(); err != nil {
+			return fmt.Errorf("validator consensus observer: close failed runtime: %w", err)
+		}
+		session.mu.Lock()
+		session.runtime = nil
+		session.mu.Unlock()
+	}
+	if err := waitObserverSession(ctx, watchDone, &session.progressWG); err != nil {
+		return err
+	}
+	if err := o.applyRestartUpdates(ctx, session); err != nil {
+		return err
+	}
+	session.mu.Lock()
+	session.phase = observerSessionPrepared
+	session.pending = nil
+	session.pendingFinalized = nil
+	session.mu.Unlock()
+	if err := o.activateSession(ctx, session, activation); err != nil {
+		return err
+	}
+	return o.applyRestartUpdates(ctx, session)
+}
+
+func (o *ConsensusObserver) applyRestartUpdates(ctx context.Context, session *observerSession) error {
+	for {
+		session.mu.Lock()
+		descriptor := session.restartUpdate
+		session.restartUpdate = nil
+		session.mu.Unlock()
+		if descriptor == nil {
+			return nil
+		}
+		input, err := o.runtimeInput(*descriptor)
+		if err == nil {
+			err = o.updateSession(ctx, session, *descriptor, input)
+		}
+		if err != nil {
+			session.mu.Lock()
+			if session.restartUpdate == nil {
+				session.restartUpdate = descriptor
+			}
+			session.mu.Unlock()
+			return err
+		}
+	}
+}
+
+// scheduleRestart is called with session.mu held, while an existing lifecycle
+// operation or watcher keeps workersWG alive until ownership is transferred.
+func (o *ConsensusObserver) scheduleRestart(lifetime context.Context, session *observerSession) {
+	if lifetime.Err() != nil || session.retireRequested || session.restartCancel != nil {
+		return
+	}
+	restartCtx, cancel := context.WithCancel(lifetime)
+	session.restartCancel = cancel
+	session.restartDone = make(chan struct{})
+	o.workersWG.Add(1)
+	go o.restartSession(restartCtx, cancel, session, session.restartDone)
 }

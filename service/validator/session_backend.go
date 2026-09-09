@@ -50,6 +50,10 @@ type CandidateValidationRequest struct {
 	// validates without the overlap, which is what every non-announcing backend
 	// does anyway.
 	successor *liveSuccessorApply
+	// states lets the local producer borrow already-resolved ancestor block
+	// roots after a candidate qualifies for speculation. Other validation paths
+	// do not inspect it or allocate a lineage snapshot.
+	states *stateResolver
 }
 
 // CandidateSubmitter is the command callback attached to one leader window.

@@ -13,6 +13,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 
 	"github.com/xssnick/gton/service/validator/collator"
 	"github.com/xssnick/gton/service/validator/groups"
@@ -102,6 +103,7 @@ type sessionSpeculativeWindow struct {
 	Leader    uint32
 	Base      simplex.CandidateID
 	BaseState *ChainState
+	Ancestors []*cell.Cell
 	StartAt   time.Time
 	Deadline  time.Time
 }
@@ -1093,7 +1095,7 @@ func (r *sessionRuntime) ReceiveCandidate(
 		// The earliest instant a candidate's successor state can be computed,
 		// and the one a validator gets for free by validating it. On an observer
 		// this is what keeps the window that opens on this candidate from paying
-		// the apply itself — and, for the last slot of a window, what makes the
+		// the apply itself — and, for the tail of a window, what makes the
 		// bet on the next one possible at all.
 		r.warmCandidateState(artifact.Candidate.ID)
 		received = *artifact
@@ -1215,6 +1217,7 @@ func (r *sessionRuntime) validateCandidateCore(
 		Parent:    parent.State,
 		Artifact:  artifact,
 		successor: parent.State.pendingSuccessor(ctx),
+		states:    r.states,
 	}
 	started := time.Now()
 	stageStarted = r.validationStageStarted()
@@ -2104,9 +2107,12 @@ func (r *sessionRuntime) warmState(id simplex.CandidateID, offerBet bool) {
 		// What this call leaves behind is the resolver's own cached flight,
 		// which is what the window start then finds; an error here is one the
 		// window start reports for itself.
-		resolved, err := r.states.resolve(ctx, simplex.Parent(id))
-		if err == nil && offerBet {
-			r.offerSpeculativeWindow(ctx, id, resolved)
+		if offerBet && r.speculate != nil && !r.config.Shard.IsMasterchain() {
+			_, _ = r.states.resolveWithPreparation(ctx, simplex.Parent(id), func(resolved ResolvedState) {
+				r.offerSpeculativeWindow(ctx, id, resolved)
+			})
+		} else {
+			_, _ = r.states.resolve(ctx, simplex.Parent(id))
 		}
 		// Last, and deliberately: everything above is what a window opening in
 		// the next few hundred milliseconds waits for, and this is not.
@@ -2143,12 +2149,12 @@ func (r *sessionRuntime) persistNotarizedCandidate(id simplex.CandidateID) {
 		return
 	}
 	if _, err := r.candidates.storeAsync(id, func(storeErr error) {
-		if storeErr == nil {
+		if storeErr == nil || r.log == nil {
 			return
 		}
 		r.log.Debug().Err(storeErr).Uint32("slot", id.Slot).
 			Msg("notarized candidate was not persisted ahead of finalization")
-	}); err != nil {
+	}); err != nil && r.log != nil {
 		r.log.Debug().Err(err).Uint32("slot", id.Slot).
 			Msg("notarized candidate was not submitted for persistence")
 	}
@@ -2158,10 +2164,10 @@ func (r *sessionRuntime) persistNotarizedCandidate(id simplex.CandidateID) {
 // candidate whose state was just resolved, and offers that bet to whatever
 // produces blocks for this session.
 //
-// Only the last slot of a window qualifies: it is the candidate whose
-// certificate opens the next window and therefore the base that window carries
-// unless the network skips it. Everything else this needs is derived here
-// rather than asked for — the leader from the session's own round-robin
+// The last speculationTailSlots slots qualify, as for an embedded validator:
+// an earlier tail candidate becomes the base if the committee skips the rest.
+// A newer candidate supersedes the producer's previous bet. Everything else
+// this needs is derived here — the leader from the session's own round-robin
 // schedule, the schedule of the window to come from the base's generation time
 // — because an observer has no window of its own to read them from.
 //
@@ -2173,7 +2179,7 @@ func (r *sessionRuntime) offerSpeculativeWindow(
 	id simplex.CandidateID,
 	resolved ResolvedState,
 ) {
-	if r.speculate == nil || r.config.Shard.IsMasterchain() {
+	if ctx.Err() != nil || r.speculate == nil || r.config.Shard.IsMasterchain() {
 		return
 	}
 	if resolved.State == nil || len(resolved.State.tips) != 1 {
@@ -2184,10 +2190,11 @@ func (r *sessionRuntime) offerSpeculativeWindow(
 	if windowSize == 0 || validators == 0 || id.Slot == math.MaxUint32 {
 		return
 	}
-	nextStart := id.Slot + 1
-	if nextStart%windowSize != 0 {
+	next := (uint64(id.Slot)/uint64(windowSize) + 1) * uint64(windowSize)
+	if next > math.MaxUint32 || next-uint64(id.Slot) > speculationTailSlots {
 		return
 	}
+	nextStart := uint32(next)
 	r.stateMu.RLock()
 	targetRate := r.state.Params.TargetRate
 	r.stateMu.RUnlock()
@@ -2216,11 +2223,11 @@ func (r *sessionRuntime) offerSpeculativeWindow(
 		Leader:    r.codec.schedule.ExpectedLeader(nextStart),
 		Base:      id,
 		BaseState: resolved.State,
+		Ancestors: r.states.speculativeAncestorBlocks(id, resolved.State),
 		StartAt:   startAt,
-		// Three target rates bounds a bet nobody comes to collect: longer than
-		// any observed gap between this estimate and the window it predicts, and
-		// short enough that a bet lost to a stalled session dies within a window.
-		Deadline: startAt.Add(3 * targetRate),
+		// Keep the bet through the remaining tail slots and two target rates,
+		// matching the embedded producer when the committee skips the tail.
+		Deadline: startAt.Add(time.Duration(nextStart-id.Slot+2) * targetRate),
 	}); err != nil && r.log != nil {
 		r.log.Debug().
 			Err(err).

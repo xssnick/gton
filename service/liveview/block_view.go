@@ -225,10 +225,11 @@ func (f *BlockView) BlockContext(now uint32, blockLT uint64) (*tvm.BlockContext,
 		return nil, err
 	}
 	return base.epoch.prepared.NewBlockContext(tvm.BlockOptions{
-		Now:        now,
-		BlockLT:    int64(blockLT),
-		PrevBlocks: base.prevBlocks,
-		Libraries:  libraries,
+		Now:           now,
+		BlockLT:       int64(blockLT),
+		ConfigAddress: &base.configAddress,
+		PrevBlocks:    base.prevBlocks,
+		Libraries:     libraries,
 	})
 }
 

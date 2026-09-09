@@ -106,6 +106,7 @@ github.com/xssnick/tonutils-go v1.18.1-0.20260819105223-d100262c898f/go.mod h1:B
 github.com/xssnick/tonutils-go v1.18.1-0.20260826121847-289d6710f3c1/go.mod h1:5fQtT9zOjjkgzSe9AEuvGWwWKgRk1KZXKGeU8TEi1Cs=
 github.com/xssnick/tonutils-go v1.18.1-0.20260828071555-40d36afb7f16/go.mod h1:5fQtT9zOjjkgzSe9AEuvGWwWKgRk1KZXKGeU8TEi1Cs=
 github.com/xssnick/tonutils-go v1.18.1-0.20260904163020-6558ee9edbdc/go.mod h1:5fQtT9zOjjkgzSe9AEuvGWwWKgRk1KZXKGeU8TEi1Cs=
+github.com/xssnick/tonutils-go v1.18.1-0.20260906170022-677cbed9b78e/go.mod h1:72JpMrwluMvrZMM2+9oKAdw/oP+vdFidE3hebslwBcM=
 github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=

@@ -443,7 +443,7 @@ func TestValidationResolvesCandidateMasterchainReferenceAheadOfCollatorView(t *t
 			snapshot:  fixture.request.Groups,
 			projected: projected,
 		},
-		configs: localConfigCache{entries: make(map[cell.Hash]localPreparedConfig)},
+		configs: localConfigCache{entries: make(map[localConfigKey]localPreparedConfig)},
 	}
 	base, err := acquisition.masterView(fixture.request.Previous, fixture.oldState, fixture.request.Groups)
 	if err != nil {
@@ -520,7 +520,7 @@ func TestMasterValidationTopsRequiresCandidateDescriptor(t *testing.T) {
 	}
 	verified.collated.roots = nil
 
-	acquisition := &LocalAcquisition{configs: localConfigCache{entries: make(map[cell.Hash]localPreparedConfig)}}
+	acquisition := &LocalAcquisition{configs: localConfigCache{entries: make(map[localConfigKey]localPreparedConfig)}}
 	master, err := acquisition.masterView(fixture.request.Previous, fixture.oldState, fixture.request.Groups)
 	if err != nil {
 		t.Fatal(err)
@@ -541,7 +541,7 @@ func TestMasterValidationTopsRejectsUnsignedCandidateDescriptor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	acquisition := &LocalAcquisition{configs: localConfigCache{entries: make(map[cell.Hash]localPreparedConfig)}}
+	acquisition := &LocalAcquisition{configs: localConfigCache{entries: make(map[localConfigKey]localPreparedConfig)}}
 	master, err := acquisition.masterView(fixture.request.Previous, fixture.oldState, fixture.request.Groups)
 	if err != nil {
 		t.Fatal(err)
@@ -677,7 +677,7 @@ func (s *localValidationStore) WaitBlockArtifacts(ctx context.Context, block ton
 
 func localValidationMasterFixture(t *testing.T) (masterBuildFixture, *cell.Cell) {
 	t.Helper()
-	fixture := newMasterBuildFixture(t, false)
+	fixture := newMasterBuildFixtureWith(t, masterBuildFixtureOptions{genUtime: 1_700_000_000})
 
 	base := emptyCandidateRequest(t)
 	var shard tlb.ShardStateUnsplit
@@ -901,14 +901,14 @@ func TestLoadExpectedNeighborsTracesOnlyWhenProofsAreNeeded(t *testing.T) {
 	}
 }
 
-// The prepared-config cache is keyed by config root hash, so without a cap it
-// retains one parsed config per distinct config the process ever sees.
+// The prepared-config cache is keyed by root hash and actual contract address;
+// its cap bounds how many distinct epochs the process retains.
 func TestLocalConfigCacheEvictsOldestBeyondCap(t *testing.T) {
-	cache := localConfigCache{entries: make(map[cell.Hash]localPreparedConfig)}
-	hashes := make([]cell.Hash, 0, maxLocalPreparedConfigs+2)
+	cache := localConfigCache{entries: make(map[localConfigKey]localPreparedConfig)}
+	hashes := make([]localConfigKey, 0, maxLocalPreparedConfigs+2)
 	for i := range maxLocalPreparedConfigs + 2 {
-		var hash cell.Hash
-		hash[0] = byte(i + 1)
+		var hash localConfigKey
+		hash.root[0] = byte(i + 1)
 		hashes = append(hashes, hash)
 		cache.store(hash, localPreparedConfig{config: &Config{}})
 	}
@@ -919,12 +919,12 @@ func TestLocalConfigCacheEvictsOldestBeyondCap(t *testing.T) {
 	}
 	for _, evicted := range hashes[:2] {
 		if _, exists := cache.entries[evicted]; exists {
-			t.Fatalf("oldest config %x survived eviction", evicted[:1])
+			t.Fatalf("oldest config %x survived eviction", evicted.root[:1])
 		}
 	}
 	for _, retained := range hashes[2:] {
 		if _, exists := cache.entries[retained]; !exists {
-			t.Fatalf("config %x was evicted before older ones", retained[:1])
+			t.Fatalf("config %x was evicted before older ones", retained.root[:1])
 		}
 	}
 

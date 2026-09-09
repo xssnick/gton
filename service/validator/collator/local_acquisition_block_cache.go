@@ -2,6 +2,7 @@ package collator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -84,17 +85,18 @@ type localBlockCache struct {
 	loads map[[32]byte]*localBlockLoad
 }
 
-// localBlockLoad is one in-flight read. source and err are written before done
-// is closed and only read after it, so the close is their publication.
+// localBlockLoad is one in-flight read. The result fields are written before
+// done is closed and only read after it, so the close is their publication.
 type localBlockLoad struct {
-	done   chan struct{}
-	source *localBlockSource
-	err    error
+	done     chan struct{}
+	source   *localBlockSource
+	err      error
+	canceled bool
 }
 
-// loadOnce returns the cached read of id, performing load at most once across
-// concurrent callers. A failed read is never cached: the flight is dropped
-// either way, so the next caller retries.
+// loadOnce returns the cached read of id, sharing each load across concurrent
+// callers. A failed read is never cached. Live callers retry a shared read
+// canceled by its owner; other errors are shared by everyone in that flight.
 //
 // The result still goes through store, which is what keeps content addressing
 // authoritative — a caller that joined a flight gets the same entry a caller
@@ -109,41 +111,65 @@ func (c *localBlockCache) loadOnce(
 		return nil, err
 	}
 
-	c.mu.Lock()
-	if flight, joined := c.loads[key]; joined {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		c.mu.Lock()
+		if source := c.entries[key]; source != nil {
+			if !source.previous.ID.Equals(&id) {
+				c.mu.Unlock()
+				return nil, fmt.Errorf("%w: cached block %x belongs to another block id", ErrInvalidInput, key)
+			}
+			source.generation = c.generation
+			c.mu.Unlock()
+
+			return source, nil
+		}
+		if flight, joined := c.loads[key]; joined {
+			c.mu.Unlock()
+			select {
+			case <-flight.done:
+			case <-ctx.Done():
+				// A waiting caller can leave without canceling the owner's read.
+				return nil, ctx.Err()
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if flight.canceled {
+				// A prewarm may own the read with a shorter-lived context than
+				// validation. Rejoin or load with this live caller's context so
+				// the owner's cancellation does not abort the other callers.
+				continue
+			}
+
+			return flight.source, flight.err
+		}
+		flight := &localBlockLoad{done: make(chan struct{})}
+		if c.loads == nil {
+			c.loads = make(map[[32]byte]*localBlockLoad)
+		}
+		c.loads[key] = flight
 		c.mu.Unlock()
-		select {
-		case <-flight.done:
-		case <-ctx.Done():
-			// Only this caller leaves; the read itself is shared work and runs
-			// to completion for whoever is still waiting on it.
-			return nil, ctx.Err()
+
+		source, err := load()
+		if err == nil {
+			source, err = c.store(source)
 		}
-		if flight.err != nil {
-			return nil, flight.err
+		flight.source, flight.err = source, err
+		if contextErr := ctx.Err(); contextErr != nil {
+			flight.canceled = errors.Is(err, contextErr)
 		}
 
-		return flight.source, nil
-	}
-	flight := &localBlockLoad{done: make(chan struct{})}
-	if c.loads == nil {
-		c.loads = make(map[[32]byte]*localBlockLoad)
-	}
-	c.loads[key] = flight
-	c.mu.Unlock()
+		c.mu.Lock()
+		delete(c.loads, key)
+		close(flight.done)
+		c.mu.Unlock()
 
-	source, err := load()
-	if err == nil {
-		source, err = c.store(source)
+		return source, err
 	}
-	flight.source, flight.err = source, err
-
-	c.mu.Lock()
-	delete(c.loads, key)
-	c.mu.Unlock()
-	close(flight.done)
-
-	return source, err
 }
 
 func (c *localBlockCache) lookup(id ton.BlockIDExt) (*localBlockSource, error) {

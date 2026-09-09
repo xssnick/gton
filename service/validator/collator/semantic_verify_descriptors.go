@@ -283,14 +283,7 @@ func semanticLoadCoins(loader *cell.Slice) (tlb.Coins, error) {
 	return coins, err
 }
 
-// semanticEnvelopeParseProbe, when set, observes every real (cache-missing)
-// envelope parse. Test-only; nil in production.
-var semanticEnvelopeParseProbe func(*cell.Cell)
-
 func parseSemanticEnvelope(root *cell.Cell) (*semanticEnvelope, error) {
-	if semanticEnvelopeParseProbe != nil {
-		semanticEnvelopeParseProbe(root)
-	}
 	var envelope tlb.MsgEnvelope
 	if err := parseExact(&envelope, root); err != nil {
 		return nil, err

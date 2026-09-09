@@ -56,7 +56,7 @@ func TestFullCollatedMainnetCandidateVerifies(t *testing.T) {
 			verification := shardVerificationRequest(req, candidate)
 			verification.NeighborShardEndLT = req.NeighborShardEndLT
 			verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-			if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+			if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 				t.Fatalf("verify collated mainnet candidate: %v", err)
 			}
 		})

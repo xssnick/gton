@@ -28,6 +28,11 @@ type dispatchInitiator struct {
 	initiatorLT uint64
 }
 
+type dispatchRemoval struct {
+	message   tlb.EnqueuedMsg
+	remaining *cell.Cell
+}
+
 // processDispatchQueue drains deferred messages in phases. Each phase
 // scans a private view while removals are applied to the real queue: phase 0
 // takes one message from every account, then the two policy-bounded phases may
@@ -103,7 +108,11 @@ func (c *collation) processDispatchQueue() error {
 			if err != nil {
 				return fmt.Errorf("%w: dispatch account %x: %v", ErrInvalidInput, source.AccountID, err)
 			}
-			metadata, err := c.processDeferredMessage(source, lt)
+			removed, err := c.removeDispatchEntry(source.AccountID, accountQueue, lt)
+			if err != nil {
+				return err
+			}
+			metadata, err := c.processDeferredMessage(source, lt, &removed.message)
 			if err != nil {
 				return err
 			}
@@ -112,7 +121,14 @@ func (c *collation) processDispatchQueue() error {
 				(phase == 1 &&
 					uint64(c.senderGenerated[source.AccountID]) >= uint64(c.req.dispatch.DeferMessagesAfter) &&
 					!dispatchAccountListed(c.req.dispatch.Whitelist, source))
-			if err = updateDispatchScanQueue(current, source.AccountID, accountQueue, lt, removeAccount); err != nil {
+			// The scan view has its own account membership, but a retained
+			// account has exactly the same remaining messages as the real queue.
+			// Reuse the value already serialized by the removal above.
+			remaining := removed.remaining
+			if removeAccount {
+				remaining = nil
+			}
+			if err = storeDispatchAccountValue(current.AugmentedDictionary, source.AccountID, remaining); err != nil {
 				return fmt.Errorf("%w: update dispatch scan account %x: %v", ErrInvalidInput, source.AccountID, err)
 			}
 
@@ -401,31 +417,12 @@ func minimumDispatchLT(queue *tlb.AccountDispatchQueue) (uint64, error) {
 	return lt, nil
 }
 
-func updateDispatchScanQueue(
-	queue *tlb.DispatchQueueAugDict,
-	accountID [32]byte,
-	accountQueue *tlb.AccountDispatchQueue,
+func (c *collation) processDeferredMessage(
+	source DispatchAccount,
 	lt uint64,
-	removeAccount bool,
-) error {
-	if removeAccount {
-		return queue.DeleteByBytesKey(accountID[:])
-	}
-
-	var discarded cell.Slice
-	if err := accountQueue.Messages.LoadValueAndDeleteByUintKeyInto(lt, &discarded); err != nil {
-		return err
-	}
-	accountQueue.Count--
-	return storeAccountDispatchQueue(queue.AugmentedDictionary, accountID, accountQueue)
-}
-
-func (c *collation) processDeferredMessage(source DispatchAccount, lt uint64) (*tlb.MsgMetadata, error) {
-	enqueued, err := c.removeDispatchEntry(source.AccountID, lt)
-	if err != nil {
-		return nil, err
-	}
-	if err = c.registerDispatchOp(false); err != nil {
+	enqueued *tlb.EnqueuedMsg,
+) (*tlb.MsgMetadata, error) {
+	if err := c.registerDispatchOp(false); err != nil {
 		return nil, err
 	}
 	c.senderGenerated[source.AccountID]++
@@ -438,7 +435,7 @@ func (c *collation) processDeferredMessage(source DispatchAccount, lt uint64) (*
 	}
 
 	var envelope tlb.MsgEnvelope
-	if err = parseExact(&envelope, enqueued.Msg); err != nil {
+	if err := parseExact(&envelope, enqueued.Msg); err != nil {
 		return nil, fmt.Errorf("%w: decode dispatch envelope %x:%d: %v", ErrInvalidInput, source.AccountID, lt, err)
 	}
 	if envelope.EmittedLT != nil {
@@ -520,37 +517,48 @@ func (c *collation) processDeferredMessage(source DispatchAccount, lt uint64) (*
 	return envelope.Metadata, nil
 }
 
-func (c *collation) removeDispatchEntry(accountID [32]byte, lt uint64) (*tlb.EnqueuedMsg, error) {
+func (c *collation) removeDispatchEntry(
+	accountID [32]byte,
+	accountQueue *tlb.AccountDispatchQueue,
+	lt uint64,
+) (dispatchRemoval, error) {
 	if err := c.traceDispatchMutation(accountID); err != nil {
-		return nil, err
+		return dispatchRemoval{}, err
 	}
 	oldAccount := c.oldDispatchAccounts[accountID]
 	if oldAccount == nil {
-		return nil, fmt.Errorf("%w: predecessor dispatch account %x is absent", ErrInvalidInput, accountID)
+		return dispatchRemoval{}, fmt.Errorf("%w: predecessor dispatch account %x is absent", ErrInvalidInput, accountID)
 	}
 	var oldValue cell.Slice
 	if err := oldAccount.Messages.LoadValueByUintKeyInto(lt, &oldValue); err != nil {
-		return nil, fmt.Errorf("%w: load predecessor dispatch message %x:%d: %v", ErrInvalidInput, accountID, lt, err)
+		return dispatchRemoval{}, fmt.Errorf("%w: load predecessor dispatch message %x:%d: %v", ErrInvalidInput, accountID, lt, err)
 	}
 
-	accountQueue, err := loadAccountDispatchQueue(c.dispatchQueue, accountID)
-	if err != nil {
-		return nil, fmt.Errorf("%w: load dispatch account %x: %v", ErrInvalidInput, accountID, err)
-	}
 	var discarded cell.Slice
-	if err = accountQueue.Messages.LoadValueAndDeleteByUintKeyInto(lt, &discarded); err != nil {
-		return nil, fmt.Errorf("%w: remove dispatch message %x:%d: %v", ErrInvalidInput, accountID, lt, err)
+	if err := accountQueue.Messages.LoadValueAndDeleteByUintKeyInto(lt, &discarded); err != nil {
+		return dispatchRemoval{}, fmt.Errorf("%w: remove dispatch message %x:%d: %v", ErrInvalidInput, accountID, lt, err)
 	}
-	var enqueued tlb.EnqueuedMsg
-	if err = loadExactSlice(&enqueued, &oldValue); err != nil {
-		return nil, fmt.Errorf("%w: decode dispatch message %x:%d: %v", ErrInvalidInput, accountID, lt, err)
+	var removed dispatchRemoval
+	if err := loadExactSlice(&removed.message, &oldValue); err != nil {
+		return dispatchRemoval{}, fmt.Errorf("%w: decode dispatch message %x:%d: %v", ErrInvalidInput, accountID, lt, err)
 	}
 
 	accountQueue.Count--
-	if err = storeAccountDispatchQueue(c.dispatchQueue.AugmentedDictionary, accountID, accountQueue); err != nil {
-		return nil, fmt.Errorf("%w: store dispatch account %x: %v", ErrInvalidInput, accountID, err)
+	if accountQueue.Count == 0 {
+		if !accountQueue.Messages.IsEmpty() {
+			return dispatchRemoval{}, fmt.Errorf("%w: dispatch account %x count reached zero with messages remaining", ErrInvalidInput, accountID)
+		}
+	} else {
+		var err error
+		removed.remaining, err = accountQueue.ToCell()
+		if err != nil {
+			return dispatchRemoval{}, fmt.Errorf("%w: serialize dispatch account %x: %v", ErrInvalidInput, accountID, err)
+		}
 	}
-	return &enqueued, nil
+	if err := storeDispatchAccountValue(c.dispatchQueue.AugmentedDictionary, accountID, removed.remaining); err != nil {
+		return dispatchRemoval{}, fmt.Errorf("%w: store dispatch account %x: %v", ErrInvalidInput, accountID, err)
+	}
+	return removed, nil
 }
 
 func (c *collation) traceDispatchMutation(accountID [32]byte) error {
@@ -595,6 +603,15 @@ func storeAccountDispatchQueue(
 	value, err := accountQueue.ToCell()
 	if err != nil {
 		return err
+	}
+	return storeDispatchAccountValue(queue, accountID, value)
+}
+
+// A nil value removes the account after its messages have been drained or its
+// participation in the current dispatch phase has ended.
+func storeDispatchAccountValue(queue *cell.AugmentedDictionary, accountID [32]byte, value *cell.Cell) error {
+	if value == nil {
+		return queue.DeleteByBytesKey(accountID[:])
 	}
 	var builder cell.Builder
 	value.ToBuilderInto(&builder)
@@ -642,19 +659,6 @@ func compareDispatchAccounts(left, right DispatchAccount) int {
 	return bytes.Compare(left.AccountID[:], right.AccountID[:])
 }
 
-func (c *collation) isMasterSpecialAccount(accountID [32]byte) (bool, error) {
-	if c.shard.Workchain != address.MasterchainID {
-		return false, nil
-	}
-	set, err := c.masterSpecialAccountIDs()
-	if err != nil {
-		return false, err
-	}
-	_, special := set[accountID]
-
-	return special, nil
-}
-
 func (c *collation) shouldDeferGenerated(
 	message *newMessage,
 	sourcePrefix msgpool.AccountPrefix,
@@ -663,10 +667,8 @@ func (c *collation) shouldDeferGenerated(
 	source := DispatchAccount{Workchain: sourcePrefix.Workchain, AccountID: sourceID}
 	policy := &c.req.dispatch
 	if c.config.capabilities&capDeferMessages != 0 && policy.DeferringEnabled && message.index != 0 {
-		special, err := c.isMasterSpecialAccount(sourceID)
-		if err != nil {
-			return false, err
-		}
+		_, special := c.config.specials.set[sourceID]
+		special = special && c.shard.Workchain == address.MasterchainID
 		if !special && !dispatchAccountListed(policy.Whitelist, source) {
 			c.senderGenerated[sourceID]++
 			deferQueueLimit := max(policy.DeferOutQueueSizeLimit, c.config.deferOutQueueSizeLimit)

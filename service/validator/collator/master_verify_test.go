@@ -91,14 +91,14 @@ func TestVerifyMasterCandidateBindsDeterministicInputs(t *testing.T) {
 		Semantics: testCandidateTransitionVerifier,
 		Candidate: candidate,
 	}
-	if err = VerifyMasterCandidate(context.Background(), request); err != nil {
+	if err = verifyMasterCandidateForTest(context.Background(), request); err != nil {
 		t.Fatalf("verify baseline candidate: %v", err)
 	}
 
 	t.Run("missing group snapshot", func(t *testing.T) {
 		changed := request
 		changed.Groups = nil
-		err := VerifyMasterCandidate(context.Background(), changed)
+		err := verifyMasterCandidateForTest(context.Background(), changed)
 		if err == nil || !strings.Contains(err.Error(), "group snapshot is absent") {
 			t.Fatalf("missing snapshot error = %v", err)
 		}
@@ -110,7 +110,7 @@ func TestVerifyMasterCandidateBindsDeterministicInputs(t *testing.T) {
 		snapshot.MasterchainBlock.RootHash = bytes.Clone(snapshot.MasterchainBlock.RootHash)
 		snapshot.MasterchainBlock.RootHash[0] ^= 1
 		changed.Groups = &snapshot
-		err := VerifyMasterCandidate(context.Background(), changed)
+		err := verifyMasterCandidateForTest(context.Background(), changed)
 		if err == nil || !strings.Contains(err.Error(), "not derived from the predecessor") {
 			t.Fatalf("stale snapshot error = %v", err)
 		}
@@ -126,7 +126,7 @@ func TestVerifyMasterCandidateBindsDeterministicInputs(t *testing.T) {
 			}
 		}
 		changed.Groups = &snapshot
-		err := VerifyMasterCandidate(context.Background(), changed)
+		err := verifyMasterCandidateForTest(context.Background(), changed)
 		if err == nil || !strings.Contains(err.Error(), "active validator session") {
 			t.Fatalf("active session error = %v", err)
 		}
@@ -135,7 +135,7 @@ func TestVerifyMasterCandidateBindsDeterministicInputs(t *testing.T) {
 	t.Run("shard descriptors", func(t *testing.T) {
 		changed := request
 		changed.ShardTops = nil
-		err := VerifyMasterCandidate(context.Background(), changed)
+		err := verifyMasterCandidateForTest(context.Background(), changed)
 		if err == nil || !strings.Contains(err.Error(), "unexpected top block") {
 			t.Fatalf("missing shard inputs error = %v", err)
 		}
@@ -146,7 +146,7 @@ func TestVerifyMasterCandidateBindsDeterministicInputs(t *testing.T) {
 		changed.ShardTops = append([]ShardTop(nil), request.ShardTops...)
 		changed.ShardTops[0].Creators = append([][32]byte(nil), request.ShardTops[0].Creators...)
 		changed.ShardTops[0].Creators[0][0] ^= 1
-		err := VerifyMasterCandidate(context.Background(), changed)
+		err := verifyMasterCandidateForTest(context.Background(), changed)
 		if err == nil || !strings.Contains(err.Error(), "creator statistics") {
 			t.Fatalf("wrong shard creator error = %v", err)
 		}

@@ -828,7 +828,7 @@ func (b *LocalSessionBackend) ValidateCandidate(
 		return CandidateValidation{}, err
 	}
 
-	b.speculateNextWindow(ctx, view, artifact, next, result.ValidAfter)
+	b.speculateNextWindow(ctx, view, artifact, next, result.ValidAfter, request.states)
 
 	return CandidateValidation{ValidAfter: result.ValidAfter, State: next}, nil
 }
@@ -853,6 +853,7 @@ func (b *LocalSessionBackend) speculateNextWindow(
 	artifact *CandidateArtifact,
 	successor *ChainState,
 	validAfter time.Time,
+	states *stateResolver,
 ) {
 	if successor == nil || len(successor.tips) != 1 {
 		return
@@ -869,6 +870,10 @@ func (b *LocalSessionBackend) speculateNextWindow(
 	specCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), bet.deadline)
 	go func() {
 		defer cancel()
+		var ancestors []*cell.Cell
+		if states != nil {
+			ancestors = states.speculativeAncestorBlocks(candidate, successor)
+		}
 		base, err := collator.NewSelectedBaseState(
 			session,
 			candidate,
@@ -876,6 +881,7 @@ func (b *LocalSessionBackend) speculateNextWindow(
 			tip.BlockBOC,
 			tip.Block,
 			tip.State,
+			ancestors,
 		)
 		if err != nil {
 			b.log.Debug().

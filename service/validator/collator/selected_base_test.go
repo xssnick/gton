@@ -45,6 +45,7 @@ func newSelectedBaseAcquisitionFixture(
 		built.BlockBOC,
 		candidateBlock(t, built),
 		built.State,
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -302,6 +303,7 @@ func TestLocalAdvanceConsensusBaseRekeysEmptyAliasWithoutStoreRead(t *testing.T)
 		fixture.blockBOC,
 		fixture.base.block.Block,
 		fixture.base.block.State,
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)

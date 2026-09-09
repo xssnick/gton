@@ -84,7 +84,7 @@ func verifyBudgetedCandidate(t *testing.T, req ShardRequest, candidate *Candidat
 		}
 		neighbors[i].OutMsgQueueInfo = resident.OutMsgQueueInfo
 	}
-	if err := VerifyShardCandidate(context.Background(), ShardVerificationRequest{
+	if err := verifyShardCandidateForTest(context.Background(), ShardVerificationRequest{
 		Previous:           req.Previous,
 		Masterchain:        req.Masterchain,
 		Neighbors:          neighbors,

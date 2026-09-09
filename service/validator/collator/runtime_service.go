@@ -165,6 +165,8 @@ type managedCollatorSession struct {
 	sessionWritePending     bool
 	progressReadyAfterWrite bool
 	sessionWriteRevision    uint64
+	sessionWriteAdmitted    uint64
+	sessionAdmissionWake    chan struct{}
 	// sessionWriteReserved counts opaque-pipeline mutations which crossed the
 	// point where they may commit but have not published their accepted record
 	// yet. The reservation starts the writer under Service.mu before that point,
@@ -3238,6 +3240,13 @@ func (s *Service) runSessionWrites(managed *managedCollatorSession) {
 		// WAL independently of the caller and run contexts. Close joins this
 		// worker and may time out, but it cannot silently discard the revision.
 		s.opts.Storage.SaveSession(context.WithoutCancel(s.runCtx), record, func(err error) { result <- err })
+		managed.mu.Lock()
+		managed.sessionWriteAdmitted = revision
+		if managed.sessionAdmissionWake != nil {
+			close(managed.sessionAdmissionWake)
+			managed.sessionAdmissionWake = nil
+		}
+		managed.mu.Unlock()
 		managed.sessionWriteMu.Unlock()
 		err := <-result
 
@@ -4532,6 +4541,31 @@ func awaitBuild(ctx context.Context, future *candidateBuildFuture) (candidateBui
 	}
 }
 
+// waitSessionAdmission orders a candidate marker after its session checkpoint
+// in the storage FIFO. Building may overlap the checkpoint, and neither this
+// barrier nor marker admission waits for the session's WAL callback.
+func (m *managedCollatorSession) waitSessionAdmission(ctx context.Context) error {
+	for {
+		m.mu.Lock()
+		if !m.sessionWritePending || m.sessionWriteAdmitted == m.sessionWriteRevision {
+			m.mu.Unlock()
+
+			return nil
+		}
+		if m.sessionAdmissionWake == nil {
+			m.sessionAdmissionWake = make(chan struct{})
+		}
+		wake := m.sessionAdmissionWake
+		m.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-wake:
+		}
+	}
+}
+
 func (s *Service) persistAndEmit(
 	ctx context.Context,
 	deliveryCtx context.Context,
@@ -4548,6 +4582,10 @@ func (s *Service) persistAndEmit(
 		defer func() {
 			s.observeCandidateProduction(chain, kind, productionStarted, resultErr)
 		}()
+	}
+
+	if err := managed.waitSessionAdmission(ctx); err != nil {
+		return err
 	}
 
 	candidateRecord := recordFromArtifact(artifact)

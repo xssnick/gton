@@ -133,13 +133,13 @@ func TestSemanticVerifierRejectsMasterSpecialV2Envelope(t *testing.T) {
 		Semantics:          NewSemanticVerifier(tvm.NewTVM()),
 		Candidate:          control,
 	}
-	if err = VerifyMasterCandidate(context.Background(), verification); err != nil {
+	if err = verifyMasterCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify untampered master candidate: %v", err)
 	}
 
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
 	verification.Candidate = tampered
-	err = VerifyMasterCandidate(context.Background(), verification)
+	err = verifyMasterCandidateForTest(context.Background(), verification)
 	if !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("master special msg_envelope_v2 verification = %v, want %v", err, ErrInvalidInput)
 	}

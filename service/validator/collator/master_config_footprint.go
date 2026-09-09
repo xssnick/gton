@@ -22,12 +22,12 @@ type masterConfigParse struct {
 	groups    *groups.Config
 }
 
-func parseMasterConfigEpoch(root *cell.Cell) (masterConfigParse, error) {
+func parseMasterConfigEpoch(root *cell.Cell, configAddress [32]byte) (masterConfigParse, error) {
 	execution, err := tvm.PrepareBlockchainConfig(root)
 	if err != nil {
 		return masterConfigParse{}, fmt.Errorf("%w: prepare blockchain config: %v", ErrInvalidInput, err)
 	}
-	config, err := PrepareConfig(execution)
+	config, err := PrepareConfig(execution, configAddress)
 	if err != nil {
 		return masterConfigParse{}, err
 	}
@@ -38,34 +38,11 @@ func parseMasterConfigEpoch(root *cell.Cell) (masterConfigParse, error) {
 	return masterConfigParse{execution: execution, config: config, groups: groupConfig}, nil
 }
 
-// configFootprint is the set of predecessor cells the configuration parses of
-// one config epoch read.
-//
-// Master collation replays it when it skips those parses: the Merkle update
-// descends only through recorded cells, and the collated-size estimate answers
-// membership out of the same record, so the block is the block the parse would
-// have produced only if the replayed set is the set the parse read.
-//
-// That is the promise, and it is kept exactly. A wrong footprint is not
-// observable on the one masterchain fixture this package has — its whole
-// non-configuration state is twenty cells — but that is a fact about the
-// fixture and not a structural guarantee. Reuse only fires when the
-// configuration the candidate installs is the root the predecessor state
-// already holds, so on that fixture the update prunes the whole configuration
-// onto one boundary and a proof over it stops there too, and a short, empty or
-// padded footprint produces byte-identical output. Membership in the read set
-// is answered by hash, wherever that hash occurs, so a configuration cell that
-// also appears elsewhere in a real state is named by the destination and moves
-// the produced bytes: one such cell is enough, and it has been reproduced.
-//
-// The set is therefore maintained against the record, which is the checkable
-// thing on every state rather than only on states where the bytes happen to
-// see it: TestMasterConfigFootprintMutationsAreDetected is the gate, and
-// TestMasterConfigFootprintDoesNotReachTheProducedBlock is the canary over the
-// fixture — it fails the day a new consumer selects cells out of the read set,
-// which is what shard collation already does for its predecessor state proof,
-// or the day this fixture holds a configuration cell that occurs outside the
-// configuration too.
+// configFootprint records the cells read by the epoch parsers. Replaying it
+// preserves the read set when a collation reuses their prepared result. Strict
+// validation already covers these reads for the mainnet fixture; retaining the
+// explicit footprint keeps reuse independent of which parameters each parser
+// consumes. Capture and replay are compared directly against a fresh parse.
 type configFootprint struct {
 	root  cell.Hash
 	cells []*cell.Cell
@@ -87,7 +64,7 @@ type configFootprint struct {
 // Nothing here reports an error and nothing returns a partial footprint: a nil
 // footprint costs one fresh parse per block, which is what the collator pays
 // today, while a short one would cost a wrong block.
-func captureConfigFootprint(root *cell.Cell) (*cell.Cell, *configFootprint) {
+func captureConfigFootprint(root *cell.Cell, configAddress [32]byte) (*cell.Cell, *configFootprint) {
 	if root == nil || root.IsVirtualized() {
 		// A virtualized root came out of a proof, so its cells are not the
 		// predecessor's own bodies and must never stand in for them.
@@ -103,7 +80,7 @@ func captureConfigFootprint(root *cell.Cell) (*cell.Cell, *configFootprint) {
 		return nil, nil
 	}
 	usage := cell.NewReadSetSized(resident, configFootprintCells)
-	if _, err = parseMasterConfigEpoch(usage.Root()); err != nil {
+	if _, err = parseMasterConfigEpoch(usage.Root(), configAddress); err != nil {
 		return resident, nil
 	}
 

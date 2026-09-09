@@ -149,7 +149,7 @@ func assertBoundCandidateIsProofBacked(t *testing.T, req ShardRequest, candidate
 		}
 		neighbors[i].OutMsgQueueInfo = resident.OutMsgQueueInfo
 	}
-	if err := VerifyShardCandidate(context.Background(), ShardVerificationRequest{
+	if err := verifyShardCandidateForTest(context.Background(), ShardVerificationRequest{
 		Previous:           req.Previous,
 		Masterchain:        req.Masterchain,
 		Neighbors:          neighbors,

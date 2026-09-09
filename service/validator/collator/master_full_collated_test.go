@@ -54,7 +54,7 @@ func TestBuildAndVerifyMasterFullCollatedNeighbors(t *testing.T) {
 		Semantics: testCandidateTransitionVerifier,
 		Candidate: candidate,
 	}
-	if err = VerifyMasterCandidate(context.Background(), verification); err != nil {
+	if err = verifyMasterCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify full masterchain candidate: %v", err)
 	}
 
@@ -78,7 +78,7 @@ func TestBuildAndVerifyMasterFullCollatedNeighbors(t *testing.T) {
 	tampered := cloneVerificationCandidate(candidate)
 	rewriteVerificationCollatedData(t, tampered, filtered...)
 	verification.Candidate = tampered
-	if err = VerifyMasterCandidate(context.Background(), verification); !errors.Is(err, ErrInvalidInput) ||
+	if err = verifyMasterCandidateForTest(context.Background(), verification); !errors.Is(err, ErrInvalidInput) ||
 		!strings.Contains(err.Error(), "state proof is absent") {
 		t.Fatalf("missing shard state proof error = %v", err)
 	}

@@ -134,7 +134,7 @@ func TestFullCollatedSharedStorageDictProvesEveryAccount(t *testing.T) {
 		recomputed = append(recomputed, key)
 	})
 	verification.Semantics = semantics
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify shared storage dict candidate: %v", err)
 	}
 	for _, key := range recomputed {

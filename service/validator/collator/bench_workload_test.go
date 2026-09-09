@@ -156,7 +156,7 @@ func TestBuildCandidateSerializesOverflowingBlock(t *testing.T) {
 	verification := shardVerificationRequest(req, candidate)
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify overflowing candidate: %v", err)
 	}
 }
@@ -199,7 +199,7 @@ func buildBenchWorkload(tb testing.TB, profile benchProfile) *benchWorkload {
 		Semantics:          NewSemanticVerifier(tvm.NewTVM()),
 		Candidate:          candidate,
 	}
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		tb.Fatalf("verify %s workload candidate: %v", profile.name, err)
 	}
 	// Reject a workload whose work moved into or out of this block: otherwise

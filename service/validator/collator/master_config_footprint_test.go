@@ -118,12 +118,12 @@ func TestCaptureConfigFootprintMatchesParseReads(t *testing.T) {
 	root := loadMainnetConfig(t).execution.Root()
 
 	usage := cell.NewReadSet(root)
-	if _, err := parseMasterConfigEpoch(usage.Root()); err != nil {
+	if _, err := parseMasterConfigEpoch(usage.Root(), testConfigAddress(t, root)); err != nil {
 		t.Fatal(err)
 	}
 	want := sortedHashes(usage.Hashes())
 
-	resident, footprint := captureConfigFootprint(root)
+	resident, footprint := captureConfigFootprint(root, testConfigAddress(t, root))
 	if footprint == nil {
 		t.Fatal("mainnet configuration produced no footprint")
 	}
@@ -176,7 +176,7 @@ func countLazyReferences(t *testing.T, cells []*cell.Cell) int {
 func TestCaptureConfigFootprintFromLazyStateIsDetachedFromTheLoader(t *testing.T) {
 	root := loadMainnetConfig(t).execution.Root()
 
-	residentRoot, resident := captureConfigFootprint(root)
+	residentRoot, resident := captureConfigFootprint(root, testConfigAddress(t, root))
 	if resident == nil || residentRoot == nil {
 		t.Fatal("resident configuration produced no footprint")
 	}
@@ -186,7 +186,7 @@ func TestCaptureConfigFootprintFromLazyStateIsDetachedFromTheLoader(t *testing.T
 	if !lazyRoot.IsLazy() && countLazyReferences(t, []*cell.Cell{lazyRoot}) == 0 {
 		t.Fatal("the fixture root is not paged in, so this proves nothing")
 	}
-	materialized, lazy := captureConfigFootprint(lazyRoot)
+	materialized, lazy := captureConfigFootprint(lazyRoot, testConfigAddress(t, root))
 	if lazy == nil || materialized == nil {
 		t.Fatal("paged-in configuration produced no footprint")
 	}
@@ -220,8 +220,8 @@ func TestPrepareConfigMaterializesBeforeParsing(t *testing.T) {
 	pages := newAdvLazifier()
 	lazyRoot := pages.root(t, root)
 
-	cache := localConfigCache{entries: make(map[cell.Hash]localPreparedConfig)}
-	prepared, err := cache.prepare(lazyRoot)
+	cache := localConfigCache{entries: make(map[localConfigKey]localPreparedConfig)}
+	prepared, err := cache.prepare(lazyRoot, testConfigAddress(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +256,7 @@ func TestPrepareConfigMaterializesBeforeParsing(t *testing.T) {
 func TestProofBackedConfigCannotPopulateEpochCache(t *testing.T) {
 	root := loadMainnetConfig(t).execution.Root()
 	usage := cell.NewReadSet(root)
-	if _, err := parseMasterConfigEpoch(usage.Root()); err != nil {
+	if _, err := parseMasterConfigEpoch(usage.Root(), testConfigAddress(t, root)); err != nil {
 		t.Fatal(err)
 	}
 	read := make(map[cell.Hash]struct{}, len(usage.Hashes()))
@@ -278,8 +278,8 @@ func TestProofBackedConfigCannotPopulateEpochCache(t *testing.T) {
 		t.Fatal("configuration proof did not produce a virtualized root")
 	}
 
-	cache := localConfigCache{entries: make(map[cell.Hash]localPreparedConfig)}
-	proofPrepared, err := cache.prepare(narrow)
+	cache := localConfigCache{entries: make(map[localConfigKey]localPreparedConfig)}
+	proofPrepared, err := cache.prepare(narrow, testConfigAddress(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,14 +290,14 @@ func TestProofBackedConfigCannotPopulateEpochCache(t *testing.T) {
 		t.Fatal("proof-backed configuration poisoned the epoch cache")
 	}
 
-	resident, err := cache.prepare(root)
+	resident, err := cache.prepare(root, testConfigAddress(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resident.execution.Root().IsVirtualized() || len(cache.entries) != 1 {
 		t.Fatal("resident configuration was not published into the epoch cache")
 	}
-	reused, err := cache.prepare(narrow)
+	reused, err := cache.prepare(narrow, testConfigAddress(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,15 +306,8 @@ func TestProofBackedConfigCannotPopulateEpochCache(t *testing.T) {
 	}
 }
 
-// TestMasterConfigFootprintMutationsAreDetected is the gate.
-//
-// It is a read-set comparison and not a byte comparison because the bytes this
-// fixture produces cannot see a wrong footprint:
-// TestMasterConfigFootprintDoesNotReachTheProducedBlock below shows why, and
-// why that is a property of the fixture rather than of the mechanism. Reuse
-// promises that skipping the parses records what the parses would have
-// recorded, and that promise is checkable against the record on every state,
-// so this is where a wrong footprint has to be caught.
+// Compare the replay in isolation: strict config validation can already read
+// the same cells, which would mask an incomplete replay in a whole transition.
 func TestMasterConfigFootprintMutationsAreDetected(t *testing.T) {
 	fixture := newMasterBuildFixture(t, false)
 	captured := fixture.request.Config.footprint.cells
@@ -322,187 +315,54 @@ func TestMasterConfigFootprintMutationsAreDetected(t *testing.T) {
 		t.Fatalf("the fixture footprint holds %d cells, too few to truncate", len(captured))
 	}
 
-	_, fresh := masterConfigTransitionReads(t, fixture, nil, nil)
-	freshBuild := buildMasterReadSetSize(t, withRequestConfig(fixture.request, withFootprint(fixture.request.Config, nil)))
+	root := fixture.request.Config.execution.Root()
+	usage := cell.NewReadSet(root)
+	if _, err := parseMasterConfigEpoch(usage.Root(), testConfigAddress(t, root)); err != nil {
+		t.Fatal(err)
+	}
+	fresh := sortedHashes(usage.Hashes())
 
 	for _, mutation := range []struct {
-		name  string
-		cells []*cell.Cell
+		name    string
+		cells   []*cell.Cell
+		matches bool
 	}{
-		{"one cell short", captured[:len(captured)-1]},
-		{"ten cells short", captured[:len(captured)-10]},
-		{"a hundred cells short", captured[:len(captured)-100]},
-		{"a thousand cells short", captured[:len(captured)-1000]},
-		{"empty", captured[:0]},
-		{"complete plus eight foreign cells", append(slices.Clone(captured), foreignCells(8)...)},
+		{"one cell short", captured[:len(captured)-1], false},
+		{"ten cells short", captured[:len(captured)-10], false},
+		{"a hundred cells short", captured[:len(captured)-100], false},
+		{"a thousand cells short", captured[:len(captured)-1000], false},
+		{"empty", captured[:0], false},
+		{"complete plus eight foreign cells", append(slices.Clone(captured), foreignCells(8)...), false},
+		{"complete", captured, true},
 	} {
 		t.Run(mutation.name, func(t *testing.T) {
 			config := withFootprint(fixture.request.Config, mutation.cells)
-
-			transition, reads := masterConfigTransitionReads(t, fixture, config, fixture.request.Groups.Config)
-			if transition.config != config {
-				t.Fatal("the reuse gate did not fire, so the mutated footprint was never replayed")
-			}
-			if slices.Equal(fresh, reads) {
-				t.Fatal("a wrong footprint recorded exactly what a fresh parse records")
-			}
-
-			// The same difference has to survive a whole collation, where the
-			// replay competes with every other read the block takes.
-			if size := buildMasterReadSetSize(t, withRequestConfig(fixture.request, config)); size == freshBuild {
-				t.Fatalf("a whole master collation recorded %d cells either way", size)
+			replayed := cell.NewReadSet(root)
+			config.footprint.replay(replayed)
+			if equal := slices.Equal(fresh, sortedHashes(replayed.Hashes())); equal != mutation.matches {
+				t.Fatalf("replayed footprint matches fresh parse = %t, want %t", equal, mutation.matches)
 			}
 		})
 	}
-
-	// The complete footprint is the one case that must record the fresh set
-	// exactly, or the table above would pass for the wrong reason.
-	transition, reads := masterConfigTransitionReads(t, fixture, fixture.request.Config, fixture.request.Groups.Config)
-	if transition.config != fixture.request.Config {
-		t.Fatal("the reuse gate did not fire for an unchanged configuration")
-	}
-	if !slices.Equal(fresh, reads) {
-		t.Fatalf("replaying the complete footprint recorded %d cells, parsing records %d", len(reads), len(fresh))
-	}
-	if size := buildMasterReadSetSize(t, fixture.request); size != freshBuild {
-		t.Fatalf("a whole master collation recorded %d cells replaying and %d parsing", size, freshBuild)
-	}
 }
 
-// TestMasterConfigFootprintDoesNotReachTheProducedBlock records why the byte
-// comparisons in this file cannot be the gate on this fixture, and fails the
-// day that stops holding.
-//
-// The reuse gate only fires when the configuration the candidate installs is the
-// very same root the predecessor state already holds. The candidate state
-// therefore references that root unchanged, the predecessor's own McStateExtra
-// is read on every masterchain block, and a state update prunes at the highest
-// hash it knows — so on this fixture the configuration leaves the block as one
-// boundary and nothing the replay contributed below it is emitted. The size
-// estimate stops at the same boundary for the same reason.
-//
-// A footprint that is short, empty or padded with foreign cells therefore
-// produces byte-identical output here. That is a property of this fixture, whose
-// entire non-configuration state is twenty cells, and not a structural one: the
-// read set answers membership by hash wherever that hash occurs, so a
-// configuration cell that also occurs elsewhere in the state is named by the
-// destination and moves the produced bytes. This test is the canary for both
-// ways that can start happening on the state we do have.
-func TestMasterConfigFootprintDoesNotReachTheProducedBlock(t *testing.T) {
+func TestMasterConfigValidationCoversParseReads(t *testing.T) {
 	fixture := newMasterBuildFixture(t, false)
-	configRoot := fixture.request.Config.execution.Root()
-	captured := fixture.request.Config.footprint.cells
-
-	// What the block reads without the replay: the raw validation of the
-	// configuration runs on every masterchain block and reaches the dictionary's
-	// top nodes whatever the footprint holds, so those are not what reuse skips.
-	// Everything else in the footprint is, and that is the set under test.
-	_, otherwise := masterConfigTransitionReads(t, fixture,
-		withFootprint(fixture.request.Config, captured[:0]), fixture.request.Groups.Config)
-	read := make(map[cell.Hash]struct{}, len(otherwise))
-	for _, hash := range otherwise {
-		read[hash] = struct{}{}
+	_, fresh := masterConfigTransitionReads(t, fixture, nil, nil)
+	withoutReplay := withFootprint(fixture.request.Config, fixture.request.Config.footprint.cells[:0])
+	transition, validated := masterConfigTransitionReads(t, fixture, withoutReplay, fixture.request.Groups.Config)
+	if transition.config != withoutReplay {
+		t.Fatal("configuration was parsed instead of reused")
 	}
-	skipped := make(map[cell.Hash]struct{}, len(captured))
-	for _, c := range captured {
-		if _, anyway := read[c.HashKey()]; !anyway {
-			skipped[c.HashKey()] = struct{}{}
-		}
+	// Full TL-B validation now reaches every cell the epoch parsers read in
+	// this fixture, even when no recorded reads are replayed.
+	if !slices.Equal(fresh, validated) {
+		t.Fatalf("validation recorded %d cells, fresh transition recorded %d", len(validated), len(fresh))
 	}
-	if len(skipped) < len(captured)/2 {
-		t.Fatalf("only %d of %d footprint cells are exclusive to the skipped parses, "+
-			"so this proves close to nothing", len(skipped), len(captured))
+	if complete, empty := buildMasterReadSetSize(t, fixture.request),
+		buildMasterReadSetSize(t, withRequestConfig(fixture.request, withoutReplay)); complete != empty {
+		t.Fatalf("whole collation recorded %d cells with replay and %d without it", complete, empty)
 	}
-
-	candidate, err := testBuilder().BuildMaster(context.Background(), fixture.request)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	boundary := false
-	for side := range 2 {
-		bodies, pruned := updateSideCells(t, candidate.StateUpdate.MustPeekRef(side))
-		for _, hash := range append(bodies, pruned...) {
-			if _, replayed := skipped[hash]; replayed {
-				t.Fatalf("side %d of the state update names a configuration cell only the "+
-					"replay read: either a new consumer now selects cells out of the read "+
-					"set, or this fixture holds a configuration cell whose hash occurs "+
-					"outside the configuration as well. Either way the footprint decides "+
-					"the produced block and the byte comparisons in this file have become "+
-					"the gate", side)
-			}
-		}
-		if slices.Contains(pruned, configRoot.HashKey()) {
-			boundary = true
-		}
-	}
-	if !boundary {
-		t.Fatal("the configuration root is not a pruned boundary of the state update")
-	}
-	t.Logf("%d of the footprint's %d cells are read only by the parses reuse skips, "+
-		"and none of them reaches either side of the state update", len(skipped), len(captured))
-
-	// The other consumer of the record: a proof over the configuration stops at
-	// the same boundary, so the size estimate cannot see the footprint either.
-	for _, cells := range [][]*cell.Cell{fixture.request.Config.footprint.cells, captured[:0]} {
-		usage := cell.NewReadSet(fixture.request.Previous.State)
-		var state tlb.ShardStateUnsplit
-		if err = parseExact(&state, usage.Root()); err != nil {
-			t.Fatal(err)
-		}
-		var extra tlb.McStateExtra
-		if err = parseExact(&extra, state.McStateExtra); err != nil {
-			t.Fatal(err)
-		}
-		if _, err = deriveMasterConfigTransition(state.Accounts.ShardAccounts, &extra,
-			masterConfigPredecessor{
-				config: withFootprint(fixture.request.Config, cells),
-				groups: fixture.request.Groups.Config,
-				usage:  usage,
-			}); err != nil {
-			t.Fatal(err)
-		}
-		stat := cell.NewCellStorageStat()
-		if err = stat.AddProof(extra.ConfigParams.Config.Params.AsCell(), usage); err != nil {
-			t.Fatal(err)
-		}
-		if total := stat.TotalStat(); total.Cells != 0 {
-			t.Fatalf("a proof over the configuration charges %d cells, so the size estimate "+
-				"now depends on the footprint", total.Cells)
-		}
-	}
-}
-
-// updateSideCells splits one side of a Merkle update into the predecessor cells
-// it carries in full and the ones it stands for with a pruned branch. Both are
-// named by the level-zero hash, which is the identity of the cell in the
-// predecessor tree rather than of its proof-side instance: a body that carries a
-// boundary below it is a level-one cell and its own hash would name nothing.
-func updateSideCells(t *testing.T, root *cell.Cell) ([]cell.Hash, []cell.Hash) {
-	t.Helper()
-
-	var bodies, pruned []cell.Hash
-	seen := make(map[cell.Hash]struct{})
-	var walk func(*cell.Cell, int)
-	walk = func(c *cell.Cell, depth int) {
-		if c == nil || depth > 64 {
-			return
-		}
-		if _, visited := seen[c.HashKey()]; visited {
-			return
-		}
-		seen[c.HashKey()] = struct{}{}
-		if c.GetType() == cell.PrunedCellType {
-			pruned = append(pruned, c.HashKeyAt(0))
-			return
-		}
-		bodies = append(bodies, c.HashKeyAt(0))
-		for i := range int(c.RefsNum()) {
-			walk(c.MustPeekRef(i), depth+1)
-		}
-	}
-	walk(root, 0)
-	return bodies, pruned
 }
 
 func assertIdenticalMasterCandidates(t *testing.T, first, second *Candidate) {
@@ -522,14 +382,7 @@ func assertIdenticalMasterCandidates(t *testing.T, first, second *Candidate) {
 	}
 }
 
-// The end-to-end run of the reuse gate: the candidate a reused configuration
-// produces has to be the candidate a fresh parse produces, and it has to verify.
-//
-// This does not check the footprint's contents — see
-// TestMasterConfigFootprintDoesNotReachTheProducedBlock for why nothing about
-// the bytes this fixture produces can. It checks the other half: that skipping three parses
-// and installing a configuration object built a block earlier yields the same
-// block, the same state, and an update that really applies to the predecessor.
+// Reusing an epoch must preserve the block, collated data and applied state.
 func TestBuildMasterConfigFootprintReuseProducesIdenticalCandidate(t *testing.T) {
 	fixture := newMasterBuildFixture(t, false)
 	if fixture.request.Config.footprint == nil {
@@ -556,7 +409,7 @@ func TestBuildMasterConfigFootprintReuseProducesIdenticalCandidate(t *testing.T)
 	if applied.HashKey() != replayed.State.HashKey() {
 		t.Fatal("the replayed candidate's update does not produce its state")
 	}
-	if err = VerifyMasterCandidate(context.Background(), MasterVerificationRequest{
+	if err = verifyMasterCandidateForTest(context.Background(), MasterVerificationRequest{
 		Previous:  fixture.request.Previous,
 		Config:    fixture.request.Config,
 		Groups:    fixture.request.Groups,

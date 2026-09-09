@@ -1,9 +1,14 @@
 package collator
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -126,5 +131,166 @@ func TestLocalBlockCacheLookupRenewsTheRetentionWindow(t *testing.T) {
 		if _, err := cache.lookup(id); err != nil {
 			t.Fatalf("entry retired at view installation %d: %v", i, err)
 		}
+	}
+}
+
+type cacheTestLoadResult struct {
+	source *localBlockSource
+	err    error
+}
+
+func TestLocalBlockCacheRetriesCanceledOwnerForLiveCallers(t *testing.T) {
+	for _, wantErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(wantErr.Error(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var cache localBlockCache
+				var loads atomic.Int32
+				id := testBlockID(0, -1<<63, 7, 0x66)
+				source := cacheTestSource(id)
+				ownerCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				ownerDone := make(chan error, 1)
+				go func() {
+					_, err := cache.loadOnce(ownerCtx, id, func() (*localBlockSource, error) {
+						loads.Add(1)
+						<-ownerCtx.Done()
+						return nil, fmt.Errorf("read block: %w", ownerCtx.Err())
+					})
+					ownerDone <- err
+				}()
+				synctest.Wait()
+
+				const callers = 8
+				results := make(chan cacheTestLoadResult, callers)
+				for range callers {
+					go func() {
+						got, err := cache.loadOnce(t.Context(), id, func() (*localBlockSource, error) {
+							loads.Add(1)
+							return source, nil
+						})
+						results <- cacheTestLoadResult{source: got, err: err}
+					}()
+				}
+				synctest.Wait()
+
+				if wantErr == context.Canceled {
+					cancel()
+				} else {
+					time.Sleep(time.Second)
+				}
+				synctest.Wait()
+				if err := <-ownerDone; !errors.Is(err, wantErr) {
+					t.Fatalf("owner error = %v, want %v", err, wantErr)
+				}
+				for range callers {
+					result := <-results
+					if result.err != nil || result.source != source {
+						t.Fatalf("live caller = (%p, %v), want (%p, nil)", result.source, result.err, source)
+					}
+				}
+				if got := loads.Load(); got != 2 {
+					t.Fatalf("loads = %d, want one canceled read and one shared retry", got)
+				}
+			})
+		})
+	}
+}
+
+func TestLocalBlockCacheCanceledCallerLeavesOwnerRunning(t *testing.T) {
+	for _, wantErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(wantErr.Error(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var cache localBlockCache
+				id := testBlockID(0, -1<<63, 7, 0x77)
+				source := cacheTestSource(id)
+				release := make(chan struct{})
+				ownerDone := make(chan cacheTestLoadResult, 1)
+				go func() {
+					got, err := cache.loadOnce(t.Context(), id, func() (*localBlockSource, error) {
+						<-release
+						return source, nil
+					})
+					ownerDone <- cacheTestLoadResult{source: got, err: err}
+				}()
+				synctest.Wait()
+
+				callerCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				callerDone := make(chan error, 1)
+				go func() {
+					_, err := cache.loadOnce(callerCtx, id, func() (*localBlockSource, error) {
+						t.Error("waiting caller started a second read")
+						return source, nil
+					})
+					callerDone <- err
+				}()
+				synctest.Wait()
+
+				if wantErr == context.Canceled {
+					cancel()
+				} else {
+					time.Sleep(time.Second)
+				}
+				synctest.Wait()
+				if err := <-callerDone; !errors.Is(err, wantErr) {
+					t.Fatalf("waiting caller error = %v, want %v", err, wantErr)
+				}
+				select {
+				case result := <-ownerDone:
+					t.Fatalf("owner completed before its read was released: %v", result.err)
+				default:
+				}
+
+				close(release)
+				result := <-ownerDone
+				if result.err != nil || result.source != source {
+					t.Fatalf("owner = (%p, %v), want (%p, nil)", result.source, result.err, source)
+				}
+			})
+		})
+	}
+}
+
+func TestLocalBlockCacheSharesLoadErrors(t *testing.T) {
+	for _, wantErr := range []error{ErrAcquisitionNotReady, context.Canceled, context.DeadlineExceeded} {
+		t.Run(wantErr.Error(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var cache localBlockCache
+				id := testBlockID(0, -1<<63, 7, 0x88)
+				release := make(chan struct{})
+				results := make(chan error, 2)
+				ownerCtx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				go func() {
+					_, err := cache.loadOnce(ownerCtx, id, func() (*localBlockSource, error) {
+						<-release
+						return nil, wantErr
+					})
+					results <- err
+				}()
+				synctest.Wait()
+
+				go func() {
+					_, err := cache.loadOnce(t.Context(), id, func() (*localBlockSource, error) {
+						t.Error("waiting caller retried an error unrelated to the owner's context")
+						return cacheTestSource(id), nil
+					})
+					results <- err
+				}()
+				synctest.Wait()
+
+				// Cancellation must not hide a storage error. Conversely, a
+				// storage timeout with a live owner must not trigger retries.
+				if wantErr == ErrAcquisitionNotReady {
+					cancel()
+				}
+				close(release)
+				for range 2 {
+					if err := <-results; !errors.Is(err, wantErr) {
+						t.Fatalf("load error = %v, want %v", err, wantErr)
+					}
+				}
+			})
+		})
 	}
 }

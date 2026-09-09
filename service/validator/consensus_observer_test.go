@@ -983,9 +983,9 @@ func TestConsensusObserverRetriesSynchronousStartupFailures(t *testing.T) {
 			t.Fatalf("activation retry: %v", err)
 		}
 		start, run, _ := fixture.sessionNet.counts()
-		prepare, _, _ := fixture.network.counts()
-		if prepare != 1 || start != 2 || run != 1 {
-			t.Fatalf("retry counts = prepare:%d start:%d run:%d", prepare, start, run)
+		prepare, retire, _ := fixture.network.counts()
+		if prepare != 2 || retire != 1 || start != 2 || run != 1 {
+			t.Fatalf("retry counts = prepare:%d retire:%d start:%d run:%d", prepare, retire, start, run)
 		}
 		if err := fixture.observer.Close(context.Background()); err != nil {
 			t.Fatal(err)
@@ -1005,8 +1005,8 @@ func TestConsensusObserverRetriesSynchronousStartupFailures(t *testing.T) {
 		if err := fixture.observer.ActivateSession(context.Background(), fixture.activation); err != nil {
 			t.Fatalf("activation retry: %v", err)
 		}
-		if prepare, _, _ := fixture.network.counts(); prepare != 1 {
-			t.Fatalf("overlay was prepared %d times, want once", prepare)
+		if prepare, retire, _ := fixture.network.counts(); prepare != 2 || retire != 1 {
+			t.Fatalf("overlay lifecycle prepare=%d retire=%d, want 2/1 for a fresh endpoint", prepare, retire)
 		}
 		if err := fixture.observer.Close(context.Background()); err != nil {
 			t.Fatal(err)
@@ -1105,7 +1105,7 @@ func TestConsensusObserverClassifiesUnavailableCandidateAsRetryable(t *testing.T
 	}
 }
 
-func TestConsensusObserverRunFailureAfterReadinessIsTerminal(t *testing.T) {
+func TestConsensusObserverRunFailureAfterReadinessDefersActivation(t *testing.T) {
 	runErr := errors.New("private overlay receiver failed")
 	fixture := newObserverFixture(t, nil, nil)
 	if err := fixture.observer.PrepareSession(context.Background(), fixture.descriptor); err != nil {
@@ -1116,8 +1116,9 @@ func TestConsensusObserverRunFailureAfterReadinessIsTerminal(t *testing.T) {
 	}
 	fixture.sessionNet.runFailures <- runErr
 	waitObserverPhase(t, fixture.observer, fixture.activation.SessionID, observerSessionFailed)
-	if err := fixture.observer.ActivateSession(context.Background(), fixture.activation); !errors.Is(err, runErr) {
-		t.Fatalf("terminal activation error = %v, want %v", err, runErr)
+	if err := fixture.observer.ActivateSession(context.Background(), fixture.activation); !errors.Is(err, runErr) ||
+		!errors.Is(err, collator.ErrAcquisitionNotReady) {
+		t.Fatalf("restarting activation error = %v, want retryable %v", err, runErr)
 	}
 	if err := fixture.observer.Close(context.Background()); err != nil {
 		t.Fatal(err)

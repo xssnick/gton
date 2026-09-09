@@ -208,7 +208,7 @@ func BenchmarkVerifyMaster(b *testing.B) {
 				Semantics:          NewSemanticVerifier(tvm.NewTVM()),
 				Candidate:          workload.candidate,
 			}
-			if err := VerifyMasterCandidate(context.Background(), verification); err != nil {
+			if err := verifyMasterCandidateForTest(context.Background(), verification); err != nil {
 				b.Fatalf("verify %s masterchain candidate: %v", profile.name, err)
 			}
 			ctx := context.Background()
@@ -216,7 +216,7 @@ func BenchmarkVerifyMaster(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				if err := VerifyMasterCandidate(ctx, verification); err != nil {
+				if err := verifyMasterCandidateForTest(ctx, verification); err != nil {
 					b.Fatal(err)
 				}
 			}

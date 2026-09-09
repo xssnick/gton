@@ -106,11 +106,11 @@ func TestFullCollatedProcessedQueueScanVerifiesOnProofs(t *testing.T) {
 			if !bytes.Equal(fixture.plain.ID.RootHash, fixture.candidate.ID.RootHash) {
 				t.Fatal("full collated data changed the block; the control no longer covers the same block")
 			}
-			if err := VerifyShardCandidate(context.Background(), fixture.control); err != nil {
+			if err := verifyShardCandidateForTest(context.Background(), fixture.control); err != nil {
 				t.Fatalf("the block itself does not verify against the resident predecessor: %v", err)
 			}
 
-			if err := VerifyShardCandidate(context.Background(), fixture.proofBacked); err != nil {
+			if err := verifyShardCandidateForTest(context.Background(), fixture.proofBacked); err != nil {
 				t.Fatalf("verify candidate on its own proofs: %v", err)
 			}
 		})
@@ -126,7 +126,7 @@ func TestFullCollatedProcessedQueueScanVerifiesOnProofs(t *testing.T) {
 			importTied:   1,
 			spread:       true,
 		})
-		if err := VerifyShardCandidate(context.Background(), fixture.proofBacked); err != nil {
+		if err := verifyShardCandidateForTest(context.Background(), fixture.proofBacked); err != nil {
 			t.Fatalf("verify candidate whose surviving queue entries have distinct lts: %v", err)
 		}
 	})

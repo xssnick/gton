@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -83,6 +84,9 @@ func VerifyShardCandidate(ctx context.Context, req ShardVerificationRequest) err
 	if err != nil {
 		return err
 	}
+	if err = verifyCandidateGenerationTime(prepared.verified.block.BlockInfo.GenUtime, time.Now()); err != nil {
+		return err
+	}
 
 	return verifyPreparedShardCandidate(ctx, req, prepared)
 }
@@ -117,7 +121,7 @@ func verifyPreparedShardCandidate(
 	if header.Shard.WorkchainID != 0 {
 		return fmt.Errorf("%w: only basechain blocks are supported", ErrUnsupported)
 	}
-	if err := verifyBasechainWorkchain(config, header.GenUtime); err != nil {
+	if err := verifyBasechainWorkchain(config, req.Masterchain.GenUtime); err != nil {
 		return err
 	}
 	if header.KeyBlock {
@@ -525,8 +529,21 @@ func VerifyMasterCandidate(ctx context.Context, req MasterVerificationRequest) e
 	if err != nil {
 		return err
 	}
+	if err = verifyCandidateGenerationTime(prepared.verified.block.BlockInfo.GenUtime, time.Now()); err != nil {
+		return err
+	}
 
 	return verifyPreparedMasterCandidate(ctx, req, prepared)
+}
+
+// The wall-clock bound is an admission check. The transition replay itself
+// remains independent of when an already-admitted candidate is executed.
+func verifyCandidateGenerationTime(genUtime uint32, now time.Time) error {
+	if int64(genUtime) > now.Unix()+30 {
+		return fmt.Errorf("%w: candidate generation time is more than 30 seconds in the future", ErrInvalidInput)
+	}
+
+	return nil
 }
 
 func verifyPreparedMasterCandidate(
@@ -1160,10 +1177,11 @@ func verifyMasterValueFlow(
 		return fmt.Errorf("%w: derive expected masterchain value flow: %v", ErrInvalidInput, err)
 	}
 	flow := &candidate.flow
+	// Recovery is optional. Its exact amount is a collator policy; validation
+	// binds it to the special message and the remaining validator fees below.
 	if !flow.FromPrevBlock.Equals(state.previousStats.TotalBalance) ||
 		!flow.FeesImported.Equals(expected.feesImported) ||
 		!flow.Created.Equals(expected.created) ||
-		!flow.Recovered.Equals(expected.recovered) ||
 		!flow.Minted.Equals(expected.minted) {
 		return fmt.Errorf("%w: masterchain value flow static components disagree with predecessor and config", ErrInvalidInput)
 	}

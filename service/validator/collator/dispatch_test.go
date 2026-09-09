@@ -429,7 +429,7 @@ func TestDeferredDescriptorTags(t *testing.T) {
 	assertTwoRefDispatchDescriptor(t, deferredTransit, 0b10101, first, second)
 }
 
-func dispatchTestCollation(t *testing.T, queue *tlb.DispatchQueueAugDict, policy DispatchPolicy) *collation {
+func dispatchTestCollation(t testing.TB, queue *tlb.DispatchQueueAugDict, policy DispatchPolicy) *collation {
 	t.Helper()
 	header := tlb.BlockHeader{}
 	header.StartLt = 1_000
@@ -469,7 +469,7 @@ func dispatchTestCollation(t *testing.T, queue *tlb.DispatchQueueAugDict, policy
 	return c
 }
 
-func makeDispatchQueue(t *testing.T, accounts ...dispatchFixtureAccount) *tlb.DispatchQueueAugDict {
+func makeDispatchQueue(t testing.TB, accounts ...dispatchFixtureAccount) *tlb.DispatchQueueAugDict {
 	t.Helper()
 	queue, err := tlb.NewDispatchQueueAugDict()
 	if err != nil {

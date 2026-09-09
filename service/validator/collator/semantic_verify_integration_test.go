@@ -17,7 +17,7 @@ func TestSemanticVerifierAcceptsBuilderShardCandidate(t *testing.T) {
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
 
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify Builder shard candidate with production semantics: %v", err)
 	}
 }
@@ -34,7 +34,7 @@ func TestSemanticVerifierAcceptsBuilderShardTransaction(t *testing.T) {
 		Candidate:          replay.transition.Candidate,
 	}
 
-	if err := VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err := verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify Builder transaction candidate with production semantics: %v", err)
 	}
 }
@@ -56,7 +56,7 @@ func TestSemanticVerifierAcceptsBuilderMasterCandidate(t *testing.T) {
 		Candidate:          candidate,
 	}
 
-	if err = VerifyMasterCandidate(context.Background(), verification); err != nil {
+	if err = verifyMasterCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify Builder masterchain candidate with production semantics: %v", err)
 	}
 }
@@ -76,7 +76,7 @@ func TestSemanticVerifierAcceptsBuilderDeferredTransit(t *testing.T) {
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
 
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify Builder deferred transit with production semantics: %v", err)
 	}
 }

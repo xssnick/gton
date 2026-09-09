@@ -331,16 +331,8 @@ func (c *collation) buildMasterValueFlow() (valueFlowParts, error) {
 }
 
 func (c *collation) deriveMasterConfig() error {
-	// This runs under the block's read set, which decides the Merkle update and
-	// answers the collated-size estimate's membership questions. The three parses
-	// read roughly 2700 cells below the configuration parameters that nothing
-	// else on this path touches — validator entries, fundamental-smc entries,
-	// storage price rows — so skipping them is sound only while the prepared
-	// configuration's footprint replays exactly what they read.
-	// TestDeriveMasterConfigTransitionReuseMatchesFreshParse and
-	// TestMasterConfigFootprintMutationsAreDetected are the guards; both compare
-	// the record and not the produced bytes, for the reason configFootprint
-	// documents.
+	// Reuse must preserve both the derived configuration and the proof read set.
+	// The transition and footprint tests compare these against a fresh parse.
 	transition, err := deriveMasterConfigTransition(
 		c.accounts,
 		&c.master.oldExtra,
@@ -385,7 +377,7 @@ type masterConfigPredecessor struct {
 // resulting configuration is the very same root at the very same address.
 // Preparing a configuration means building the execution config, the collator
 // config and the validator group config, which together are the bulk of this
-// function's cost and are pure functions of the root — the reference collator
+// function's cost and depend on the root and actual address — the reference collator
 // likewise reuses its parsed config and only re-validates the raw data every
 // block. Either half may be absent, in which case everything is derived from
 // scratch.
@@ -434,6 +426,7 @@ func deriveMasterConfigTransition(
 	nextConfig, nextGroups := previous.config, previous.groups
 	reuse := previous.config != nil && previous.groups != nil &&
 		previous.config.execution != nil &&
+		previous.config.configAddress == [32]byte(currentAddr) &&
 		bytes.Equal(currentAddr, nextAddr) &&
 		root.HashKey() == oldRoot.HashKey() &&
 		previous.config.execution.Root().HashKey() == oldRoot.HashKey() &&
@@ -441,7 +434,7 @@ func deriveMasterConfigTransition(
 	if reuse {
 		previous.config.footprint.replay(previous.usage)
 	} else {
-		parsed, parseErr := parseMasterConfigEpoch(root)
+		parsed, parseErr := parseMasterConfigEpoch(root, [32]byte(nextAddr))
 		if parseErr != nil {
 			return masterConfigTransition{}, parseErr
 		}

@@ -423,7 +423,7 @@ func TestBuildCandidateSkipsProcessedInternalMessage(t *testing.T) {
 	// The verifier is the point of the assertions above: it is the rule, they are
 	// its consequences. NewSemanticVerifier, never the accepting stub, and on a
 	// resident predecessor so that nothing here depends on proof coverage.
-	if err = VerifyShardCandidate(context.Background(), ShardVerificationRequest{
+	if err = verifyShardCandidateForTest(context.Background(), ShardVerificationRequest{
 		Previous:           req.Previous,
 		Masterchain:        req.Masterchain,
 		Neighbors:          req.Neighbors,

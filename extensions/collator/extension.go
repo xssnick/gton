@@ -54,7 +54,7 @@ type Options struct {
 	Controller Controller
 	ShardTops  ShardTopDescriptionSink
 	Messages   *msgpool.Pool
-	// Feed advances the message pool by applied blocks. It is the same
+	// Feed advances the message pool by accepted and applied blocks. It is the same
 	// component a validator drives from its own hook: without it the collator's
 	// out-queue runs are never at the head and every leader window pays a full
 	// queue walk out of state before it can collate.
@@ -105,6 +105,16 @@ func New(options Options) hooks.ExtensionFactory {
 				return nil, fmt.Errorf("register collator debug command: %w", err)
 			}
 		}
+
+		// Register after every fallible setup step so a failed constructor cannot
+		// leave a callback attached to the store. Stores without this optional
+		// capability keep feeding downloaded/applied blocks through the hook.
+		if publisher, ok := node.Store.(hooks.AcceptedBlockStatePublisher); ok {
+			extension.stopAcceptedFeed = publisher.ObserveAcceptedBlockStates(extension.onAcceptedBlockState)
+		} else {
+			extension.log.Debug().Msg("node store publishes no accepted states, message pool follows the apply pipeline only")
+		}
+
 		return extension, nil
 	}
 }
@@ -139,6 +149,12 @@ type Extension struct {
 	startErr error
 	buffered []groups.BufferedMasterchainState
 	waiting  bool
+
+	// Protected by mu. The idle channel is allocated only when Close needs to
+	// drain an accepted-state callback; normal publications allocate no channel.
+	stopAcceptedFeed    func()
+	activeAcceptedFeeds int
+	acceptedFeedIdle    chan struct{}
 }
 
 var _ hooks.Extension = (*Extension)(nil)
@@ -323,6 +339,7 @@ func (e *Extension) Close(ctx context.Context) error {
 	// Close against Close, which the hooks contract forbids anyway, and
 	// Mutex.Lock is not context-aware so it could not honour ctx.
 	var wait <-chan struct{}
+	var acceptedFeedIdle <-chan struct{}
 	var cancel context.CancelFunc
 	e.mu.Lock()
 	switch e.state {
@@ -337,7 +354,22 @@ func (e *Extension) Close(ctx context.Context) error {
 		// running controller cleanup concurrently with startup.
 		wait = e.done
 	}
+	stopAcceptedFeed := e.stopAcceptedFeed
+	e.stopAcceptedFeed = nil
+	if e.activeAcceptedFeeds > 0 {
+		if e.acceptedFeedIdle == nil {
+			e.acceptedFeedIdle = make(chan struct{})
+		}
+		acceptedFeedIdle = e.acceptedFeedIdle
+	}
 	e.mu.Unlock()
+
+	// Unregister outside mu: a publisher may still be invoking a callback that
+	// needs the same lock. Closing the admission gate above also rejects any
+	// callback the publisher copied before this unregistration.
+	if stopAcceptedFeed != nil {
+		stopAcceptedFeed()
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -348,6 +380,14 @@ func (e *Extension) Close(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	if acceptedFeedIdle != nil {
+		select {
+		case <-acceptedFeedIdle:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	// Joined after the cancel above and before the controller goes away: the
 	// sweep touches the pool the controller's sessions read.
 	e.sweep.Wait()
@@ -362,6 +402,41 @@ func (e *Extension) Close(ctx context.Context) error {
 	e.mu.Unlock()
 
 	return nil
+}
+
+// onAcceptedBlockState advances shard queues and starts account prewarming as
+// soon as consensus publishes their resident state. The feed deduplicates the
+// later applied-block event. Masterchain topology still follows OnBlockApplied.
+func (e *Extension) onAcceptedBlockState(artifacts storage.LiveBlockArtifacts) {
+	if artifacts.Block.Workchain == masterchainWorkchain || artifacts.Meta == nil ||
+		artifacts.Root == nil || artifacts.State == nil || artifacts.State.Cell == nil {
+		return
+	}
+
+	e.mu.Lock()
+	if e.state == extensionClosing || e.state == extensionClosed {
+		e.mu.Unlock()
+
+		return
+	}
+	e.activeAcceptedFeeds++
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		e.activeAcceptedFeeds--
+		if e.activeAcceptedFeeds == 0 && e.acceptedFeedIdle != nil {
+			close(e.acceptedFeedIdle)
+		}
+		e.mu.Unlock()
+	}()
+
+	e.feed.ObserveAccepted(msgpool.AppliedBlock{
+		ID:        artifacts.Block,
+		BlockRoot: artifacts.Root,
+		StateRoot: artifacts.State.Cell,
+		StartLT:   artifacts.Meta.StartLT,
+		GenUTime:  artifacts.Meta.GenUTime,
+	})
 }
 
 func (e *Extension) OnBlockApplied(ctx context.Context, event hooks.BlockAppliedEvent) error {

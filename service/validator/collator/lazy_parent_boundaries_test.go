@@ -515,7 +515,7 @@ func TestLazyParentChangesRootAndFileHash(t *testing.T) {
 		verification := shardVerificationRequest(arm.req, arm.candidate)
 		verification.NeighborShardEndLT = arm.req.NeighborShardEndLT
 		verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
-		if err := VerifyShardCandidate(context.Background(), verification); err != nil {
+		if err := verifyShardCandidateForTest(context.Background(), verification); err != nil {
 			t.Fatalf("%s: %v", arm.name, err)
 		}
 	}

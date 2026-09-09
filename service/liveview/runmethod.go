@@ -180,10 +180,11 @@ type RunMethodConfigInfo struct {
 }
 
 // runMethodBaseConfig is the per-master-block execution base: the shared
-// config-epoch context plus the master-specific prev-blocks tuple.
+// config-epoch context plus the active config contract and prev-blocks tuple.
 type runMethodBaseConfig struct {
-	epoch      *liveConfigEpoch
-	prevBlocks tuple.Tuple
+	epoch         *liveConfigEpoch
+	configAddress [32]byte
+	prevBlocks    tuple.Tuple
 }
 
 func RunMethodConfig(master ton.BlockIDExt, masterState *cell.Cell, now uint32, code *cell.Cell) (RunMethodConfigInfo, error) {
@@ -214,8 +215,9 @@ func buildRunMethodBaseConfig(master ton.BlockIDExt, extra *tlb.McStateExtra) (*
 	}
 
 	return &runMethodBaseConfig{
-		epoch:      epoch,
-		prevBlocks: prevBlocks,
+		epoch:         epoch,
+		configAddress: [32]byte(extra.ConfigParams.ConfigAddr),
+		prevBlocks:    prevBlocks,
 	}, nil
 }
 

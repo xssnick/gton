@@ -1169,11 +1169,25 @@ func loadMainnetConfig(tb testing.TB) *Config {
 func testPrepareConfig(tb testing.TB, root *cell.Cell) *Config {
 	tb.Helper()
 
-	resident, footprint := captureConfigFootprint(root)
+	return testPrepareConfigAt(tb, root, testConfigAddress(tb, root))
+}
+
+func testConfigAddress(tb testing.TB, root *cell.Cell) [32]byte {
+	tb.Helper()
+	addr, err := (tlb.BlockchainConfig{Root: root}).GetConfigAddress()
+	if err != nil || len(addr) != 32 {
+		tb.Fatalf("fixture config address: %v", err)
+	}
+	return [32]byte(addr)
+}
+
+func testPrepareConfigAt(tb testing.TB, root *cell.Cell, configAddress [32]byte) *Config {
+	tb.Helper()
+	resident, footprint := captureConfigFootprint(root, configAddress)
 	if footprint == nil {
 		tb.Fatal("configuration footprint was not captured")
 	}
-	parsed, err := parseMasterConfigEpoch(resident)
+	parsed, err := parseMasterConfigEpoch(resident, configAddress)
 	if err != nil {
 		tb.Fatal(err)
 	}

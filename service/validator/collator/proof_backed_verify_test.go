@@ -38,7 +38,7 @@ func TestFullCollatedShardVerificationRunsOnProofsNotResidentState(t *testing.T)
 	verification.Previous.State = narrowedStateRoot(t, req.Previous.State)
 	verification.Neighbors = collatedNeighborQueues(t, req, candidate)
 
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify collated candidate without a resident predecessor: %v", err)
 	}
 
@@ -52,7 +52,7 @@ func TestFullCollatedShardVerificationRunsOnProofsNotResidentState(t *testing.T)
 	control.NeighborShardEndLT = plainReq.NeighborShardEndLT
 	control.Semantics = NewSemanticVerifier(tvm.NewTVM())
 	control.Previous.State = narrowedStateRoot(t, plainReq.Previous.State)
-	if err = VerifyShardCandidate(context.Background(), control); err == nil {
+	if err = verifyShardCandidateForTest(context.Background(), control); err == nil {
 		t.Fatal("narrowed predecessor verified without collated proofs to replace it")
 	}
 }
@@ -107,7 +107,7 @@ func TestFullCollatedShardVerificationRejectsNarrowedPredecessorProof(t *testing
 	verification.NeighborShardEndLT = req.NeighborShardEndLT
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
 
-	err = VerifyShardCandidate(context.Background(), verification)
+	err = verifyShardCandidateForTest(context.Background(), verification)
 	if err == nil {
 		t.Fatal("candidate with an under-proven predecessor was accepted")
 	}

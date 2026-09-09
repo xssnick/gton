@@ -186,6 +186,10 @@ func TestSemanticPrecheckRejectsIncompleteAccountDiff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	index, err := buildAccountBlockIndex(accountBlocks)
+	if err != nil {
+		t.Fatal(err)
+	}
 	previous := &tlb.ShardStateUnsplit{}
 	previous.Accounts.ShardAccounts = oldAccounts
 	candidateState := tlb.ShardStateUnsplit{}
@@ -194,10 +198,12 @@ func TestSemanticPrecheckRejectsIncompleteAccountDiff(t *testing.T) {
 		ctx:      context.Background(),
 		previous: previous,
 		candidate: &verifiedCandidate{
-			state:         candidateState,
-			accountBlocks: accountBlocks,
+			state:             candidateState,
+			accountBlocks:     accountBlocks,
+			accountBlockIndex: index,
 		},
-		accountBlocks: accountBlocks,
+		accountBlocks:     accountBlocks,
+		accountBlockIndex: index,
 	}
 
 	err = replay.precheckAccountUpdates()

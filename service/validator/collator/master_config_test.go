@@ -2,12 +2,10 @@ package collator
 
 import (
 	"bytes"
-	"math/big"
 	"slices"
 	"strings"
 	"testing"
 
-	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -26,7 +24,7 @@ func TestValidateOracleBridgeParameter(t *testing.T) {
 		t.Fatal(err)
 	}
 	parameter.MustStoreUInt(5, 256)
-	raw := masterConfigTestRaw(t, 71, parameter.EndCell())
+	raw := parameter.EndCell()
 	if err := validateKnownConfigParameter(raw, 71); err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +41,7 @@ func TestValidateOracleBridgeParameter(t *testing.T) {
 		t.Fatal(err)
 	}
 	parameter.MustStoreUInt(5, 256)
-	raw = masterConfigTestRaw(t, 71, parameter.EndCell())
+	raw = parameter.EndCell()
 	if err := validateKnownConfigParameter(raw, 71); err == nil {
 		t.Fatal("malformed oracle value was accepted")
 	}
@@ -59,7 +57,7 @@ func TestValidateJettonBridgeParameters(t *testing.T) {
 		t.Fatal(err)
 	}
 	v0.MustStoreUInt(3, 8).MustStoreCoins(4)
-	if err := validateKnownConfigParameter(masterConfigTestRaw(t, 79, v0.EndCell()), 79); err != nil {
+	if err := validateKnownConfigParameter(v0.EndCell(), 79); err != nil {
 		t.Fatal(err)
 	}
 
@@ -75,7 +73,7 @@ func TestValidateJettonBridgeParameters(t *testing.T) {
 		t.Fatal(err)
 	}
 	v1.MustStoreUInt(3, 8).MustStoreRef(prices.EndCell()).MustStoreUInt(4, 256)
-	if err := validateKnownConfigParameter(masterConfigTestRaw(t, 81, v1.EndCell()), 81); err != nil {
+	if err := validateKnownConfigParameter(v1.EndCell(), 81); err != nil {
 		t.Fatal(err)
 	}
 
@@ -84,13 +82,13 @@ func TestValidateJettonBridgeParameters(t *testing.T) {
 		t.Fatal(err)
 	}
 	unknown.MustStoreUInt(0, 8)
-	if err := validateKnownConfigParameter(masterConfigTestRaw(t, 82, unknown.EndCell()), 82); err == nil {
+	if err := validateKnownConfigParameter(unknown.EndCell(), 82); err == nil {
 		t.Fatal("unknown jetton bridge version was accepted")
 	}
 }
 
 func TestValidateKnownConfigParameterRejectsUnknownPositive(t *testing.T) {
-	raw := masterConfigTestRaw(t, 70, cell.BeginCell().EndCell())
+	raw := cell.BeginCell().EndCell()
 	if err := validateKnownConfigParameter(raw, 70); err == nil {
 		t.Fatal("unknown positive parameter was accepted")
 	}
@@ -107,7 +105,7 @@ func TestValidateValidatorRegistryConfigParameter(t *testing.T) {
 			parameter.MustStoreUInt(2, 256)
 		}
 
-		raw := masterConfigTestRaw(t, 46, parameter.EndCell())
+		raw := parameter.EndCell()
 		if err := validateKnownConfigParameter(raw, 46); err != nil {
 			t.Fatalf("new_code_hash=%v: %v", withNewCodeHash, err)
 		}
@@ -139,7 +137,7 @@ func TestValidateValidatorRegistryConfigParameterRejectsMalformed(t *testing.T) 
 
 	for name, parameter := range tests {
 		t.Run(name, func(t *testing.T) {
-			raw := masterConfigTestRaw(t, 46, parameter)
+			raw := parameter
 			if err := validateKnownConfigParameter(raw, 46); err == nil {
 				t.Fatal("malformed validator registry parameter was accepted")
 			}
@@ -147,21 +145,15 @@ func TestValidateValidatorRegistryConfigParameterRejectsMalformed(t *testing.T) 
 	}
 }
 
-// TestValidateKnownConfigParameterAcceptedSet pins the exact set of positive
-// parameter ids the switch recognises. An id missing from it stops the node:
-// validateMasterConfigData runs over the CURRENT config, so one unrecognised
-// live parameter fails every masterchain block, both collated and validated.
-// The reference set is ConfigParam::get_tag of ton c7da81d4 (2023-03-23) —
-// {0..4, 6..18, 20..25, 28,29, 31..37, 39,40, 43,44, 71,72,73, 79,80,81} —
-// widened by the ids that appeared upstream after that checkout and are already
-// carried by mainnet: 5, 19, 30, 45, 82. Do not narrow it back to the pinned
-// tree's set.
+// TestValidateKnownConfigParameterAcceptedSet pins the positive parameter IDs
+// declared in cppnode/ton/crypto/block/block.tlb. Checking both known and unknown
+// IDs prevents either rejecting valid configurations or accepting unsupported ones.
 func TestValidateKnownConfigParameterAcceptedSet(t *testing.T) {
 	want := map[uint32]struct{}{}
 	for _, id := range []uint32{
 		1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
 		20, 21, 22, 23, 24, 25, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 39, 40,
-		43, 44, 45, 46, 71, 72, 73, 79, 80, 81, 82,
+		43, 44, 45, 46, 71, 72, 73, 79, 81, 82,
 	} {
 		want[id] = struct{}{}
 	}
@@ -169,7 +161,7 @@ func TestValidateKnownConfigParameterAcceptedSet(t *testing.T) {
 	// Parameter 0 is handled by validateMasterConfigData itself and never
 	// reaches the switch, so it is deliberately outside the pinned set here.
 	for id := uint32(1); id <= 100; id++ {
-		raw := masterConfigTestRaw(t, id, cell.BeginCell().EndCell())
+		raw := cell.BeginCell().EndCell()
 		err := validateKnownConfigParameter(raw, id)
 		// Every branch but the default one either accepts the parameter or
 		// fails while decoding it; only an unlisted id reports the switch miss.
@@ -180,28 +172,9 @@ func TestValidateKnownConfigParameterAcceptedSet(t *testing.T) {
 	}
 }
 
-func masterConfigTestRaw(t *testing.T, id uint32, parameter *cell.Cell) tlb.BlockchainConfig {
-	t.Helper()
-	dict := cell.NewDict(32)
-	value := cell.BeginCell().MustStoreRef(parameter).EndCell()
-	if err := dict.SetIntKey(new(big.Int).SetUint64(uint64(id)), value); err != nil {
-		t.Fatal(err)
-	}
-	return tlb.BlockchainConfig{Root: dict.AsCell()}
-}
-
-// TestDeriveMasterConfigTransitionReuseMatchesFreshParse is the differential
-// guard for reusing the predecessor's prepared configuration.
-//
-// The outputs must match because they feed the candidate. The read sets must
-// match too, and that is the less obvious half: on the collation path this
-// function runs under the block's read set, the Merkle update descends only
-// through cells that set recorded, and the collated-size estimate answers
-// membership out of the same record — so reuse is sound exactly while the
-// replayed footprint is the set the skipped parses would have read.
-//
-// This half only bites while a wrong footprint is rejected, which is what
-// TestMasterConfigFootprintMutationsAreDetected keeps true.
+// TestDeriveMasterConfigTransitionReuseMatchesFreshParse compares both the
+// transition and recorded reads after strict validation, whether prepared
+// config objects are reused or parsed again.
 func TestDeriveMasterConfigTransitionReuseMatchesFreshParse(t *testing.T) {
 	fixture := newMasterBuildFixture(t, false)
 

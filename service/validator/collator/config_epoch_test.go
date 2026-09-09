@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"math/big"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/xssnick/tonutils-go/tlb"
@@ -15,23 +13,11 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-// TestPrepareConfigAddsNoReadsToTheMasterConfigTransition pins what the
-// configuration parses of one masterchain block read.
-//
-// deriveMasterConfigTransition runs under the block's read set on the collation
-// path: the Merkle update descends only through cells that set recorded, and the
-// collated-size estimate answers membership out of the same record. So this
-// count and this digest ARE the produced masterchain block. A change in either
-// number means the collator emits different bytes than it emitted before, and
-// the only acceptable reason to move the golden is a deliberate, reviewed change
-// to what a masterchain block commits to.
-//
-// The golden was taken from the tree before Config held any epoch-derived
-// configuration data, which is what makes this a differential rather than a
-// tautology. Every value PrepareConfig now precomputes is derived either from the
-// already-prepared execution config (no cell touched at all) or from parameters
-// validateMasterConfigData has read on this path before PrepareConfig runs.
-func TestPrepareConfigAddsNoReadsToTheMasterConfigTransition(t *testing.T) {
+// Pin the configuration transition's proof read set. Strict TL-B validation
+// deliberately adds 11 cells over the former getter-only validation: nested
+// records must be read before their shape can be accepted. This fixture also
+// checks fresh parsing and epoch reuse against each other in master_config_test.go.
+func TestMasterConfigTransitionReadSet(t *testing.T) {
 	fixture := newMasterBuildFixture(t, false)
 	_, reads := masterConfigTransitionReads(t, fixture, nil, nil)
 
@@ -42,8 +28,8 @@ func TestPrepareConfigAddsNoReadsToTheMasterConfigTransition(t *testing.T) {
 	got := hex.EncodeToString(digest.Sum(nil))
 
 	const (
-		wantCount  = 2868
-		wantDigest = "bb62eb5021630c3034e03a70a0ae82fa97d9109f426f272d08ca930fb202fb3f"
+		wantCount  = 2879
+		wantDigest = "8b63e24a709e49b2b8f76116f50f0aed5f99ff8d037c182067ca748e859ae993"
 	)
 	if len(reads) != wantCount || got != wantDigest {
 		t.Fatalf("configuration transition recorded %d cells (%s), want %d (%s)",
@@ -60,7 +46,7 @@ func epochConfigOf(t *testing.T, root *cell.Cell) *Config {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config, err := PrepareConfig(execution)
+	config, err := PrepareConfig(execution, testConfigAddress(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,9 +159,6 @@ func TestPrepareConfigEpochValuesMatchFreshParse(t *testing.T) {
 		if len(want) < 2 {
 			t.Fatalf("mainnet lists %d special accounts, too few to prove an order", len(want))
 		}
-		if config.specials.err != nil {
-			t.Fatal(config.specials.err)
-		}
 		if !slices.Equal(config.specials.ordered, want) {
 			t.Fatalf("special accounts %x, want %x", config.specials.ordered, want)
 		}
@@ -260,52 +243,51 @@ func TestPrepareConfigEpochValuesMatchFreshParse(t *testing.T) {
 	}
 }
 
-// TestPrepareConfigWithoutConfigAddressDefersRejectionToMasterPaths pins the
-// timing of the one rejection that moved into the epoch derivation.
-//
-// PrepareConfig must still succeed: it also runs from localConfigCache.prepare,
-// so failing here would make the whole epoch unpreparable and take SHARD
-// collation down over a masterchain-shaped defect. The rejection has to keep
-// arriving where it arrives today — at the master consumers.
-func TestPrepareConfigWithoutConfigAddressDefersRejectionToMasterPaths(t *testing.T) {
-	root := epochConfigWithoutParam(t, loadMainnetConfig(t).execution.Root(), tlb.ConfigParamConfigAddress)
-	config := epochConfigOf(t, root)
+func TestPrepareConfigWithoutParamZeroUsesStateAddress(t *testing.T) {
+	base := loadMainnetConfig(t).execution.Root()
+	actual := testConfigAddress(t, base)
+	root := epochConfigWithoutParam(t, base, tlb.ConfigParamConfigAddress)
+	config := testPrepareConfigAt(t, root, actual)
 
-	if config.specials.err == nil {
-		t.Fatal("a configuration without parameter 0 produced a special-account list")
+	if config.configAddress != actual {
+		t.Fatalf("configuration address = %x, want state address %x", config.configAddress, actual)
 	}
-	if !errors.Is(config.specials.err, ErrInvalidInput) ||
-		!strings.Contains(config.specials.err.Error(), "config smart contract address is malformed") {
-		t.Fatalf("carried rejection = %v", config.specials.err)
-	}
-	// Nothing else in the epoch is collateral damage: a shard block never asks
-	// about special accounts, and its gas allowance still resolves.
-	if config.gas[0].err != nil || config.gas[0].normal == 0 {
-		t.Fatalf("basechain gas accounting = %+v", config.gas[0])
-	}
-
-	collation := &collation{config: config}
-	if _, err := collation.masterSpecialAccounts(); !errors.Is(err, ErrInvalidInput) {
-		t.Fatalf("masterSpecialAccounts error = %v", err)
-	}
-	if _, err := collation.masterSpecialAccountIDs(); !errors.Is(err, ErrInvalidInput) {
-		t.Fatalf("masterSpecialAccountIDs error = %v", err)
+	want := freshMasterSpecialAccounts(t, base)
+	if !slices.Equal(config.specials.ordered, want) {
+		t.Fatalf("special accounts = %x, want %x", config.specials.ordered, want)
 	}
 
 	replay := &semanticReplay{
 		transition: CandidateTransition{Config: config},
 		candidate:  &verifiedCandidate{},
 	}
-	if err := replay.prepareGasAccounting(); !errors.Is(err, ErrInvalidInput) {
-		t.Fatalf("masterchain gas accounting error = %v", err)
-	}
-	// The shard path must not see it at all.
-	replay.candidate.block.BlockInfo.NotMaster = true
 	if err := replay.prepareGasAccounting(); err != nil {
-		t.Fatalf("shard gas accounting rejected a masterchain-only defect: %v", err)
+		t.Fatalf("masterchain gas accounting: %v", err)
 	}
-	if replay.specials.set != nil {
-		t.Fatal("the shard path bound a special-account set")
+	if replay.normalGasLimit != config.gas[1].normal || replay.specialGasLimit != config.gas[1].special {
+		t.Fatal("masterchain gas limits differ from the prepared epoch")
+	}
+	lane := &semanticAccountLane{key: actual}
+	transactionRoot := cell.BeginCell().EndCell()
+	transaction := &tlb.TransactionLean{Kind: tlb.TransactionKindOrdinary}
+	result := &tvm.TransactionExecutionResult{ExecutionResult: tvm.ExecutionResult{GasUsed: 1}}
+	if err := replay.recordTransactionGas(lane, transactionRoot, transaction, result); err != nil {
+		t.Fatalf("configuration contract gas accounting: %v", err)
+	}
+	if lane.specialGas != 1 || lane.normalGas != 0 {
+		t.Fatalf("configuration contract gas: special=%d normal=%d", lane.specialGas, lane.normalGas)
+	}
+
+	shard := &semanticReplay{
+		transition: CandidateTransition{Config: config},
+		candidate:  &verifiedCandidate{},
+	}
+	shard.candidate.block.BlockInfo.NotMaster = true
+	if err := shard.prepareGasAccounting(); err != nil {
+		t.Fatalf("shard gas accounting: %v", err)
+	}
+	if shard.normalGasLimit != config.gas[0].normal || shard.specials.set != nil {
+		t.Fatal("shard gas accounting inherited masterchain special accounts")
 	}
 }
 
@@ -508,9 +490,6 @@ var masterchainTickTockOrderMainnet = []string{
 // together. This one has no algorithm on the expectation side at all.
 func TestMasterSpecialAccountOrderIsTheReferenceOrder(t *testing.T) {
 	specials := epochConfigOf(t, loadMainnetConfig(t).execution.Root()).specials
-	if specials.err != nil {
-		t.Fatalf("prepare mainnet special accounts: %v", specials.err)
-	}
 
 	want := make([][32]byte, len(masterchainTickTockOrderMainnet))
 	for i, encoded := range masterchainTickTockOrderMainnet {

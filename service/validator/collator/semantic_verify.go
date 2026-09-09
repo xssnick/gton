@@ -318,9 +318,6 @@ func (r *semanticReplay) prepareGasAccounting() error {
 	if !masterchain {
 		return nil
 	}
-	if config.specials.err != nil {
-		return config.specials.err
-	}
 	r.specials = config.specials
 
 	return nil
@@ -362,10 +359,11 @@ func (r *semanticReplay) loadMasterSpecialTransactions() error {
 func (r *semanticReplay) newBlockContext() (*tvm.BlockContext, error) {
 	header := &r.candidate.block.BlockInfo
 	options := tvm.BlockOptions{
-		Now:      header.GenUtime,
-		BlockLT:  int64(header.StartLt),
-		RandSeed: r.candidate.block.Extra.RandSeed,
-		GlobalID: r.previous.GlobalID,
+		ConfigAddress: &r.transition.Config.configAddress,
+		Now:           header.GenUtime,
+		BlockLT:       int64(header.StartLt),
+		RandSeed:      r.candidate.block.Extra.RandSeed,
+		GlobalID:      r.previous.GlobalID,
 	}
 	if header.NotMaster {
 		if r.transition.Masterchain == nil {
@@ -460,9 +458,8 @@ func (r *semanticReplay) precheckAccountUpdates() error {
 		// The structural pass had to decode every entry to reach its transaction
 		// augmentation, so this is a binary search over what it recorded rather
 		// than a second decode. The keyed descent below runs only when the index
-		// cannot answer: a replay assembled without the structural pass, a trie
-		// whose walk was not strictly ascending, or an account the candidate
-		// changed without supplying an AccountBlock — which is the failure the
+		// cannot answer: a trie whose walk was not strictly ascending, or an
+		// account changed without an AccountBlock — which is the failure the
 		// message names, reported by the same LoadValue that reported it before.
 		entry, indexed := r.accountBlockIndex.find(key)
 		if !indexed {
@@ -597,20 +594,6 @@ func (r *semanticReplay) verifyAccounts() error {
 // deferring the error keeps it ranked by account key like any replay failure.
 func (r *semanticReplay) decodeAccountLanes() ([]semanticAccountLane, error) {
 	index := r.accountBlockIndex
-	if index == nil {
-		// Only a replay assembled without the structural verifier reaches this;
-		// the production constructor sets accountBlocks and accountBlockIndex
-		// from one verifyBlockDictionaries result, and a nil accountBlocks is
-		// already rejected above it. Rebuilding rather than failing keeps a
-		// hand-built replay's verdict the one it had — which is why the rebuild
-		// defers the structural verdicts instead of raising them: raising would
-		// replace a lane failure ranked by account key with an unranked
-		// structural rejection in different words.
-		var err error
-		if index, err = buildAccountBlockIndexDeferred(r.accountBlocks); err != nil {
-			return nil, fmt.Errorf("%w: iterate semantic account blocks: %v", ErrInvalidInput, err)
-		}
-	}
 	// The duplicate check needs a set only when the walk was not proven strictly
 	// ascending: a strictly ascending sequence is pairwise distinct, so for a
 	// keyed index the set answers "no duplicate" for every entry and building it
@@ -630,7 +613,7 @@ func (r *semanticReplay) decodeAccountLanes() ([]semanticAccountLane, error) {
 		}
 		lane := semanticAccountLane{key: entry.key, entry: entry}
 		switch {
-		case entry.decodeErr != nil, entry.exactErr != nil:
+		case entry.exactErr != nil:
 			lane.err = fmt.Errorf("%w: decode semantic account block %x", ErrInvalidInput, lane.key)
 		case !bytes.Equal(entry.block.Addr, lane.key[:]):
 			lane.err = fmt.Errorf("%w: semantic account block %x address differs from its key", ErrInvalidInput, lane.key)

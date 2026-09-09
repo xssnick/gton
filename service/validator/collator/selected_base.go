@@ -14,6 +14,11 @@ import (
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
+// MaxSpeculativeLineageBlocks bounds the uncommitted lineage carried by a bet,
+// including its selected tip. The applied frontier normally trails by only a
+// few blocks; a longer gap must catch up before speculation can use it.
+const MaxSpeculativeLineageBlocks = 16
+
 // SelectedBaseState is an immutable in-process capability binding one
 // consensus candidate ID to its exact ordinary block and full successor state.
 // Its fields stay private so a caller cannot relabel unrelated resident cells.
@@ -21,6 +26,9 @@ type SelectedBaseState struct {
 	sessionID [32]byte
 	candidate simplex.CandidateID
 	block     PreviousBlock
+	// ancestors contains only block roots, newest first. These roots are bound
+	// to block by its authenticated parent references; no ancestor state is held.
+	ancestors []PreviousBlock
 	// successor is what the empty-block policy asks about the block that would
 	// extend this base. Both values are read out of the state this constructor
 	// has already decoded, so a caller that needs the verdict does not decode it
@@ -39,7 +47,11 @@ func NewSelectedBaseState(
 	blockBOC []byte,
 	blockRoot *cell.Cell,
 	stateRoot *cell.Cell,
+	ancestorBlocks []*cell.Cell,
 ) (*SelectedBaseState, error) {
+	if len(ancestorBlocks) >= MaxSpeculativeLineageBlocks {
+		return nil, fmt.Errorf("%w: selected base lineage exceeds %d blocks", ErrInvalidInput, MaxSpeculativeLineageBlocks)
+	}
 	if err := validateBlockID(block); err != nil || block.SeqNo == 0 {
 		return nil, fmt.Errorf("%w: selected base block is invalid", ErrInvalidInput)
 	}
@@ -84,9 +96,34 @@ func NewSelectedBaseState(
 		return nil, fmt.Errorf("%w: selected base seqno overflows", ErrInvalidInput)
 	}
 
+	var ancestors []PreviousBlock
+	if len(ancestorBlocks) != 0 {
+		ancestors = make([]PreviousBlock, len(ancestorBlocks))
+		childID, childRoot := block, blockRoot
+		for i, root := range ancestorBlocks {
+			parent, _, parentErr := shardParentBlockID(childID, childRoot)
+			if parentErr != nil {
+				return nil, fmt.Errorf("%w: selected ancestor %d: %v", ErrInvalidInput, i, parentErr)
+			}
+			if root == nil || root.IsSpecial() || root.Level() != 0 || !equalCellHashBytes(root, parent.RootHash) {
+				return nil, fmt.Errorf("%w: selected ancestor %d differs from its parent reference", ErrInvalidInput, i)
+			}
+			var parsed tlb.Block
+			if err = parseExact(&parsed, root); err != nil {
+				return nil, fmt.Errorf("%w: decode selected ancestor %d: %v", ErrInvalidInput, i, err)
+			}
+			if parsed.BlockInfo.SeqNo != parent.SeqNo || parsed.BlockInfo.Shard != state.ShardIdent {
+				return nil, fmt.Errorf("%w: selected ancestor %d has another identity", ErrInvalidInput, i)
+			}
+			ancestors[i] = PreviousBlock{ID: parent, Block: root}
+			childID, childRoot = parent, root
+		}
+	}
+
 	return &SelectedBaseState{
 		sessionID: sessionID,
 		candidate: candidate,
+		ancestors: ancestors,
 		block: PreviousBlock{
 			ID:           cloneBlockID(block),
 			Block:        blockRoot,

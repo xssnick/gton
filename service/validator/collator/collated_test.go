@@ -106,7 +106,7 @@ func TestVerifyShardCandidateBindsFullCollatedPredecessorProofs(t *testing.T) {
 	verification := shardVerificationRequest(req, candidate)
 	recorder := new(recordingCandidateTransitionVerifier)
 	verification.Semantics = recorder
-	if err = VerifyShardCandidate(context.Background(), verification); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), verification); err != nil {
 		t.Fatalf("verify full collated candidate: %v", err)
 	}
 	if !recorder.transition.FullCollatedData {
@@ -147,7 +147,7 @@ func TestVerifyShardCandidateBindsFullCollatedPredecessorProofs(t *testing.T) {
 			rewriteVerificationCollatedData(t, tampered, test.roots...)
 			changed := verification
 			changed.Candidate = tampered
-			err := VerifyShardCandidate(context.Background(), changed)
+			err := verifyShardCandidateForTest(context.Background(), changed)
 			if !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("verification error = %v, want containing %q", err, test.wantErr)
 			}
@@ -185,7 +185,7 @@ func TestFullCollatedDataBindsMasterchainProcessedFrontier(t *testing.T) {
 			LastMsgHash: processedInfinityHash,
 		}}
 	}
-	if err = VerifyShardCandidate(context.Background(), shardVerificationRequest(forged, candidate)); !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), "processed frontier") {
+	if err = verifyShardCandidateForTest(context.Background(), shardVerificationRequest(forged, candidate)); !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), "processed frontier") {
 		t.Fatalf("forged masterchain frontier error = %v", err)
 	}
 }
@@ -298,7 +298,7 @@ func TestBuildShardRequiresAndValidatesNeighborProofProvider(t *testing.T) {
 	if provider.called != 1 {
 		t.Fatalf("provider calls = %d, want 1", provider.called)
 	}
-	if err = VerifyShardCandidate(context.Background(), shardVerificationRequest(req, candidate)); err != nil {
+	if err = verifyShardCandidateForTest(context.Background(), shardVerificationRequest(req, candidate)); err != nil {
 		t.Fatalf("verify candidate with supplied neighbor proofs: %v", err)
 	}
 

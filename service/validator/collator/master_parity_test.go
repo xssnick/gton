@@ -189,7 +189,7 @@ func TestBuildAndVerifyMasterClearsTerminalBeforeSplitFSM(t *testing.T) {
 			resultFields.beforeSplit, resultFields.splitMerge)
 	}
 
-	err = VerifyMasterCandidate(context.Background(), MasterVerificationRequest{
+	err = verifyMasterCandidateForTest(context.Background(), MasterVerificationRequest{
 		Previous:  fixture.request.Previous,
 		Config:    fixture.request.Config,
 		Groups:    fixture.request.Groups,

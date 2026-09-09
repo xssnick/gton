@@ -102,16 +102,21 @@ const maxLocalMasterViews = 4
 // refresh their generation, which can evict fresher block-cache entries.
 const maxLocalMasterViewLag = localBlockSourceGenerations
 
+type localConfigKey struct {
+	root    cell.Hash
+	address [32]byte
+}
+
 type localConfigCache struct {
 	// log carries the one event this cache can emit: a configuration whose parse
 	// footprint could not be captured. prepare runs once per configuration root,
 	// so it fires once per epoch rather than once per block.
 	log     zerolog.Logger
 	mu      sync.Mutex
-	entries map[cell.Hash]localPreparedConfig
+	entries map[localConfigKey]localPreparedConfig
 	// order is insertion order, evicted from the front. At this cap the shift
 	// is cheaper than tracking generations, and it keeps one backing array.
-	order []cell.Hash
+	order []localConfigKey
 }
 
 type localMasterView struct {
@@ -465,7 +470,7 @@ func (a *LocalAcquisition) masterView(
 	if extra.ConfigParams.Config.Params == nil || extra.ConfigParams.Config.Params.AsCell() == nil {
 		return nil, fmt.Errorf("%w: masterchain config dictionary is absent", ErrInvalidInput)
 	}
-	prepared, err := a.configs.prepare(extra.ConfigParams.Config.Params.AsCell())
+	prepared, err := a.configs.prepare(extra.ConfigParams.Config.Params.AsCell(), [32]byte(extra.ConfigParams.ConfigAddr))
 	if err != nil {
 		return nil, err
 	}
@@ -515,16 +520,17 @@ func (a *LocalAcquisition) masterView(
 	}, nil
 }
 
-func (c *localConfigCache) prepare(root *cell.Cell) (localPreparedConfig, error) {
+func (c *localConfigCache) prepare(root *cell.Cell, configAddress [32]byte) (localPreparedConfig, error) {
 	hash := root.HashKey()
+	key := localConfigKey{root: hash, address: configAddress}
 	c.mu.Lock()
-	prepared, exists := c.entries[hash]
+	prepared, exists := c.entries[key]
 	c.mu.Unlock()
 	if exists {
 		return prepared, nil
 	}
 	if root.IsVirtualized() {
-		parsed, err := parseMasterConfigEpoch(root)
+		parsed, err := parseMasterConfigEpoch(root, configAddress)
 		if err != nil {
 			return localPreparedConfig{}, err
 		}
@@ -558,11 +564,11 @@ func (c *localConfigCache) prepare(root *cell.Cell) (localPreparedConfig, error)
 	// alternative is worse in both directions — publishing without a footprint
 	// makes master collation re-parse 0.92ms of configuration on every block, and
 	// filling one in afterwards races the readers this runs before.
-	resident, footprint := captureConfigFootprint(root)
+	resident, footprint := captureConfigFootprint(root, configAddress)
 	if resident == nil {
 		resident = root
 	}
-	parsed, err := parseMasterConfigEpoch(resident)
+	parsed, err := parseMasterConfigEpoch(resident, configAddress)
 	if err != nil {
 		return localPreparedConfig{}, err
 	}
@@ -573,21 +579,21 @@ func (c *localConfigCache) prepare(root *cell.Cell) (localPreparedConfig, error)
 	}
 	prepared = localPreparedConfig{execution: parsed.execution, config: parsed.config, groups: parsed.groups}
 
-	return c.store(hash, prepared), nil
+	return c.store(key, prepared), nil
 }
 
 // store publishes one prepared config and evicts the oldest once the cache is
 // over its cap. The incumbent wins a race so that every caller of one config
-// root shares one prepared instance.
-func (c *localConfigCache) store(hash cell.Hash, prepared localPreparedConfig) localPreparedConfig {
+// root and actual contract address shares one prepared instance.
+func (c *localConfigCache) store(key localConfigKey, prepared localPreparedConfig) localPreparedConfig {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if current, ok := c.entries[hash]; ok {
+	if current, ok := c.entries[key]; ok {
 		return current
 	}
-	c.entries[hash] = prepared
-	c.order = append(c.order, hash)
+	c.entries[key] = prepared
+	c.order = append(c.order, key)
 	for len(c.order) > maxLocalPreparedConfigs {
 		delete(c.entries, c.order[0])
 		c.order = append(c.order[:0], c.order[1:]...)

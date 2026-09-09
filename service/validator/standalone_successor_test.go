@@ -9,7 +9,6 @@ import (
 	"github.com/xssnick/gton/service/validator/collator"
 	"github.com/xssnick/gton/service/validator/groups"
 	"github.com/xssnick/gton/service/validator/simplex"
-	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -44,34 +43,14 @@ func TestObserverPreparesSuccessorBeforeCertification(t *testing.T) {
 			provider := &retryCandidateProvider{called: make(chan struct{}, 4), finished: make(chan struct{}, 4)}
 			config, _ := runtimeTestConfig(resolverTestSessionTag, &runtimeTestJournal{})
 			runtime := newWarmupRuntime(t, config, provider)
-			artifact, expected := acceptanceSplitBlock(t, runtime.states.genesis.root, 2, 0x92)
-			root, err := cell.FromBOC(artifact.BlockBOC)
-			if err != nil {
-				t.Fatal(err)
-			}
-			artifact.validationRoots = &candidateValidationRoots{block: root}
-			if own {
-				parser, err := root.BeginParse()
-				if err != nil {
-					t.Fatal(err)
-				}
-				var block tlb.Block
-				if err = tlb.LoadFromCell(&block, parser); err != nil {
-					t.Fatal(err)
-				}
-				update, err := cell.PrepareMerkleUpdatePlanned(block.StateUpdate)
-				if err != nil {
-					t.Fatal(err)
-				}
-				live, err := collator.LiveSuccessorOf(update, runtime.states.genesis.root, runtime.states.genesis.tipStates()...)
-				if err != nil {
-					t.Fatal(err)
-				}
-				artifact.validationRoots.builtSuccessor = live
-				expected, _ = live.Over(runtime.states.genesis.root, runtime.states.genesis.tipStates()...)
+			fixture := newBuiltSuccessorFixture(t)
+			runtime.states.genesis = fixture.parent
+			artifact, expected := fixture.artifact, fixture.expected
+			if !own {
+				artifact.validationRoots.builtSuccessor = collator.LiveSuccessorState{}
 			}
 			id := artifact.Candidate.ID
-			if err = runtime.candidates.stage(artifact, []byte{0x92}); err != nil {
+			if err := runtime.candidates.stage(artifact, []byte{0x92}); err != nil {
 				t.Fatal(err)
 			}
 			if own {

@@ -277,7 +277,8 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 	if len(oldExtra.ConfigParams.ConfigAddr) != 32 || configRoot == nil || configRoot.GetKeySize() != 32 || configRoot.IsEmpty() {
 		return nil, fmt.Errorf("%w: previous masterchain config params are malformed", ErrInvalidInput)
 	}
-	if configRoot.AsCell().HashKey() != req.Config.execution.Root().HashKey() {
+	if configRoot.AsCell().HashKey() != req.Config.execution.Root().HashKey() ||
+		[32]byte(oldExtra.ConfigParams.ConfigAddr) != req.Config.configAddress {
 		return nil, fmt.Errorf("%w: supplied config is not the config stored in predecessor state", ErrInvalidInput)
 	}
 	if err = validateMasterSnapshot(req.Previous, req.Groups, configRoot.AsCell(), oldState.GenUTime); err != nil {
@@ -345,12 +346,13 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 		return nil, err
 	}
 	blockCtx, err := req.Config.execution.NewBlockContext(tvm.BlockOptions{
-		Now:        header.GenUtime,
-		BlockLT:    int64(header.StartLt),
-		RandSeed:   req.RandSeed[:],
-		PrevBlocks: prevBlocks,
-		GlobalID:   oldState.GlobalID,
-		Libraries:  executionLibraries,
+		ConfigAddress: &req.Config.configAddress,
+		Now:           header.GenUtime,
+		BlockLT:       int64(header.StartLt),
+		RandSeed:      req.RandSeed[:],
+		PrevBlocks:    prevBlocks,
+		GlobalID:      oldState.GlobalID,
+		Libraries:     executionLibraries,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("prepare masterchain transaction context: %w", err)
@@ -932,10 +934,8 @@ func (c *collation) masterCollatedPrefix(consensus *cell.Cell) ([]*cell.Cell, er
 }
 
 func (c *collation) processMasterTickTock(tock bool) error {
-	addresses, err := c.masterSpecialAccounts()
-	if err != nil {
-		return err
-	}
+	addresses := c.config.specials.ordered
+	var err error
 
 	if c.header.StartLt >= math.MaxInt64 {
 		return fmt.Errorf("%w: tick/tock logical time exceeds signed TVM range", ErrInvalidInput)
@@ -1123,25 +1123,6 @@ func (c *collation) processMasterSpecial(amount tlb.CurrencyCollection, destinat
 	c.updatePeakLoad()
 
 	return in, nil
-}
-
-// masterSpecialAccounts is the fundamental-contract list of this config epoch,
-// in the order tick and tock execute. It is derived once when the configuration
-// is prepared; what stays per-block is in the caller — which of these accounts
-// is active, carries a tick/tock state init, and at which logical time.
-func (c *collation) masterSpecialAccounts() ([][32]byte, error) {
-	if c.config.specials.err != nil {
-		return nil, c.config.specials.err
-	}
-	return c.config.specials.ordered, nil
-}
-
-// masterSpecialAccountIDs is the same list as a membership set.
-func (c *collation) masterSpecialAccountIDs() (map[[32]byte]struct{}, error) {
-	if c.config.specials.err != nil {
-		return nil, c.config.specials.err
-	}
-	return c.config.specials.set, nil
 }
 
 func tickTockName(tock bool) string {

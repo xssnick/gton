@@ -7,6 +7,7 @@ import (
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 const defaultCandidateSizeLimit = uint32(4 << 20)
@@ -16,8 +17,8 @@ const defaultCandidateSizeLimit = uint32(4 << 20)
 const legacyDeferOutQueueSizeLimit = uint64(256)
 
 // Config contains immutable per-epoch data used by block collation. It is the
-// single home for everything derived from one configuration root: parsed once
-// when the epoch is prepared, shared across lanes and across blocks, never
+// single home for data derived from a configuration root and its actual contract
+// address: parsed once, shared across lanes and across blocks, never
 // mutated by a consumer.
 //
 // The caveat that decides whether a field may live here: PrepareConfig runs
@@ -32,6 +33,7 @@ const legacyDeferOutQueueSizeLimit = uint64(256)
 // configuration root for convenience.
 type Config struct {
 	execution          *tvm.PreparedBlockchainConfig
+	configAddress      [32]byte
 	globalVersion      uint32
 	capabilities       uint64
 	basechain          chainConfig
@@ -51,7 +53,7 @@ type Config struct {
 	// ltDelta, never gas, so the hard gas threshold does not move within an epoch.
 	gas [2]gasAccounting
 	// specials is the masterchain fundamental-contract set of parameter 31 plus
-	// the configuration contract of parameter 0.
+	// the actual configuration contract from McStateExtra.ConfigParams.
 	specials masterSpecials
 	// fees names the destinations of the two masterchain special messages:
 	// parameter 3 (fee collector, falling back to the elector of parameter 1)
@@ -93,10 +95,6 @@ type masterSpecials struct {
 	// set is the same identities as a membership test. It is shared by every
 	// consumer of one epoch and must never be written to.
 	set map[[32]byte]struct{}
-	// err is the rejection the master paths raise today when the configuration
-	// contract address is missing or malformed. It is carried rather than
-	// returned for the same reason gasAccounting.err is.
-	err error
 }
 
 // feeDestination is one masterchain special-message recipient.
@@ -128,7 +126,9 @@ type chainConfig struct {
 }
 
 // PrepareConfig derives immutable collation data for one config epoch.
-func PrepareConfig(execution *tvm.PreparedBlockchainConfig) (*Config, error) {
+// configAddress is the actual contract from McStateExtra.ConfigParams, which
+// may differ from the optional relocation request in parameter 0.
+func PrepareConfig(execution *tvm.PreparedBlockchainConfig, configAddress [32]byte) (*Config, error) {
 	raw := tlb.BlockchainConfig{Root: execution.Root()}
 
 	globalVersion, err := raw.GetGlobalVersion()
@@ -196,7 +196,13 @@ func PrepareConfig(execution *tvm.PreparedBlockchainConfig) (*Config, error) {
 		}
 	}
 
+	specials, err := deriveMasterSpecials(raw, configAddress)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
+		configAddress:          configAddress,
 		execution:              execution,
 		globalVersion:          globalVersion.Version,
 		capabilities:           globalVersion.Capabilities,
@@ -212,7 +218,7 @@ func PrepareConfig(execution *tvm.PreparedBlockchainConfig) (*Config, error) {
 			deriveGasAccounting(execution, basechainLimits.limits, false),
 			deriveGasAccounting(execution, masterchainLimits.limits, true),
 		},
-		specials: deriveMasterSpecials(execution),
+		specials: specials,
 		fees:     deriveFeeDestinations(raw),
 	}, nil
 }
@@ -246,26 +252,33 @@ func deriveGasAccounting(
 	return gasAccounting{normal: normal, special: special}
 }
 
-// deriveMasterSpecials resolves the masterchain special accounts once per config
-// epoch: the fundamental smart contracts of parameter 31 and the configuration
-// contract of parameter 0.
-//
-// The identities come off the prepared execution config, which walked parameter
-// 31 and read parameter 0 when the epoch was prepared, so this touches no cell.
-// That matters beyond cost: deriveMasterConfigTransition runs PrepareConfig
-// under the block's read set when the candidate installs a configuration, and a
-// parse added here that reads a cell nothing else on that path reads would change
-// the masterchain block the collator produces. Rerouting any of this onto the
-// in-state configuration root would do exactly that.
-func deriveMasterSpecials(execution *tvm.PreparedBlockchainConfig) masterSpecials {
-	if _, ok := execution.ConfigAddress(); !ok {
-		// Master-only rejection, carried so the epoch stays preparable: shard
-		// collation never asks about special accounts and must not die here.
-		return masterSpecials{err: fmt.Errorf("%w: config smart contract address is malformed", ErrInvalidInput)}
+// deriveMasterSpecials keeps the parameter-31 dictionary order and appends the
+// actual configuration contract when it is not already fundamental. Parameter
+// 0 may be absent or request relocation to a contract that cannot be installed.
+func deriveMasterSpecials(raw tlb.BlockchainConfig, configAddress [32]byte) (masterSpecials, error) {
+	fundamental, err := raw.GetFundamentalSmartContractAddresses()
+	if err != nil {
+		return masterSpecials{}, fmt.Errorf("%w: load fundamental smart contracts: %v", ErrInvalidInput, err)
 	}
-	// Cloned rather than aliased: the backing array belongs to the prepared
-	// execution config, and nothing in this package may reach into it.
-	return newMasterSpecials(slices.Clone(execution.SpecialAccounts()))
+	var ordered [][32]byte
+	listed := false
+	err = fundamental.Addresses.ForEachBorrowed(false, false, func(item cell.DictItemView) error {
+		key, err := item.Key.LoadSlice(256)
+		if err != nil || item.Key.BitsLeft() != 0 || item.Value.BitsLeft() != 0 || item.Value.RefsNum() != 0 {
+			return fmt.Errorf("%w: fundamental smart contract entry is malformed", ErrInvalidInput)
+		}
+		accountID := [32]byte(key)
+		ordered = append(ordered, accountID)
+		listed = listed || accountID == configAddress
+		return nil
+	})
+	if err != nil {
+		return masterSpecials{}, err
+	}
+	if !listed {
+		ordered = append(ordered, configAddress)
+	}
+	return newMasterSpecials(ordered), nil
 }
 
 // newMasterSpecials derives the three views of one identity list together.
@@ -288,10 +301,10 @@ func newMasterSpecials(ordered [][32]byte) masterSpecials {
 
 // deriveFeeDestinations resolves config parameters 3 and 2 with their fallbacks.
 //
-// Unlike the two above, this does parse the configuration root — but only cells
-// validateMasterConfigData has already read on every masterchain block, since
+// It reads cells validateMasterConfigData has already read on every
+// masterchain block, since
 // parameters 0 through 3 all go through its exactBits256 check before this runs.
-// See deriveMasterSpecials for why that distinction decides block bytes.
+// These reads therefore preserve the transition read set.
 func deriveFeeDestinations(raw tlb.BlockchainConfig) feeDestinations {
 	return feeDestinations{
 		collector: feeDestinationOf(raw.GetFeeCollectorAddress()),
@@ -348,7 +361,7 @@ func chainName(masterchain bool) string {
 	return "basechain"
 }
 
-func verifyBasechainWorkchain(config *Config, genUtime uint32) error {
+func verifyBasechainWorkchain(config *Config, masterchainUtime uint32) error {
 	workchain := config.basechainWorkchain
 	if !workchain.present {
 		return fmt.Errorf("%w: basechain is absent from workchain config", ErrInvalidInput)
@@ -356,8 +369,8 @@ func verifyBasechainWorkchain(config *Config, genUtime uint32) error {
 	if !workchain.active || !workchain.basic {
 		return fmt.Errorf("%w: basechain is inactive or uses an extended address format", ErrInvalidInput)
 	}
-	if genUtime < workchain.enabledSince {
-		return fmt.Errorf("%w: basechain is not enabled at candidate generation time", ErrInvalidInput)
+	if masterchainUtime < workchain.enabledSince {
+		return fmt.Errorf("%w: basechain is not enabled at reference masterchain time", ErrInvalidInput)
 	}
 
 	return nil
