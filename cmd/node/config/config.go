@@ -256,12 +256,8 @@ type Storage struct {
 	//     config carries min_entries = 65536, so honouring it would override any
 	//     smaller value an operator sets today.
 	//
-	// They are kept as fields, rather than deleted, because Load parses with
-	// DisallowUnknownFields: a config.json written by any released version of
-	// this node carries some of them, and removing the field would make an
-	// existing node fail to start. They are still range-checked so an obviously
-	// broken value is reported rather than ignored, and a non-zero value is
-	// warned about at startup so an operator who tuned one learns it is dead.
+	// They remain explicit fields for range checks and startup deprecation
+	// warnings when loading older configs.
 	// omitempty keeps them out of newly written configs, so they fade out on
 	// their own instead of being re-emitted forever.
 	OperationDecodedCellCacheEntries int64 `json:"operation_decoded_cell_cache_entries,omitempty"`
@@ -508,7 +504,6 @@ func Load(path string) (Config, error) {
 
 	cfg := defaultConfig()
 	dec := json.NewDecoder(file)
-	dec.DisallowUnknownFields()
 	if err = dec.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}

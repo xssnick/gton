@@ -151,10 +151,7 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
-// Load parses with DisallowUnknownFields, so a config.json written by any
-// earlier build — every one of which carried all three byte knobs — must still
-// open. This is the whole reason the fields are kept as no-ops rather than
-// deleted: deleting them would have made existing nodes refuse to start.
+// Deprecated byte knobs from older configs must not affect current cache sizing.
 func TestLoadAcceptsDeprecatedDecodedCellCacheByteKnobs(t *testing.T) {
 	path := writeTestConfig(t, `{
 	  "storage": {
@@ -257,9 +254,8 @@ func TestDecodedCellCacheEntriesAreBoundedAbove(t *testing.T) {
 }
 
 // A config written by the two-cache build carries the service/operation pair.
-// DisallowUnknownFields means both names must still parse, and — the part that
-// matters to an operator who tuned it — the service value must still be applied
-// rather than silently reverting to the default.
+// The service value must still be applied rather than silently reverting to
+// the default.
 func TestLoadHonoursTheRenamedServiceEntriesKnob(t *testing.T) {
 	path := writeTestConfig(t, `{
 	  "storage": {
@@ -492,11 +488,15 @@ func TestLoadConsensusADNLDisabled(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsValidatorKeysInConfig(t *testing.T) {
+func TestLoadIgnoresValidatorKeysInConfig(t *testing.T) {
 	path := writeTestConfig(t, `{"validator":{"enabled":true,"keys":[]}}`)
 
-	if _, err := Load(path); err == nil {
-		t.Fatal("validator signing keys in config were accepted")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.Validator.Enabled {
+		t.Fatal("validator should be enabled")
 	}
 }
 
@@ -519,8 +519,10 @@ func TestLoadStandaloneCollatorAllowlist(t *testing.T) {
 func TestLoadCustomOverlays(t *testing.T) {
 	nodeID := bytes.Repeat([]byte{0x11}, 32)
 	path := writeTestConfig(t, `{"custom_overlays":[{
+		"@type":"engine.validator.customOverlay",
 		"name":"private-a",
 		"nodes":[{
+			"@type":"engine.validator.customOverlayNode",
 			"adnl_id":"`+base64.StdEncoding.EncodeToString(nodeID)+`",
 			"msg_sender":true,
 			"msg_sender_priority":7,
@@ -528,6 +530,7 @@ func TestLoadCustomOverlays(t *testing.T) {
 			"accept_queries":true
 		}],
 		"sender_shards":[{
+			"@type":"tonNode.shardId",
 			"workchain":0,
 			"shard":-9223372036854775808
 		}],
@@ -1046,25 +1049,18 @@ func TestStorageOptionsPersistentStateKeepRecent(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsUnknownFields(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-	}{
-		{
-			name: "logging",
-			body: `{"logging":{"level":"debug"}}`,
-		},
+func TestLoadIgnoresUnknownFields(t *testing.T) {
+	path := writeTestConfig(t, `{
+		"logging":{"level":"debug"},
+		"ton":{"sync_before":123,"unknown_option":{"values":[1,true,null]}}
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config with unknown fields: %v", err)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			path := writeTestConfig(t, tt.body)
-
-			if _, err := Load(path); err == nil {
-				t.Fatal("expected unknown config field to fail")
-			}
-		})
+	if cfg.TON.SyncBefore != 123 {
+		t.Fatalf("unexpected sync before %d", cfg.TON.SyncBefore)
 	}
 }
 

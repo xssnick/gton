@@ -520,6 +520,8 @@ the trusted-client allowlist and authenticated connections remain in memory.
 
 ### `custom_overlays`
 
+Unknown JSON fields are ignored throughout the node config, including `@type` keys in overlay definitions copied from the C++ node.
+
 List of private overlay definitions. Empty by default. Each overlay has:
 
 | Field | Description |
