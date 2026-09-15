@@ -252,6 +252,9 @@ func TestPreparedShardBlockCacheExpiresStaleEntries(t *testing.T) {
 	entry := cache.entries[tnstore.BlockKey(stale)]
 	entry.storedAt = time.Now().Add(-2 * preparedShardBlockTTL)
 	cache.entries[tnstore.BlockKey(stale)] = entry
+	// the order position is aged with it: a differently stamped position
+	// belongs to an earlier store of the block
+	cache.order[len(cache.order)-1].storedAt = entry.storedAt
 	cache.mu.Unlock()
 
 	if _, err := cache.take(stale); !errors.Is(err, tnstore.ErrNotFound) {
@@ -264,6 +267,7 @@ func TestPreparedShardBlockCacheExpiresStaleEntries(t *testing.T) {
 	entry = cache.entries[tnstore.BlockKey(stale)]
 	entry.storedAt = time.Now().Add(-2 * preparedShardBlockTTL)
 	cache.entries[tnstore.BlockKey(stale)] = entry
+	cache.order[len(cache.order)-1].storedAt = entry.storedAt
 	cache.mu.Unlock()
 
 	cache.storePrepared(PreparedBlock{ID: fresh, BlockBOC: []byte{2}})

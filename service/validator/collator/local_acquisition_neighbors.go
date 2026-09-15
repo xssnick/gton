@@ -30,6 +30,17 @@ type localNeighborView struct {
 	queue     tlb.OutMsgQueueInfo
 	processed []tlb.ProcessedUptoRecord
 	proof     *cell.MerkleProofBuilder
+	// siblingCut is set on a still-registered ancestor whose queue
+	// prepareShardNeighborQueues narrowed to our sibling's half, so a view
+	// rebuilt for a retried attempt can repeat that read.
+	siblingCut *virtualSiblingCut
+}
+
+// virtualSiblingCut is the collation target and the sibling half one
+// siblingQueueCut was taken for.
+type virtualSiblingCut struct {
+	target  msgpool.ShardIdent
+	sibling msgpool.ShardIdent
 }
 
 type localShardTopProvider struct {
@@ -284,6 +295,7 @@ func prepareShardNeighborQueues(
 		if _, err = siblingQueueCut(view.queue.OutQueue, source, target, entry.Shard); err != nil {
 			return fmt.Errorf("prepare virtual sibling queue: %w", err)
 		}
+		view.siblingCut = &virtualSiblingCut{target: target, sibling: entry.Shard}
 	}
 
 	return nil
@@ -829,8 +841,8 @@ func (a *LocalAcquisition) cutCommittedViews(
 	return a.cutViews(branch, destination, views, candidateBase, candidateTip, nil, seedAllowed, hints)
 }
 
-// seedAllowed says whether this acquisition may fall back to walking a whole
-// source queue out of its state when a source is not pinned.
+// seedAllowed says whether this acquisition may fall back to walking a source
+// queue out of its state when a source is not pinned.
 //
 // It is false for the two builds that run beside a block the producer is still
 // finishing: the pipelined successor and the speculative first slot. The walk is
@@ -899,12 +911,12 @@ func (a *LocalAcquisition) cutViews(
 					ErrAcquisitionNotReady, source,
 				)
 			}
-			// The fallback walks the whole source queue out of the state and is
-			// suspected of being most of acquire_inputs under load, when the
-			// queue is thousands deep. Its own span, so the suspicion can be
-			// settled by a histogram instead of argued.
+			// The fallback walks the source queue subtrees routed to this
+			// destination out of the state and is suspected of being most of
+			// acquire_inputs under load, when the queue is thousands deep. Its own
+			// span, so the suspicion can be settled by a histogram instead of argued.
 			seedStarted := time.Now()
-			seeded, _, err := branch.SeedSourceFromStateRoot(source, ref, view.previous.State)
+			seeded, err := branch.SeedSourceFromStateRoot(source, ref, view.previous.State)
 			a.observeSubstage(MetricChainShardchain, CollationStageAcquireInputs, "seed_source_from_state", seedStarted)
 			if err != nil {
 				return nil, fmt.Errorf("seed session internal-message source: %w", err)
@@ -1185,12 +1197,26 @@ type localFullProofProvider struct {
 	// inbound replay.
 	proofViews   map[msgpool.ShardIdent]*localNeighborView
 	messageViews map[msgpool.ShardIdent]*localNeighborView
+	// traced says an earlier attempt has already walked and proved the views.
+	traced bool
 }
 
 func (p *localFullProofProvider) BuildFullCollatedProofs(
 	ctx context.Context,
 	request FullCollatedProofRequest,
 ) (FullCollatedProofs, error) {
+	// Every call after the first is a size-limit retry of the same block, and a
+	// read set only grows: walked again, these views would also prove the
+	// earlier attempt's deeper queue walk, the collated bytes the retry exists
+	// to shed. The reference repeats with a new Collator (collator.cpp:359-364)
+	// whose neighbour proof builders start empty (collator.cpp:1052).
+	if p.traced {
+		if err := p.rebuildTracedViews(); err != nil {
+			return FullCollatedProofs{}, err
+		}
+	}
+	p.traced = true
+
 	exhausted := true
 	if request.QueueScan != nil {
 		var err error
@@ -1251,6 +1277,39 @@ func (p *localFullProofProvider) BuildFullCollatedProofs(
 	}
 
 	return FullCollatedProofs{Roots: proofs, ScanExhausted: exhausted}, nil
+}
+
+// rebuildTracedViews replaces every traced view with a fresh one over the same
+// state and repeats the reads acquisition made through it, so the next walk
+// records into proofs that hold what one attempt reads and nothing more. The
+// states and queue prefixes are the ones the first attempt has just read, so
+// this opens no cell that attempt did not.
+func (p *localFullProofProvider) rebuildTracedViews() error {
+	for source, view := range p.proofViews {
+		if view.proof == nil {
+			continue
+		}
+		rebuilt, err := localViewFromPrevious(view.previous, true, true)
+		if err != nil {
+			return fmt.Errorf("rebuild neighbor %d view: %w", view.previous.ID.SeqNo, err)
+		}
+		if cut := view.siblingCut; cut != nil {
+			if _, err = siblingQueueCut(rebuilt.queue.OutQueue, source, cut.target, cut.sibling); err != nil {
+				return fmt.Errorf("repeat virtual sibling queue: %w", err)
+			}
+			rebuilt.siblingCut = cut
+		}
+
+		p.proofViews[source] = rebuilt
+		// The message views share a registered view under the same source
+		// wherever they did not replace it with the exact predecessor; on the
+		// masterchain they are the same map.
+		if p.messageViews[source] == view {
+			p.messageViews[source] = rebuilt
+		}
+	}
+
+	return nil
 }
 
 func (a *LocalAcquisition) historicalShardEndLT(

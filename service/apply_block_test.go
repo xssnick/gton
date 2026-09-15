@@ -816,6 +816,65 @@ func TestStateCellWindowRetainedLoaderFallsThroughToBaseRefs(t *testing.T) {
 	}
 }
 
+func TestStateCellWindowRetainedLoaderFollowsCheckpointSwaps(t *testing.T) {
+	first := cell.BeginCell().MustStoreUInt(0x61, 8).EndCell()
+	second := cell.BeginCell().MustStoreUInt(0x62, 8).EndCell()
+
+	window := newTestStateCellWindowCache(nil)
+	loader := window.retainedLoader(nil)
+
+	// A concurrent reader keeps the race detector on the swaps below.
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := loader(first.HashKey()); err != nil && !errors.Is(err, tnstore.ErrNotFound) {
+				t.Errorf("concurrent retained load: %v", err)
+				return
+			}
+		}
+	}()
+
+	if err := window.addPreparedRecords(mustPreparedReachableStateCells(t, first)); err != nil {
+		t.Fatalf("add first prepared records: %v", err)
+	}
+	if _, err := loader(first.HashKey()); err != nil {
+		t.Fatalf("load active cell: %v", err)
+	}
+
+	checkpoint := window.beginCheckpoint()
+	if _, err := loader(first.HashKey()); err != nil {
+		t.Fatalf("load pending checkpoint cell: %v", err)
+	}
+
+	// A committed checkpoint resolves from celldb, so the run-long loader must
+	// stop serving the frozen cache.
+	checkpoint.complete()
+	if _, err := loader(first.HashKey()); !errors.Is(err, tnstore.ErrNotFound) {
+		t.Fatalf("completed checkpoint cell err=%v, want ErrNotFound", err)
+	}
+
+	if err := window.addPreparedRecords(mustPreparedReachableStateCells(t, second)); err != nil {
+		t.Fatalf("add second prepared records: %v", err)
+	}
+	loaded, err := loader(second.HashKey())
+	if err != nil {
+		t.Fatalf("load cell staged after checkpoint: %v", err)
+	}
+	if loaded.HashKey() != second.HashKey() {
+		t.Fatalf("loaded hash mismatch")
+	}
+
+	close(stop)
+	<-stopped
+}
+
 func TestStateCellWindowCacheRetriesPendingCheckpointCells(t *testing.T) {
 	first := cell.BeginCell().MustStoreUInt(0x11, 8).EndCell()
 	second := cell.BeginCell().MustStoreUInt(0x22, 8).EndCell()

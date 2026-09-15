@@ -2,10 +2,12 @@ package msgpool
 
 import (
 	"errors"
+	"math/rand/v2"
 	"runtime"
 	"sync"
 	"testing"
 
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -506,12 +508,9 @@ func TestBranchExplicitStateSeedUsesPinnedDestination(t *testing.T) {
 	state := stateRootWithQueue(t, queueDictCell(t, map[QueueKey]tlb.EnqueuedMsg{
 		key: {EnqueuedLT: 1_000, Msg: envelope},
 	}), 1, true)
-	seeded, total, err := branch.SeedSourceFromStateRoot(source, visible, state)
+	seeded, err := branch.SeedSourceFromStateRoot(source, visible, state)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if total != 1 {
-		t.Fatalf("seed total = %d, want 1", total)
 	}
 	if len(seeded) != 1 || seeded[0].Key != key {
 		t.Fatalf("returned seed messages = %+v, want queue key %x", seeded, key)
@@ -587,12 +586,9 @@ func TestBranchPinSourceStaleThenExplicitStateSeed(t *testing.T) {
 		t.Fatalf("pin before compacted history floor = %v", err)
 	}
 
-	seeded, total, err := branch.SeedSourceFromStateRoot(source, visible, state)
+	seeded, err := branch.SeedSourceFromStateRoot(source, visible, state)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if total != count {
-		t.Fatalf("seed total = %d, want %d", total, count)
 	}
 	if len(seeded) != count {
 		t.Fatalf("returned seed messages = %d, want %d", len(seeded), count)
@@ -615,6 +611,126 @@ func TestBranchPinSourceStaleThenExplicitStateSeed(t *testing.T) {
 	}
 	if len(cut.Messages) != 1 || !cut.More {
 		t.Fatalf("seeded bounded cut = %+v", cut)
+	}
+}
+
+// TestBranchSeedSourceMatchesWholeQueueWalk holds the branch seed to the walk it
+// used to be: every queue entry decoded and routed through the branch's pinned
+// router. The narrowed walk skips subtrees and entries bound elsewhere, and a
+// mistake there drops messages silently, so the gate is the same messages in the
+// same order on randomized queues, over both the split and the sequential arm,
+// for destinations that own a workchain, share it at several depths, or sit on
+// the far side of a split bit.
+func TestBranchSeedSourceMatchesWholeQueueWalk(t *testing.T) {
+	destinations := []ShardIdent{
+		{Workchain: 0, Shard: ShardAll},
+		{Workchain: 0, Shard: 1 << 62},
+		{Workchain: 0, Shard: 3 << 62},
+		{Workchain: 0, Shard: 1 << 61},
+		{Workchain: 0, Shard: 7 << 61},
+		{Workchain: 0, Shard: 0x0080000000000000},
+		{Workchain: 0, Shard: 0x0380000000000000},
+		{Workchain: -1, Shard: ShardAll},
+	}
+	source := ShardIdent{Workchain: 0, Shard: ShardAll}
+	visible := sref(10, 0xaa)
+
+	for _, tc := range []struct {
+		name  string
+		size  int
+		split bool
+	}{
+		// Keys spread over both workchains: KeyPrefixes splits, the parallel arm
+		// runs and the prefix filter prunes.
+		{name: "split queue", size: 1_024, split: true},
+		// Every key under one 38-bit prefix: the walk cannot split and takes
+		// the sequential arm, which routes per entry only.
+		{name: "one prefix queue", size: 256, split: false},
+	} {
+		for seed := range uint64(4) {
+			rng := rand.New(rand.NewPCG(seed, uint64(tc.size)))
+			entries := make(map[QueueKey]tlb.EnqueuedMsg, tc.size)
+			for range tc.size {
+				data := make([]byte, 32)
+				for index := range data {
+					data[index] = byte(rng.Uint32())
+				}
+				workchain := byte(0)
+				if tc.split && rng.IntN(8) == 0 {
+					workchain = 0xff
+				}
+				if !tc.split {
+					data[0] = byte(rng.IntN(4))
+				}
+				destination := address.NewAddress(0, workchain, data)
+				// A narrow lt range makes equal-lt runs, so the hash tie-break of
+				// the order is exercised too.
+				lt := uint64(1_000 + rng.IntN(tc.size/4))
+				message := deltaInternalMsg(t, deltaAddr(0, 0x11), destination, lt)
+				hop, err := AccountPrefixFromAddress(destination)
+				if err != nil {
+					t.Fatal(err)
+				}
+				entries[MakeQueueKey(hop, message.HashKey())] = tlb.EnqueuedMsg{
+					EnqueuedLT: lt, Msg: deltaEnvelope(t, message, regularNext(96)),
+				}
+			}
+			state := stateRootWithQueue(t, queueDictCell(t, entries), uint64(len(entries)), true)
+			queueInfo, err := StateOutMsgQueueInfo(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prefixes, err := queueInfo.OutQueue.KeyPrefixes(queueKeyWorkchainBits+seedWalkPrefixBits, seedWalkMaxTasks)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (len(prefixes) >= 2) != tc.split {
+				t.Fatalf("%s seed %d: fixture has %d prefixes, the wanted arm is never reached",
+					tc.name, seed, len(prefixes))
+			}
+
+			seededAny, narrowedAny := false, false
+			for _, destination := range destinations {
+				pool := New(Config{})
+				if err = pool.Internals().ReconcileDestinations([]ShardIdent{destination}); err != nil {
+					t.Fatal(err)
+				}
+				branch, err := pool.Internals().OpenBranch(destination)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				whole, _, err := routedSeedsFromStateRootWith(state, source, visible, branch.routing, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				sequential, _, err := routedSeedsFromStateRootWith(state, source, visible, branch.routing, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !equalBranchMessages(whole[0].Messages, sequential[0].Messages) {
+					t.Fatalf("%s seed %d destination %016x: the whole-queue walks disagree", tc.name, seed, destination.Shard)
+				}
+
+				seeded, err := branch.SeedSourceFromStateRoot(source, visible, state)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !equalBranchMessages(seeded, whole[0].Messages) {
+					t.Fatalf("%s seed %d destination %d:%016x: seeded %d messages, the whole-queue walk %d",
+						tc.name, seed, destination.Workchain, destination.Shard, len(seeded), len(whole[0].Messages))
+				}
+				seededAny = seededAny || len(seeded) > 0
+				narrowedAny = narrowedAny || len(seeded) < len(entries)
+
+				branch.Close()
+				pool.Close()
+			}
+			if !seededAny || !narrowedAny {
+				t.Fatalf("%s seed %d: the fixture seeded something=%t, narrowed something=%t",
+					tc.name, seed, seededAny, narrowedAny)
+			}
+		}
 	}
 }
 

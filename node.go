@@ -303,7 +303,7 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 		Dur("elapsed", time.Since(storageOpenStarted)).
 		Msg("configured storage")
 	opts.StateFilesDir = stateFilesDir
-	liveBlockCache := storage.NewLiveBlockCache(storage.DefaultLiveBlockCacheMaxBlocks)
+	liveBlockCache := storage.NewLiveBlockCache(storage.DefaultLiveBlockCacheMaxBlocks, storage.DefaultLiveBlockCacheMaxBytes)
 	opts.LiveBlockCache = liveBlockCache
 	storageClosed := false
 	shutdownAbandoned := false

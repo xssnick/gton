@@ -141,7 +141,7 @@ func TestCandidateWrappedRoundtrip(t *testing.T) {
 	if !bytes.Equal(data, wantBare) {
 		t.Fatal("non-delegated candidate is not bare")
 	}
-	back, err := ParseCandidateWrapped(data)
+	back, err := ParseCandidateWrappedNoCopy(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +154,10 @@ func TestCandidateWrappedRoundtrip(t *testing.T) {
 	}
 	if gotBlock.Slot != 3 || !bytes.Equal(gotBlock.Candidate, blockData.Candidate) {
 		t.Fatalf("block data mismatch: %+v", gotBlock)
+	}
+	data[bytes.Index(data, blockData.Candidate)] ^= 0xff
+	if gotBlock.Candidate[0] == blockData.Candidate[0] {
+		t.Fatal("compressed candidate was copied out of the wire")
 	}
 	bare, err := ParseCandidateData(wantBare)
 	if err != nil {
@@ -181,7 +185,7 @@ func TestCandidateWrappedRoundtrip(t *testing.T) {
 	if data, err = full.Serialize(); err != nil {
 		t.Fatal(err)
 	}
-	if back, err = ParseCandidateWrapped(data); err != nil {
+	if back, err = ParseCandidateWrappedNoCopy(data); err != nil {
 		t.Fatal(err)
 	}
 	gotEmpty, ok := back.Data.(ConsensusEmptyData)
@@ -192,6 +196,10 @@ func TestCandidateWrappedRoundtrip(t *testing.T) {
 		t.Fatalf("empty data mismatch: %+v", gotEmpty)
 	}
 	requireSameDelegation(t, back.Delegation, deleg)
+	data[bytes.Index(data, deleg.Signature)] ^= 0xff
+	if back.Delegation.Signature[0] == deleg.Signature[0] {
+		t.Fatal("delegation signature was copied out of the wire")
+	}
 	if _, err = ParseCandidateData(data); err == nil {
 		t.Fatal("wrapped candidate was accepted as bare broadcast data")
 	}
@@ -203,7 +211,7 @@ func TestCandidateWrappedRoundtrip(t *testing.T) {
 	}
 	bad := append([]byte{}, data[:8]...)
 	bad[4], bad[5], bad[6], bad[7] = 0, 0, 0, 0 // flags: no delegation
-	if _, err = ParseCandidateWrapped(append(bad, foreign...)); err == nil {
+	if _, err = ParseCandidateWrappedNoCopy(append(bad, foreign...)); err == nil {
 		t.Fatal("foreign inner object accepted")
 	}
 }

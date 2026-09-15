@@ -385,12 +385,14 @@ type plumtreeSimpleState struct {
 // deadline and lets NextAlarm and the Alarm drain read only the head.
 //
 // announcers are the buffered IHAVEs for this part, capped so a part is never
-// asked of more peers than plumtreeRepairTargetLimit.
+// asked of more peers than plumtreeRepairTargetLimit. The first askedCount of
+// them have already been handed out for repair (C++ sent_repair_targets).
 type plumtreeMissingPart struct {
 	key            plumtreePartKey
 	repairAt       time.Time
 	announcers     [plumtreeRepairTargetLimit]*plumtreeAnnouncement
 	announcerCount uint8
+	askedCount     uint8
 
 	previous *plumtreeMissingPart
 	next     *plumtreeMissingPart

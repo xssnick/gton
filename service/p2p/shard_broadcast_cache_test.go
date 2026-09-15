@@ -9,6 +9,7 @@ import (
 
 	tnstore "github.com/xssnick/gton/service/storage"
 
+	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -301,6 +302,63 @@ func TestShardDescriptionProofAndCandidateAssemblesHotBlock(t *testing.T) {
 	}
 }
 
+func TestShardDescriptionProofSkipsDecodeOfFinalityHeldBlock(t *testing.T) {
+	node := newTestNode(t)
+	finalized := testShardBroadcastDownloadedBlock(t, 28, 0x28)
+	finalizedCandidate := testShardBlockCandidate(finalized)
+	pending := testShardBroadcastDownloadedBlock(t, 29, 0x29)
+	pendingCandidate := testShardBlockCandidate(pending)
+
+	// the candidate broadcast parks the same payload in both assembly caches
+	for _, candidate := range []*DownloadedBlock{&finalizedCandidate, &pendingCandidate} {
+		if _, err := node.rememberBlockFinalityCandidate(candidate); err != nil {
+			t.Fatalf("store finality candidate %s: %v", tnstore.FormatBlockRef(candidate.ID), err)
+		}
+		node.rememberShardBlockCandidate(candidate)
+	}
+
+	finality := testShardBlockFinality(finalized.ID)
+	signed, err := node.rememberBlockFinality(finality)
+	if err != nil {
+		t.Fatalf("store finality: %v", err)
+	}
+	requireAssembledShardFinalityBlock(t, finalizedCandidate, finality, signed)
+	if !node.rememberShardBroadcastBlock(&signed[0]) {
+		t.Fatal("finality-assembled block was not cached")
+	}
+
+	node.RememberShardDescriptionProofs([]ShardDescriptionProof{
+		{Block: finalized.ID, Proof: finalized.Proof, ProofBOC: finalized.ProofBOC},
+		{Block: pending.ID, Proof: pending.Proof, ProofBOC: pending.ProofBOC},
+	})
+
+	got, err := node.shardBroadcastCache.Block(finalized.ID)
+	if err != nil {
+		t.Fatalf("read finalized block: %v", err)
+	}
+	if got.Kind != blockFinalityBroadcastKind || got.Block != signed[0].Block || !bytes.Equal(got.ProofBOC, signed[0].ProofBOC) {
+		t.Fatalf("description proof decoded the held block again: kind=%q same_root=%v", got.Kind, got.Block == signed[0].Block)
+	}
+
+	cache := node.shardCandidateCache
+	if len(cache.candidates) != 0 || len(cache.proofs) != 0 {
+		t.Fatalf("description proofs retained payload: candidates=%d proofs=%d", len(cache.candidates), len(cache.proofs))
+	}
+	for _, block := range []DownloadedBlock{finalized, pending} {
+		if _, ok := cache.assembled[tnstore.BlockKey(block.ID)]; !ok {
+			t.Fatalf("block %s was not marked assembled", tnstore.FormatBlockRef(block.ID))
+		}
+	}
+
+	got, err = node.shardBroadcastCache.Block(pending.ID)
+	if err != nil {
+		t.Fatalf("read pending block: %v", err)
+	}
+	if got.Kind != shardDescriptionBroadcastKind || got.StateUpdate == nil || len(got.ProofBOC) == 0 {
+		t.Fatalf("pending block was not assembled from its description proof: kind=%q", got.Kind)
+	}
+}
+
 func TestShardCandidateCacheAssemblesProofAfterCandidateBeforeOverflowPrune(t *testing.T) {
 	cache := newShardBlockCandidateCache(time.Minute, 1<<20, 1)
 	now := time.Unix(300, 0)
@@ -320,7 +378,7 @@ func TestShardCandidateCacheAssemblesProofAfterCandidateBeforeOverflowPrune(t *t
 		Block:    downloaded.ID,
 		Proof:    downloaded.Proof,
 		ProofBOC: downloaded.ProofBOC,
-	}}, now.Add(time.Second))
+	}}, testNoShardBlockHeld, now.Add(time.Second))
 	if err != nil {
 		t.Fatalf("store proof: %v", err)
 	}
@@ -336,7 +394,7 @@ func TestShardCandidateCacheAssemblesCandidateAfterProofBeforeOverflowPrune(t *t
 		Block:    downloaded.ID,
 		Proof:    downloaded.Proof,
 		ProofBOC: downloaded.ProofBOC,
-	}}, now)
+	}}, testNoShardBlockHeld, now)
 	if err != nil {
 		t.Fatalf("store proof: %v", err)
 	}
@@ -365,7 +423,7 @@ func TestShardCandidateCacheReleasesAssembledPayloadAndSuppressesDuplicates(t *t
 	if blocks, err := cache.StoreCandidate(candidate, now); err != nil || len(blocks) != 0 {
 		t.Fatalf("store candidate: blocks=%d err=%v", len(blocks), err)
 	}
-	blocks, err := cache.StoreProofs([]ShardDescriptionProof{proof}, now.Add(time.Second))
+	blocks, err := cache.StoreProofs([]ShardDescriptionProof{proof}, testNoShardBlockHeld, now.Add(time.Second))
 	if err != nil {
 		t.Fatalf("store proof: %v", err)
 	}
@@ -385,7 +443,7 @@ func TestShardCandidateCacheReleasesAssembledPayloadAndSuppressesDuplicates(t *t
 	if blocks, err = cache.StoreCandidate(candidate, now.Add(2*time.Second)); err != nil || len(blocks) != 0 {
 		t.Fatalf("store repeated candidate: blocks=%d err=%v", len(blocks), err)
 	}
-	if blocks, err = cache.StoreProofs([]ShardDescriptionProof{proof}, now.Add(3*time.Second)); err != nil || len(blocks) != 0 {
+	if blocks, err = cache.StoreProofs([]ShardDescriptionProof{proof}, testNoShardBlockHeld, now.Add(3*time.Second)); err != nil || len(blocks) != 0 {
 		t.Fatalf("store repeated proof: blocks=%d err=%v", len(blocks), err)
 	}
 	if len(cache.candidates) != 0 || len(cache.proofs) != 0 {
@@ -417,7 +475,7 @@ func TestShardCandidateCacheAssemblesRemainingLinksAfterBadProof(t *testing.T) {
 		{Block: poisoned.ID, Proof: poisoned.Proof, ProofBOC: poisoned.ProofBOC},
 		{Block: healthy.ID, Proof: healthy.Proof, ProofBOC: healthy.ProofBOC},
 	}
-	blocks, err := cache.StoreProofs(proofs, now.Add(time.Second))
+	blocks, err := cache.StoreProofs(proofs, testNoShardBlockHeld, now.Add(time.Second))
 	if err == nil {
 		t.Fatal("bad chain link did not report an error")
 	}
@@ -451,7 +509,7 @@ func TestShardCandidateCacheAssembledMarkerExpires(t *testing.T) {
 	if blocks, err := cache.StoreCandidate(candidate, now); err != nil || len(blocks) != 0 {
 		t.Fatalf("store candidate: blocks=%d err=%v", len(blocks), err)
 	}
-	blocks, err := cache.StoreProofs([]ShardDescriptionProof{proof}, now.Add(time.Millisecond))
+	blocks, err := cache.StoreProofs([]ShardDescriptionProof{proof}, testNoShardBlockHeld, now.Add(time.Millisecond))
 	if err != nil {
 		t.Fatalf("store proof: %v", err)
 	}
@@ -460,7 +518,7 @@ func TestShardCandidateCacheAssembledMarkerExpires(t *testing.T) {
 	if blocks, err = cache.StoreCandidate(candidate, now.Add(ttl+2*time.Millisecond)); err != nil || len(blocks) != 0 {
 		t.Fatalf("store candidate after marker expiry: blocks=%d err=%v", len(blocks), err)
 	}
-	blocks, err = cache.StoreProofs([]ShardDescriptionProof{proof}, now.Add(ttl+3*time.Millisecond))
+	blocks, err = cache.StoreProofs([]ShardDescriptionProof{proof}, testNoShardBlockHeld, now.Add(ttl+3*time.Millisecond))
 	if err != nil {
 		t.Fatalf("store proof after marker expiry: %v", err)
 	}
@@ -498,6 +556,10 @@ func requireAssembledShardCandidate(t *testing.T, assembled []DownloadedBlock, w
 	if string(got.SignaturesVerifiedKey) != string(want.SignaturesVerifiedKey) {
 		t.Fatalf("assembled signature key = %x, want %x", got.SignaturesVerifiedKey, want.SignaturesVerifiedKey)
 	}
+}
+
+func testNoShardBlockHeld(ton.BlockIDExt) bool {
+	return false
 }
 
 func testShardBlockCandidate(downloaded DownloadedBlock) DownloadedBlock {

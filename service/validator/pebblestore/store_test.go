@@ -315,9 +315,9 @@ func TestWriteBatchByteLimit(t *testing.T) {
 		{name: "within cap", batchBytes: maxWriteBatchBytes / 2, nextBytes: maxWriteBatchBytes / 2, want: true},
 		{name: "crosses cap", batchBytes: maxWriteBatchBytes / 2, nextBytes: maxWriteBatchBytes/2 + 1},
 		{name: "zero-size request", batchBytes: maxWriteBatchBytes / 2, want: true},
-		// The durability partition: one batch commits with one WriteOptions, so a
-		// payload may not join a commitment batch however small it is, and coalescing
-		// within one class is untouched.
+		// The durability partition: a payload may not join a commitment batch however
+		// small it is, or its callback would wait for the commitment's fsync, and
+		// coalescing within one class is untouched.
 		{name: "payload after commitment", nextClass: restartRecoverable},
 		{name: "commitment after payload", batchClass: restartRecoverable},
 		{name: "payload after payload", batchClass: restartRecoverable, nextClass: restartRecoverable, want: true},
@@ -1771,10 +1771,7 @@ func waitForClosed(t *testing.T, store *Store) {
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		store.stateMu.Lock()
-		closed := store.isClosed
-		store.stateMu.Unlock()
-		if closed {
+		if store.isClosed.Load() {
 			return
 		}
 		runtime.Gosched()

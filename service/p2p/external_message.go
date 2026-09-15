@@ -85,6 +85,30 @@ func (n *Node) sendExternalMessage(ctx context.Context, data []byte, addrKey ext
 		Message: msg,
 	}
 
+	// The address limit and the broadcast capacity are taken before admission:
+	// admission may put the message into this node's pool, and a refusal after
+	// that tells the client the message failed while it can still be included.
+	if err = n.addExternalMessageAddressLimit(addrKey, now); err != nil {
+		return err
+	}
+
+	costBytes := externalBroadcastCostBytes(pending, len(payload))
+	sendAt, err := n.externalBroadcastPacer.Reserve(costBytes)
+	if err != nil {
+		n.externalMessageLimiter.Remove(addrKey, now)
+		return err
+	}
+
+	if err = n.admitAndEnqueueExternalMessage(ctx, ev, checked, sendAt, pending, payload); err != nil {
+		n.externalBroadcastPacer.Cancel(sendAt, costBytes)
+		n.externalMessageLimiter.Remove(addrKey, now)
+		return err
+	}
+	return nil
+}
+
+func (n *Node) admitAndEnqueueExternalMessage(ctx context.Context, ev ExternalMessageEvent, checked bool, sendAt time.Time, targets []externalMessageTarget, payload []byte) error {
+	var err error
 	if checked {
 		err = n.acceptCheckedExternalMessage(ctx, ev)
 	} else {
@@ -94,11 +118,10 @@ func (n *Node) sendExternalMessage(ctx context.Context, data []byte, addrKey ext
 		return err
 	}
 
-	costBytes := externalBroadcastCostBytes(pending, len(payload))
-	if err = n.externalBroadcastPacer.Wait(ctx, costBytes); err != nil {
+	if err = n.externalBroadcastPacer.Wait(ctx, sendAt); err != nil {
 		return err
 	}
-	return n.enqueueExternalMessageTargets(addrKey, pending, payload, time.Now())
+	return n.enqueueExternalMessageTargets(targets, payload, time.Now())
 }
 
 func (n *Node) acceptExternalMessage(ctx context.Context, event ExternalMessageEvent) error {
@@ -124,11 +147,7 @@ type externalMessageTarget struct {
 	hash string
 }
 
-func (n *Node) enqueueExternalMessageTargets(addrKey extmsg.AddressKey, targets []externalMessageTarget, payload []byte, now time.Time) error {
-	if err := n.addExternalMessageAddressLimit(addrKey, now); err != nil {
-		return err
-	}
-
+func (n *Node) enqueueExternalMessageTargets(targets []externalMessageTarget, payload []byte, now time.Time) error {
 	queued := 0
 	for _, target := range targets {
 		req := rebroadcastRequest{
@@ -144,7 +163,6 @@ func (n *Node) enqueueExternalMessageTargets(addrKey extmsg.AddressKey, targets 
 		queued++
 	}
 	if queued == 0 {
-		n.externalMessageLimiter.Remove(addrKey, now)
 		return errors.New("local external message rebroadcast queues are full")
 	}
 	return nil

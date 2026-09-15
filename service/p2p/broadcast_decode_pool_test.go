@@ -117,8 +117,8 @@ func TestOffloadedBroadcastDecodeDeliversEventAndCachesResult(t *testing.T) {
 	if result.disposition != broadcastDispositionAccept || result.accepted.event != nil {
 		t.Fatalf("second delivery should skip the processed decode, got %+v", result)
 	}
-	if result.accepted.block == nil || !result.accepted.block.Equals(&block) {
-		t.Fatalf("processed block mismatch: %+v", result.accepted.block)
+	if result.accepted.block != nil {
+		t.Fatalf("processed delivery feeds the undecoded payload of %s to the custom and FastSync fanout", storage.FormatBlockRef(*result.accepted.block))
 	}
 	if result.accepted.rebroadcast == nil {
 		t.Fatal("processed delivery is missing the rebroadcast payload")

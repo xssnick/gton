@@ -67,7 +67,7 @@ func TestParseAcceptedBlockRejectsTrailingReferencedData(t *testing.T) {
 					readyRoot = poisoned
 				}
 				t.Run(name, func(t *testing.T) {
-					_, _, err := parseAcceptedBlock(block, boc, readyRoot)
+					_, _, err := parseAcceptedBlock(block, boc, readyRoot, false)
 					if err == nil || !strings.Contains(err.Error(), test.want) {
 						t.Fatalf("parse block with trailing %s error = %v", test.name, err)
 					}

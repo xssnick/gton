@@ -288,7 +288,7 @@ func (a *BlockAccepter) Prepare(
 			residentRoot = tip.Block
 		}
 	}
-	blockRoot, parsed, err := parseAcceptedBlock(blockID, blockBOC, residentRoot)
+	blockRoot, parsed, err := parseAcceptedBlock(blockID, blockBOC, residentRoot, acceptance.Candidate.digested)
 	if err != nil {
 		return nil, err
 	}
@@ -517,14 +517,26 @@ func parseAcceptedBlock(
 	id ton.BlockIDExt,
 	blockBOC []byte,
 	root *cell.Cell,
+	digested bool,
 ) (*cell.Cell, *tlb.Block, error) {
 	if len(blockBOC) == 0 {
 		return nil, nil, errors.New("validator block acceptance: block boc is empty")
 	}
 
 	// Replay and acceptance without a matching resident tip still decode the
-	// original wire. A supplied root is only a decode reuse: all identity,
-	// digest, TL-B and header checks below remain mandatory on either path.
+	// original wire. A supplied root is only a decode reuse: all identity, TL-B
+	// and header checks below remain mandatory on either path.
+	//
+	// The file hash is the one check a supplied root may drop, and only for a
+	// candidate carrying the digest seal. Its ID's file hash is where the sha256
+	// of these very bytes went when the codec decoded them or the producer
+	// serialized them, and the tip matched both that ID and these bytes, so a
+	// second pass over the same megabyte could only fail on local memory
+	// corruption. The reference precheck hashes only fake and fork blocks
+	// (accept-block.cpp:119). Without a resident tip — a replay after a restart,
+	// a block no state was rebuilt for — the wire is decoded here anyway and the
+	// digest stays.
+	rehash := root == nil || !digested
 	var err error
 	if root == nil {
 		root, err = cell.FromBOC(blockBOC)
@@ -535,9 +547,11 @@ func parseAcceptedBlock(
 	if !cellHashEquals(root, id.RootHash) {
 		return nil, nil, fmt.Errorf("validator block acceptance: root hash mismatch for %s", storage.FormatBlockRef(id))
 	}
-	fileHash := sha256.Sum256(blockBOC)
-	if !bytes.Equal(fileHash[:], id.FileHash) {
-		return nil, nil, fmt.Errorf("validator block acceptance: file hash mismatch for %s", storage.FormatBlockRef(id))
+	if rehash {
+		fileHash := sha256.Sum256(blockBOC)
+		if !bytes.Equal(fileHash[:], id.FileHash) {
+			return nil, nil, fmt.Errorf("validator block acceptance: file hash mismatch for %s", storage.FormatBlockRef(id))
+		}
 	}
 
 	var rootView cell.Slice

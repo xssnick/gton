@@ -162,6 +162,17 @@ func BenchmarkCandidateDecodePayload(b *testing.B) {
 					}
 				}
 			})
+			// The resolver path: a candidate fetched by request or loaded from
+			// storage arrives as the wrapped wire, which for a non-delegated
+			// candidate is the same bare frame.
+			b.Run(name+"/decode_wrapped", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					if _, _, err := codec.decodeDeferred(compressed.broadcast, nil); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
 		}
 	}
 }

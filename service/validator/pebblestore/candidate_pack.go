@@ -185,19 +185,29 @@ func (s *candidatePackStore) abandon(
 	)
 }
 
-func (s *candidatePackStore) delete(namespace storageNamespace) error {
-	var result error
-	if pack := s.current[namespace]; pack != nil {
-		if err := pack.file.Close(); err != nil {
-			result = errors.Join(result, fmt.Errorf("validator pebblestore: close candidate pack: %w", err))
-		}
-		delete(s.current, namespace)
+// closeNamespace closes the open segment of one namespace, if it has one.
+func (s *candidatePackStore) closeNamespace(namespace storageNamespace) error {
+	pack := s.current[namespace]
+	if pack == nil {
+		return nil
 	}
-	if err := os.RemoveAll(s.sessionDir(namespace)); err != nil {
-		result = errors.Join(result, fmt.Errorf("validator pebblestore: delete candidate packs: %w", err))
+	delete(s.current, namespace)
+	if err := pack.file.Close(); err != nil {
+		return fmt.Errorf("validator pebblestore: close candidate pack: %w", err)
 	}
 
-	return result
+	return nil
+}
+
+// delete removes every segment of one namespace. It touches only files, so
+// unlike the rest of the store it may run outside the writer goroutine once
+// closeNamespace has run there.
+func (s *candidatePackStore) delete(namespace storageNamespace) error {
+	if err := os.RemoveAll(s.sessionDir(namespace)); err != nil {
+		return fmt.Errorf("validator pebblestore: delete candidate packs: %w", err)
+	}
+
+	return nil
 }
 
 func (s *candidatePackStore) close() error {

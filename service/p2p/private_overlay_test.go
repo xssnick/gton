@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -623,6 +624,60 @@ func TestPublicPlumtreeOriginationUsesPerCallSignerWithoutReceiveOriginalRole(t 
 	}
 	if !canOriginate {
 		t.Fatal("public Plumtree engine did not expose origination capability")
+	}
+}
+
+func TestPrivateOverlaySendMessageRawMatchesJoinedQUICWire(t *testing.T) {
+	fx := newPrioritySendTestPeer(t)
+	handle := &PrivateOverlay{sub: fx.sub}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// A vote, a certificate past the default TL serialize buffer, and a body past
+	// the transport's pooled single-write threshold.
+	for _, size := range []int{256, 1536, 40 << 10} {
+		body := make([]byte, size)
+		for i := range body {
+			body[i] = byte(i * 131)
+		}
+		joined, err := fx.envelope.Message(tl.Raw(body))
+		if err != nil {
+			t.Fatalf("join %d-byte message: %v", size, err)
+		}
+
+		if err = handle.SendMessage(ctx, fx.peer.id, tl.Raw(body)); err != nil {
+			t.Fatalf("send joined %d-byte message: %v", size, err)
+		}
+		if got := fx.receiveMessage(t); !bytes.Equal(got, joined) {
+			t.Fatalf("joined %d-byte message wire = %x, want %x", size, got, joined)
+		}
+
+		if err = handle.SendMessageRaw(ctx, fx.peer.id, body); err != nil {
+			t.Fatalf("send raw %d-byte message: %v", size, err)
+		}
+		if got := fx.receiveMessage(t); !bytes.Equal(got, joined) {
+			t.Fatalf("raw %d-byte message wire = %x, want %x", size, got, joined)
+		}
+	}
+}
+
+func BenchmarkPrivateOverlaySendMessageRaw(b *testing.B) {
+	for _, size := range []int{256, 1536} {
+		b.Run(fmt.Sprintf("body=%d", size), func(b *testing.B) {
+			fx := newPrioritySendTestPeer(b)
+			handle := &PrivateOverlay{sub: fx.sub}
+			body := make([]byte, size)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := handle.SendMessageRaw(ctx, fx.peer.id, body); err != nil {
+					b.Fatalf("send raw message: %v", err)
+				}
+				<-fx.messages
+			}
+		})
 	}
 }
 

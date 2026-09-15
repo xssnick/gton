@@ -59,11 +59,15 @@ func (v *configParameterValidator) parameter(s *cell.Slice, id uint32) error {
 	case tlb.ConfigParamExtraCurrencyMintPrices:
 		return configGrams(s, 2)
 	case tlb.ConfigParamExtraCurrencyToMint:
+		// The generated ConfigParam 7 is HashmapE 32 (VarUInteger 32), so a zero
+		// length and a zero leading byte typecheck. VarUIntegerPos is only
+		// compute_minted_amount's gate, and failing it disables minting.
 		return v.hashmapE(s, 32, func(value *cell.Slice) error {
-			if !validExtraCurrencyMintAmount(value) {
-				return fmt.Errorf("invalid positive extra currency amount")
+			length, err := value.LoadUInt(5)
+			if err != nil {
+				return err
 			}
-			return nil
+			return value.SkipBits(uint(length) * 8)
 		})
 	case tlb.ConfigParamGlobalVersion:
 		return tlb.LoadFromCell(new(tlb.GlobalVersion), s)
@@ -637,25 +641,16 @@ func (v *configParameterValidator) jettonBridge(s *cell.Slice) error {
 	}
 }
 
-// Grams uses VarUInteger 16: zero has zero length, and every nonzero
-// magnitude starts with a nonzero byte (VarUInteger::validate_skip).
+// Grams is the generated VarUInteger 16: a four-bit length and that many bytes.
+// Unlike the handwritten block::tlb::VarUInteger, its validate_skip does not
+// require a minimal magnitude.
 func configGrams(s *cell.Slice, count int) error {
 	for range count {
 		length, err := s.LoadUInt(4)
 		if err != nil {
 			return err
 		}
-		if length == 0 {
-			continue
-		}
-		first, err := s.LoadUInt(8)
-		if err != nil {
-			return err
-		}
-		if first == 0 {
-			return fmt.Errorf("nonminimal Grams encoding")
-		}
-		if err = s.SkipBits(uint(length-1) * 8); err != nil {
+		if err = s.SkipBits(uint(length) * 8); err != nil {
 			return err
 		}
 	}

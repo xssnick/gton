@@ -53,6 +53,7 @@ func TestDecodedCellColdMissIsCoalescedAndCanonical(t *testing.T) {
 				cache,
 				activeCellCacheNamespace,
 				hash[:],
+				nil,
 				func(context.Context) (*cell.Cell, error) {
 					loads.Add(1)
 					<-release
@@ -103,7 +104,7 @@ func TestDecodedCellFollowerCancellationDoesNotCancelSharedFill(t *testing.T) {
 	firstDone := make(chan *cell.Cell, 1)
 	firstErr := make(chan error, 1)
 	go func() {
-		loaded, err := store.loadDecodedCell(context.Background(), cache, activeCellCacheNamespace, hash[:], load)
+		loaded, err := store.loadDecodedCell(context.Background(), cache, activeCellCacheNamespace, hash[:], nil, load)
 		firstDone <- loaded
 		firstErr <- err
 	}()
@@ -114,7 +115,7 @@ func TestDecodedCellFollowerCancellationDoesNotCancelSharedFill(t *testing.T) {
 	followerCtx := &decodedCellFollowerContext{Context: followerBaseCtx, joined: joined}
 	followerErr := make(chan error, 1)
 	go func() {
-		_, err := store.loadDecodedCell(followerCtx, cache, activeCellCacheNamespace, hash[:], load)
+		_, err := store.loadDecodedCell(followerCtx, cache, activeCellCacheNamespace, hash[:], nil, load)
 		followerErr <- err
 	}()
 	select {
@@ -180,7 +181,7 @@ func TestDecodedCellLeaderCancellationDoesNotCancelLiveFollower(t *testing.T) {
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	leaderDone := make(chan loadResult, 1)
 	go func() {
-		loaded, err := store.loadDecodedCell(leaderCtx, cache, activeCellCacheNamespace, hash[:], load)
+		loaded, err := store.loadDecodedCell(leaderCtx, cache, activeCellCacheNamespace, hash[:], nil, load)
 		leaderDone <- loadResult{cell: loaded, err: err}
 	}()
 	<-leaderEntered
@@ -189,7 +190,7 @@ func TestDecodedCellLeaderCancellationDoesNotCancelLiveFollower(t *testing.T) {
 	followerCtx := &decodedCellFollowerContext{Context: context.Background(), joined: joined}
 	followerDone := make(chan loadResult, 1)
 	go func() {
-		loaded, err := store.loadDecodedCell(followerCtx, cache, activeCellCacheNamespace, hash[:], load)
+		loaded, err := store.loadDecodedCell(followerCtx, cache, activeCellCacheNamespace, hash[:], nil, load)
 		followerDone <- loadResult{cell: loaded, err: err}
 	}()
 	select {
@@ -241,6 +242,7 @@ func TestDecodedCellCanceledOnlyWaiterCancelsSharedFill(t *testing.T) {
 			cache,
 			activeCellCacheNamespace,
 			hash[:],
+			nil,
 			func(loadCtx context.Context) (*cell.Cell, error) {
 				close(entered)
 				<-loadCtx.Done()
@@ -307,6 +309,7 @@ func BenchmarkDecodedCellUniqueMiss(b *testing.B) {
 					cache,
 					activeCellCacheNamespace,
 					hash[:],
+					nil,
 					load,
 				)
 				if err != nil || loaded != want {

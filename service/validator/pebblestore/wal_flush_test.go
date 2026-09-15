@@ -257,6 +257,51 @@ func (f *offsetTrackingFile) SyncData() error {
 	return f.File.SyncData()
 }
 
+// The writer commits a commitment batch unsynced and its callback then appends an
+// empty synced log record, DB.LogData(nil, pebble.Sync). Pebble documents that
+// record as flushing and syncing every write committed before it (checkpoint.go,
+// WithFlushedWAL). This is that contract measured the same way as the synced
+// commit below: the fsync lands past the unsynced commit.
+func TestAnEmptySyncedLogRecordFsyncsPastTheUnsyncedCommit(t *testing.T) {
+	tracking := newOffsetTrackingFS()
+	db, err := pebble.Open(t.TempDir(), &pebble.Options{FS: tracking})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
+	})
+
+	batch := db.NewIndexedBatch()
+	if err = batch.Set([]byte("commitment"), make([]byte, measureWireBytes), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = batch.Commit(pebble.NoSync); err != nil {
+		t.Fatal(err)
+	}
+	if err = batch.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	syncsBefore := tracking.walSyncCount()
+	if err = db.LogData(nil, pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	if tracking.walSyncCount() <= syncsBefore {
+		t.Fatal("the empty synced log record did not fsync the write-ahead log at all")
+	}
+	if synced := tracking.walSyncedBytes(); synced < int64(measureWireBytes) {
+		t.Fatalf(
+			"the log has %d fsynced bytes after the empty synced record, less than the %d-byte "+
+				"commit written before it: that record does NOT make the unsynced commit durable",
+			synced,
+			measureWireBytes,
+		)
+	}
+}
+
 // The accounting half of the property: the commitment's fsync of the write-ahead
 // log happens at an offset PAST the unsynced payload, so the one fsync it pays for
 // is what makes the payload durable.

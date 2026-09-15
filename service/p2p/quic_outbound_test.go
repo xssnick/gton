@@ -1450,7 +1450,7 @@ func peerIDForQUICOutboundTest(t *testing.T, pub ed25519.PublicKey) PeerID {
 	return id
 }
 
-func quicOutboundTestKey(t *testing.T) ed25519.PrivateKey {
+func quicOutboundTestKey(t testing.TB) ed25519.PrivateKey {
 	t.Helper()
 
 	_, key, err := ed25519.GenerateKey(rand.Reader)
@@ -1460,7 +1460,7 @@ func quicOutboundTestKey(t *testing.T) ed25519.PrivateKey {
 	return key
 }
 
-func startQUICOutboundTestGateway(t *testing.T, gateway *adnlquic.Gateway) string {
+func startQUICOutboundTestGateway(t testing.TB, gateway *adnlquic.Gateway) string {
 	t.Helper()
 
 	packetConn, err := net.ListenUDP("udp", &net.UDPAddr{

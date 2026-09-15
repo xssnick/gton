@@ -527,7 +527,7 @@ func (f *viewRaceAcquisition) commitMasterchainSources(t *testing.T) {
 		if refErr != nil {
 			t.Fatal(refErr)
 		}
-		if _, _, err = managed.branch.SeedSourceFromStateRoot(
+		if _, err = managed.branch.SeedSourceFromStateRoot(
 			blockShardIdent(f.blocks[i].ID),
 			ref,
 			f.blocks[i].State,

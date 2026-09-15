@@ -1759,6 +1759,16 @@ func (r *candidateResolver) loadDurableCandidate(id simplex.CandidateID) (*Candi
 	if err != nil {
 		return nil, fmt.Errorf("validator runtime: decode stored candidate: %w", err)
 	}
+	// A durable copy is read back for finalization, lineage, replay and state
+	// reconstruction, and none of them claims the parsed roots. Handed on, those
+	// roots would sit on the entry outside cache.Bytes — cells over the whole
+	// decompressed buffer — until the sweep released the payload again, which
+	// for the ancestry a restarted session reloads above the floor is not soon.
+	// The rare validation or
+	// observer successor that does reach a reloaded candidate decodes BlockBOC
+	// and CollatedData itself, as it does for any artifact without roots.
+	artifact.preparedBlock = nil
+	artifact.validationRoots = nil
 
 	r.mu.Lock()
 	defer r.mu.Unlock()

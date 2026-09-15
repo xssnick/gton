@@ -235,9 +235,10 @@ func (m *managedCollatorSession) recallEmitted(id WindowID, slot uint32) (Candid
 	return artifact, found
 }
 
-// forgetEmitted releases a completed window's payloads. A failed production
-// keeps them: it stays eligible for relaunch, and relaunching without them
-// would end the window at its first already signed slot.
+// forgetEmitted releases a window's payloads once nothing produces it again. A
+// production cancelled by the session lifecycle keeps them: it stays eligible
+// for relaunch, and relaunching without them would end the window at its first
+// already signed slot.
 func (m *managedCollatorSession) forgetEmitted(id WindowID) {
 	m.emittedMu.Lock()
 	defer m.emittedMu.Unlock()
@@ -2931,9 +2932,6 @@ func (s *Service) produceWindow(job *productionJob) {
 		// Bookkeeping lands before the production barrier is released, so a
 		// duplicate receiver call and advancing progress see one coherent state.
 		job.session.releaseProduction(job.window.ID, err)
-		if err == nil {
-			job.session.forgetEmitted(job.window.ID)
-		}
 		job.session.productionMu.Unlock()
 	} else {
 		job.session.releaseProduction(job.window.ID, err)
@@ -2957,8 +2955,10 @@ func (s *Service) produceWindow(job *productionJob) {
 }
 
 // releaseProduction drops the running job. A terminal result stays in receiver
-// memory as an idempotency record until progress moves past its window. A
-// lifecycle cancellation remains pending so an aborted update can resume it.
+// memory as an idempotency record until progress moves past its window, and
+// releases the payloads remembered for a relaunch, since nothing produces that
+// window again. A lifecycle cancellation remains pending so an aborted update
+// can resume it.
 func (m *managedCollatorSession) releaseProduction(id WindowID, resultErr error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2975,6 +2975,7 @@ func (m *managedCollatorSession) releaseProduction(id WindowID, resultErr error)
 			m.authorizations[id] = window
 		}
 		delete(m.selfWindows, id)
+		m.forgetEmitted(id)
 	}
 }
 
@@ -3482,6 +3483,25 @@ func (p *windowProducer) acceptHandoff(offer SuccessorOffer) {
 		return
 	}
 
+	// The underloaded floor is one rate past the instant the predecessor stopped
+	// gathering externals, so this slot gathers a rate's worth of its own. That
+	// instant is where the predecessor's wait ended, or its handoff when it
+	// shipped before reaching it. On schedule it is the predecessor's slot
+	// boundary and the floor is this slot's own, which changes nothing; in a
+	// window behind its schedule the slots gather one rate apart. Taken from the
+	// handoff instead, the floor would carry the predecessor's tail, and each
+	// underloaded slot of a window on schedule would start its wait later than the
+	// last until the soft deadline turned one empty. It is never past the loop's
+	// floor, one rate past the predecessor's emission.
+	//
+	// underloadedNotBefore is not read. Every emission it can report is of the
+	// slot before the predecessor, and the producer goroutine writes it while
+	// this runs.
+	gathered := offer.externalWaitEnd
+	if offer.handoffAt.Before(gathered) {
+		gathered = offer.handoffAt
+	}
+	notBefore := gathered.Add(p.record.Update.TargetRate)
 	pending := offer
 	request := slotBuildRequest(
 		p.activeSession,
@@ -3491,7 +3511,7 @@ func (p *windowProducer) acceptHandoff(offer SuccessorOffer) {
 		simplex.ParentID{},
 		nil,
 		p.transactionCap(next),
-		p.underloadedNotBefore(),
+		notBefore,
 	)
 	request.PreviousPending = &pending
 	request.excludeExternals = offer.Exclude
@@ -5198,8 +5218,9 @@ func slotBuildRequest(
 	// opened late the early slots' schedule is already in the past, and a build
 	// that finds the pool empty would ship an empty block at once rather than
 	// wait for what the slot would have gathered. notBefore is the producer's
-	// floor for that wait — one target rate after its previous emission — and
-	// it only ever extends the schedule, never shortens it. A loaded block still
+	// floor for that wait — one target rate past the previous slot, see
+	// underloadedNotBefore and acceptHandoff — and it only ever extends the
+	// schedule, never shortens it. A loaded block still
 	// ships the moment it is built: the floor bounds the wait, not the block.
 	if !notBefore.IsZero() && !request.ExternalWaitUntil.IsZero() {
 		request.ExternalWaitUntil = laterOf(request.ExternalWaitUntil, notBefore)

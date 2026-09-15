@@ -1,15 +1,18 @@
 package pebblestore
 
 import (
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/vfs"
@@ -258,9 +261,9 @@ type observedBatch struct {
 	count int
 }
 
-// The writer must never mix the classes in one batch — a batch commits with one
-// pebble.WriteOptions — and must still coalesce WITHIN a class, which is the
-// group-commit property the single queue exists for.
+// The writer must never mix the classes in one batch — the callbacks of a batch
+// either wait for a write-ahead log fsync or they do not — and must still coalesce
+// WITHIN a class, which is the group-commit property the single queue exists for.
 //
 // The fsync count is asserted alongside the grouping, because grouping alone would
 // not notice a payload batch that still went to the disk.
@@ -322,10 +325,11 @@ func TestWriterPartitionsBatchesByDurabilityClass(t *testing.T) {
 			t.Errorf("batch %d = %+v, want %+v", i, batches[i], want[i])
 		}
 	}
-	// Two commitment batches, two fsyncs; the payload batch adds none. Asserted as a
-	// bound rather than an equality because pebble may sync its own bookkeeping.
-	if syncs < 2 {
-		t.Errorf("fsyncs = %d, want at least one per commitment batch", syncs)
+	// Two commitment batches, at most two fsyncs; the payload batch adds none. The
+	// commitments fsync beside the writer, so pebble may cover both with one.
+	// Asserted as bounds because pebble may also sync its own bookkeeping.
+	if syncs < 1 {
+		t.Errorf("fsyncs = %d, want the commitment batches to fsync the log", syncs)
 	}
 	if syncs > 3 {
 		t.Errorf("fsyncs = %d, want the payload batch to add none to the two commitment batches", syncs)
@@ -405,16 +409,162 @@ func TestRecoverablePebbleWritesCostFewerFsyncsThanCommitments(t *testing.T) {
 	}
 }
 
-func TestDurabilityClassWriteOptions(t *testing.T) {
-	if durableCommitment.writeOptions() != pebble.Sync {
-		t.Error("a commitment is not fsynced")
+// walSyncGateFS holds every fsync of a write-ahead log file until release is
+// closed. It is armed only after pebble.Open, which syncs its own files while
+// opening.
+type walSyncGateFS struct {
+	vfs.FS
+	armed   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newWALSyncGateFS() *walSyncGateFS {
+	return &walSyncGateFS{
+		FS:      vfs.Default,
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
 	}
-	if restartRecoverable.writeOptions() != pebble.NoSync {
-		t.Error("a restart-recoverable write waits for an fsync")
+}
+
+func (f *walSyncGateFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
+	file, err := f.FS.Create(name, category)
+	if err != nil {
+		return nil, err
 	}
-	// The zero value is the strict one: a write that says nothing is synced.
+
+	return &walSyncGateFile{File: file, fs: f, name: name}, nil
+}
+
+type walSyncGateFile struct {
+	vfs.File
+	fs   *walSyncGateFS
+	name string
+}
+
+func (f *walSyncGateFile) hold() {
+	if filepath.Ext(f.name) != ".log" || !f.fs.armed.Load() {
+		return
+	}
+	select {
+	case f.fs.entered <- struct{}{}:
+	default:
+	}
+	<-f.fs.release
+}
+
+func (f *walSyncGateFile) Sync() error {
+	f.hold()
+
+	return f.File.Sync()
+}
+
+func (f *walSyncGateFile) SyncData() error {
+	f.hold()
+
+	return f.File.SyncData()
+}
+
+// The fsync a commitment waits for must not hold the writer: a restart-recoverable
+// write queued behind a vote — the collator marker of slot s+1 behind the notarize
+// vote of slot s — completes while the vote still waits for the disk. The vote,
+// and an identical re-save of it that writes nothing, still complete only after
+// the write-ahead log fsync returns.
+func TestCommitmentFsyncDoesNotHoldTheWriter(t *testing.T) {
+	gate := newWALSyncGateFS()
+	db, err := pebble.Open(t.TempDir(), &pebble.Options{FS: gate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{db: db, queue: make(chan writeRequest, 4), writerDone: make(chan struct{})}
+	go store.runWriter()
+	released := false
+	defer func() {
+		if !released {
+			close(gate.release)
+		}
+		close(store.queue)
+		<-store.writerDone
+		store.callbackWG.Wait()
+		if closeErr := db.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
+	}()
+
+	// The shape of an idempotent commitment: the second submission finds the
+	// record already committed and writes nothing.
+	commitment := func(done chan<- error) writeRequest {
+		return writeRequest{
+			apply: func(batch *pebble.Batch) error {
+				if _, err := getBatchCopy(batch, []byte("commitment")); err == nil {
+					return nil
+				} else if !errors.Is(err, pebble.ErrNotFound) {
+					return err
+				}
+
+				return batch.Set([]byte("commitment"), []byte{1}, nil)
+			},
+			done: func(err error) { done <- err },
+		}
+	}
+	submit := func(req writeRequest) {
+		if err := store.submit(req); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	gate.armed.Store(true)
+	first := make(chan error, 1)
+	submit(commitment(first))
+	select {
+	case <-gate.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the commitment never reached a write-ahead log fsync")
+	}
+
+	recoverable := make(chan error, 1)
+	submit(writeRequest{
+		durability: restartRecoverable,
+		apply: func(batch *pebble.Batch) error {
+			return batch.Set([]byte("recoverable"), []byte{1}, nil)
+		},
+		done: func(err error) { recoverable <- err },
+	})
+	select {
+	case err = <-recoverable:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a restart-recoverable write waited for the fsync of the commitment queued before it")
+	}
+
+	// The re-save reports the record durable although it writes nothing, so it
+	// has to wait for an fsync that covers the original.
+	resave := make(chan error, 1)
+	submit(commitment(resave))
+	select {
+	case err = <-first:
+		t.Fatalf("the commitment completed (%v) while its fsync was held", err)
+	case err = <-resave:
+		t.Fatalf("the identical re-save completed (%v) while the original's fsync was held", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(gate.release)
+	released = true
+	if err = receiveTestResult(t, first); err != nil {
+		t.Fatal(err)
+	}
+	if err = receiveTestResult(t, resave); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestZeroDurabilityClassIsCommitment(t *testing.T) {
+	// The zero value is the strict one: a write that says nothing waits for the fsync.
 	var unset durabilityClass
-	if unset != durableCommitment || unset.writeOptions() != pebble.Sync {
+	if unset != durableCommitment {
 		t.Fatal("the zero durability class is not the strict one, so a new write could default to unsynced")
 	}
 }

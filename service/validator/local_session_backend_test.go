@@ -1936,11 +1936,11 @@ func TestLocalSessionBackendTerminalProgressClearsFinalizedRecheckDebt(t *testin
 	if err := fixture.backend.ObserveConsensusProgress(t.Context(), progress); err != nil {
 		t.Fatalf("terminal progress was not isolated: %v", err)
 	}
-	if !fixture.backend.collatorUnavailable || fixture.backend.recheckWindow != nil ||
+	if !fixture.backend.collatorUnavailable.Load() || fixture.backend.recheckWindow != nil ||
 		fixture.backend.pendingWindow != nil || fixture.backend.appliedWindow != nil ||
 		fixture.backend.handledWindow != nil {
 		t.Fatalf("terminal recheck quarantine state = unavailable %v, recheck %v, pending %v, applied %v, handled %v",
-			fixture.backend.collatorUnavailable, fixture.backend.recheckWindow,
+			fixture.backend.collatorUnavailable.Load(), fixture.backend.recheckWindow,
 			fixture.backend.pendingWindow, fixture.backend.appliedWindow,
 			fixture.backend.handledWindow)
 	}
@@ -2019,9 +2019,9 @@ func TestLocalSessionBackendDeferredTerminalProducerFailurePublishesValidationVi
 			if err := backend.UpdateSession(context.Background(), recoveredState); err != nil {
 				t.Fatalf("authoritative update after deferred producer failure: %v", err)
 			}
-			if !backend.collatorUnavailable || backend.collatorDeferred.Load() || backend.pendingWindow != nil {
+			if !backend.collatorUnavailable.Load() || backend.collatorDeferred.Load() || backend.pendingWindow != nil {
 				t.Fatalf("terminal producer state unavailable/deferred/pending = %v/%v/%v, want true/false/nil",
-					backend.collatorUnavailable, backend.collatorDeferred.Load(), backend.pendingWindow)
+					backend.collatorUnavailable.Load(), backend.collatorDeferred.Load(), backend.pendingWindow)
 			}
 			if !backend.state.MasterchainBlock.Equals(&recoveredState.MasterchainBlock) {
 				t.Fatalf("committed masterchain block = %v, want %v",
@@ -2575,7 +2575,7 @@ func TestLocalSessionBackendRetriesNonterminalConsensusProgress(t *testing.T) {
 	if err := backend.ObserveConsensusProgress(context.Background(), progress); !errors.Is(err, progressErr) {
 		t.Fatalf("first progress error = %v, want %v", err, progressErr)
 	}
-	if backend.update.HasCurrentWindow || backend.collatorUnavailable {
+	if backend.update.HasCurrentWindow || backend.collatorUnavailable.Load() {
 		t.Fatalf("failed retryable progress changed backend state: %+v", backend.update)
 	}
 	producer.mu.Lock()
@@ -2627,7 +2627,7 @@ func TestLocalSessionBackendQuarantinesTerminalProducerOnly(t *testing.T) {
 	if err := backend.ObserveConsensusProgress(context.Background(), progress); err != nil {
 		t.Fatalf("terminal producer progress isolated from validation: %v", err)
 	}
-	if !backend.collatorUnavailable {
+	if !backend.collatorUnavailable.Load() {
 		t.Fatal("terminal producer was not quarantined")
 	}
 	view := backend.validation.Load()
@@ -2688,10 +2688,10 @@ func TestLocalSessionBackendQuarantinesTerminalActivation(t *testing.T) {
 		t.Fatalf("terminal producer activation isolated from validation: %v", err)
 	}
 	want := localCollatorActivation(fixture.config.SessionID, fixture.start)
-	if !fixture.backend.collatorUnavailable || fixture.backend.activation == nil ||
+	if !fixture.backend.collatorUnavailable.Load() || fixture.backend.activation == nil ||
 		!fixture.backend.activation.Equal(want) {
 		t.Fatalf("terminal activation unavailable/activation = %v/%+v",
-			fixture.backend.collatorUnavailable, fixture.backend.activation)
+			fixture.backend.collatorUnavailable.Load(), fixture.backend.activation)
 	}
 	if len(fixture.producer.activateCalls) != 1 {
 		t.Fatalf("terminal producer activation calls = %d, want 1", len(fixture.producer.activateCalls))
@@ -2720,10 +2720,10 @@ func TestLocalSessionBackendQuarantinesTerminalUpdate(t *testing.T) {
 	if err := fixture.backend.UpdateSession(context.Background(), next); err != nil {
 		t.Fatalf("terminal producer update isolated from validation: %v", err)
 	}
-	if !fixture.backend.collatorUnavailable ||
+	if !fixture.backend.collatorUnavailable.Load() ||
 		!fixture.backend.state.MasterchainBlock.Equals(&next.MasterchainBlock) {
 		t.Fatalf("terminal update unavailable/state = %v/%+v",
-			fixture.backend.collatorUnavailable, fixture.backend.state)
+			fixture.backend.collatorUnavailable.Load(), fixture.backend.state)
 	}
 	if len(fixture.producer.updateCalls) != 1 {
 		t.Fatalf("terminal producer update calls = %d, want 1", len(fixture.producer.updateCalls))
@@ -2864,9 +2864,9 @@ func TestLocalSessionBackendDeferredLeaderWindowStopsAfterTerminalCatchUp(t *tes
 	default:
 		t.Fatal("terminal catch-up did not close producer readiness")
 	}
-	if !fixture.backend.collatorUnavailable || fixture.backend.collatorDeferred.Load() {
+	if !fixture.backend.collatorUnavailable.Load() || fixture.backend.collatorDeferred.Load() {
 		t.Fatalf("terminal catch-up unavailable/deferred = %v/%v, want true/false",
-			fixture.backend.collatorUnavailable, fixture.backend.collatorDeferred.Load())
+			fixture.backend.collatorUnavailable.Load(), fixture.backend.collatorDeferred.Load())
 	}
 	if len(fixture.producer.updateCalls) != 1 || len(fixture.producer.selfCalls) != 0 {
 		t.Fatalf("terminal catch-up producer update/self calls = %d/%d, want 1/0",
@@ -2971,7 +2971,7 @@ func TestLocalSessionBackendLeaderWindowQuarantinesTerminalProducer(t *testing.T
 			if err := fixture.backend.HandleLeaderWindow(ctx, fixture.window(0, 0)); err != nil {
 				t.Fatalf("terminal leader producer stage: %v", err)
 			}
-			if !fixture.backend.collatorUnavailable {
+			if !fixture.backend.collatorUnavailable.Load() {
 				t.Fatal("terminal leader producer was not quarantined")
 			}
 			if len(fixture.producer.updateCalls) != 1 ||

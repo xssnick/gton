@@ -1292,8 +1292,9 @@ func (a *LocalAcquisition) installCandidateDeltaLocked(
 }
 
 // seedAllowed says whether this caller may fall back to rebuilding the source
-// from the predecessor's state root. That fallback walks the whole out-queue and
-// took 100-250 ms when it was last measured, and every caller here holds the
+// from the predecessor's state root. That fallback walks the out-queue subtrees
+// routed to the branch destination (the whole-queue walk it replaced took
+// 100-250 ms when it was last measured), and every caller here holds the
 // session lock — which is fine for a commit, whose whole job is to hold it, and
 // not fine for a speculative successor that would be holding it in front of the
 // predecessor's own commit. A caller that cannot afford the seed asks for it to
@@ -1324,7 +1325,7 @@ func (a *LocalAcquisition) ensureCandidateBase(
 			return fmt.Errorf("%w: candidate predecessor queue is not pinned and may not be seeded here",
 				ErrAcquisitionNotReady)
 		}
-		seeded, _, err := branch.SeedSourceFromStateRoot(source, ref, previous[index].State)
+		seeded, err := branch.SeedSourceFromStateRoot(source, ref, previous[index].State)
 		if err != nil {
 			return fmt.Errorf("seed candidate predecessor queue: %w", err)
 		}
@@ -1712,6 +1713,11 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 		request.BuildSoftDeadline,
 		request.ExternalWaitUntil,
 	)
+	// From assembly too: a build whose slot boundary had already passed when it
+	// began cannot have stopped gathering before it began.
+	if input.successor != nil {
+		input.successor.externalWaitEnd = laterOf(request.ExternalWaitUntil, assembly)
+	}
 	var assemblyDurations candidateAssemblyDurations
 	if a.collationObserver != nil {
 		input.assembly = &assemblyDurations

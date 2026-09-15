@@ -69,24 +69,23 @@ type ValidationRequest struct {
 	// in-process handoff.
 	BlockRoot     *cell.Cell
 	CollatedRoots []*cell.Cell
-	// Digested is the caller's assertion that Candidate.CollatedFileHash is
-	// already known to be the sha256 of CollatedData — not that it ought to be,
-	// but that the digest was taken of these bytes and compared, or that these
-	// bytes are where the digest came from.
+	// Digested is the caller's assertion that Candidate.Block.FileHash and
+	// Candidate.CollatedFileHash are already known to be the sha256 of BlockBOC
+	// and CollatedData — not that they ought to be, but that the digests were
+	// taken of these bytes and compared, or that these bytes are where the
+	// digests came from.
 	//
 	// It exists because on every path that reaches here in production the
-	// statement is a tautology and checking it costs a full sha256 of the
-	// collated payload, twice per slot on a leader: the candidate codec derives
-	// the hash from the payload it just decompressed and feeds it into the
-	// candidate id the signature covers, and the local producer takes it inside
-	// finish() from the buffer it just serialized. The reference re-checks
-	// nothing here either — ValidateQuery::unpack_block_candidate
-	// (validate-query.cpp:475-522) re-verifies the block file hash and uses
+	// statement is a tautology and checking it costs a full sha256 of both
+	// payloads: the candidate codec derives the hashes from the payload it just
+	// decoded and feeds them into the candidate id the signature covers, and the
+	// local producer takes them inside finish() from the buffers it just
+	// serialized. The reference re-derives only the block file hash here —
+	// ValidateQuery::unpack_block_candidate (validate-query.cpp:475-522) uses
 	// collated_file_hash for statistics only.
 	//
-	// Leave it false and the digest is taken, which is what every caller that
-	// cannot make the statement should do. The block file hash is checked
-	// unconditionally regardless; that one is parity with the reference.
+	// Leave it false and both digests are taken, which is what every caller that
+	// cannot make the statement should do.
 	Digested bool
 	// AnnounceTransition is optional. When absent, nothing about validation
 	// changes: the caller simply performs its own work after this call instead
@@ -458,8 +457,18 @@ func (a *LocalAcquisition) projectedMasterView(
 		return cached, nil
 	}
 
-	previous, state, err := a.loadPrevious(ctx, id, mode)
-	if err != nil {
+	// A cached view already carries the verified block/state pair of this exact
+	// id, and both the projection and a rebuild below need nothing else. Reading
+	// the block again would cost a block-cache lock at best and a full storage
+	// read at worst, and an immediate read could refuse a view that is in memory.
+	var (
+		previous PreviousBlock
+		state    tlb.ShardStateUnsplit
+		err      error
+	)
+	if cached != nil {
+		previous, state = cached.previous, cached.state
+	} else if previous, state, err = a.loadPrevious(ctx, id, mode); err != nil {
 		return nil, err
 	}
 	input := groups.ApplyInput{

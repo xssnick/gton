@@ -210,6 +210,18 @@ func (a *LocalAcquisition) PublishMasterchainView(
 	// Registered neighbor tops only move when the masterchain view moves, so
 	// installing a view is the exact bound on cached block lifetime.
 	a.blocks.advance()
+	// Once the next masterchain block demotes this view, historical frontier
+	// lookups and projections ask the block cache for this exact block, and the
+	// pair was verified and its registry decoded just above. Stored after
+	// advance so it carries the current generation. The only possible error is
+	// a different block id cached under this root hash, which every later lookup
+	// of this id reports itself, so there is nothing to add here.
+	source := &localBlockSource{previous: previous, state: state}
+	source.masterOnce.Do(func() {
+		source.masterGenLT = state.GenLT
+		source.masterRegistry = view.registry
+	})
+	_, _ = a.blocks.store(source)
 	a.warmRegisteredTops(view)
 
 	return nil
@@ -338,6 +350,16 @@ func (a *LocalAcquisition) warmRegisteredTops(view *localMasterView) {
 		return
 	}
 
+	// The pins depend on neither the reads below nor on whether any are needed:
+	// a masterchain block this node collated itself already put every new top in
+	// the block cache, and its sessions still need their neighbours pinned.
+	// Detached for the same reason as the reads, and also because the caller
+	// holds the masterchain view lock, which a build takes under the session
+	// mutex the pins acquire. The masterchain neighbour's own position usually
+	// misses here: the apply hook feeds that block to the pool only after this
+	// publication returns, so its pin is taken in the slot instead.
+	go a.pinRegisteredNeighbors(view)
+
 	tops := make([]ton.BlockIDExt, 0, len(view.registry.leaves))
 	for _, leaf := range view.registry.leaves {
 		if leaf.top.Block.Workchain == masterchainWorkchainID {
@@ -379,50 +401,56 @@ func (a *LocalAcquisition) warmRegisteredTops(view *localMasterView) {
 			}()
 		}
 		wg.Wait()
-
-		// Pinning here, not at the slot. The slot takes the same positions
-		// under the session mutex a build already holds, and a miss there costs
-		// the from-state seed walk. Once a slot may select a masterchain view
-		// newer than the one its session was updated to, those positions move
-		// with every masterchain block instead of once per leader window, so
-		// the pin has to move off the slot with them.
-		//
-		// Failures are dropped exactly as the reads above are: this decides
-		// nothing, and the view pick probes the same positions authoritatively
-		// before it chooses a view.
-		a.mu.RLock()
-		sessions := make([]*localAcquisitionSession, 0, len(a.sessions))
-		for _, managed := range a.sessions {
-			sessions = append(sessions, managed)
-		}
-		a.mu.RUnlock()
-		for _, managed := range sessions {
-			managed.mu.Lock()
-			target := managed.session.Shard
-			branch := managed.branch
-			retired := managed.retired
-			managed.mu.Unlock()
-			if branch == nil || retired || target.IsMasterchain() {
-				continue
-			}
-			expected, err := expectedShardNeighbors(view.context, target)
-			if err != nil {
-				continue
-			}
-			destination := targetShardIdent(target)
-			for _, block := range expected {
-				source := blockShardIdent(block)
-				if block.SeqNo == 0 || source == destination {
-					continue
-				}
-				ref, refErr := localSourceRef(block)
-				if refErr != nil {
-					continue
-				}
-				_ = branch.PinSource(source, ref)
-			}
-		}
 	}()
+}
+
+// pinRegisteredNeighbors pins the neighbour positions view registers into every
+// live shard session's branch.
+//
+// Pinning here, not at the slot. The slot takes the same positions under the
+// session mutex a build already holds, and a miss there costs the from-state
+// seed walk. Once a slot may select a masterchain view newer than the one its
+// session was updated to, those positions move with every masterchain block
+// instead of once per leader window, so the pin has to move off the slot with
+// them.
+//
+// Failures are dropped exactly as the top reads are: this decides nothing, and
+// the view pick probes the same positions authoritatively before it chooses a
+// view.
+func (a *LocalAcquisition) pinRegisteredNeighbors(view *localMasterView) {
+	a.mu.RLock()
+	sessions := make([]*localAcquisitionSession, 0, len(a.sessions))
+	for _, managed := range a.sessions {
+		sessions = append(sessions, managed)
+	}
+	a.mu.RUnlock()
+
+	for _, managed := range sessions {
+		managed.mu.Lock()
+		target := managed.session.Shard
+		branch := managed.branch
+		retired := managed.retired
+		managed.mu.Unlock()
+		if branch == nil || retired || target.IsMasterchain() {
+			continue
+		}
+		expected, err := expectedShardNeighbors(view.context, target)
+		if err != nil {
+			continue
+		}
+		destination := targetShardIdent(target)
+		for _, block := range expected {
+			source := blockShardIdent(block)
+			if block.SeqNo == 0 || source == destination {
+				continue
+			}
+			ref, refErr := localSourceRef(block)
+			if refErr != nil {
+				continue
+			}
+			_ = branch.PinSource(source, ref)
+		}
+	}
 }
 
 // residentMasterchainViewIsCurrent reports whether the installed view already is

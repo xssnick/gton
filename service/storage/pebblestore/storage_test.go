@@ -3710,6 +3710,9 @@ func TestDropPendingCellGenerationDetachesStatus(t *testing.T) {
 		t.Fatal("dropped pending generation is still visible in db status")
 	}
 
+	heldCells.release()
+	heldCellsReleased = true
+
 	deadline := time.Now().Add(time.Second)
 	for {
 		removed := true
@@ -3725,12 +3728,10 @@ func TestDropPendingCellGenerationDetachesStatus(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("dropped pending generation dirs were not removed while cell store ref is held")
+			t.Fatal("dropped pending generation dirs were not removed after cell store ref release")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	heldCells.release()
-	heldCellsReleased = true
 }
 
 func TestCellsRejectsZeroGeneration(t *testing.T) {

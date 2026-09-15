@@ -99,10 +99,34 @@ func (s *Store) PublishAcceptedBlockState(artifacts storage.LiveBlockArtifacts) 
 	// half only, and nothing is lost.
 	artifacts.AvailabilityOnly = true
 
+	// A block the applied current state has already reached is not published.
+	// Acceptance then runs behind the sync pipeline, whose own copy of the block
+	// serves it, resident or flushed to the backing. A publication here would also
+	// never be released: rememberAcceptedStateLocked does not enrol a covered
+	// block, and the block's flushes have already happened, so the live block and
+	// the block cache entry it installs would stay unflushed and unevictable. The
+	// check precedes the install because the block cache write comes first; a
+	// current state passing the block in between still finds the pipeline's
+	// unflushed copy, which the install merges into. The observers are told either
+	// way: they take the block and its state from the artifacts.
+	s.mu.RLock()
+	covered := s.coveredByCurrentStateLocked(artifacts.Block)
+	s.mu.RUnlock()
+	if covered {
+		s.notifyAcceptedBlockState(artifacts)
+
+		return nil
+	}
+
 	if err := s.publishLiveBlockArtifacts(artifacts, true); err != nil {
 		return err
 	}
+	// Observers before the non-final promotion: the promotion rebuilds every waiting
+	// block this publication unblocked, and the message pool must not wait for it.
 	s.notifyAcceptedBlockState(artifacts)
+	if s.nonFinalEnabled {
+		s.promoteNonfinalWaiting()
+	}
 
 	return nil
 }
@@ -130,8 +154,10 @@ type acceptedStateObserver struct {
 // The observer runs synchronously on the publishing goroutine, strictly after the
 // publication is installed and outside every store lock: an observer that reads
 // the block or its state back from this store during the call is served the
-// publication. A failed publication notifies nobody, so an observer never learns
-// of a block the store itself cannot answer for.
+// publication. A block the applied current state has already reached is not
+// installed, and such a read is served by the sync pipeline's own copy instead. A
+// failed publication notifies nobody, so an observer never learns of a block the
+// store itself cannot answer for.
 func (s *Store) ObserveAcceptedBlockStates(observe func(storage.LiveBlockArtifacts)) func() {
 	s.acceptedObserversMu.Lock()
 	s.acceptedObserverNext++

@@ -3,6 +3,7 @@ package collator
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -110,6 +111,44 @@ func TestVerifyCollatedDataChecksTheDigestWithoutProvenance(t *testing.T) {
 	claimed.digested = true
 	if _, err = verifyCollatedData(&claimed, nil, 0); err != nil && strings.Contains(err.Error(), mismatch) {
 		t.Fatalf("a provenance-carrying candidate re-derived its collated digest: %v", err)
+	}
+}
+
+// TestPrepareBlockChecksTheFileHashWithoutProvenance is the same gate for the
+// block file hash. Without provenance — a storage-recovered artifact, a
+// Candidate assembled outside this package — the digest is taken and a mismatch
+// is refused. With provenance the ID's file hash is where the digest of these
+// very bytes came from, so it is not taken a second time.
+func TestPrepareBlockChecksTheFileHashWithoutProvenance(t *testing.T) {
+	req := emptyCandidateRequest(t)
+	req.Internals = &msgpool.Cut{}
+	built, err := testBuilder().BuildShard(t.Context(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const mismatch = "block file hash mismatch"
+	foreign := *built
+	foreign.digested = false
+	if err = (&preparedValidationCandidate{}).prepareBlock(t.Context(), &foreign, nil); err != nil {
+		t.Fatalf("an honest candidate without provenance was refused: %v", err)
+	}
+
+	tampered := foreign
+	tampered.ID.FileHash = append([]byte(nil), built.ID.FileHash...)
+	tampered.ID.FileHash[0] ^= 1
+	err = (&preparedValidationCandidate{}).prepareBlock(t.Context(), &tampered, nil)
+	if !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), mismatch) {
+		t.Fatalf("block digest mismatch without provenance = %v, want a rejection", err)
+	}
+
+	// The same bytes and the same wrong hash, now claimed to have been digested
+	// by the codec or the builder. Nothing else in stage 1 reads the file hash,
+	// so the whole stage passes: the sha256 was not taken.
+	claimed := tampered
+	claimed.digested = true
+	if err = (&preparedValidationCandidate{}).prepareBlock(t.Context(), &claimed, nil); err != nil {
+		t.Fatalf("a provenance-carrying candidate re-derived its block digest: %v", err)
 	}
 }
 

@@ -112,7 +112,7 @@ func (c *collation) buildStateAndBlockParts() (blockParts, error) {
 	// moves for different reasons.
 	stateUpdate, stateRoot, memoCells, err := c.usage.CreateMerkleUpdateAppliedSized(
 		stateRoot,
-		c.builder.updateMemoHint(),
+		c.builder.updateMemoHint(MetricChainShardchain),
 		collationParallelism,
 	)
 	if err != nil {

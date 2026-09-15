@@ -177,7 +177,7 @@ func (s *Store) SaveStateCheckpointEntries(ctx context.Context, blocks []storage
 	if err != nil {
 		return timing, err
 	}
-	timing, err = s.savePreparedBlockStateRecords(cellGeneration, prepared, current, timing, artifactWrites, artifactRegistrations, artifactLinks)
+	timing, err = s.savePreparedBlockStateRecords(prepared, current, timing, artifactWrites, artifactRegistrations, artifactLinks)
 	if err != nil {
 		return timing, err
 	}
@@ -388,6 +388,17 @@ func (s *Store) prepareBlockStatesForSave(ctx context.Context, cellGeneration ui
 		for i := range prepared {
 			prepared[i].flushCells = true
 		}
+
+		// Flushed here, before the checkpoint takes artifactPublishMu: the cells
+		// only have to be durable ahead of the hot metadata commit, and a celldb
+		// write stall under that lock would park the artifact prewriter for as
+		// long as it lasts.
+		flushStarted := time.Now()
+		err = s.flushCellDBs(cellGeneration)
+		timing.CellsFlush = time.Since(flushStarted)
+		if err != nil {
+			return nil, timing, fmt.Errorf("flush generation %d state cells before state metadata: %w", cellGeneration, err)
+		}
 	}
 	for i := range prepared {
 		if prepared[i].saved.Cell == nil {
@@ -449,22 +460,13 @@ func shouldParseSavedLazyState(state storage.BlockState) bool {
 	return state.Parsed != nil && (state.Block.Workchain != -1 || state.Parsed.McStateExtra != nil)
 }
 
-func (s *Store) savePreparedBlockStateRecords(cellGeneration uint64, prepared []preparedBlockStateSave, current *storage.CurrentState, timing storage.StateCheckpointTiming, artifactWrites []checkpointArtifactWrite, artifactRegistrations []archivePackRegistration, artifactLinks []storage.ServedBlockLink) (storage.StateCheckpointTiming, error) {
+func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave, current *storage.CurrentState, timing storage.StateCheckpointTiming, artifactWrites []checkpointArtifactWrite, artifactRegistrations []archivePackRegistration, artifactLinks []storage.ServedBlockLink) (storage.StateCheckpointTiming, error) {
 	flushCells := false
 	for _, state := range prepared {
 		if state.flushCells {
 			flushCells = true
 			break
 		}
-	}
-
-	flushStarted := time.Now()
-	if flushCells {
-		if err := s.flushCellDBs(cellGeneration); err != nil {
-			timing.CellsFlush = time.Since(flushStarted)
-			return timing, fmt.Errorf("flush generation %d state cells before state metadata: %w", cellGeneration, err)
-		}
-		timing.CellsFlush = time.Since(flushStarted)
 	}
 
 	syncArtifacts := len(artifactWrites) != 0 || len(artifactRegistrations) != 0

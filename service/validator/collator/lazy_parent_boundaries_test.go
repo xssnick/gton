@@ -560,7 +560,7 @@ func TestLazyParentBlockDoesNotDependOnTheCarriedMemoHint(t *testing.T) {
 			var want [2][32]byte
 			for i, hint := range []int{0, 200, 227, 228, 255, 4096, 1 << 20} {
 				builder := testBuilder()
-				builder.observeBuildSizes(0, 0, 0, hint)
+				builder.observeBuildSizes(MetricChainShardchain, 0, 0, 0, hint)
 				candidate, err := builder.BuildShard(context.Background(), parent.build(t))
 				if err != nil {
 					t.Fatalf("hint %d: collate: %v", hint, err)

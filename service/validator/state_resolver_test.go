@@ -299,6 +299,15 @@ func TestStateResolverReplaysPersistedFinalizationOnce(t *testing.T) {
 
 		return nil
 	}
+	// The node had not applied the persisted block when the process stopped;
+	// an applied one is reconciled without a replay.
+	backend.load = func(_ context.Context, request ChainStateRequest) (ChainStateData, error) {
+		if request.Blocks[0].SeqNo != 0 {
+			return ChainStateData{}, ErrBlockNotReady
+		}
+
+		return ChainStateData{Tips: []ChainTip{{ID: request.Blocks[0], State: backend.stateRoot}}}, nil
+	}
 	resolver := newStateResolver(
 		config.Shard,
 		config.StorageID,

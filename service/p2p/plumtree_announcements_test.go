@@ -186,17 +186,19 @@ func TestPlumtreeIHaveStartsRepairImmediatelyWithoutEagerPeer(t *testing.T) {
 				)
 			}
 
+			// The part stays missing until its deadline, so the asked
+			// announcer keeps counting against a repeated IHAVE.
 			engine.mu.Lock()
 			defer engine.mu.Unlock()
-			if len(engine.missing) != 0 {
+			if len(engine.missing) != 1 {
 				t.Fatalf(
-					"%d delayed repairs survived immediate handoff",
+					"missing parts after immediate handoff = %d, want 1",
 					len(engine.missing),
 				)
 			}
-			if len(engine.announcements) != 0 {
+			if len(engine.announcements) != 1 {
 				t.Fatalf(
-					"%d announcement queues survived immediate handoff",
+					"announcement queues after immediate handoff = %d, want 1",
 					len(engine.announcements),
 				)
 			}

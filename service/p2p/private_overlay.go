@@ -347,12 +347,32 @@ func (o *PrivateOverlay) SendMessage(
 	return nil
 }
 
+// SendMessageRaw sends a boxed message the caller no longer mutates. Over QUIC
+// the envelope prefix and the body are written as two segments: a session
+// fans one consensus message out to every committee peer, and joining them
+// would copy the whole message once per recipient.
 func (o *PrivateOverlay) SendMessageRaw(
 	ctx context.Context,
 	peerID PeerID,
 	boxed []byte,
 ) error {
-	return o.SendMessage(ctx, peerID, tl.Raw(boxed))
+	peer, err := o.peer(peerID)
+	if err != nil {
+		return err
+	}
+	if !o.sub.spec.UseQUIC {
+		return peer.overlay.SendCustomMessage(ctx, tl.Raw(boxed))
+	}
+
+	quicPeer, err := peer.dialQUIC(ctx)
+	if err != nil {
+		return err
+	}
+	prefix := o.sub.quicEnvelope.state.Load().messagePrefix
+	if err = quicPeer.SendOutboundMessageParts(ctx, prefix, boxed); err != nil {
+		return fmt.Errorf("send private overlay QUIC message: %w", err)
+	}
+	return nil
 }
 
 func (o *PrivateOverlay) SendRLDPMessage(

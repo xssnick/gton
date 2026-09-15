@@ -39,21 +39,13 @@ const (
 	// restartRecoverable is state that a restart may lose without changing what
 	// this node is allowed to sign. The network or a durable consensus record can
 	// reconstruct it; losing it costs replay, re-fetching, or telemetry only. The
-	// collator marker is the explicit accepted exception to that rule. This class
-	// commits with pebble.NoSync, so its callback fires once the write is in the
-	// write-ahead log rather than after the log has been fsynced.
+	// collator marker is the explicit accepted exception to that rule. The
+	// callback of this class fires once the write is in the write-ahead log
+	// rather than after the log has been fsynced.
 	//
 	// Error reporting is unchanged. Only the stable-media wait goes away.
 	restartRecoverable
 )
-
-func (c durabilityClass) writeOptions() *pebble.WriteOptions {
-	if c == restartRecoverable {
-		return pebble.NoSync
-	}
-
-	return pebble.Sync
-}
 
 type writeRequest struct {
 	apply func(*pebble.Batch) error
@@ -103,8 +95,12 @@ type Store struct {
 	queue      chan writeRequest
 	writerDone chan struct{}
 
-	stateMu   sync.Mutex
-	isClosed  bool
+	// stateMu is held shared across every queue send and exclusively by Close
+	// while it closes the queue. isClosed is stored under the exclusive lock but
+	// read without it, so reads and journal reservations never wait behind a
+	// send that is blocked on a full queue.
+	stateMu   sync.RWMutex
+	isClosed  atomic.Bool
 	closeErr  error
 	closeDone chan struct{}
 
@@ -123,6 +119,12 @@ type ValidatorStore struct {
 	namespaceMu sync.Mutex
 	deleting    map[storageNamespace]struct{}
 	deleted     map[storageNamespace]struct{}
+	// admitting counts the writes per namespace that passed the deletion gate
+	// and are still being sent to the queue. namespaceMu is not held across that
+	// send, so DeleteSession waits on admitted until its namespace has none left
+	// and its tombstones queue behind every write the gate let through.
+	admitting map[storageNamespace]int
+	admitted  *sync.Cond
 
 	journalMu sync.Mutex
 	journals  map[storageNamespace]*journal
@@ -166,7 +168,7 @@ func (s *Store) Collator() *CollatorStore {
 // closes the database and its cache. It is safe to call more than once.
 func (s *Store) Close() error {
 	s.stateMu.Lock()
-	if s.isClosed {
+	if s.isClosed.Load() {
 		done := s.closeDone
 		s.stateMu.Unlock()
 		<-done
@@ -178,7 +180,7 @@ func (s *Store) Close() error {
 		return err
 	}
 
-	s.isClosed = true
+	s.isClosed.Store(true)
 	close(s.queue)
 	done := s.closeDone
 	s.stateMu.Unlock()
@@ -209,10 +211,7 @@ func (s *ValidatorStore) reserveJournalInit() bool {
 	s.initMu.Lock()
 	defer s.initMu.Unlock()
 
-	s.store.stateMu.Lock()
-	isClosed := s.store.isClosed
-	s.store.stateMu.Unlock()
-	if isClosed {
+	if s.store.isClosed.Load() {
 		return false
 	}
 	s.initWG.Add(1)
@@ -231,16 +230,17 @@ func (s *Store) submitContext(ctx context.Context, req writeRequest) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
 
-	if s.isClosed {
+	if s.isClosed.Load() {
 		return validator.ErrStorageClosed
 	}
 
 	// Holding stateMu across the bounded send prevents Close from closing the
-	// channel between the state check and submission. The writer never takes
-	// this lock, so backpressure cannot deadlock shutdown.
+	// channel between the state check and submission. Senders hold it shared:
+	// the channel already orders them. The writer never takes this lock, so
+	// backpressure cannot deadlock shutdown.
 	s.outstanding.Add(1)
 	select {
 	case s.queue <- req:
@@ -253,17 +253,7 @@ func (s *Store) submitContext(ctx context.Context, req writeRequest) error {
 }
 
 func (s *ValidatorStore) submitSession(namespace storageNamespace, req writeRequest) error {
-	s.namespaceMu.Lock()
-	defer s.namespaceMu.Unlock()
-
-	if _, isDeleting := s.deleting[namespace]; isDeleting {
-		return validator.ErrSessionClosed
-	}
-	if _, isDeleted := s.deleted[namespace]; isDeleted {
-		return validator.ErrSessionClosed
-	}
-
-	return s.store.submit(req)
+	return s.submitSessionContext(context.Background(), namespace, req)
 }
 
 func (s *ValidatorStore) submitSessionContext(
@@ -272,16 +262,29 @@ func (s *ValidatorStore) submitSessionContext(
 	req writeRequest,
 ) error {
 	s.namespaceMu.Lock()
-	defer s.namespaceMu.Unlock()
+	_, isDeleting := s.deleting[namespace]
+	_, isDeleted := s.deleted[namespace]
+	if isDeleting || isDeleted {
+		s.namespaceMu.Unlock()
 
-	if _, isDeleting := s.deleting[namespace]; isDeleting {
 		return validator.ErrSessionClosed
 	}
-	if _, isDeleted := s.deleted[namespace]; isDeleted {
-		return validator.ErrSessionClosed
-	}
+	s.admitting[namespace]++
+	s.namespaceMu.Unlock()
 
-	return s.store.submitContext(ctx, req)
+	// The send may wait for room in a full queue, so it runs without
+	// namespaceMu: Journal and the gates of other namespaces stay available.
+	err := s.store.submitContext(ctx, req)
+
+	s.namespaceMu.Lock()
+	s.admitting[namespace]--
+	if s.admitting[namespace] == 0 {
+		delete(s.admitting, namespace)
+		s.admitted.Broadcast()
+	}
+	s.namespaceMu.Unlock()
+
+	return err
 }
 
 func (s *ValidatorStore) submitSessionAsync(namespace storageNamespace, req writeRequest) {
@@ -388,11 +391,12 @@ func (s *Store) runWriter() {
 // oversized single write still goes through — the cap only stops it from being
 // joined by others.
 //
-// The class check is what partitions the two commits: one batch commits with one
-// pebble.WriteOptions, so a batch may not mix a commitment with a payload. A
-// request of the other class is carried to the next batch rather than dropped or
-// downgraded, which keeps coalescing intact WITHIN each class — the group-commit
-// property the single queue exists for, where small writes ride one fsync.
+// The class check is what partitions the two completions: the callbacks of one
+// batch either wait for a write-ahead log fsync or they do not, so a payload
+// never joins a commitment batch to wait for its fsync. A request of the other
+// class is carried to the next batch rather than dropped or downgraded, which
+// keeps coalescing intact WITHIN each class — the group-commit property the
+// single queue exists for, where small writes ride one fsync.
 func writeBatchCanAppend(batchBytes int, class durabilityClass, request writeRequest) bool {
 	if request.durability != class {
 		return false
@@ -423,24 +427,17 @@ func (s *Store) commitRequests(requests []writeRequest) {
 		break
 	}
 
-	// One batch, one durability class: writeBatchCanAppend refuses to mix them, so
-	// the first request's class is the batch's. A failed commit is fatal in either
-	// class — with NoSync only the WAIT is relaxed, never the error handling below.
+	// Every batch commits without waiting for the disk, so the fsync of a
+	// commitment never holds the writer and the requests queued behind it. A
+	// failed commit is fatal in either class.
 	if fatalErr == nil && !batch.Empty() {
-		fatalErr = batch.Commit(requests[0].durability.writeOptions())
+		fatalErr = batch.Commit(pebble.NoSync)
 	}
 	closeErr := batch.Close()
 	if fatalErr == nil {
 		fatalErr = closeErr
 	} else if closeErr != nil {
 		fatalErr = errors.Join(fatalErr, closeErr)
-	}
-	if fatalErr != nil {
-		for i := range results {
-			if results[i] == nil {
-				results[i] = fatalErr
-			}
-		}
 	}
 
 	// Callbacks may synchronously submit more storage work. Running them away
@@ -450,6 +447,25 @@ func (s *Store) commitRequests(requests []writeRequest) {
 	go func() {
 		defer s.callbackWG.Done()
 
+		// One batch, one durability class: writeBatchCanAppend refuses to mix them,
+		// so the first request's class is the batch's. A commitment completes only
+		// after the write-ahead log is fsynced past it: the empty synced record
+		// flushes and syncs every write committed before it — this batch and, for
+		// a commitment that found its record already committed and wrote nothing,
+		// the earlier batch that wrote it. A failed fsync does not return here:
+		// open.go leaves pebble.Options.Logger unset, and the default logger's
+		// Fatalf exits the process on it exactly as on a synced commit.
+		if fatalErr == nil && requests[0].durability == durableCommitment {
+			fatalErr = s.db.LogData(nil, pebble.Sync)
+		}
+		if fatalErr != nil {
+			for i := range results {
+				if results[i] == nil {
+					results[i] = fatalErr
+				}
+			}
+		}
+
 		for i := range requests {
 			requests[i].done(results[i])
 			s.outstanding.Add(-1)
@@ -457,13 +473,13 @@ func (s *Store) commitRequests(requests []writeRequest) {
 	}()
 }
 
+// acquireRead keeps the database open until releaseRead. Close stores isClosed
+// before it takes readMu exclusively to release Pebble, so a reader holding
+// readMu that still sees the store open reads an open database.
 func (s *Store) acquireRead() error {
 	s.readMu.RLock()
 
-	s.stateMu.Lock()
-	isClosed := s.isClosed
-	s.stateMu.Unlock()
-	if isClosed {
+	if s.isClosed.Load() {
 		s.readMu.RUnlock()
 
 		return validator.ErrStorageClosed

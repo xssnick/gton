@@ -11,8 +11,7 @@ import (
 
 const (
 	// A Plumtree forwarding decision contains at most this many distinct
-	// non-eager destinations. Keeping one round buffered avoids retaining an
-	// unbounded number of immutable payloads behind a flow-controlled peer.
+	// non-eager destinations.
 	plumtreeOutboundBatchLimit = plumtreeActiveNeighbourLimit
 
 	// C++ stops treating an eager peer as active after this many unacknowledged

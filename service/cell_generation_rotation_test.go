@@ -281,6 +281,10 @@ func TestStopCellGenerationMigrationCancelsActiveRunBeforeDrop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin migration run: %v", err)
 	}
+	go func() {
+		<-runCtx.Done()
+		state.finishCellGenerationMigrationRun(run)
+	}()
 
 	if err = state.StopCellGenerationMigration(context.Background()); err != nil {
 		t.Fatalf("stop migration: %v", err)
@@ -296,7 +300,6 @@ func TestStopCellGenerationMigrationCancelsActiveRunBeforeDrop(t *testing.T) {
 	if !store.dropped {
 		t.Fatal("pending generation was not dropped")
 	}
-	state.finishCellGenerationMigrationRun(run)
 }
 
 func TestStopCellGenerationMigrationWithoutPendingFails(t *testing.T) {

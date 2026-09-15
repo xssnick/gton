@@ -329,7 +329,7 @@ func TestStatusSnapshotUsesLiveBlockCacheForTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create p2p node: %v", err)
 	}
-	cache := tnstore.NewLiveBlockCache(tnstore.DefaultLiveBlockCacheMaxBlocks)
+	cache := tnstore.NewLiveBlockCache(tnstore.DefaultLiveBlockCacheMaxBlocks, tnstore.DefaultLiveBlockCacheMaxBytes)
 
 	block, _, data, meta := mustStatusFixtureBlock(t)
 	meta.GenUTime = 100

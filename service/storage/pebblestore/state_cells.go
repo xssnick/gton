@@ -719,11 +719,17 @@ func (s *Store) cachedCellLoader(
 		return loadMiss
 	}
 
-	return func(hash cell.Hash) (*cell.Cell, error) {
-		return s.loadDecodedCell(context.Background(), cache, cacheNamespace, hash[:], func(context.Context) (*cell.Cell, error) {
+	// The record tier decodes with this closure itself: it is what
+	// newActiveCellLoader stores as activeCellLoader and what
+	// newLazyCellLoaderForGeneration threads into its misses, so a record-cache
+	// hit builds the same child placeholders a store read would.
+	var loader cell.LazyCellLoader
+	loader = func(hash cell.Hash) (*cell.Cell, error) {
+		return s.loadDecodedCell(context.Background(), cache, cacheNamespace, hash[:], loader, func(context.Context) (*cell.Cell, error) {
 			return loadMiss(hash)
 		})
 	}
+	return loader
 }
 
 type decodedCellLoadFlight struct {
@@ -843,11 +849,17 @@ func (g *decodedCellLoadGroup) do(
 // lazy child resolution. The cache is checked both before and inside the
 // flight: a winner may publish between those points, and consulting it again
 // avoids starting I/O after the answer already became resident.
+//
+// The record tier is consulted before the flight too: a hit there does no I/O,
+// so there is nothing to coalesce, and set still hands every racing caller the
+// one resident cell. loader is what the decoded cell's child placeholders
+// resolve through, the same loader loadMiss decodes with.
 func (s *Store) loadDecodedCell(
 	ctx context.Context,
 	cache *decodedCellCache,
 	cacheNamespace uint64,
 	hash []byte,
+	loader cell.LazyCellLoader,
 	loadMiss func(context.Context) (*cell.Cell, error),
 ) (*cell.Cell, error) {
 	if cache == nil {
@@ -858,6 +870,13 @@ func (s *Store) loadDecodedCell(
 	if loaded, err := cache.getKey(key); err == nil {
 		s.lazyCellLoads.observeDecodedCache(key.hash[0])
 		return loaded, nil
+	}
+
+	if loaded, hit, err := s.decodeFromRecordCache(hash, loader); hit {
+		if err != nil {
+			return nil, err
+		}
+		return cache.set(cacheNamespace, key.hash[:], loaded), nil
 	}
 
 	return s.decodedCellLoads.do(ctx, key, func(loadCtx context.Context) (*cell.Cell, error) {
@@ -888,7 +907,7 @@ func (s *Store) loadLazyCellFromGeneration(
 		return nil, fmt.Errorf("cell generation is zero")
 	}
 
-	return s.loadDecodedCell(ctx, s.decodedCells, generation, hash, func(loadCtx context.Context) (*cell.Cell, error) {
+	return s.loadDecodedCell(ctx, s.decodedCells, generation, hash, loader, func(loadCtx context.Context) (*cell.Cell, error) {
 		return s.loadLazyCellMissFromGeneration(loadCtx, generation, hash, loader)
 	})
 }
@@ -992,7 +1011,7 @@ func (s *Store) decodeFromRecordCache(hash []byte, loader cell.LazyCellLoader) (
 }
 
 func (s *Store) loadActiveLazyCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
-	return s.loadDecodedCell(ctx, s.decodedCells, activeCellCacheNamespace, hash, func(loadCtx context.Context) (*cell.Cell, error) {
+	return s.loadDecodedCell(ctx, s.decodedCells, activeCellCacheNamespace, hash, s.activeCellLoader, func(loadCtx context.Context) (*cell.Cell, error) {
 		return s.loadActiveLazyCellThrough(loadCtx, hash)
 	})
 }

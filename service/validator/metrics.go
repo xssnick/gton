@@ -874,7 +874,7 @@ func (o *prometheusValidationObserver) ObserveSessionSpecRejection(
 func (o *prometheusValidationObserver) ObserveValidationCoreStage(
 	observation collator.ValidationCoreStageObservation,
 ) {
-	if observation.Stage > collator.ValidationCoreStageTransition {
+	if int(observation.Stage) >= validationSemanticStageCount {
 		return
 	}
 	o.semanticStageDuration[boundedValidationChain(observation.Chain)][observation.Stage].Observe(

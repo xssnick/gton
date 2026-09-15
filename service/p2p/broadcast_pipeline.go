@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"hash/crc64"
+	"hash/maphash"
 	"sync"
 	"time"
 
@@ -18,7 +18,11 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-var externalMessageCRC64Table = crc64.MakeTable(crc64.ECMA)
+// externalMessageFingerprintSeed keys the external message dedup hash for the
+// life of the process. The seed is secret, so a peer cannot build a message
+// whose key collides with an honest one and occupy its dedup entry; a CRC is
+// linear and let it do that.
+var externalMessageFingerprintSeed = maphash.MakeSeed()
 
 type customBroadcastRole uint8
 
@@ -352,7 +356,7 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 			return broadcastResult{}, err
 		}
 
-		// The crc64 key was already marked in processedExternalMessages above;
+		// The fingerprint key was already marked in processedExternalMessages above;
 		// reuse it (deduped) instead of hashing the payload again and filling
 		// the shared block deduper with high-rate externals.
 		return acceptedBroadcastResult(acceptedBroadcast{
@@ -449,7 +453,7 @@ func (s *overlaySubscription) classifyFullBlockBroadcast(
 		return broadcastResult{}, err
 	}
 	if s.node.chainNode().alreadyHeldBlockBroadcast(block) {
-		return s.acceptedHeldBlockBroadcast(fingerprint, delivery, kind, block, payload, peer)
+		return s.acceptedHeldBlockBroadcast(fingerprint, delivery, kind, payload, peer)
 	}
 	return s.acceptedFullBlockBroadcast(fingerprint, delivery, trusted, kind, block, sourcePeerID, msg, payload, peer)
 }
@@ -458,19 +462,17 @@ func (s *overlaySubscription) classifyFullBlockBroadcast(
 // block this node already holds (see alreadyHeldBlockBroadcast): the header
 // alone decides it, so neither the validator-signature pass nor the payload
 // decode runs, and the skipped local processing is accounted as an
-// already_applied drop. The payload is still deduplicated and relayed exactly
-// like a processed block — the overlay forwards the raw bytes, the custom and
-// FastSync fanout stay deduped per block — which is what the reference node
-// does as well: it distributes FEC parts independently of the validator's
-// verdict on the block.
-func (s *overlaySubscription) acceptedHeldBlockBroadcast(fingerprint string, delivery Delivery, kind string, block ton.BlockIDExt, payload *broadcastPayload, peer *overlayPeer) (broadcastResult, error) {
+// already_applied drop. The payload is still deduplicated and relayed by the
+// overlay, which is what the reference node does as well: it distributes FEC
+// parts independently of the validator's verdict on the block.
+func (s *overlaySubscription) acceptedHeldBlockBroadcast(fingerprint string, delivery Delivery, kind string, payload *broadcastPayload, peer *overlayPeer) (broadcastResult, error) {
 	if !s.node.chainNode().deduper.Mark(fingerprint, time.Now()) {
 		s.node.chainNode().noteBroadcastDrop(s.spec.Name, kind, "seen")
 		return ignoredBroadcastResult(), nil
 	}
 	s.node.chainNode().noteBroadcastDrop(s.spec.Name, kind, "already_applied")
 
-	result, err := s.acceptedProcessedBlockBroadcast(fingerprint, delivery, kind, block, payload, peer)
+	result, err := s.acceptedProcessedBlockBroadcast(fingerprint, delivery, kind, payload, peer)
 	if err != nil {
 		return broadcastResult{}, err
 	}
@@ -681,11 +683,15 @@ func (s *overlaySubscription) acceptedBlockBroadcast(fingerprint string, deliver
 	}
 }
 
+// acceptedProcessedBlockBroadcast relays a block broadcast whose payload is not
+// decoded, because the block is already held or another copy of it was already
+// processed. These bytes stay unverified, so the result carries no block: the
+// custom and FastSync fanout belongs to the copy that decoded, as the reference
+// node sends only a deserialized broadcast to custom overlays.
 func (s *overlaySubscription) acceptedProcessedBlockBroadcast(
 	fingerprint string,
 	delivery Delivery,
 	kind string,
-	block ton.BlockIDExt,
 	payload *broadcastPayload,
 	peer *overlayPeer,
 ) (broadcastResult, error) {
@@ -699,7 +705,6 @@ func (s *overlaySubscription) acceptedProcessedBlockBroadcast(
 		fingerprint: fingerprint,
 		deduped:     true,
 		delivery:    delivery,
-		block:       block.Copy(),
 		rebroadcast: rebroadcast,
 	}), nil
 }
@@ -791,7 +796,7 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 	downloaded, sigSet, cacheErr := s.node.chainNode().decodedBroadcasts.get(kind, block)
 	if errors.Is(cacheErr, errDecodedBroadcastProcessed) {
 		s.node.chainNode().noteBroadcast("decode_reused", s.spec.Name, kind, delivery)
-		return s.acceptedProcessedBlockBroadcast(fingerprint, delivery, kind, block, payload, peer)
+		return s.acceptedProcessedBlockBroadcast(fingerprint, delivery, kind, payload, peer)
 	}
 	cached := cacheErr == nil
 	if cached && !signaturesChecked {
@@ -838,15 +843,14 @@ func (s *overlaySubscription) acceptedFullBlockBroadcast(fingerprint string, del
 			// the ack counts as "accepted" for relay purposes even though the
 			// decode may still fail on the pool (mirrors the reference node,
 			// which relays after signature validation, not after decode);
-			// block is set so custom-overlay fanout of the signature-verified
-			// payload does not wait out the decode — the fanout deduper keeps
-			// the worker's completion from fanning out a second time
-			blockCopy := cloneBlockID(block)
+			// block stays unset, so the custom and FastSync fanout waits for
+			// the worker's decode: the signatures do not cover data_compressed,
+			// and the reference node sends only a deserialized broadcast to
+			// custom overlays
 			accepted := acceptedBroadcast{
 				fingerprint: fingerprint,
 				deduped:     true,
 				delivery:    delivery,
-				block:       &blockCopy,
 				rebroadcast: rebroadcast,
 			}
 			if block.Workchain == -1 && block.Shard == topShard {
@@ -1043,7 +1047,7 @@ func (s *overlaySubscription) acceptedBlockCandidateBroadcast(fingerprint string
 	downloaded, _, cacheErr := s.node.chainNode().decodedBroadcasts.get(kind, block)
 	if errors.Is(cacheErr, errDecodedBroadcastProcessed) {
 		s.node.chainNode().noteBroadcast("decode_reused", s.spec.Name, kind, delivery)
-		return s.acceptedProcessedBlockBroadcast(fingerprint, delivery, kind, block, payload, peer)
+		return s.acceptedProcessedBlockBroadcast(fingerprint, delivery, kind, payload, peer)
 	}
 	cached := cacheErr == nil
 	if cached {
@@ -1225,10 +1229,8 @@ func (n *Node) enqueueBlockOverlayFanout(accepted acceptedBroadcast) error {
 
 	now := time.Now()
 	if class == "finality" {
-		if !n.overlayFanoutDeduper.Mark(
-			blockOverlayFanoutKey(class, *accepted.block),
-			now,
-		) {
+		if n.overlayFanoutDeduper.Seen(blockPublicationFanoutKey(class, *accepted.block), now) ||
+			!n.overlayFanoutDeduper.Mark(blockOverlayFanoutKey(class, *accepted.block), now) {
 			return nil
 		}
 
@@ -1244,16 +1246,10 @@ func (n *Node) enqueueBlockOverlayFanout(accepted acceptedBroadcast) error {
 		return nil
 	}
 
-	if len(customTargets) > 0 && n.overlayFanoutDeduper.Mark(
-		blockOverlayRouteFanoutKey(blockOverlayFanoutRouteCustom, class, *accepted.block),
-		now,
-	) {
+	if len(customTargets) > 0 && n.markBlockOverlayRouteFanout(blockOverlayFanoutRouteCustom, class, *accepted.block, now) {
 		n.enqueueCustomOverlayFanout(customTargets, source)
 	}
-	if fastSyncTarget != nil && n.overlayFanoutDeduper.Mark(
-		blockOverlayRouteFanoutKey(blockOverlayFanoutRouteFastSync, class, *accepted.block),
-		now,
-	) {
+	if fastSyncTarget != nil && n.markBlockOverlayRouteFanout(blockOverlayFanoutRouteFastSync, class, *accepted.block, now) {
 		n.sendFastSyncFanout(
 			fastSyncTarget,
 			source.kind,
@@ -1262,6 +1258,20 @@ func (n *Node) enqueueBlockOverlayFanout(accepted acceptedBroadcast) error {
 		)
 	}
 	return nil
+}
+
+// markBlockOverlayRouteFanout claims the chain-position fanout key of an
+// accepted broadcast unless this node already published the same block on the
+// route itself: the reference node keeps one sent cache by full block id for its
+// own sends and the relay (custom_overlays_sent_broadcasts_). Whether that
+// publication ran under Plumtree decides if a candidate took the block key, and
+// the receive path cannot tell, so both publication spellings are checked.
+func (n *Node) markBlockOverlayRouteFanout(route string, class string, block ton.BlockIDExt, now time.Time) bool {
+	if n.overlayFanoutDeduper.Seen(blockPublicationRouteFanoutKey(route, class, block, false), now) ||
+		n.overlayFanoutDeduper.Seen(blockPublicationRouteFanoutKey(route, class, block, true), now) {
+		return false
+	}
+	return n.overlayFanoutDeduper.Mark(blockOverlayRouteFanoutKey(route, class, block), now)
 }
 
 func (n *Node) enqueueCustomOverlayFanout(
@@ -1543,11 +1553,13 @@ func broadcastFingerprint(overlayID []byte, payload []byte) string {
 }
 
 func externalMessageFingerprint(overlayID []byte, data []byte) string {
-	crc := crc64.Update(0, externalMessageCRC64Table, overlayID)
-	crc = crc64.Update(crc, externalMessageCRC64Table, data)
+	var hash maphash.Hash
+	hash.SetSeed(externalMessageFingerprintSeed)
+	hash.Write(overlayID)
+	hash.Write(data)
 
 	var key [8]byte
-	binary.BigEndian.PutUint64(key[:], crc)
+	binary.BigEndian.PutUint64(key[:], hash.Sum64())
 	return string(key[:])
 }
 

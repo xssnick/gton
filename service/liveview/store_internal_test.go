@@ -30,6 +30,23 @@ func TestStoreCheckpointFlushDoesNotRememberMissingBlocks(t *testing.T) {
 	}
 }
 
+func TestStoreArtifactFlushDoesNotRememberBlocksBehindCurrentState(t *testing.T) {
+	live, _ := acceptedStateStore(t)
+	behind := testLiveBlockID(0, acceptedStateShardID(), acceptedStateAppliedSeqno-1, 0x37)
+	ahead := testLiveBlockID(0, acceptedStateShardID(), acceptedStateAppliedSeqno+1, 0x38)
+
+	live.MarkLiveBlockFlushed(behind)
+	if len(live.flushed) != 0 {
+		t.Fatalf("flush markers for a block behind the current state = %d, want 0", len(live.flushed))
+	}
+	// A block the current state has not reached keeps its marker: its publication
+	// can still arrive.
+	live.MarkLiveBlockFlushed(ahead)
+	if !live.flushed[storage.BlockKey(ahead)].artifact {
+		t.Fatal("the flush marker for a block ahead of the current state was not remembered")
+	}
+}
+
 func TestStoreLoadsZeroStateCurrentWithoutBlockData(t *testing.T) {
 	block := testLiveBlockID(-1, masterchainShard, 0, 0x21)
 	root := cell.BeginCell().MustStoreUInt(0x22, 8).EndCell()

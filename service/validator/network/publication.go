@@ -5,6 +5,7 @@ import (
 
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/validator"
+	"github.com/xssnick/gton/service/validator/collator"
 )
 
 type blockBroadcastPublisher interface {
@@ -26,12 +27,14 @@ func (m *Manager) PublishAcceptedBlock(publication validator.AcceptedBlockPublic
 			Msg("dropping block publication without an active validator session")
 		return
 	}
-	if session.currentSpec().kind == sessionKindObserver {
+	current := session.currentSpec()
+	if current.kind == sessionKindObserver || current.role == collator.OverlayRoleObserver {
 		// Observer-only sessions validate and accept finalized blocks so the
-		// standalone collator can follow consensus, but they intentionally have
-		// no validator signer. Public acceptance publication is therefore not a
-		// degraded path for this role; the validators which signed the block own
-		// that publication.
+		// standalone collator can follow consensus, and a persistent observer
+		// accepts them inside a validator-owned session the same way; neither
+		// has a validator signer. Public acceptance publication is therefore not
+		// a degraded path for these roles; the validators which signed the block
+		// own that publication.
 		m.log.Debug().
 			Hex("session_id", publication.SessionID[:]).
 			Str("publication", "accepted").

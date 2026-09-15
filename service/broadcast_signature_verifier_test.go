@@ -194,7 +194,7 @@ func TestBroadcastValidatorConfigAcceptsKnownEpochsAndCacheHits(t *testing.T) {
 	var coordinator SyncCoordinator
 	config := broadcastValidatorConfig{rootHash: cfg.Root.HashKey(), cfg: cfg}
 	coordinator.broadcastValidatorCache.putConfig(testBlockID(-1, topShard, 100), config)
-	warmed, err := coordinator.broadcastValidatorSetForSignatures(
+	key, warmed, err := coordinator.broadcastValidatorSetForSignatures(
 		context.Background(),
 		block,
 		catchainSeqno,
@@ -203,7 +203,9 @@ func TestBroadcastValidatorConfigAcceptsKnownEpochsAndCacheHits(t *testing.T) {
 	if err != nil || warmed.Hash() != previousSet.Hash() {
 		t.Fatalf("warm previous validator set cache: set=%v err=%v", warmed, err)
 	}
-	cached, err := coordinator.broadcastValidatorSetForSignatures(
+	// Only a set whose signatures verified is cached.
+	coordinator.broadcastValidatorCache.put(key, warmed)
+	_, cached, err := coordinator.broadcastValidatorSetForSignatures(
 		context.Background(),
 		block,
 		catchainSeqno,

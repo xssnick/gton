@@ -29,7 +29,9 @@ import (
 // So forwarding is metered. Parts beyond the budget are not sent; the other
 // copies in flight carry the broadcast. What this node originates — its own
 // blocks, its candidates, its votes, the two-step forwarding for the
-// committee — is not metered, because nothing else carries those.
+// committee — is not metered, because nothing else carries those. Nor are the
+// simple broadcasts it forwards: they are the external messages the budget is
+// there to keep flowing (see overlaySimpleRelayPeerSet).
 const (
 	// defaultRelayEgressBitsPerSecond is the budget for forwarded FEC parts on
 	// a gigabit link: 150 Mbit/s, under half of what the flood took, which

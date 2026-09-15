@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -301,6 +302,87 @@ func BenchmarkQUICOverlayEnvelopeMessage(b *testing.B) {
 }
 
 var quicOverlayEnvelopeBenchmarkWire []byte
+
+// appendQUICOverlayBodyDefaultCapacity is appendQUICOverlayBody before raw
+// bodies were joined at their exact size.
+func appendQUICOverlayBodyDefaultCapacity(
+	prefix []byte,
+	body tl.Serializable,
+) ([]byte, error) {
+	payload := make([]byte, 0, len(prefix)+tl.DefaultSerializeBufferSize)
+	payload = append(payload, prefix...)
+	return tl.Append(payload, body, true)
+}
+
+func TestQUICOverlayEnvelopeRawBodyMatchesDefaultCapacityJoin(t *testing.T) {
+	certificate := overlay.MemberCertificate{
+		IssuedBy: newFastSyncMembershipTestIssuer(t, 0x42).public,
+		Flags:    1,
+		Slot:     3,
+		ExpireAt: int32(time.Now().Add(time.Hour).Unix()),
+	}
+	overlayID := testPeerID("raw-body-envelope-equivalence").Bytes()
+
+	for _, member := range []*overlay.MemberCertificate{nil, &certificate} {
+		envelope, err := newQUICOverlayEnvelope(overlayID, member)
+		if err != nil {
+			t.Fatalf("create envelope: %v", err)
+		}
+		state := envelope.state.Load()
+
+		for _, size := range []int{0, 1, 256, 1024, 1536, 40 << 10} {
+			body := make(tl.Raw, size)
+			for i := range body {
+				body[i] = byte(i * 131)
+			}
+
+			query, err := envelope.Query(body)
+			if err != nil {
+				t.Fatalf("wrap %d-byte query: %v", size, err)
+			}
+			want, err := appendQUICOverlayBodyDefaultCapacity(state.queryPrefix, body)
+			if err != nil {
+				t.Fatalf("join %d-byte query: %v", size, err)
+			}
+			if !bytes.Equal(query, want) {
+				t.Fatalf("%d-byte query wire = %x, want %x", size, query, want)
+			}
+
+			message, err := envelope.Message(body)
+			if err != nil {
+				t.Fatalf("wrap %d-byte message: %v", size, err)
+			}
+			want, err = appendQUICOverlayBodyDefaultCapacity(state.messagePrefix, body)
+			if err != nil {
+				t.Fatalf("join %d-byte message: %v", size, err)
+			}
+			if !bytes.Equal(message, want) {
+				t.Fatalf("%d-byte message wire = %x, want %x", size, message, want)
+			}
+		}
+	}
+}
+
+func BenchmarkQUICOverlayEnvelopeQueryRaw(b *testing.B) {
+	overlayID := testPeerID("raw-query-envelope-benchmark").Bytes()
+	envelope, err := newQUICOverlayEnvelope(overlayID, nil)
+	if err != nil {
+		b.Fatalf("create envelope: %v", err)
+	}
+
+	for _, size := range []int{256, 1536} {
+		var request tl.Serializable = make(tl.Raw, size)
+		b.Run(fmt.Sprintf("body=%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				quicOverlayEnvelopeBenchmarkWire, err = envelope.Query(request)
+				if err != nil {
+					b.Fatalf("serialize query: %v", err)
+				}
+			}
+		})
+	}
+}
 
 func TestRLDPPeerQueryTransportTypedRawAndStrictParsing(t *testing.T) {
 	answer := Capabilities{VersionMajor: 3, VersionMinor: 1, Flags: 7}

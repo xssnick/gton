@@ -224,8 +224,8 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 		return nil, fmt.Errorf("%w: masterchain sequence number overflow", ErrInvalidInput)
 	}
 
-	usage := cell.NewReadSetSized(req.Previous.State, b.readSetHint())
-	storageCells, storageProofCells := b.storageHints()
+	usage := cell.NewReadSetSized(req.Previous.State, b.readSetHint(MetricChainMasterchain))
+	storageCells, storageProofCells := b.storageHints(MetricChainMasterchain)
 	oldRoot := usage.Root()
 	var oldState tlb.ShardStateUnsplit
 	if err := parseExact(&oldState, oldRoot); err != nil {

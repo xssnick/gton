@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 func BenchmarkInternalsCut(b *testing.B) {
@@ -267,6 +268,51 @@ func BenchmarkInternalFromEnvelope(b *testing.B) {
 // the same walk collation runs through SeedsFromStateRoot.
 func BenchmarkSeedFromState10k(b *testing.B) {
 	const size = 10_000
+	state := benchQueueState(b, size)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		messages, total, err := seedFromStateRoot(state, testOwner)
+		if err != nil || total != size || len(messages) != size {
+			b.Fatalf("seed returned %d/%d messages: %v", len(messages), total, err)
+		}
+	}
+}
+
+// BenchmarkBranchSeedSourceFromState10k measures the session branch's seed
+// fallback over the same queue, whose next hops are spread evenly over four
+// shards of which the branch owns one: 2512 of the 10k entries.
+func BenchmarkBranchSeedSourceFromState10k(b *testing.B) {
+	const size = 10_000
+	state := benchQueueState(b, size)
+	destination := ShardIdent{Workchain: 0, Shard: 1 << 61}
+	pool := New(Config{})
+	defer pool.Close()
+	if err := pool.Internals().ReconcileDestinations([]ShardIdent{destination}); err != nil {
+		b.Fatal(err)
+	}
+	branch, err := pool.Internals().OpenBranch(destination)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer branch.Close()
+	visible := sref(10, 0xaa)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		messages, err := branch.SeedSourceFromStateRoot(baseSource, visible, state)
+		if err != nil || len(messages) != 2_512 {
+			b.Fatalf("seed returned %d messages: %v", len(messages), err)
+		}
+		// Drop the installed source, so the next iteration seeds it again
+		// instead of comparing against this one.
+		if err = branch.Retain(nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchQueueState(b *testing.B, size int) *cell.Cell {
 	source := deltaAddr(0, 0x11)
 	entries := make(map[QueueKey]tlb.EnqueuedMsg, size)
 	for index := range size {
@@ -284,13 +330,6 @@ func BenchmarkSeedFromState10k(b *testing.B) {
 	if len(entries) != size {
 		b.Fatalf("fixture collapsed to %d queue keys", len(entries))
 	}
-	state := stateRootWithQueue(b, queueDictCell(b, entries), size, true)
 
-	b.ReportAllocs()
-	for b.Loop() {
-		messages, total, err := seedFromStateRoot(state, testOwner)
-		if err != nil || total != size || len(messages) != size {
-			b.Fatalf("seed returned %d/%d messages: %v", len(messages), total, err)
-		}
-	}
+	return stateRootWithQueue(b, queueDictCell(b, entries), uint64(size), true)
 }

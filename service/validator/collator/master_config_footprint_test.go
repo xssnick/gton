@@ -103,7 +103,7 @@ func buildMasterReadSetSize(t *testing.T, req MasterRequest) int {
 	if _, err := builder.BuildMaster(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
-	size := builder.readSetHint()
+	size := builder.readSetHint(MetricChainMasterchain)
 	if size == 0 {
 		t.Fatal("the builder did not record a read set size")
 	}

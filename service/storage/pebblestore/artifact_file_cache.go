@@ -34,6 +34,9 @@ type artifactFileEntry struct {
 
 type artifactFileOpen struct {
 	done chan struct{}
+	// stale is set when the path is invalidated while the file is opening:
+	// the opened descriptor may reference a removed or replaced inode.
+	stale bool
 }
 
 type artifactFileHandle struct {
@@ -132,7 +135,7 @@ func (c *artifactFileCache) acquire(ctx context.Context, path string) (*artifact
 		select {
 		case <-notify:
 		case <-ctx.Done():
-			c.cancelWaiter()
+			c.cancelWaiter(notify)
 			return nil, ctx.Err()
 		}
 	}
@@ -191,6 +194,14 @@ func (c *artifactFileCache) openReserved(ctx context.Context, path string, openi
 		file: file,
 		size: fileSize,
 		refs: 1,
+	}
+	if opening.stale {
+		// The path was removed or replaced while it was opening, so this
+		// descriptor may reference the old inode: finish the read that opened
+		// it, but keep it out of the cache and close it on release.
+		c.openCount--
+		entry.closeOnRelease = true
+		return &artifactFileHandle{cache: c, entry: entry}, nil
 	}
 	entry.elem = c.order.PushFront(entry)
 	c.entries[path] = entry
@@ -313,9 +324,38 @@ func (c *artifactFileCache) broadcastLocked() {
 	c.notify = make(chan struct{})
 }
 
-func (c *artifactFileCache) cancelWaiter() {
+// invalidate drops the cached descriptor of a removed or replaced artifact
+// file. Reads holding the entry finish on the old descriptor, which is closed
+// on their release; later reads open the path again.
+func (c *artifactFileCache) invalidate(path string) {
 	c.mu.Lock()
-	if c.waiters > 0 {
+	if opening := c.opening[path]; opening != nil {
+		opening.stale = true
+	}
+	entry := c.entries[path]
+	if entry == nil {
+		c.mu.Unlock()
+		return
+	}
+
+	c.removeEntryLocked(entry)
+	shouldClose := entry.refs == 0
+	if !shouldClose {
+		entry.closeOnRelease = true
+	}
+	c.broadcastLocked()
+	c.mu.Unlock()
+
+	if shouldClose {
+		_ = entry.file.Close()
+	}
+}
+
+func (c *artifactFileCache) cancelWaiter(notify chan struct{}) {
+	c.mu.Lock()
+	// A broadcast that replaced the channel already dropped this registration:
+	// the counter now belongs to waiters of the new channel.
+	if c.notify == notify {
 		c.waiters--
 	}
 	c.mu.Unlock()

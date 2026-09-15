@@ -28,11 +28,16 @@ const (
 	// same bound without creating an unbounded goroutine per vote.
 	consensusPeerSendTimeout = 10 * time.Second
 	// Detaching the fan-out from the producing slot moves the memory bound
-	// here, and nowhere else: at most candidateOutboundQueueSize candidates
-	// wait by reference plus candidateSenderWorkerCount fan-outs in flight,
-	// each holding one FEC encoding of its candidate. Nothing per-broadcast is
-	// unbounded - tonutils dispatches a bounded number of peer goroutines and
-	// joins them before the worker takes the next candidate.
+	// here: at most candidateOutboundQueueSize candidates wait by reference
+	// plus candidateSenderWorkerCount fan-outs waiting for their quorum, each
+	// holding one FEC encoding of its candidate. The worker takes the next
+	// candidate once k+3 peers took their symbol (privateTwoStepQuorumMargin in
+	// service/p2p) without joining the rest: tonutils leaves those sends
+	// running on a context that keeps only the candidateTransportSendBudget
+	// deadline, so every straggler holds its candidate's encoding for up to
+	// that budget. sendWG does not count them and retiring the session does not
+	// cancel them, so the fan-outs still lingering are bounded only by how many
+	// candidates this node originates within the budget.
 	candidateOutboundQueueSize = 8
 	candidateSenderWorkerCount = 4
 	// C++ hands every recipient to the transport actor and returns, with no
@@ -589,8 +594,10 @@ func (e *sessionEndpoint) runTransport(
 		// that the NEXT session's prepare takes — so waiting for an in-flight
 		// fan-out here would let one wedged QUIC write delay a validator-set
 		// rotation by the whole guard. Cancelling does not help: a write blocked
-		// on peer flow control only unblocks at its own deadline. Stragglers
-		// finish detached; they hold a bounded queue slot and nothing the next
+		// on peer flow control only unblocks at its own deadline, and a candidate
+		// fan-out that returns at quorum never sees the cancel (see
+		// broadcastTwoStep). Stragglers finish detached, each holding one
+		// consensus message or one candidate FEC encoding and nothing the next
 		// session needs.
 		if !waitBounded(&e.sendWG, candidateSenderDrainWait) {
 			e.hub.manager.log.Debug().
@@ -1447,17 +1454,28 @@ func (s *session) validateCandidateSource(
 	return extra, nil
 }
 
+// sendMessageRaw snapshots the handle under the lock and sends without it, as
+// broadcastTwoStep does. A QUIC write waiting on peer flow control ignores
+// cancellation until its own deadline, so holding handleMu across it would let
+// closeHandles wait out consensusPeerSendTimeout under the manager-wide
+// operation lock. The cancel closeHandles issues first still reaches the send
+// through the snapshotted context, and a closed overlay refuses new sends.
 func (s *session) sendMessageRaw(ctx context.Context, peer p2p.PeerID, wire []byte) error {
 	s.handleMu.RLock()
-	defer s.handleMu.RUnlock()
-	if s.consensusHandle == nil || s.handleContext == nil {
+	handle := s.consensusHandle
+	handleContext := s.handleContext
+	s.handleMu.RUnlock()
+	if handle == nil || handleContext == nil {
 		return ErrSessionInactive
 	}
-	requestCtx, cancel := contextWithPeerLifetime(ctx, s.handleContext)
+
+	requestCtx, cancel := contextWithPeerLifetime(ctx, handleContext)
 	defer cancel()
-	return s.consensusHandle.SendMessageRaw(requestCtx, peer, wire)
+	return handle.SendMessageRaw(requestCtx, peer, wire)
 }
 
+// queryRaw releases handleMu before the query for the same reason as
+// sendMessageRaw.
 func (s *session) queryRaw(
 	ctx context.Context,
 	peer p2p.PeerID,
@@ -1465,13 +1483,16 @@ func (s *session) queryRaw(
 	wire []byte,
 ) ([]byte, error) {
 	s.handleMu.RLock()
-	defer s.handleMu.RUnlock()
-	if s.consensusHandle == nil || s.handleContext == nil {
+	handle := s.consensusHandle
+	handleContext := s.handleContext
+	s.handleMu.RUnlock()
+	if handle == nil || handleContext == nil {
 		return nil, ErrSessionInactive
 	}
-	requestCtx, cancel := contextWithPeerLifetime(ctx, s.handleContext)
+
+	requestCtx, cancel := contextWithPeerLifetime(ctx, handleContext)
 	defer cancel()
-	return s.consensusHandle.QueryRaw(requestCtx, peer, maxAnswerSize, wire)
+	return handle.QueryRaw(requestCtx, peer, maxAnswerSize, wire)
 }
 
 func (s *session) broadcastTwoStep(
@@ -1485,8 +1506,13 @@ func (s *session) broadcastTwoStep(
 	// on a loaded stand was hundreds of milliseconds; holding handleMu for that
 	// long blocks sendMessageRaw and queryRaw behind any session rebind, since
 	// Go's RWMutex stops admitting readers once a writer waits. The overlay
-	// handle carries its own lifecycle — a retired one refuses the broadcast —
-	// and the snapshotted context still cancels the send when the session ends.
+	// handle carries its own lifecycle — a retired one refuses the broadcast.
+	// The snapshotted context does not stop a fan-out that returns at quorum:
+	// tonutils runs every peer send of it on a context that keeps only the
+	// deadline, so ending the session stops neither the wait for the quorum nor
+	// the sends past it (see candidateOutboundQueueSize). The cancel reaches the
+	// sends only when the fan-out waits for every peer: a Simple-mode payload,
+	// or a committee small enough that k+3 covers all of its peers.
 	s.handleMu.RLock()
 	handle := s.consensusHandle
 	if s.handleSpec.hasBlockSync() {

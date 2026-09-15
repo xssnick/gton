@@ -299,7 +299,7 @@ func New(opts Options) (*Node, error) {
 	}
 	liveBlockCache := opts.LiveBlockCache
 	if liveBlockCache == nil {
-		liveBlockCache = storage2.NewLiveBlockCache(storage2.DefaultLiveBlockCacheMaxBlocks)
+		liveBlockCache = storage2.NewLiveBlockCache(storage2.DefaultLiveBlockCacheMaxBlocks, storage2.DefaultLiveBlockCacheMaxBytes)
 	}
 
 	externalBroadcastPacer, err := newExternalBroadcastPacer(opts.ExternalBroadcastCapacity)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/cockroachdb/pebble/v2"
 )
@@ -85,8 +86,10 @@ func Open(opts Options) (*Store, error) {
 		candidatePacks: newCandidatePackStore(opts.Dir),
 		deleting:       make(map[storageNamespace]struct{}),
 		deleted:        make(map[storageNamespace]struct{}),
+		admitting:      make(map[storageNamespace]int),
 		journals:       make(map[storageNamespace]*journal),
 	}
+	store.validator.admitted = sync.NewCond(&store.validator.namespaceMu)
 	store.collator = &CollatorStore{
 		store:    store,
 		deleting: make(map[[32]byte]struct{}),

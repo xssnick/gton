@@ -92,6 +92,7 @@ func newTestPebbleFailureStore(t *testing.T, dir string) (*Store, *testPebbleFai
 		cellGenerations: make(map[uint64]*cellStore),
 		dir:             dir,
 		hotDrained:      make(chan struct{}),
+		artifactFiles:   newArtifactFileCache(DefaultArtifactFileMaxOpen),
 	}, failure
 }
 

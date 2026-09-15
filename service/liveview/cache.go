@@ -174,7 +174,11 @@ func (s *Store) putBlockLocked(key storage.BlockRootHash, block *liveBlock, stat
 		block.artifactFlushed = block.artifactFlushed || existing.artifactFlushed
 		block.stateFlushed = block.stateFlushed || existing.stateFlushed
 		block.currentCachesReleased = block.currentCachesReleased || existing.currentCachesReleased
-		if block.fragments == nil || retainAccepted {
+		// A view the non-final path built is over its rebuilt tree, which its pending
+		// entry backs lazily. A publication bringing its own state replaces that tree,
+		// and a view left over it would lose its backing with the non-final release.
+		inheritFragments := block.fragments == nil && (state == nil || !existing.nonfinalOwner)
+		if inheritFragments || retainAccepted {
 			block.fragments = existing.fragments
 		}
 		existingKind := liveBlockKind(existing.id)

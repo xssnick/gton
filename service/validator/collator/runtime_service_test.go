@@ -201,6 +201,7 @@ func (p *runtimeTestPipeline) ResolveCandidateState(
 }
 
 func (p *runtimeTestPipeline) BuildCandidate(ctx context.Context, request BuildRequest) (*Candidate, error) {
+	started := time.Now()
 	p.mu.Lock()
 	p.built++
 	build := p.build
@@ -218,7 +219,7 @@ func (p *runtimeTestPipeline) BuildCandidate(ctx context.Context, request BuildR
 		p.mu.Lock()
 		policy, rootOverride := p.successorPolicy, p.successorRoot
 		p.mu.Unlock()
-		runtimeHandOffSuccessor(request, candidate, policy, rootOverride)
+		runtimeHandOffSuccessor(request, candidate, started, policy, rootOverride)
 	}
 
 	return candidate, err
@@ -235,6 +236,7 @@ func (p *runtimeTestPipeline) BuildCandidate(ctx context.Context, request BuildR
 func runtimeHandOffSuccessor(
 	request BuildRequest,
 	candidate *Candidate,
+	started time.Time,
 	successorPolicy func(BuildRequest, *Candidate) CandidateState,
 	successorRoot func(BuildRequest, *Candidate) []byte,
 ) {
@@ -273,6 +275,8 @@ func runtimeHandOffSuccessor(
 		Policy:          policy,
 		predecessorSlot: request.Slot,
 		handoffAt:       time.Now(),
+		// What LocalAcquisition puts on its port, from the same two instants.
+		externalWaitEnd: laterOf(request.ExternalWaitUntil, started),
 	})
 }
 

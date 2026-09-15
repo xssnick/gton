@@ -275,6 +275,9 @@ type newMessage struct {
 	index            uint32
 	parallelSafe     bool
 	dispatchEnvelope *cell.Cell
+	// dispatchParsed is dispatchEnvelope as processDeferredMessage built it,
+	// emitted lt included. Every copy of the item shares it, so it is read-only.
+	dispatchParsed *tlb.MsgEnvelope
 }
 
 // newMessageHeap orders generated messages by (lt, hash) — the canonical
@@ -570,12 +573,8 @@ func (c *collation) completeGeneratedImmediate(
 		err          error
 	)
 	if item.dispatchEnvelope != nil {
-		var envelope tlb.MsgEnvelope
-		if err = parseExact(&envelope, item.dispatchEnvelope); err != nil {
-			return fmt.Errorf("%w: decode emitted dispatch envelope %x: %v", ErrInvalidInput, item.hash, err)
-		}
 		envelopeCell = item.dispatchEnvelope
-		in, err = descriptorFee(0b00100, 5, envelopeCell, result.TransactionCell, envelope.FwdFeeRemaining) // msg_import_deferred_fin$00100
+		in, err = descriptorFee(0b00100, 5, envelopeCell, result.TransactionCell, item.dispatchParsed.FwdFeeRemaining) // msg_import_deferred_fin$00100
 	} else {
 		envelopeCell, err = (tlb.MsgEnvelope{
 			CurAddr:         tlb.IntermediateAddress{Type: tlb.IntermediateAddressRegular, UseDestBits: routingAddressBits},
@@ -647,12 +646,7 @@ func (c *collation) enqueue(item *newMessage, source, destination msgpool.Accoun
 	// recomputed, so the two shapes share nothing but those two fields.
 	var envelope tlb.MsgEnvelope
 	if item.dispatchEnvelope != nil {
-		if err = parseExact(&envelope, item.dispatchEnvelope); err != nil {
-			return fmt.Errorf("%w: decode emitted dispatch envelope %x: %v", ErrInvalidInput, item.hash, err)
-		}
-		if envelope.EmittedLT == nil || *envelope.EmittedLT != item.lt {
-			return fmt.Errorf("%w: dispatch envelope %x emitted lt mismatch", ErrInvalidInput, item.hash)
-		}
+		envelope = *item.dispatchParsed
 		envelope.CurAddr = tlb.IntermediateAddress{Type: tlb.IntermediateAddressRegular, UseDestBits: uint8(curBits)}
 		envelope.NextAddr = tlb.IntermediateAddress{Type: tlb.IntermediateAddressRegular, UseDestBits: uint8(nextBits)}
 	} else {
@@ -790,7 +784,25 @@ func (c *collation) emulateFrom(
 		OnCellLoad:         lane.tracer.onExecutionRead,
 	})
 	if err != nil {
-		return nil, err
+		if message.Message().MsgType != tlb.MsgTypeExternalIn {
+			return nil, err
+		}
+
+		// tonutils-go exposes these pre-compute rejections as untyped errors.
+		// cppnode maps unpack_input_msg failures to account rejection (-701).
+		// A queued external can become invalid when the config changes, so the
+		// collator must reject it even if ingress validated it under an older epoch.
+		// Match only these exact errors; state, storage and execution faults stay fatal.
+		switch err.Error() {
+		case "external import fees exceed account balance",
+			"invalid inbound external message destination",
+			"inbound external message depth exceeds limit",
+			"inbound external message size exceeds limit",
+			"inbound external message merkle depth exceeds limit":
+			result = &tvm.TransactionExecutionResult{Accepted: false}
+		default:
+			return nil, err
+		}
 	}
 	if err = c.ctx.Err(); err != nil {
 		return nil, err

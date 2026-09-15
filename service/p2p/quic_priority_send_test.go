@@ -46,6 +46,7 @@ func (o *prioritySendWaitObserver) waits() []BroadcastPipelineStageObservation {
 type prioritySendTestPeer struct {
 	node     *Node
 	peer     *overlayPeer
+	sub      *overlaySubscription
 	envelope *quicOverlayEnvelope
 	messages chan []byte
 	observer *prioritySendWaitObserver
@@ -64,13 +65,13 @@ type prioritySendTestRemote struct {
 	hold   <-chan struct{}
 }
 
-func newPrioritySendTestPeer(t *testing.T) *prioritySendTestPeer {
+func newPrioritySendTestPeer(t testing.TB) *prioritySendTestPeer {
 	t.Helper()
 
 	return newPrioritySendTestPeerWithRemote(t, prioritySendTestRemote{limits: adnlquic.DefaultLimits()})
 }
 
-func newPrioritySendTestPeerWithRemote(t *testing.T, remoteSpec prioritySendTestRemote) *prioritySendTestPeer {
+func newPrioritySendTestPeerWithRemote(t testing.TB, remoteSpec prioritySendTestRemote) *prioritySendTestPeer {
 	t.Helper()
 
 	remote, err := adnlquic.NewGatewayWithLimits(remoteSpec.limits, quicOutboundTestKey(t))
@@ -133,6 +134,7 @@ func newPrioritySendTestPeerWithRemote(t *testing.T, remoteSpec prioritySendTest
 	return &prioritySendTestPeer{
 		node:     node,
 		peer:     peer,
+		sub:      sub,
 		envelope: sub.quicEnvelope,
 		messages: messages,
 		observer: observer,
@@ -149,6 +151,19 @@ func (fx *prioritySendTestPeer) priority() quicPriorityBroadcastPeer {
 
 func (fx *prioritySendTestPeer) latchIdle() bool {
 	return !fx.peer.prioritySend.raised.Load() && fx.peer.prioritySend.clearedChan() == nil
+}
+
+// receiveMessage waits for the next payload the remote received.
+func (fx *prioritySendTestPeer) receiveMessage(t *testing.T) []byte {
+	t.Helper()
+
+	select {
+	case payload := <-fx.messages:
+		return payload
+	case <-time.After(3 * time.Second):
+		t.Fatal("remote received nothing")
+		return nil
+	}
 }
 
 // expectMessage waits for the next payload the remote received and checks it
@@ -369,10 +384,11 @@ func TestPriorityWriteLowersLatchOnSuccessAndFailure(t *testing.T) {
 		t.Fatalf("generate offline peer key: %v", err)
 	}
 	offline := &overlayPeer{
-		node:  fx.node,
-		id:    peerIDForQUICOutboundTest(t, offlinePub),
-		pub:   offlinePub,
-		route: newTestPeerRoute(""),
+		node:         fx.node,
+		id:           peerIDForQUICOutboundTest(t, offlinePub),
+		pub:          offlinePub,
+		route:        newTestPeerRoute(""),
+		prioritySend: &quicPrioritySendLatch{},
 	}
 	offlinePriority := quicPriorityBroadcastPeer{route: quicRouteBroadcastPeer{peer: offline, envelope: fx.envelope}}
 	if err = offlinePriority.SendPreparedCustomMessage(ctx, body); !errors.Is(err, errQUICPeerOffline) {
@@ -634,7 +650,7 @@ func TestPrioritySendLatchNestsOverlappingWrites(t *testing.T) {
 // The path every relay write takes when no candidate is in flight must stay
 // free: one atomic load, no timer, no closure.
 func TestPrioritySendFastPathAllocatesNothing(t *testing.T) {
-	peer := &overlayPeer{node: &Node{}}
+	peer := &overlayPeer{node: &Node{}, prioritySend: &quicPrioritySendLatch{}}
 	ctx := context.Background()
 
 	if allocs := testing.AllocsPerRun(1000, func() {

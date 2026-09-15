@@ -1289,6 +1289,7 @@ func (s *Store) writeStateArtifactFile(block ton.BlockIDExt, data []byte) (*stor
 	if err = os.Rename(tmpPath, finalPath); err != nil {
 		return nil, err
 	}
+	s.artifactFiles.invalidate(finalPath)
 	if err = storage.SyncDir(dir); err != nil {
 		return nil, err
 	}
@@ -1372,7 +1373,11 @@ func (s *Store) truncateUncommittedPackTail(path string, cleanSize int64) error 
 	}
 
 	if cleanSize == 0 {
-		return removePackFile(path)
+		if err := removePackFile(path); err != nil {
+			return err
+		}
+		s.artifactFiles.invalidate(path)
+		return nil
 	}
 
 	stat, err := os.Stat(path)

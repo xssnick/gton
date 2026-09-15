@@ -147,6 +147,15 @@ func appendQUICOverlayBody(
 	prefix []byte,
 	body tl.Serializable,
 ) ([]byte, error) {
+	// A raw body already has its wire size: the default serialize buffer is
+	// a kilobyte too much for a small request and too little for a large one.
+	if raw, ok := body.(tl.Raw); ok {
+		payload := make([]byte, len(prefix)+len(raw))
+		copy(payload, prefix)
+		copy(payload[len(prefix):], raw)
+		return payload, nil
+	}
+
 	payload := make([]byte, 0, len(prefix)+tl.DefaultSerializeBufferSize)
 	payload = append(payload, prefix...)
 	return tl.Append(payload, body, true)

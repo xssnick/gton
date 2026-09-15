@@ -671,7 +671,7 @@ func TestLiveStoreBlockDataDoesNotParseColdPayload(t *testing.T) {
 }
 
 func TestLiveStoreDoesNotPublishInvalidArtifactsToSharedBlockCache(t *testing.T) {
-	shared := storage.NewLiveBlockCache(8)
+	shared := storage.NewLiveBlockCache(8, storage.DefaultLiveBlockCacheMaxBytes)
 	live := NewLiveStore(&fakeStore{}, liveview.Options{LiveBlockCache: shared})
 
 	expectedRoot := cell.BeginCell().MustStoreUInt(0x31, 8).EndCell()
@@ -775,7 +775,7 @@ func TestLiveStoreKeepsPendingBlocksOverLimitUntilFlush(t *testing.T) {
 }
 
 func TestLiveStoreKeepsUnflushedArtifactsUnderSharedCachePressure(t *testing.T) {
-	shared := storage.NewLiveBlockCache(1)
+	shared := storage.NewLiveBlockCache(1, storage.DefaultLiveBlockCacheMaxBytes)
 	live := NewLiveStore(&fakeStore{}, liveview.Options{
 		MasterBlockCache: 0,
 		ShardBlockCache:  0,
@@ -835,7 +835,7 @@ func TestLiveStoreKeepsUnflushedArtifactsUnderSharedCachePressure(t *testing.T) 
 }
 
 func TestLiveStoreCachedBlockRootKeepsSharedUnflushedBlockPinned(t *testing.T) {
-	shared := storage.NewLiveBlockCache(1)
+	shared := storage.NewLiveBlockCache(1, storage.DefaultLiveBlockCacheMaxBytes)
 	live := NewLiveStore(&fakeStore{}, liveview.Options{
 		MasterBlockCache: 0,
 		ShardBlockCache:  0,

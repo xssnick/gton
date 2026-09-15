@@ -116,6 +116,8 @@ func externalMessageLimitsFromConfigRoot(root *cell.Cell) (ExternalMessageSizeLi
 		return ExternalMessageSizeLimits{MaxSize: cfg.MaxExtMsgSize, MaxDepth: cfg.MaxExtMsgDepth}, nil
 	case tlb.SizeLimitsConfigV2:
 		return ExternalMessageSizeLimits{MaxSize: cfg.MaxExtMsgSize, MaxDepth: cfg.MaxExtMsgDepth}, nil
+	case tlb.SizeLimitsConfigV3:
+		return ExternalMessageSizeLimits{MaxSize: cfg.MaxExtMsgSize, MaxDepth: cfg.MaxExtMsgDepth}, nil
 	default:
 		return ExternalMessageSizeLimits{}, fmt.Errorf("unsupported size limits config %T", limits.Config)
 	}

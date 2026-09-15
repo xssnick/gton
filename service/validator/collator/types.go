@@ -818,7 +818,14 @@ type Builder struct {
 	// every step. Consecutive blocks of one chain read the same order of
 	// magnitude, and a wrong estimate only costs the growth it failed to avoid,
 	// so this is a hint and nothing reads it for anything else.
-	readSetCells atomic.Int64
+	//
+	// Indexed by chain, as are the three below: one Builder serves every chain
+	// the node collates, interleaved, and a build sized from the other chain's
+	// figures presizes megabytes of tables it never fills or grows its own by
+	// doubling. On the collator benchmarks a heavy shard build recorded 12,599
+	// cells and walked 11,189 storage cells, a light masterchain build 3,447
+	// and 146.
+	readSetCells [metricChainCount]atomic.Int64
 
 	// The three below are the same idea for the other scratch structures a build
 	// fills, and they are separate counters because the read count does not
@@ -835,16 +842,16 @@ type Builder struct {
 	// interior pointers that become cells of the produced block and of the
 	// collated data a background goroutine is still serializing, so a reused
 	// buffer aliases one block's proof into the next one's.
-	storageCells      atomic.Int64
-	storageProofCells atomic.Int64
-	updateMemoCells   atomic.Int64
+	storageCells      [metricChainCount]atomic.Int64
+	storageProofCells [metricChainCount]atomic.Int64
+	updateMemoCells   [metricChainCount]atomic.Int64
 	// neighborProofBytes is what the last build's neighbour proofs serialized
 	// to, per shard the build was for. The next build of that shard charges it
 	// against the collated budget before it has walked anything, because the
 	// walk that produces the real number runs after the block has decided what
 	// to import.
 	//
-	// Keyed, unlike the counters above, because this one is not a capacity: it
+	// Keyed by shard rather than chain, because this one is not a capacity: it
 	// is charged against a limit, and one Builder serves every chain the node
 	// collates, interleaved. On the stand that is the masterchain and one
 	// shard, 3,416 chain switches in a day, with neighbour proofs of 3 kB on
@@ -863,14 +870,14 @@ func NewBuilder(machine *tvm.TVM, software tlb.GlobalVersion) *Builder {
 	return &Builder{machine: machine, software: software}
 }
 
-func (b *Builder) readSetHint() int {
-	return int(b.readSetCells.Load())
+func (b *Builder) readSetHint(chain MetricChain) int {
+	return int(b.readSetCells[chain].Load())
 }
 
 // storageHints sizes the next build's storage stat: how many distinct ordinary
 // cells it walked and how many cells its proofs held outside the read set.
-func (b *Builder) storageHints() (cells, proofCells int) {
-	return int(b.storageCells.Load()), int(b.storageProofCells.Load())
+func (b *Builder) storageHints(chain MetricChain) (cells, proofCells int) {
+	return int(b.storageCells[chain].Load()), int(b.storageProofCells[chain].Load())
 }
 
 // updateMemoMaxPresizedCells bounds what the memo hint asks for, so a figure
@@ -882,21 +889,20 @@ func (b *Builder) storageHints() (cells, proofCells int) {
 // be sized from rs.Size(), the count of cells the build in front of it had just
 // read: an over-estimate, but one that could not exceed the block being built.
 // The hint replaces that bound with a number carried over from the previous
-// build, and one builder serves collations whose shapes differ by an order of
-// magnitude — a masterchain build's memo sizing the next shard build's. This is
-// what stops that from becoming an allocation nothing in the current block
-// justifies.
+// build of the chain, and the shards of one chain share it, so a backed-up
+// shard's memo can size the next build of an idle one. This is what stops that
+// from becoming an allocation nothing in the current block justifies.
 const updateMemoMaxPresizedCells = 1 << 20
 
 // updateMemoHint sizes the memo the next state update's destination walk fills.
 // An eighth is added because the walk grows its entry array by doubling, so
 // landing just under costs a copy of everything memoised so far, while landing
 // an eighth over costs an eighth of one array.
-func (b *Builder) updateMemoHint() int {
+func (b *Builder) updateMemoHint(chain MetricChain) int {
 	if b == nil {
 		return 0
 	}
-	cells := int(b.updateMemoCells.Load())
+	cells := int(b.updateMemoCells[chain].Load())
 	if cells > updateMemoMaxPresizedCells {
 		cells = updateMemoMaxPresizedCells
 	}
@@ -950,9 +956,9 @@ func (b *Builder) observeNeighborProofBytes(shard msgpool.ShardIdent, size int) 
 // next build is better sized from that than from a figure left behind by a build
 // two ago: a zero costs the ordinary lazy growth, which is what every one of
 // these structures did before there were hints at all.
-func (b *Builder) observeBuildSizes(readSetCells, storageCells, storageProofCells, updateMemoCells int) {
-	b.readSetCells.Store(int64(readSetCells))
-	b.storageCells.Store(int64(storageCells))
-	b.storageProofCells.Store(int64(storageProofCells))
-	b.updateMemoCells.Store(int64(updateMemoCells))
+func (b *Builder) observeBuildSizes(chain MetricChain, readSetCells, storageCells, storageProofCells, updateMemoCells int) {
+	b.readSetCells[chain].Store(int64(readSetCells))
+	b.storageCells[chain].Store(int64(storageCells))
+	b.storageProofCells[chain].Store(int64(storageProofCells))
+	b.updateMemoCells[chain].Store(int64(updateMemoCells))
 }

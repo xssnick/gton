@@ -595,6 +595,104 @@ func TestAcceptedStateReleaseStillTakesItsOwnBlock(t *testing.T) {
 	}
 }
 
+// The same ownership rule from the non-final side. The non-final cache is on for
+// every validator and collator node and holds a pending entry for every shard
+// block this node accepts, with or without an accepted publication in front of
+// it. The sync pipeline then publishes its own copy of the block, unflushed until
+// the checkpoint, and one masterchain block moves the applied current state past
+// the block without naming it. Releasing the pending entry there deleted the
+// pipeline's publication together with its state, and the checkpoint flush that
+// followed left a marker nothing would ever consume.
+func TestNonfinalReleaseLeavesThePipelinesBlockAlone(t *testing.T) {
+	for _, accepted := range []bool{false, true} {
+		name := "non-final publication"
+		if accepted {
+			name = "accepted publication"
+		}
+		t.Run(name, func(t *testing.T) {
+			live, _ := acceptedStateStore(t, Options{MasterBlockCache: 4, ShardBlockCache: 64, NonFinalEnabled: true})
+			fixture := newAcceptedBlockFixture(t, acceptedStateAppliedSeqno+2, 0xe0)
+			prev := testLiveBlockID(0, acceptedStateShardID(), acceptedStateAppliedSeqno, 0x60)
+
+			if accepted {
+				if err := live.PublishAcceptedBlockState(fixture.artifacts()); err != nil {
+					t.Fatalf("publish the accepted block state: %v", err)
+				}
+			}
+			ingest := fixture.ingestArtifacts(t, appliedShardTopState(0x60), prev)
+			if err := live.PublishNonfinalBlockArtifacts(ingest, storage.LiveBlockNonfinalSigned); err != nil {
+				t.Fatalf("publish the block through the ingest: %v", err)
+			}
+			if signed, _ := live.NonfinalPendingShardBlocks(nil); len(signed) != 1 {
+				t.Fatalf("pending non-final signed blocks = %d, want the published block", len(signed))
+			}
+			// Stand-in cells again, so the view build is skipped; see ingestArtifacts.
+			pipeline := fixture.artifacts()
+			pipeline.AvailabilityOnly = true
+			if err := live.PublishLiveBlockArtifacts(pipeline); err != nil {
+				t.Fatalf("publish the pipeline copy of the block: %v", err)
+			}
+
+			advanceAppliedShardTop(t, live, fixture.block.SeqNo+3, 904, 0xe1)
+
+			if signed, _ := live.NonfinalPendingShardBlocks(nil); len(signed) != 0 {
+				t.Fatalf("pending non-final signed blocks after the current state passed them = %d, want none", len(signed))
+			}
+			state, err := live.BlockState(context.Background(), fixture.block)
+			if err != nil {
+				t.Fatalf("the non-final release destroyed the pipeline's own publication: %v", err)
+			}
+			if _, err = live.LoadStateCellTree(context.Background(), fixture.block, state.StateRootHash); err != nil {
+				t.Fatalf("the non-final release destroyed the pipeline's own state cells: %v", err)
+			}
+
+			live.MarkLiveBlockFlushed(fixture.block)
+			live.mu.RLock()
+			cached := live.blocks[storage.BlockKey(fixture.block)]
+			markers := len(live.flushed)
+			live.mu.RUnlock()
+			if cached == nil || !cached.artifactFlushed {
+				t.Fatal("the checkpoint flush did not reach the pipeline's live block")
+			}
+			if markers != 0 {
+				t.Fatalf("flush markers remembered = %d, want none", markers)
+			}
+		})
+	}
+}
+
+// A view the non-final path installs is built over its rebuilt tree, whose cells
+// its pending entry backs lazily. The pipeline publishes with the view build
+// deferred, so its entry used to keep that view: a second materialization of the
+// state the publication replaced, and one whose backing the non-final release
+// takes away before the checkpoint flush can take over.
+func TestPipelinePublicationDoesNotInheritTheNonfinalView(t *testing.T) {
+	live, _ := acceptedStateStore(t, Options{MasterBlockCache: 4, ShardBlockCache: 64, NonFinalEnabled: true})
+	fixture := newAcceptedBlockFixture(t, acceptedStateAppliedSeqno+2, 0xe4)
+	prev := testLiveBlockID(0, acceptedStateShardID(), acceptedStateAppliedSeqno, 0x60)
+
+	ingest := fixture.ingestArtifacts(t, appliedShardTopState(0x60), prev)
+	if err := live.PublishNonfinalBlockArtifacts(ingest, storage.LiveBlockNonfinalSigned); err != nil {
+		t.Fatalf("publish the block through the ingest: %v", err)
+	}
+	// Stand-in cells cannot build a real view, so the one the non-final publish
+	// installs is installed directly.
+	nonfinalView := &BlockView{}
+	if installed := live.rememberBlockFragments(fixture.block, nonfinalView); installed != nonfinalView {
+		t.Fatal("the non-final live block did not take the view")
+	}
+	// No view of its own at install time, which is what a deferred build looks like.
+	pipeline := fixture.artifacts()
+	pipeline.AvailabilityOnly = true
+	if err := live.PublishLiveBlockArtifacts(pipeline); err != nil {
+		t.Fatalf("publish the pipeline copy of the block: %v", err)
+	}
+
+	if _, err := live.cachedBlockFragments(fixture.block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("pipeline publication view = %v, want the non-final view dropped", err)
+	}
+}
+
 // The existing non-final publish path is NOT a usable vehicle for a validator's
 // own state, and this is the measured reason a separate entry point exists: it
 // rebuilds the state cell from cell records, which destroys the pointer identity

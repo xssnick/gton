@@ -146,7 +146,7 @@ func TestSerializeCandidateForBroadcastMatchesReferenceOrdinaryPayload(t *testin
 	if got := binary.LittleEndian.Uint32(wire); got != idCandidateWrapped {
 		t.Fatalf("serialized delegated candidate constructor = %#x, want consensus.candidate", got)
 	}
-	wrapped, err := ParseCandidateWrapped(wire)
+	wrapped, err := ParseCandidateWrappedNoCopy(wire)
 	if err != nil {
 		t.Fatal(err)
 	}

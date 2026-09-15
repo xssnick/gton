@@ -519,6 +519,17 @@ func (a *LocalAcquisition) AdvanceConsensusBase(
 		if err = managed.branch.Retain(retainTip); err != nil {
 			return fmt.Errorf("retain selected consensus base: %w", err)
 		}
+		if retainTip != nil {
+			// Retain keeps every ancestor of the selected base. When consecutive
+			// windows open on this node's own candidates — a delegated collator,
+			// or a session of one — nothing else ever cuts them, and the lineage
+			// and the maps below would grow for the whole session. The committed
+			// part is folded into a base instead; pruneCandidates then drops the
+			// states whose queue tips went with it.
+			if err = managed.branch.RebaseCommitted(*retainTip); err != nil {
+				return fmt.Errorf("rebase selected consensus base: %w", err)
+			}
+		}
 		if request.Base != nil {
 			managed.candidates[request.Base.candidate] = baseState
 			managed.blocks[baseKey] = baseState

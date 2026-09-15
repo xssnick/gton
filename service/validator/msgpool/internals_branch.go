@@ -85,7 +85,6 @@ func (b *Branch) seedSource(source ShardIdent, visible SourceRef, messages []*In
 		return err
 	}
 
-	entries := append([]*InternalMessage(nil), messages...)
 	key := branchSourceKey{source: source, visible: visible}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -93,13 +92,13 @@ func (b *Branch) seedSource(source ShardIdent, visible SourceRef, messages []*In
 		return ErrClosed
 	}
 	if current := b.sources[key]; current != nil {
-		if equalBranchMessages(current.entries, entries) {
+		if equalBranchMessages(current.entries, messages) {
 			return nil
 		}
 		return fmt.Errorf("%w: source %d:%016x conflicts at position %d",
 			ErrCutStale, source.Workchain, source.Shard, visible.Seqno)
 	}
-	b.sources[key] = &branchSource{entries: entries}
+	b.sources[key] = &branchSource{entries: messages}
 
 	return nil
 }
@@ -148,31 +147,33 @@ func (b *Branch) SourcePinnable(source ShardIdent, visible SourceRef) bool {
 // the branch's pinned destination router and returns its immutable messages.
 // Unlike Internals.SeedsFromStateRoot, it cannot be redirected by a newer
 // global split/merge topology.
+//
+// The pinned router holds the branch's destination alone, so the walk is the
+// one narrowed to it: key-prefix subtrees and entries bound elsewhere are
+// dropped before they are loaded or decoded. It counts no queue total, for the
+// reason given on routedSeedsForDestination.
 func (b *Branch) SeedSourceFromStateRoot(
 	source ShardIdent,
 	visible SourceRef,
 	stateRoot *cell.Cell,
-) ([]*InternalMessage, uint64, error) {
+) ([]*InternalMessage, error) {
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
-		return nil, 0, ErrClosed
+		return nil, ErrClosed
 	}
 	routing := b.routing
 	b.mu.Unlock()
 
-	seeds, total, err := routedSeedsFromStateRoot(stateRoot, source, visible, routing)
+	messages, err := routedSeedsForDestination(stateRoot, source, visible, routing, b.destination)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	if len(seeds) != 1 || seeds[0].Destination != b.destination {
-		return nil, 0, errors.New("msgpool: branch routing snapshot is invalid")
-	}
-	if err = b.seedSource(source, visible, seeds[0].Messages); err != nil {
-		return nil, 0, err
+	if err = b.seedSource(source, visible, messages); err != nil {
+		return nil, err
 	}
 
-	return seeds[0].Messages, total, nil
+	return messages, nil
 }
 
 // DeltaFromBlockRoot derives one candidate's queue delta using the routing
@@ -378,24 +379,7 @@ func (b *Branch) Cut(request CutRequest) (*Cut, error) {
 			}
 			replaced[source.Source] = struct{}{}
 		}
-		cursors = append(cursors, &branchCursor{
-			entries: tip.base.entries,
-			live: func(message *InternalMessage) bool {
-				return b.lookupOrder(tip, tip.base, orderKey(message)) == message
-			},
-		})
-		for at := tip; at != nil; at = at.parent {
-			candidate := at
-			if len(candidate.delta.added) == 0 {
-				continue
-			}
-			cursors = append(cursors, &branchCursor{
-				entries: candidate.delta.added,
-				live: func(message *InternalMessage) bool {
-					return b.lookupOrder(tip, tip.base, orderKey(message)) == message
-				},
-			})
-		}
+		cursors = lineageCursors(tip, cursors)
 	}
 	for source, selection := range request.Sources {
 		if _, skip := replaced[source]; skip {
@@ -410,31 +394,12 @@ func (b *Branch) Cut(request CutRequest) (*Cut, error) {
 	}
 	b.mu.Unlock()
 
-	ready := cursors[:0]
-	for _, cursor := range cursors {
-		if cursor.advance() {
-			ready = append(ready, cursor)
-		}
-	}
 	limit := request.Limit
 	if limit <= 0 {
 		limit = int(^uint(0) >> 1)
 	}
-	result := &Cut{}
-	merge := branchCursorHeap(ready)
-	heap.Init(&merge)
-	for merge.Len() > 0 && len(result.Messages) < limit {
-		top := merge[0]
-		result.Messages = append(result.Messages, top.current)
-		if top.advance() {
-			heap.Fix(&merge, 0)
-		} else {
-			heap.Pop(&merge)
-		}
-	}
-	result.More = merge.Len() > 0
 
-	return result, nil
+	return mergeBranchCursors(cursors, limit), nil
 }
 
 // Retain keeps tip, its ancestors and every descendant built on tip. nil clears
@@ -505,6 +470,84 @@ func (b *Branch) Retain(tip *[32]byte) error {
 	return nil
 }
 
+// RebaseCommitted re-roots tip's lineage at its newest strict ancestor whose
+// exact position the destination has already applied: that ancestor's child
+// becomes a root based on the ancestor's queue, and the ancestor and everything
+// below it are forgotten. Retain keeps every ancestor, so a session whose
+// windows keep opening on its own candidates would otherwise hold its whole
+// history and walk it on every lookup.
+//
+// The new base is materialized from the lineage itself rather than pinned from
+// the applied run, so every retained tip still cuts the same message pointers in
+// the same order. tip always stays a node, because a pipelined successor may
+// still install on it by Parent. Retained nodes are replaced rather than edited:
+// a Cut in progress walks the old ones without the lock.
+func (b *Branch) RebaseCommitted(tip [32]byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return ErrClosed
+	}
+	candidate := b.candidates[tip]
+	if candidate == nil {
+		return fmt.Errorf("%w: unknown candidate %x", ErrCutStale, tip[:8])
+	}
+
+	// Only whether the position was applied matters, not whether a cut could
+	// still be reconstructed there, so the walk asks the run's history directly
+	// instead of sourceRunAtLocked, which would count a stale cut for every
+	// ancestor behind the floor.
+	b.state.mu.Lock()
+	run := b.state.runs[b.destination]
+	if run == nil {
+		b.state.mu.Unlock()
+		return nil
+	}
+	child, committed := candidate, candidate.parent
+	for committed != nil && !run.hasRef(SourceRef{Seqno: committed.seqno, RootHash: committed.id}) {
+		child, committed = committed, committed.parent
+	}
+	b.state.mu.Unlock()
+	if committed == nil {
+		return nil
+	}
+
+	base, err := newBranchBase(
+		[]CandidateSource{{
+			Source:  b.destination,
+			Visible: SourceRef{Seqno: committed.seqno, RootHash: committed.id},
+		}},
+		mergeBranchCursors(lineageCursors(committed, nil), int(^uint(0)>>1)).Messages,
+	)
+	if err != nil {
+		return err
+	}
+
+	root := &branchCandidate{id: child.id, seqno: child.seqno, base: base, delta: child.delta}
+	b.candidates[root.id] = root
+	pending := []*branchCandidate{root}
+	for len(pending) > 0 {
+		last := len(pending) - 1
+		parent := pending[last]
+		pending = pending[:last]
+		for id := range b.children[parent.id] {
+			current := b.candidates[id]
+			copied := &branchCandidate{id: id, seqno: current.seqno, parent: parent, base: base, delta: current.delta}
+			b.candidates[id] = copied
+			pending = append(pending, copied)
+		}
+	}
+	for at := committed; at != nil; at = at.parent {
+		delete(b.candidates, at.id)
+		delete(b.children, at.id)
+	}
+	for _, source := range child.base.sources {
+		delete(b.sources, branchSourceKey{source: source.Source, visible: source.Visible})
+	}
+
+	return nil
+}
+
 // DropCandidate removes id and its descendants. Missing ids are idempotent.
 func (b *Branch) DropCandidate(id [32]byte) {
 	b.mu.Lock()
@@ -541,8 +584,13 @@ func (b *Branch) snapshotBaseLocked(sources []CandidateSource) (*branchBase, err
 	if len(streams) == 2 {
 		entries = mergeBranchEntries(streams[0], streams[1])
 	}
+
+	return newBranchBase(append([]CandidateSource(nil), sources...), entries)
+}
+
+func newBranchBase(sources []CandidateSource, entries []*InternalMessage) (*branchBase, error) {
 	base := &branchBase{
-		sources: append([]CandidateSource(nil), sources...),
+		sources: sources,
 		entries: entries,
 		byKey:   make(map[QueueKey]*InternalMessage, len(entries)),
 		byEnv:   make(map[[32]byte]*InternalMessage, len(entries)),
@@ -724,28 +772,105 @@ func (b *Branch) branchCandidateMatchesPromotedBase(
 		return false
 	}
 	if candidate.parent != nil && request.Parent == nil {
-		return len(request.Base) == 1 &&
-			candidateSourceNamesParent(request.Base[0], b.destination, candidate.parent)
+		return len(request.Base) == 1 && candidateSourceNamesParent(request.Base[0], b.destination, SourceRef{
+			Seqno:    candidate.parent.seqno,
+			RootHash: candidate.parent.id,
+		})
 	}
 	if candidate.parent == nil && request.Parent != nil && len(request.Base) == 0 {
-		parent := b.candidates[*request.Parent]
-
-		return parent != nil && len(candidate.base.sources) == 1 &&
-			candidateSourceNamesParent(candidate.base.sources[0], b.destination, parent)
+		// The parent need not be a node any more: RebaseCommitted forgets a
+		// committed parent once its child is based on it. The matching seqno
+		// already places the parent one position below the candidate.
+		return len(candidate.base.sources) == 1 &&
+			candidateSourceNamesParent(candidate.base.sources[0], b.destination, SourceRef{
+				Seqno:    request.Seqno - 1,
+				RootHash: *request.Parent,
+			})
 	}
 
 	return false
 }
 
-func candidateSourceNamesParent(
-	source CandidateSource,
-	destination ShardIdent,
-	parent *branchCandidate,
-) bool {
-	return source.Source == destination && source.Visible == (SourceRef{
-		Seqno:    parent.seqno,
-		RootHash: parent.id,
-	})
+func candidateSourceNamesParent(source CandidateSource, destination ShardIdent, parent SourceRef) bool {
+	return source.Source == destination && source.Visible == parent
+}
+
+// lineageCursors appends the cursors of tip's candidate queue: its base and
+// every non-empty delta addition, each filtered to what is still live at tip.
+func lineageCursors(tip *branchCandidate, cursors []*branchCursor) []*branchCursor {
+	live := lineageLive(tip)
+	cursors = append(cursors, &branchCursor{entries: tip.base.entries, live: live})
+	for at := tip; at != nil; at = at.parent {
+		if len(at.delta.added) == 0 {
+			continue
+		}
+		cursors = append(cursors, &branchCursor{entries: at.delta.added, live: live})
+	}
+
+	return cursors
+}
+
+// lineageLive decides once per call what lookupOrder at tip decides per message,
+// so a cursor pays one pointer probe instead of a walk of the lineage. Every
+// removal resolved to the very message holding its identity, and a new holder
+// of that identity can only appear after it, so a message is live exactly when
+// its last event from root to tip is not a removal. Within one delta a removal
+// precedes an addition, as lookupOrder's precedence has it. A lineage without
+// removals keeps everything and needs no check at all.
+func lineageLive(tip *branchCandidate) func(*InternalMessage) bool {
+	depth, removed := 0, 0
+	for at := tip; at != nil; at = at.parent {
+		depth++
+		removed += len(at.delta.removedOrd)
+	}
+	if removed == 0 {
+		return nil
+	}
+
+	lineage := make([]*branchCandidate, 0, depth)
+	for at := tip; at != nil; at = at.parent {
+		lineage = append(lineage, at)
+	}
+	gone := make(map[*InternalMessage]struct{}, removed)
+	for index := len(lineage) - 1; index >= 0; index-- {
+		for _, message := range lineage[index].delta.removedOrd {
+			gone[message] = struct{}{}
+		}
+		for _, message := range lineage[index].delta.added {
+			delete(gone, message)
+		}
+	}
+
+	return func(message *InternalMessage) bool {
+		_, dead := gone[message]
+		return !dead
+	}
+}
+
+// mergeBranchCursors drains cursors in canonical order until limit messages are
+// taken.
+func mergeBranchCursors(cursors []*branchCursor, limit int) *Cut {
+	ready := cursors[:0]
+	for _, cursor := range cursors {
+		if cursor.advance() {
+			ready = append(ready, cursor)
+		}
+	}
+	result := &Cut{}
+	merge := branchCursorHeap(ready)
+	heap.Init(&merge)
+	for merge.Len() > 0 && len(result.Messages) < limit {
+		top := merge[0]
+		result.Messages = append(result.Messages, top.current)
+		if top.advance() {
+			heap.Fix(&merge, 0)
+		} else {
+			heap.Pop(&merge)
+		}
+	}
+	result.More = merge.Len() > 0
+
+	return result
 }
 
 func orderKey(message *InternalMessage) branchOrderKey {

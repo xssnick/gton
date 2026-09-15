@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 
@@ -587,83 +588,423 @@ func (c *collation) loadQueueEntry(key msgpool.QueueKey) (queueEntry, error) {
 // parseQueueEntry decodes one out-queue entry and re-derives its routing from
 // the message it carries. The queue key is checked against that derivation, so
 // an entry can never claim a next hop its envelope does not produce.
+//
+// The entry is walked by bits instead of being decoded into tlb.EnqueuedMsg,
+// tlb.MsgEnvelope and tlb.InternalMessage. Cleanup runs this on every entry it
+// pulls, and the decode allocated about a dozen objects per entry — boxed
+// Coins, both addresses, the extra-currency dictionary and StateInit values, an
+// inline body copied into a fresh cell — none of which is consumed here. What
+// the walk opens is recorded into the collated proof, so it keeps the two
+// properties of the decode that are observable:
+//
+//   - it opens the same cells in the same order: the envelope, the message, a
+//     by-reference StateInit, the extra-currency dictionary, the StateInit roots
+//     and an indirect body root;
+//   - it accepts exactly the entries the decode accepted, and refuses the rest
+//     after the same opens the decode had made by then, which is why the two
+//     address verdicts still wait for the last open.
+//
+// C++ EnqueuedMsgDescr::unpack (block.cpp:628) reads only the envelope and the
+// int_msg_info header. The roots below the message are opened anyway because
+// the reference validator's generated EnqueuedMsg check opens them as Anything
+// cells, see traceQueueEntryClosure. parseQueueEntryReference in
+// queue_entry_parse_test.go is the decode this replaced, and both properties
+// are asserted against it.
 func parseQueueEntry(value *cell.Slice, key msgpool.QueueKey) (queueEntry, error) {
-	var enqueued tlb.EnqueuedMsg
-	if err := loadExactSlice(&enqueued, value); err != nil {
-		return queueEntry{}, fmt.Errorf("%w: decode queue entry %x: %v", ErrInvalidInput, key, err)
+	// EnqueuedMsg: enqueued_lt:uint64 out_msg:^MsgEnvelope, nothing trailing.
+	enqueuedLT, err := value.LoadUInt(64)
+	if err != nil {
+		return queueEntry{}, fmt.Errorf("%w: decode queue entry %x: failed to load enqueued lt: %v", ErrInvalidInput, key, err)
 	}
-	var env tlb.MsgEnvelope
-	if err := parseExact(&env, enqueued.Msg); err != nil {
+	envelope, err := value.LoadRefCell()
+	if err != nil {
+		return queueEntry{}, fmt.Errorf("%w: decode queue entry %x: failed to load enqueued message envelope: %v",
+			ErrInvalidInput, key, err)
+	}
+	if value.BitsLeft() != 0 || value.RefsNum() != 0 {
+		return queueEntry{}, fmt.Errorf("%w: decode queue entry %x: trailing data: %d bits, %d refs",
+			ErrInvalidInput, key, value.BitsLeft(), value.RefsNum())
+	}
+
+	route, err := loadQueuedEnvelope(envelope)
+	if err != nil {
 		return queueEntry{}, fmt.Errorf("%w: decode queued envelope %x: %v", ErrInvalidInput, key, err)
 	}
-	if env.CurAddr.Type != tlb.IntermediateAddressRegular || env.NextAddr.Type != tlb.IntermediateAddressRegular {
-		return queueEntry{}, fmt.Errorf("%w: queued envelope %x has a non-regular intermediate address", ErrInvalidInput, key)
-	}
-	var internal tlb.InternalMessage
-	if err := parseExact(&internal, env.Msg); err != nil {
+	message, err := loadQueuedMessage(route.msg)
+	if err != nil {
 		return queueEntry{}, fmt.Errorf("%w: decode queued message %x: %v", ErrInvalidInput, key, err)
 	}
-	if err := validateQueuedExtraCurrencies(internal.ExtraCurrencies); err != nil {
-		return queueEntry{}, fmt.Errorf("%w: decode queued message extra currencies %x: %v", ErrInvalidInput, key, err)
-	}
-	if internal.StateInit != nil {
-		roots := [3]*cell.Cell{internal.StateInit.Code, internal.StateInit.Data}
-		if internal.StateInit.Lib != nil && !internal.StateInit.Lib.IsEmpty() {
-			roots[2] = internal.StateInit.Lib.AsCell()
+
+	// The decode reached these only after the whole message, in this order.
+	if message.extra != nil {
+		if err = validateQueuedExtraCurrencies(message.extra.AsDict(32)); err != nil {
+			return queueEntry{}, fmt.Errorf("%w: decode queued message extra currencies %x: %v", ErrInvalidInput, key, err)
 		}
-		for _, root := range roots {
-			if root == nil {
-				continue
-			}
-			var content cell.Slice
-			if err := root.BeginParseInto(&content); err != nil {
+	}
+	if message.hasInit {
+		var root cell.Slice
+		for i := 0; i < 2; i++ { // code, data
+			if _, err = message.initRoots.LoadMaybeRefInto(&root); err != nil {
 				return queueEntry{}, fmt.Errorf("%w: decode queued message StateInit %x: %v", ErrInvalidInput, key, err)
 			}
 		}
+		hasLibraries, err := message.initRoots.LoadBoolBit()
+		if err != nil {
+			return queueEntry{}, fmt.Errorf("%w: decode queued message StateInit %x: %v", ErrInvalidInput, key, err)
+		}
+		if hasLibraries {
+			libraries, err := message.initRoots.LoadRefCell()
+			if err != nil {
+				return queueEntry{}, fmt.Errorf("%w: decode queued message StateInit %x: %v", ErrInvalidInput, key, err)
+			}
+			// The decode opened the library root only when Dictionary.IsEmpty
+			// called it non-empty, and a root with neither bits nor references
+			// is empty to it.
+			if !libraries.AsDict(256).IsEmpty() {
+				if err = libraries.BeginParseInto(&root); err != nil {
+					return queueEntry{}, fmt.Errorf("%w: decode queued message StateInit %x: %v", ErrInvalidInput, key, err)
+				}
+			}
+		}
 	}
-	// The reference validator's generated EnqueuedMsg validation opens an
-	// indirect message body and every StateInit reference as Anything cells.
-	// Parsing InternalMessage only loads those references, so explicitly
-	// materialize their roots as part of the same validation closure.
-	// Descendants stay opaque, matching Anything.
-	var body cell.Slice
-	if err := internal.Body.BeginParseInto(&body); err != nil {
-		return queueEntry{}, fmt.Errorf("%w: decode queued message body %x: %v", ErrInvalidInput, key, err)
-	}
-	lt := internal.CreatedLT
-	if env.EmittedLT != nil {
-		lt = *env.EmittedLT
+	if message.bodyByRef {
+		var body cell.Slice
+		if err = message.body.LoadRefInto(&body); err != nil {
+			return queueEntry{}, fmt.Errorf("%w: decode queued message body %x: %v", ErrInvalidInput, key, err)
+		}
 	}
 
-	source, err := accountPrefixFromAddress(internal.SrcAddr)
+	source, err := message.source.routingPrefix()
 	if err != nil {
 		return queueEntry{}, fmt.Errorf("%w: queued message %x source: %v", ErrInvalidInput, key, err)
 	}
-	destination, err := accountPrefixFromAddress(internal.DstAddr)
+	destination, err := message.destination.routingPrefix()
 	if err != nil {
 		return queueEntry{}, fmt.Errorf("%w: queued message %x destination: %v", ErrInvalidInput, key, err)
 	}
-	cur := msgpool.InterpolatePrefix(source, destination, int(env.CurAddr.UseDestBits))
-	next := msgpool.InterpolatePrefix(source, destination, int(env.NextAddr.UseDestBits))
-	hash := env.Msg.HashKey()
+	lt := message.createdLT
+	if route.hasEmittedLT {
+		lt = route.emittedLT
+	}
+	cur := msgpool.InterpolatePrefix(source, destination, route.curBits)
+	next := msgpool.InterpolatePrefix(source, destination, route.nextBits)
+	hash := route.msg.HashKey()
 	if msgpool.MakeQueueKey(next, hash) != key {
 		return queueEntry{}, fmt.Errorf("%w: queue entry %x key differs from its envelope", ErrInvalidInput, key)
 	}
 
 	return queueEntry{
 		key:      key,
-		envelope: enqueued.Msg,
-		msg:      env.Msg,
+		envelope: envelope,
+		msg:      route.msg,
 		descr: tlb.ProcessedMsgDescr{
 			CurWorkchain:  cur.Workchain,
 			CurPrefix:     cur.Prefix,
 			NextWorkchain: next.Workchain,
 			NextPrefix:    next.Prefix,
 			LT:            lt,
-			EnqueuedLT:    enqueued.EnqueuedLT,
+			EnqueuedLT:    enqueuedLT,
 			Hash:          hash,
 		},
 	}, nil
+}
+
+// queuedEnvelope is a MsgEnvelope reduced to what a queue entry consumes: the
+// message, the use_dest_bits of both intermediate addresses and emitted_lt.
+type queuedEnvelope struct {
+	msg          *cell.Cell
+	curBits      int
+	nextBits     int
+	emittedLT    uint64
+	hasEmittedLT bool
+}
+
+// loadQueuedEnvelope walks msg_envelope#4 and msg_envelope_v2#5 in the field
+// order of tlb.MsgEnvelope.LoadFromCell and then checks exactness as parseExact
+// does. A non-regular intermediate address is refused at its tag by
+// loadClaimedRegularRoute: the decode finished one only to refuse it after the
+// envelope, and nothing is opened in between.
+func loadQueuedEnvelope(envelope *cell.Cell) (queuedEnvelope, error) {
+	var s cell.Slice
+	if err := envelope.BeginParseInto(&s); err != nil {
+		return queuedEnvelope{}, err
+	}
+	tag, err := s.LoadUInt(4)
+	if err != nil {
+		return queuedEnvelope{}, fmt.Errorf("failed to load message envelope tag: %w", err)
+	}
+	if tag != 4 && tag != 5 {
+		return queuedEnvelope{}, fmt.Errorf("unsupported message envelope tag %d", tag)
+	}
+
+	var route queuedEnvelope
+	if route.curBits, err = loadClaimedRegularRoute(&s); err != nil {
+		return queuedEnvelope{}, fmt.Errorf("failed to load current intermediate address: %w", err)
+	}
+	if route.nextBits, err = loadClaimedRegularRoute(&s); err != nil {
+		return queuedEnvelope{}, fmt.Errorf("failed to load next intermediate address: %w", err)
+	}
+	if err = skipMessageGrams(&s); err != nil {
+		return queuedEnvelope{}, fmt.Errorf("failed to load remaining forward fee: %w", err)
+	}
+	if route.msg, err = s.LoadRefCell(); err != nil {
+		return queuedEnvelope{}, fmt.Errorf("failed to load message ref: %w", err)
+	}
+
+	if tag == 5 {
+		if route.hasEmittedLT, err = s.LoadBoolBit(); err != nil {
+			return queuedEnvelope{}, fmt.Errorf("failed to load emitted lt flag: %w", err)
+		}
+		if route.hasEmittedLT {
+			if route.emittedLT, err = s.LoadUInt(64); err != nil {
+				return queuedEnvelope{}, fmt.Errorf("failed to load emitted lt: %w", err)
+			}
+		}
+		hasMetadata, err := s.LoadBoolBit()
+		if err != nil {
+			return queuedEnvelope{}, fmt.Errorf("failed to load metadata flag: %w", err)
+		}
+		if hasMetadata {
+			if err = skipClaimedMetadata(&s); err != nil {
+				return queuedEnvelope{}, fmt.Errorf("failed to load metadata: %w", err)
+			}
+		}
+	}
+	if s.BitsLeft() != 0 || s.RefsNum() != 0 {
+		return queuedEnvelope{}, fmt.Errorf("trailing data: %d bits, %d refs", s.BitsLeft(), s.RefsNum())
+	}
+
+	return route, nil
+}
+
+// queuedMessage is an int_msg_info walked to its end. The addresses are kept
+// without a routing verdict, and the references under the message are taken
+// but not opened — apart from a by-reference StateInit — with initRoots and
+// body left resting on the references the caller opens.
+type queuedMessage struct {
+	source      queuedAddress
+	destination queuedAddress
+	createdLT   uint64
+	extra       *cell.Cell
+	hasInit     bool
+	initRoots   cell.Slice
+	bodyByRef   bool
+	body        cell.Slice
+}
+
+// loadQueuedMessage walks the message in the field order of
+// tlb.InternalMessage.LoadFromCell, with the same failure points, and then
+// checks exactness as parseExact does. The only cell it opens below the message
+// is a by-reference StateInit, which the decode opened at the same point.
+func loadQueuedMessage(root *cell.Cell) (queuedMessage, error) {
+	var s cell.Slice
+	if err := root.BeginParseInto(&s); err != nil {
+		return queuedMessage{}, err
+	}
+	notInternal, err := s.LoadBoolBit()
+	if err != nil {
+		return queuedMessage{}, fmt.Errorf("failed to load internal message magic: %w", err)
+	}
+	if notInternal {
+		return queuedMessage{}, errors.New("invalid internal message magic")
+	}
+	if err = s.SkipBits(3); err != nil { // ihr_disabled, bounce, bounced
+		return queuedMessage{}, fmt.Errorf("failed to load message flags: %w", err)
+	}
+
+	var m queuedMessage
+	if m.source, err = loadQueuedAddress(&s); err != nil {
+		return queuedMessage{}, fmt.Errorf("failed to load source address: %w", err)
+	}
+	if m.destination, err = loadQueuedAddress(&s); err != nil {
+		return queuedMessage{}, fmt.Errorf("failed to load destination address: %w", err)
+	}
+	if err = skipMessageGrams(&s); err != nil {
+		return queuedMessage{}, fmt.Errorf("failed to load amount: %w", err)
+	}
+	hasExtra, err := s.LoadBoolBit()
+	if err != nil {
+		return queuedMessage{}, fmt.Errorf("failed to load extra currencies: %w", err)
+	}
+	if hasExtra {
+		if m.extra, err = s.LoadRefCell(); err != nil {
+			return queuedMessage{}, fmt.Errorf("failed to load extra currencies: %w", err)
+		}
+	}
+	if err = skipMessageGrams(&s); err != nil {
+		return queuedMessage{}, fmt.Errorf("failed to load ihr fee: %w", err)
+	}
+	if err = skipMessageGrams(&s); err != nil {
+		return queuedMessage{}, fmt.Errorf("failed to load fwd fee: %w", err)
+	}
+	if m.createdLT, err = s.LoadUInt(64); err != nil {
+		return queuedMessage{}, fmt.Errorf("failed to load created lt: %w", err)
+	}
+	if err = s.SkipBits(32); err != nil {
+		return queuedMessage{}, fmt.Errorf("failed to load created at: %w", err)
+	}
+
+	// init:(Maybe (Either StateInit ^StateInit)). Code, data and the library
+	// root are stepped over, so a StateInit missing one of them is refused here,
+	// where the decode refused it.
+	if m.hasInit, err = s.LoadBoolBit(); err != nil {
+		return queuedMessage{}, fmt.Errorf("failed to load state init: %w", err)
+	}
+	if m.hasInit {
+		byRef, err := s.LoadBoolBit()
+		if err != nil {
+			return queuedMessage{}, fmt.Errorf("failed to load state init: %w", err)
+		}
+		init := &s
+		var initCell cell.Slice
+		if byRef {
+			if err = s.LoadRefInto(&initCell); err != nil {
+				return queuedMessage{}, fmt.Errorf("failed to load state init: %w", err)
+			}
+			init = &initCell
+		}
+		if err = skipStateInitHead(init); err != nil {
+			return queuedMessage{}, fmt.Errorf("failed to load state init: %w", err)
+		}
+		init.CopyInto(&m.initRoots)
+		for i := 0; i < 3; i++ {
+			present, err := init.LoadBoolBit()
+			if err != nil {
+				return queuedMessage{}, fmt.Errorf("failed to load state init: %w", err)
+			}
+			if !present {
+				continue
+			}
+			if err = init.SkipBitsAndRefs(0, 1); err != nil {
+				return queuedMessage{}, fmt.Errorf("failed to load state init: %w", err)
+			}
+		}
+	}
+
+	// body:(Either X ^X). An inline body is Any and takes everything left; an
+	// indirect one has to leave the message exhausted.
+	if m.bodyByRef, err = s.LoadBoolBit(); err != nil {
+		return queuedMessage{}, fmt.Errorf("failed to load body: %w", err)
+	}
+	if m.bodyByRef {
+		s.CopyInto(&m.body)
+		if err = s.SkipBitsAndRefs(0, 1); err != nil {
+			return queuedMessage{}, fmt.Errorf("failed to load body: %w", err)
+		}
+		if s.BitsLeft() != 0 || s.RefsNum() != 0 {
+			return queuedMessage{}, fmt.Errorf("trailing data: %d bits, %d refs", s.BitsLeft(), s.RefsNum())
+		}
+	}
+
+	return m, nil
+}
+
+// queuedAddress is a MsgAddress with what routing reads: the constructor, the
+// workchain, the address length and the first 64 address bits with the anycast
+// rewrite applied.
+type queuedAddress struct {
+	tag       uint64
+	workchain int32
+	bits      uint64
+	prefix    uint64
+}
+
+// loadQueuedAddress consumes one MsgAddress with the failure points of
+// cell.Slice.LoadAddr and without its allocations. Whether the address routes
+// is decided later by routingPrefix.
+func loadQueuedAddress(s *cell.Slice) (queuedAddress, error) {
+	tag, err := s.LoadUInt(2)
+	if err != nil {
+		return queuedAddress{}, err
+	}
+	switch tag {
+	case 0: // addr_none$00
+		return queuedAddress{tag: tag}, nil
+	case 1: // addr_extern$01
+		length, err := s.LoadUInt(9)
+		if err != nil {
+			return queuedAddress{}, fmt.Errorf("failed to load len: %w", err)
+		}
+		if err = s.SkipBits(uint(length)); err != nil {
+			return queuedAddress{}, fmt.Errorf("failed to load addr data: %w", err)
+		}
+		return queuedAddress{tag: tag}, nil
+	}
+
+	// addr_std$10 and addr_var$11 both open with anycast:(Maybe Anycast).
+	anycast, err := s.LoadBoolBit()
+	if err != nil {
+		return queuedAddress{}, fmt.Errorf("failed to load anycast bit: %w", err)
+	}
+	var depth, rewrite uint64
+	if anycast {
+		if depth, err = s.LoadUInt(5); err != nil {
+			return queuedAddress{}, fmt.Errorf("failed to load depth: %w", err)
+		}
+		if depth == 0 || depth > 30 {
+			return queuedAddress{}, fmt.Errorf("invalid anycast depth: %d", depth)
+		}
+		if rewrite, err = s.LoadUInt(uint(depth)); err != nil {
+			return queuedAddress{}, fmt.Errorf("failed to load prefix: %w", err)
+		}
+	}
+
+	addr := queuedAddress{tag: tag, bits: 256}
+	if tag == 2 {
+		workchain, err := s.LoadUInt(8)
+		if err != nil {
+			return queuedAddress{}, fmt.Errorf("failed to load workchain: %w", err)
+		}
+		addr.workchain = int32(int8(workchain))
+	} else {
+		if addr.bits, err = s.LoadUInt(9); err != nil {
+			return queuedAddress{}, fmt.Errorf("failed to load len: %w", err)
+		}
+		workchain, err := s.LoadInt(32)
+		if err != nil {
+			return queuedAddress{}, fmt.Errorf("failed to load workchain: %w", err)
+		}
+		addr.workchain = int32(workchain)
+	}
+
+	if addr.bits < 64 {
+		if err = s.SkipBits(uint(addr.bits)); err != nil {
+			return queuedAddress{}, fmt.Errorf("failed to load addr data: %w", err)
+		}
+		return addr, nil
+	}
+	if addr.prefix, err = s.LoadUInt(64); err != nil {
+		return queuedAddress{}, fmt.Errorf("failed to load addr data: %w", err)
+	}
+	if err = s.SkipBits(uint(addr.bits - 64)); err != nil {
+		return queuedAddress{}, fmt.Errorf("failed to load addr data: %w", err)
+	}
+	if anycast {
+		// msgpool.RewriteAnycast over the first 64 bits; depth <= 30 keeps the
+		// rewrite inside them.
+		addr.prefix = rewrite<<(64-depth) | addr.prefix&(^uint64(0)>>depth)
+	}
+	return addr, nil
+}
+
+// routingPrefix is msgpool.AccountPrefixFromAddress over the kept fields, with
+// its accepted set: addr_std always, addr_var only in canonical form and with at
+// least 64 address bits, nothing else.
+func (a queuedAddress) routingPrefix() (msgpool.AccountPrefix, error) {
+	switch a.tag {
+	case 2:
+	case 3:
+		if a.workchain == 0 || a.workchain == address.MasterchainID ||
+			(a.workchain >= -128 && a.workchain <= 127 && a.bits == 256) {
+			return msgpool.AccountPrefix{}, fmt.Errorf("%w: non-canonical variable account address", ErrInvalidInput)
+		}
+		if a.bits < 64 {
+			return msgpool.AccountPrefix{}, fmt.Errorf("%w: variable account address has no routing prefix", ErrInvalidInput)
+		}
+	default:
+		return msgpool.AccountPrefix{}, fmt.Errorf("%w: account address has no routable prefix", ErrInvalidInput)
+	}
+	return msgpool.AccountPrefix{Workchain: a.workchain, Prefix: a.prefix}, nil
 }
 
 // validateQueuedExtraCurrencies covers the same HashmapE 32

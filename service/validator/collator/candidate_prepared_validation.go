@@ -243,21 +243,28 @@ func (p *preparedValidationCandidate) prepareBlock(
 	if err := verifyCandidateIDHashes(candidate); err != nil {
 		return err
 	}
-	// The file hash is what the block is stored and requested under. On the
-	// wire path the candidate codec derives the ID from this same digest, but a
-	// storage-recovered artifact and both exported entry points carry no such
-	// guarantee, so it is checked unconditionally.
-	fileHash := sha256.Sum256(candidate.BlockBOC)
-	if !bytes.Equal(candidate.ID.FileHash, fileHash[:]) {
-		return fmt.Errorf("%w: candidate block file hash mismatch", ErrInvalidInput)
+	// The file hash is what the block is stored and requested under. Skipped
+	// only for a candidate whose ID.FileHash is where these bytes' digest came
+	// from: a wire-decoded candidate, whose codec took it of the block it
+	// serialized and folded it into the signed candidate id, and one this node
+	// produced or resumed. A storage-recovered artifact and a Candidate assembled
+	// outside this package carry no such seal and are checked. The reference
+	// re-derives it on every path (validate-query.cpp:478); here that second
+	// pass over the same megabyte could only fail on local memory corruption.
+	if !candidate.digested {
+		fileHash := sha256.Sum256(candidate.BlockBOC)
+		if !bytes.Equal(candidate.ID.FileHash, fileHash[:]) {
+			return fmt.Errorf("%w: candidate block file hash mismatch", ErrInvalidInput)
+		}
 	}
-	// A supplied root replaces the decode, never the two hash checks around it:
-	// the digest above says these bytes are the block the ID names, and the root
-	// hash below says this tree is. What the decode also used to establish — that
-	// our own serializer's output parses back — is not a property of the
-	// candidate, and neither producer of a supplied root can offer it: the
-	// network path decodes the wire and re-serializes BlockBOC from the result,
-	// and the local path serializes it from the tree it built.
+	// A supplied root replaces the decode, never the root hash check below. A
+	// root is only supplied together with the digest seal, so the file hash says
+	// these bytes are the block the ID names, and the root hash says this tree
+	// is. What the decode also used to establish — that our own serializer's
+	// output parses back — is not a property of the candidate, and neither
+	// producer of a supplied root can offer it: the network path decodes the
+	// wire and re-serializes BlockBOC from the result, and the local path
+	// serializes it from the tree it built.
 	if root == nil {
 		var err error
 		// Candidate owns BlockBOC for the full validation lifetime. Parsed cells

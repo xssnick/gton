@@ -123,7 +123,7 @@ func acceptanceTestViewResolver(view BlockAcceptanceView) BlockAcceptanceViewRes
 func (f acceptanceTestFixture) view(t *testing.T) BlockAcceptanceView {
 	t.Helper()
 
-	_, parsed, err := parseAcceptedBlock(f.candidate.Candidate.Block, f.candidate.BlockBOC, nil)
+	_, parsed, err := parseAcceptedBlock(f.candidate.Candidate.Block, f.candidate.BlockBOC, nil, false)
 	if err != nil {
 		t.Fatalf("parse acceptance view block: %v", err)
 	}
@@ -147,7 +147,7 @@ func (f acceptanceTestFixture) view(t *testing.T) BlockAcceptanceView {
 func (f acceptanceTestFixture) masterchainBlock(t *testing.T) ton.BlockIDExt {
 	t.Helper()
 
-	_, parsed, err := parseAcceptedBlock(f.candidate.Candidate.Block, f.candidate.BlockBOC, nil)
+	_, parsed, err := parseAcceptedBlock(f.candidate.Candidate.Block, f.candidate.BlockBOC, nil, false)
 	if err != nil {
 		t.Fatalf("parse acceptance fixture block: %v", err)
 	}
@@ -436,7 +436,7 @@ func TestBlockAccepterRejectsInvalidBlockHeadersBeforeSignatures(t *testing.T) {
 func TestValidateAcceptedBlockHeaderRejectsMalformedShape(t *testing.T) {
 	shard := groups.ShardID{Workchain: 0, Shard: math.MinInt64}
 	fixture := newAcceptanceTestFixture(t, shard)
-	_, parsed, err := parseAcceptedBlock(fixture.candidate.Candidate.Block, fixture.candidate.BlockBOC, nil)
+	_, parsed, err := parseAcceptedBlock(fixture.candidate.Candidate.Block, fixture.candidate.BlockBOC, nil, false)
 	if err != nil {
 		t.Fatalf("parse fixture block: %v", err)
 	}

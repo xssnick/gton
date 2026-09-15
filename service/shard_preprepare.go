@@ -31,6 +31,14 @@ type preparedShardBlockEntry struct {
 	storedAt time.Time
 }
 
+// preparedShardBlockOrderItem is one store in FIFO order. The storedAt stamp
+// tells it from a later store of the same block: a taken block can be
+// prepared and stored again, and only its newest position owns the entry.
+type preparedShardBlockOrderItem struct {
+	key      storage.BlockRootHash
+	storedAt time.Time
+}
+
 // preparedShardBlockCache holds shard blocks prepared ahead of the commit
 // stage (parsed, state-update cells extracted), keyed by block root hash. The
 // shard resolver takes them on the master commit critical path so only the
@@ -38,7 +46,7 @@ type preparedShardBlockEntry struct {
 type preparedShardBlockCache struct {
 	mu       sync.Mutex
 	entries  map[storage.BlockRootHash]preparedShardBlockEntry
-	order    []storage.BlockRootHash
+	order    []preparedShardBlockOrderItem
 	bytes    int64
 	inflight map[storage.BlockRootHash]struct{}
 }
@@ -116,34 +124,36 @@ func (c *preparedShardBlockCache) storePrepared(prepared PreparedBlock) {
 		bytes:    bytes,
 		storedAt: now,
 	}
-	c.order = append(c.order, key)
+	c.order = append(c.order, preparedShardBlockOrderItem{key: key, storedAt: now})
 	c.bytes += bytes
 	c.pruneLocked(now)
 }
 
 // pruneLocked drops expired entries and evicts oldest ones while the cache is
-// over its limits. Taken entries leave tombstone keys in order; those are
-// skipped for free here.
+// over its limits. Taken entries leave tombstone positions in order, and a
+// block stored again after its take leaves its earlier position behind; both
+// are skipped for free here without touching the entry.
 func (c *preparedShardBlockCache) pruneLocked(now time.Time) {
 	cutoff := now.Add(-preparedShardBlockTTL)
 	for len(c.order) > 0 {
-		key := c.order[0]
-		entry, ok := c.entries[key]
-		if ok && entry.storedAt.After(cutoff) {
+		item := c.order[0]
+		entry, ok := c.entries[item.key]
+		owned := ok && entry.storedAt.Equal(item.storedAt)
+		if owned && entry.storedAt.After(cutoff) {
 			break
 		}
 		c.order = c.order[1:]
-		if ok {
+		if owned {
 			c.bytes -= entry.bytes
-			delete(c.entries, key)
+			delete(c.entries, item.key)
 		}
 	}
 	for len(c.order) > 0 && (len(c.entries) > preparedShardBlockMaxItems || c.bytes > preparedShardBlockMaxBytes) {
-		key := c.order[0]
+		item := c.order[0]
 		c.order = c.order[1:]
-		if entry, ok := c.entries[key]; ok {
+		if entry, ok := c.entries[item.key]; ok && entry.storedAt.Equal(item.storedAt) {
 			c.bytes -= entry.bytes
-			delete(c.entries, key)
+			delete(c.entries, item.key)
 		}
 	}
 }

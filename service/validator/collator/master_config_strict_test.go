@@ -32,8 +32,6 @@ func TestMasterConfigRejectsMalformedGovernanceParameters(t *testing.T) {
 		{"mint prices trailing bit", 6, prices, prices.ToBuilder().MustStoreBoolBit(true).EndCell()},
 		{"mint prices trailing reference", 6, prices, prices.ToBuilder().MustStoreRef(cell.BeginCell().EndCell()).EndCell()},
 		{"critical set nonempty True", 10, critical.AsCell(), malformedCritical.AsCell()},
-		{"mint price nonminimal zero", 6, prices, cell.BeginCell().MustStoreUInt(1, 4).MustStoreUInt(0, 8).MustStoreCoins(2).EndCell()},
-		{"mint price nonminimal positive", 6, prices, cell.BeginCell().MustStoreUInt(2, 4).MustStoreUInt(1, 16).MustStoreCoins(2).EndCell()},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -350,5 +348,150 @@ func TestMasterConfigRejectsOuterForkPayloads(t *testing.T) {
 				t.Fatalf("malformed config fork: %v", err)
 			}
 		})
+	}
+}
+
+// valid_config_data runs the generated ConfigParam (block.cpp:1877), where
+// VarUInteger n is only fetch_uint_less(n, len) and advance(8*len)
+// (tlbc-gen-cpp.cpp:1996, 2045): a zero length and a zero leading byte both
+// typecheck. Minimality belongs to the handwritten block::tlb types that
+// compute_minted_amount and fetch_config_params read through.
+func TestConfigParameterAcceptsNonminimalVarUInteger(t *testing.T) {
+	zero := cell.BeginCell().MustStoreUInt(1, 4).MustStoreUInt(0, 8).EndCell()
+	positive := cell.BeginCell().MustStoreUInt(2, 4).MustStoreUInt(1, 16).EndCell()
+	toMint := func(amount *cell.Cell) *cell.Cell {
+		dict := cell.NewDict(32)
+		if err := dict.SetIntKey(big.NewInt(9), amount); err != nil {
+			t.Fatal(err)
+		}
+		return cell.BeginCell().MustStoreDict(dict).EndCell()
+	}
+	bridgePrices := cell.BeginCell().MustStoreBuilder(zero.ToBuilder()).MustStoreBuilder(positive.ToBuilder()).
+		MustStoreCoins(1).MustStoreCoins(2).MustStoreCoins(3).MustStoreCoins(4).EndCell()
+	cases := []struct {
+		name  string
+		id    uint32
+		root  *cell.Cell
+		valid bool
+	}{
+		{"to mint zero length", 7, toMint(cell.BeginCell().MustStoreUInt(0, 5).EndCell()), true},
+		{"to mint leading zero byte", 7, toMint(cell.BeginCell().MustStoreUInt(2, 5).MustStoreUInt(1, 16).EndCell()), true},
+		{"to mint trailing bit", 7, toMint(cell.BeginCell().MustStoreUInt(0, 5).MustStoreBoolBit(true).EndCell()), false},
+		{"mint prices", 6, cell.BeginCell().MustStoreBuilder(zero.ToBuilder()).MustStoreBuilder(positive.ToBuilder()).EndCell(), true},
+		{"complaint pricing", 13, cell.BeginCell().MustStoreUInt(0x1a, 8).MustStoreBuilder(zero.ToBuilder()).
+			MustStoreBuilder(positive.ToBuilder()).MustStoreCoins(1).EndCell(), true},
+		{"block create fees", 14, cell.BeginCell().MustStoreUInt(0x6b, 8).MustStoreBuilder(zero.ToBuilder()).
+			MustStoreBuilder(positive.ToBuilder()).EndCell(), true},
+		{"block create fees truncated magnitude", 14, cell.BeginCell().MustStoreUInt(0x6b, 8).MustStoreUInt(2, 4).
+			MustStoreUInt(1, 8).MustStoreCoins(1).EndCell(), false},
+		{"stake limits", 17, cell.BeginCell().MustStoreBuilder(positive.ToBuilder()).MustStoreCoins(1).
+			MustStoreBuilder(zero.ToBuilder()).MustStoreUInt(3, 32).EndCell(), true},
+		{"misbehaviour punishment", 40, cell.BeginCell().MustStoreUInt(1, 8).MustStoreBuilder(positive.ToBuilder()).
+			MustStoreSlice(make([]byte, 22), 32+9*16).EndCell(), true},
+		{"jetton bridge v0", 79, cell.BeginCell().MustStoreUInt(0, 8).MustStoreSlice(make([]byte, 64), 512).
+			MustStoreBoolBit(false).MustStoreUInt(0, 8).MustStoreBuilder(zero.ToBuilder()).EndCell(), true},
+		{"jetton bridge v1 prices", 81, cell.BeginCell().MustStoreUInt(1, 8).MustStoreSlice(make([]byte, 64), 512).
+			MustStoreBoolBit(false).MustStoreUInt(0, 8).MustStoreRef(bridgePrices).MustStoreSlice(make([]byte, 32), 256).EndCell(), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateKnownConfigParameter(tc.root, tc.id)
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%t, err=%v", tc.valid, err)
+			}
+		})
+	}
+}
+
+// An amount store_varuint32 never writes is still a valid parameter 7. Only
+// compute_minted_amount's handwritten VarUIntegerPos gate refuses it, and that
+// disables the whole mint while the block is produced (collator.cpp:2233-2236).
+func TestMasterConfigAcceptsNonpositiveMintAmounts(t *testing.T) {
+	base := loadMainnetConfig(t).execution.Root()
+	cases := []struct {
+		name   string
+		amount *cell.Cell
+	}{
+		{"zero length", cell.BeginCell().MustStoreUInt(0, 5).EndCell()},
+		{"leading zero byte", cell.BeginCell().MustStoreUInt(2, 5).MustStoreUInt(1, 16).EndCell()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			toMint := cell.NewDict(32)
+			mintConfigEntry(t, toMint, 7, big.NewInt(1_000_000))
+			if err := toMint.SetIntKey(big.NewInt(9), tc.amount); err != nil {
+				t.Fatal(err)
+			}
+			root := mintConfigRoot(t, toMint)
+			address := testConfigAddress(t, root)
+			if err := validateMasterConfigData(root, address[:], base, false); err != nil {
+				t.Fatal(err)
+			}
+
+			minted, err := computeMinted(tlb.BlockchainConfig{Root: root}, tlb.CurrencyCollection{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !currencyZero(minted) {
+				t.Fatalf("minted %+v", minted)
+			}
+
+			fixture := newMasterBuildFixtureWith(t, masterBuildFixtureOptions{accountConfigRoot: root})
+			candidate, err := testBuilder().BuildMaster(context.Background(), fixture.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verification := MasterVerificationRequest{
+				Previous: fixture.request.Previous, Config: fixture.request.Config,
+				Groups: fixture.request.Groups, ShardTops: fixture.request.ShardTops,
+				Neighbors: fixture.request.Neighbors, NeighborShardEndLT: fixture.request.NeighborShardEndLT,
+				Semantics: NewSemanticVerifier(tvm.NewTVM()), Candidate: candidate,
+			}
+			if err = verifyMasterCandidateForTest(context.Background(), verification); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// Parameter 14 is the one Grams configuration value the node reads back:
+// fetch_config_params takes both fees through block::tlb::t_Grams.as_integer_to
+// (transaction.cpp:4363-4367, validate-query.cpp:1176-1180), whose VarUInteger 16
+// refuses a zero leading byte (block-parse.cpp:320-323). Such a configuration
+// is valid, and no block can be built on it.
+func TestPrepareConfigRejectsNonminimalCreateFee(t *testing.T) {
+	base := loadMainnetConfig(t).execution.Root()
+	minimal := cell.BeginCell().MustStoreUInt(1, 4).MustStoreUInt(1, 8).EndCell()
+	nonminimal := cell.BeginCell().MustStoreUInt(2, 4).MustStoreUInt(1, 16).EndCell()
+	fees := func(masterchain, basechain *cell.Cell) *cell.Cell {
+		return cell.BeginCell().MustStoreUInt(0x6b, 8).MustStoreBuilder(masterchain.ToBuilder()).
+			MustStoreBuilder(basechain.ToBuilder()).EndCell()
+	}
+	prepare := func(parameter *cell.Cell) (*Config, error) {
+		root := masterBuildConfigWithParam(t, base, int64(tlb.ConfigParamBlockCreateFees), parameter)
+		address := testConfigAddress(t, root)
+		if err := validateMasterConfigData(root, address[:], base, false); err != nil {
+			t.Fatal(err)
+		}
+		execution, err := tvm.PrepareBlockchainConfig(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return PrepareConfig(execution, address)
+	}
+
+	config, err := prepare(fees(minimal, cell.BeginCell().MustStoreUInt(0, 4).EndCell()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.masterchain.createFee.Nano().Uint64() != 1 || config.basechain.createFee.Nano().Sign() != 0 {
+		t.Fatalf("creation fees %s/%s", config.masterchain.createFee.Nano(), config.basechain.createFee.Nano())
+	}
+
+	for _, parameter := range []*cell.Cell{fees(nonminimal, minimal), fees(minimal, nonminimal)} {
+		_, err = prepare(parameter)
+		if !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), "nonminimal") {
+			t.Fatalf("nonminimal creation fee: %v", err)
+		}
 	}
 }

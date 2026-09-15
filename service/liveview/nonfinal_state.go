@@ -212,7 +212,7 @@ func nonfinalLoadStateRoot(hash cell.Hash, records storage.StateCellRecords, bas
 }
 
 func nonfinalLazyCellRecord(hash cell.Hash, encoded []byte, loader cell.LazyCellLoader) (*cell.Cell, error) {
-	return storage.LazyCellRecord(storage.DecodeCellRecordTrusted(hash[:], encoded), loader)
+	return storage.DecodeLazyCellRecordTrusted(hash[:], encoded, loader)
 }
 
 func nonfinalSnapshotStateRecords(root *cell.Cell) (storage.StateCellRecords, error) {

@@ -1,6 +1,7 @@
 package pebblestore
 
 import (
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,8 +14,10 @@ type pebbleCompactionTestDB struct {
 	schedule func(pebble.CompactionGrantHandle) bool
 }
 
+// GetAllowedWithoutPermission leaves the per-DB limit open so these tests
+// exercise only the controller-wide limit.
 func (d *pebbleCompactionTestDB) GetAllowedWithoutPermission() int {
-	return 0
+	return math.MaxInt
 }
 
 func (d *pebbleCompactionTestDB) GetWaitingCompaction() (bool, pebble.WaitingCompaction) {

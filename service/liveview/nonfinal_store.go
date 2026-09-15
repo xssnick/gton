@@ -250,6 +250,7 @@ func (s *Store) publishNonfinalBlockArtifacts(artifacts storage.LiveBlockArtifac
 	pending.cells = cells
 	s.putNonfinalPendingLocked(key, pending)
 
+	prepared.nonfinal = true
 	published, masterReady := s.publishLiveBlockArtifactsPreparedLocked(prepared)
 	s.removeNonfinalLookupIndexesLocked(block)
 	s.trimNonfinalPendingLocked()
@@ -439,20 +440,18 @@ func (s *Store) putNonfinalPendingLocked(key storage.BlockRootHash, pending live
 	s.addNonfinalCellIndexLocked(key, pending.cells)
 }
 
+// addNonfinalCellIndexLocked indexes the records of one pending block without a
+// dedupe: both producers of those records, PrepareStateUpdateCells and
+// nonfinalSnapshotStateRecords, already emit each cell hash once.
 func (s *Store) addNonfinalCellIndexLocked(key storage.BlockRootHash, records storage.StateCellRecords) {
 	if records.Empty() {
 		return
 	}
 
-	seen := map[cell.Hash]struct{}{}
 	_ = records.ForEach(func(record storage.EncodedCellRecord) error {
 		if len(record.Data) == 0 {
 			return nil
 		}
-		if _, ok := seen[record.Hash]; ok {
-			return nil
-		}
-		seen[record.Hash] = struct{}{}
 		s.nonFinalCellIndex[record.Hash] = append(s.nonFinalCellIndex[record.Hash], liveNonfinalCellIndexEntry{
 			block: key,
 			data:  record.Data,
@@ -466,15 +465,10 @@ func (s *Store) removeNonfinalCellIndexLocked(key storage.BlockRootHash, records
 		return
 	}
 
-	seen := map[cell.Hash]struct{}{}
 	_ = records.ForEach(func(record storage.EncodedCellRecord) error {
 		if len(record.Data) == 0 {
 			return nil
 		}
-		if _, ok := seen[record.Hash]; ok {
-			return nil
-		}
-		seen[record.Hash] = struct{}{}
 
 		entries := s.nonFinalCellIndex[record.Hash]
 		for i := 0; i < len(entries); i++ {
@@ -720,13 +714,16 @@ func (s *Store) deleteNonfinalBlockLocked(key storage.BlockRootHash, block ton.B
 	if cached == nil {
 		return
 	}
-	// The same ownership rule dropAcceptedStateLocked applies, from the other
-	// side: a block whose live entry belongs to an accepted publication is not
-	// this cache's to delete. The non-final path can hold a listing entry for
-	// such a block without ever having published its state — see the accepted
-	// branch of publishNonfinalBlockArtifacts — and releasing the entry must
+	// The same ownership rule dropAcceptedStateLocked applies: the release takes
+	// the live block only while the non-final publication still owns it. The sync
+	// pipeline publishes its own copy of every block it applies, unflushed until
+	// the checkpoint, before one masterchain block moves the applied current state
+	// past the block without naming it; deleting that copy here left the store
+	// unable to answer for the block until the flush. The non-final path can also
+	// hold a listing entry for a block it never published — see the accepted
+	// branch of publishNonfinalBlockArtifacts — and releasing that entry must
 	// release only the entry.
-	if cached.acceptedOwner {
+	if !cached.nonfinalOwner {
 		return
 	}
 	s.deleteLiveBlockLocked(liveKey, cached, liveBlockKind(cached.id))

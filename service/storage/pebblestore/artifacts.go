@@ -457,9 +457,16 @@ func (s *Store) SavePersistentStateFile(file *storage.PersistentStateFile) error
 	if file.Ref.Offset != 0 {
 		return fmt.Errorf("persistent state file offset must be zero")
 	}
-	if err := s.validatePersistentStateArtifactPath(file.Block, file.MasterchainBlock, file.EffectiveShard, file.Ref.Path); err != nil {
+	path, err := s.persistentStateArtifactPath(file.Block, file.MasterchainBlock, file.EffectiveShard)
+	if err != nil {
 		return err
 	}
+	if err = validateArtifactCanonicalPath(s.artifactPath(file.Ref.Path), path); err != nil {
+		return err
+	}
+	// A snapshot download renames its file over the canonical path and may
+	// replace a file this store already serves: drop the old descriptor.
+	s.artifactFiles.invalidate(path)
 
 	previousSize := int64(0)
 	previous, err := s.persistentStateFileRecord(context.Background(), file.Block, file.MasterchainBlock, file.EffectiveShard)
@@ -581,6 +588,7 @@ func (s *Store) unlinkPersistentStateFile(ctx context.Context, block ton.BlockID
 	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 		return persistentStateFileDelete{}, removeErr
 	}
+	s.artifactFiles.invalidate(path)
 	if diskFileExisted {
 		s.observePersistentStateBytes(-removedBytes)
 	}
@@ -1071,14 +1079,6 @@ func (s *Store) persistentStateArtifactPath(block ton.BlockIDExt, master ton.Blo
 
 func (s *Store) validateZeroStateArtifactPath(block ton.BlockIDExt, path string) error {
 	expected, err := s.zeroStateArtifactPath(block)
-	if err != nil {
-		return err
-	}
-	return validateArtifactCanonicalPath(s.artifactPath(path), expected)
-}
-
-func (s *Store) validatePersistentStateArtifactPath(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64, path string) error {
-	expected, err := s.persistentStateArtifactPath(block, master, effectiveShard)
 	if err != nil {
 		return err
 	}

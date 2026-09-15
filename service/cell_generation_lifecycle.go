@@ -279,6 +279,16 @@ func (s *StateLifecycle) StopCellGenerationMigration(ctx context.Context) error 
 	}
 	defer s.finishCellGenerationMigrationStop()
 
+	// Cancellation does not interrupt pebble calls the run already makes on the
+	// pending generation, so its cell DB is detached only after the run returns.
+	if run != nil {
+		select {
+		case <-run.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	pending, err := store.PendingCellGenerationMigration(ctx)
 	if errors.Is(err, storage.ErrNotFound) {
 		if run != nil {

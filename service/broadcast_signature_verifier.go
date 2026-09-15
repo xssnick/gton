@@ -24,6 +24,18 @@ type broadcastValidatorConfig struct {
 	fastSync       fastSyncBlockchainConfig
 }
 
+// broadcastValidatorCacheMaxEntries bounds the validator sets cached for one
+// config root. Only sets whose signatures verified are cached, and legitimate
+// broadcasts name a few per shard epoch, so the map simply starts over on
+// overflow.
+const broadcastValidatorCacheMaxEntries = 256
+
+// broadcastFinalityCacheMaxEntries bounds the verified finality evidence kept
+// to recognize copies of one broadcast arriving through other overlays. Copies
+// land within moments of each other, so starting over on overflow costs at most
+// one more verification of a copy racing the reset.
+const broadcastFinalityCacheMaxEntries = 1024
+
 type broadcastValidatorCacheKey struct {
 	configRootHash   cell.Hash
 	workchain        int32
@@ -32,15 +44,25 @@ type broadcastValidatorCacheKey struct {
 	validatorSetHash uint32
 }
 
+// broadcastFinalityCacheKey covers every input of a finality signature check:
+// the validator set, the block id (root and file hash are part of the content
+// key) and the whole signature set content.
+type broadcastFinalityCacheKey struct {
+	validators broadcastValidatorCacheKey
+	seqno      uint32
+	content    [32]byte
+}
+
 type broadcastValidatorCache struct {
-	mu             sync.Mutex
-	configBlockSeq uint32
-	config         broadcastValidatorConfig
-	configLoaded   bool
-	configRootHash cell.Hash
-	initialized    bool
-	entries        map[broadcastValidatorCacheKey]*blockproof.PreparedValidatorSet
-	shardTopView   *shardTopValidationView
+	mu               sync.Mutex
+	configBlockSeq   uint32
+	config           broadcastValidatorConfig
+	configLoaded     bool
+	configRootHash   cell.Hash
+	initialized      bool
+	entries          map[broadcastValidatorCacheKey]*blockproof.PreparedValidatorSet
+	verifiedFinality map[broadcastFinalityCacheKey]struct{}
+	shardTopView     *shardTopValidationView
 }
 
 func (c *broadcastValidatorCache) getConfig() (broadcastValidatorConfig, error) {
@@ -64,12 +86,25 @@ func (c *broadcastValidatorCache) putConfig(block ton.BlockIDExt, config broadca
 	c.configBlockSeq = block.SeqNo
 	c.config = config
 	c.configLoaded = true
-	if !c.initialized || c.configRootHash != config.rootHash {
-		c.configRootHash = config.rootHash
+	c.cachesConfigRootLocked(config.rootHash)
+	return c.config
+}
+
+// cachesConfigRootLocked reports whether entries computed under configRootHash
+// may be cached, starting the caches over when that root replaces the cached
+// one. A root other than the loaded config's belongs to a config this node
+// already replaced.
+func (c *broadcastValidatorCache) cachesConfigRootLocked(configRootHash cell.Hash) bool {
+	if c.configLoaded && c.config.rootHash != configRootHash {
+		return false
+	}
+	if !c.initialized || c.configRootHash != configRootHash {
+		c.configRootHash = configRootHash
 		c.initialized = true
 		c.entries = make(map[broadcastValidatorCacheKey]*blockproof.PreparedValidatorSet)
+		c.verifiedFinality = make(map[broadcastFinalityCacheKey]struct{})
 	}
-	return c.config
+	return true
 }
 
 func (s *SyncCoordinator) publishBroadcastValidatorConfig(
@@ -95,23 +130,44 @@ func (c *broadcastValidatorCache) get(key broadcastValidatorCacheKey) (*blockpro
 	return set, nil
 }
 
-func (c *broadcastValidatorCache) put(key broadcastValidatorCacheKey, set *blockproof.PreparedValidatorSet) *blockproof.PreparedValidatorSet {
+// put caches a validator set only after signatures made with it verified: the
+// key comes from an untrusted broadcast, and the set hash is computable offline
+// from the public config for any shard and catchain seqno.
+func (c *broadcastValidatorCache) put(key broadcastValidatorCacheKey, set *blockproof.PreparedValidatorSet) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.configLoaded && c.config.rootHash != key.configRootHash {
-		return set
+	if !c.cachesConfigRootLocked(key.configRootHash) {
+		return
 	}
-	if !c.initialized || c.configRootHash != key.configRootHash {
-		c.configRootHash = key.configRootHash
-		c.initialized = true
+	if _, ok := c.entries[key]; ok {
+		return
+	}
+	if len(c.entries) >= broadcastValidatorCacheMaxEntries {
 		c.entries = make(map[broadcastValidatorCacheKey]*blockproof.PreparedValidatorSet)
 	}
-	if cached, ok := c.entries[key]; ok {
-		return cached
-	}
 	c.entries[key] = set
-	return set
+}
+
+func (c *broadcastValidatorCache) finalityVerified(key broadcastFinalityCacheKey) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	_, ok := c.verifiedFinality[key]
+	return ok
+}
+
+func (c *broadcastValidatorCache) putVerifiedFinality(key broadcastFinalityCacheKey) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.cachesConfigRootLocked(key.validators.configRootHash) {
+		return
+	}
+	if len(c.verifiedFinality) >= broadcastFinalityCacheMaxEntries {
+		c.verifiedFinality = make(map[broadcastFinalityCacheKey]struct{})
+	}
+	c.verifiedFinality[key] = struct{}{}
 }
 
 func (s *SyncCoordinator) CheckBlockBroadcastSignatures(ctx context.Context, req p2p.BlockBroadcastSignatureCheck) error {
@@ -127,7 +183,7 @@ func (s *SyncCoordinator) CheckBlockBroadcastSignatures(ctx context.Context, req
 		return err
 	}
 
-	validators, err := s.broadcastValidatorSetForSignatures(
+	key, validators, err := s.broadcastValidatorSetForSignatures(
 		ctx,
 		req.Block,
 		signatures.CatchainSeqno(),
@@ -136,7 +192,12 @@ func (s *SyncCoordinator) CheckBlockBroadcastSignatures(ctx context.Context, req
 	if err != nil {
 		return err
 	}
-	return blockproof.CheckPreparedSignatures(req.Block, signatures, validators)
+	if err = blockproof.CheckPreparedSignatures(req.Block, signatures, validators); err != nil {
+		return err
+	}
+
+	s.broadcastValidatorCache.put(key, validators)
+	return nil
 }
 
 // CheckBlockFinalitySignatures authenticates a Simplex finality broadcast
@@ -150,6 +211,11 @@ func (s *SyncCoordinator) CheckBlockBroadcastSignatures(ctx context.Context, req
 // Here the certificate came from a peer and no engine of ours ever saw it, so
 // blockproof.CheckPreparedSignatures — never CheckPreparedSignatureWeight — is
 // what stands between a forged quorum and the block store.
+//
+// The one thing it does not verify twice is a copy of evidence it already
+// verified in full — the same broadcast arriving through another overlay. The
+// copy is recognized by broadcastFinalityCacheKey, which covers every input of
+// the check, so any difference in the evidence is verified again.
 func (s *SyncCoordinator) CheckBlockFinalitySignatures(ctx context.Context, req p2p.BlockFinalitySignatureCheck) (*p2p.BlockFinalitySignatureCheckResult, error) {
 	if !req.Signatures.IsSimplex() {
 		return nil, fmt.Errorf("block finality broadcast %s has non-simplex validator signatures", storage.FormatBlockRef(req.Block))
@@ -158,7 +224,7 @@ func (s *SyncCoordinator) CheckBlockFinalitySignatures(ctx context.Context, req 
 		return nil, fmt.Errorf("masterchain block %s has non-final validator signatures", storage.FormatBlockRef(req.Block))
 	}
 
-	validators, err := s.broadcastValidatorSetForSignatures(
+	key, validators, err := s.broadcastValidatorSetForSignatures(
 		ctx,
 		req.Block,
 		req.Signatures.CatchainSeqno(),
@@ -167,12 +233,23 @@ func (s *SyncCoordinator) CheckBlockFinalitySignatures(ctx context.Context, req 
 	if err != nil {
 		return nil, err
 	}
-	if err = blockproof.CheckPreparedSignatures(req.Block, req.Signatures, validators); err != nil {
-		return nil, err
+
+	verifiedKey := req.Signatures.ContentKey(req.Block)
+	finalityKey := broadcastFinalityCacheKey{
+		validators: key,
+		seqno:      req.Block.SeqNo,
+		content:    [32]byte(verifiedKey),
+	}
+	if !s.broadcastValidatorCache.finalityVerified(finalityKey) {
+		if err = blockproof.CheckPreparedSignatures(req.Block, req.Signatures, validators); err != nil {
+			return nil, err
+		}
+
+		s.broadcastValidatorCache.put(key, validators)
+		s.broadcastValidatorCache.putVerifiedFinality(finalityKey)
 	}
 
 	var signaturesCell *cell.Cell
-	verifiedKey := req.Signatures.ContentKey(req.Block)
 	if req.Block.Workchain == -1 {
 		signaturesCell, err = req.Signatures.FinalitySignaturesCell(validators)
 		if err != nil {
@@ -236,15 +313,18 @@ func (s *SyncCoordinator) validateShardDescriptionAgainstView(
 	return nil
 }
 
+// broadcastValidatorSetForSignatures returns the validator set named by a
+// broadcast together with its cache key. It does not cache a computed set:
+// the caller puts it once signatures made with it verified.
 func (s *SyncCoordinator) broadcastValidatorSetForSignatures(
 	ctx context.Context,
 	block ton.BlockIDExt,
 	catchainSeqno uint32,
 	validatorSetHash uint32,
-) (*blockproof.PreparedValidatorSet, error) {
+) (broadcastValidatorCacheKey, *blockproof.PreparedValidatorSet, error) {
 	config, err := s.currentBroadcastValidatorConfig(ctx)
 	if err != nil {
-		return nil, err
+		return broadcastValidatorCacheKey{}, nil, err
 	}
 
 	return s.broadcastValidatorSetForConfig(config, block, catchainSeqno, validatorSetHash)
@@ -255,21 +335,21 @@ func (s *SyncCoordinator) broadcastValidatorSetForConfig(
 	block ton.BlockIDExt,
 	catchainSeqno uint32,
 	validatorSetHash uint32,
-) (*blockproof.PreparedValidatorSet, error) {
+) (broadcastValidatorCacheKey, *blockproof.PreparedValidatorSet, error) {
 	key := broadcastValidatorCacheKeyFromBlock(config.rootHash, block, catchainSeqno, validatorSetHash)
 	set, err := s.broadcastValidatorCache.get(key)
 	if err == nil {
-		return set, nil
+		return key, set, nil
 	}
 	if !errors.Is(err, storage.ErrNotFound) {
-		return nil, err
+		return broadcastValidatorCacheKey{}, nil, err
 	}
 
 	set, err = broadcastValidatorSetFromConfig(config.cfg, block, catchainSeqno, validatorSetHash)
 	if err != nil {
-		return nil, err
+		return broadcastValidatorCacheKey{}, nil, err
 	}
-	return s.broadcastValidatorCache.put(key, set), nil
+	return key, set, nil
 }
 
 func broadcastValidatorCacheKeyFromBlock(

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/xssnick/gton/service/p2p/internal/fastsync"
@@ -51,19 +52,24 @@ type authenticatedQUICPeer struct {
 	// registeredAt bounds the idle age of a path that has not carried anything
 	// yet, so a freshly dialed peer is not swept before it is used.
 	registeredAt time.Time
+	// lastInbound is when the remote last delivered a query or message on this
+	// path, in unix nanoseconds. Both directions share the managed peer, so a
+	// dialed path the remote keeps feeding us over is not idle; any arrival
+	// counts, as an inbound packet does for the pooled ADNL transport.
+	lastInbound atomic.Int64
 }
 
-// lastActive reports when this path last carried an outbound payload. The stamp
-// lives on the transport itself (adnlquic.Peer.LastOutbound), so every send and
-// query updates it and no call site can be forgotten. QUIC keep-alive (5s) is
-// shorter than the idle timeout (15s), so without this a path never expires.
+// lastActive reports when this path last carried a payload in either direction.
+// The outbound stamp lives on the transport itself (adnlquic.Peer.LastOutbound),
+// so every send and query updates it and no call site can be forgotten; the
+// inbound one is taken by the query and message handlers. QUIC keep-alive (5s)
+// is shorter than the idle timeout (15s), so without this a path never expires.
 func (p *authenticatedQUICPeer) lastActive() time.Time {
+	lastActive := latestTime(p.registeredAt, time.Unix(0, p.lastInbound.Load()))
 	if p.peer != nil {
-		if at := p.peer.LastOutbound(); !at.IsZero() {
-			return at
-		}
+		lastActive = latestTime(lastActive, p.peer.LastOutbound())
 	}
-	return p.registeredAt
+	return lastActive
 }
 
 type quicMembershipCertificateKind uint8
@@ -289,11 +295,13 @@ func (n *Node) handleQUICQuery(
 	}
 	defer n.finishInbound()
 
+	now := time.Now()
+	peer.lastInbound.Store(now.UnixNano())
+
 	header, body, err := parseQUICQueryEnvelope(payload)
 	if err != nil {
 		return nil, fmt.Errorf("parse QUIC overlay query: %w", err)
 	}
-	now := time.Now()
 	sub, err := n.quicSubscription(header, peer.id, now)
 	if err != nil {
 		return nil, err
@@ -350,11 +358,14 @@ func (n *Node) handleQUICMessage(
 	}
 	defer n.finishInbound()
 
+	now := time.Now()
+	peer.lastInbound.Store(now.UnixNano())
+
 	header, body, err := parseQUICMessageEnvelope(payload)
 	if err != nil {
 		return fmt.Errorf("parse QUIC overlay message: %w", err)
 	}
-	sub, err := n.quicSubscription(header, peer.id, time.Now())
+	sub, err := n.quicSubscription(header, peer.id, now)
 	if err != nil {
 		return err
 	}

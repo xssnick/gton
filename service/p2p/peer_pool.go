@@ -53,6 +53,10 @@ type pooledPeer struct {
 	adnlOverlayRefs map[*overlay.ADNLOverlayWrapper]int
 	rldpOverlayRefs map[*overlay.RLDPOverlayWrapper]int
 	lastUsedAt      atomic.Int64
+
+	// prioritySend is the candidate latch of the node's one QUIC connection to
+	// this peer, shared by the peer's attachments to every overlay.
+	prioritySend quicPrioritySendLatch
 }
 
 type idlePooledPeer struct {

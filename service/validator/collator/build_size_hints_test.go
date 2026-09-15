@@ -10,9 +10,9 @@ func TestUpdateMemoHintIsCapped(t *testing.T) {
 	b := testBuilder()
 
 	for _, observed := range []int{0, 1, 4686, updateMemoMaxPresizedCells, 64 * updateMemoMaxPresizedCells} {
-		b.observeBuildSizes(0, 0, 0, observed)
+		b.observeBuildSizes(MetricChainShardchain, 0, 0, 0, observed)
 
-		hint := b.updateMemoHint()
+		hint := b.updateMemoHint(MetricChainShardchain)
 		if hint > updateMemoMaxPresizedCells {
 			t.Fatalf("a memo of %d cells hinted %d, above the %d ceiling",
 				observed, hint, updateMemoMaxPresizedCells)
@@ -32,26 +32,26 @@ func TestUpdateMemoHintIsCapped(t *testing.T) {
 func TestObserveBuildSizesTracksEveryFieldOfTheLastBuild(t *testing.T) {
 	b := testBuilder()
 
-	b.observeBuildSizes(9367, 5297, 3222, 4686)
-	if got := b.readSetHint(); got != 9367 {
+	b.observeBuildSizes(MetricChainShardchain, 9367, 5297, 3222, 4686)
+	if got := b.readSetHint(MetricChainShardchain); got != 9367 {
 		t.Fatalf("read set hint %d, want 9367", got)
 	}
-	cells, proofCells := b.storageHints()
+	cells, proofCells := b.storageHints(MetricChainShardchain)
 	if cells != 5297 || proofCells != 3222 {
 		t.Fatalf("storage hints %d/%d, want 5297/3222", cells, proofCells)
 	}
-	if got := b.updateMemoHint(); got != 4686+4686/8 {
+	if got := b.updateMemoHint(MetricChainShardchain); got != 4686+4686/8 {
 		t.Fatalf("memo hint %d, want %d", got, 4686+4686/8)
 	}
 
-	b.observeBuildSizes(0, 0, 0, 0)
-	if got := b.readSetHint(); got != 0 {
+	b.observeBuildSizes(MetricChainShardchain, 0, 0, 0, 0)
+	if got := b.readSetHint(MetricChainShardchain); got != 0 {
 		t.Fatalf("read set hint %d after a build that read nothing, want 0", got)
 	}
-	if cells, proofCells = b.storageHints(); cells != 0 || proofCells != 0 {
+	if cells, proofCells = b.storageHints(MetricChainShardchain); cells != 0 || proofCells != 0 {
 		t.Fatalf("storage hints %d/%d after a build that walked nothing, want 0/0", cells, proofCells)
 	}
-	if got := b.updateMemoHint(); got != 0 {
+	if got := b.updateMemoHint(MetricChainShardchain); got != 0 {
 		t.Fatalf("memo hint %d after a build that memoised nothing, want 0 — "+
 			"the field kept a stale hint while the other three were reset", got)
 	}

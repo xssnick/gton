@@ -11,30 +11,44 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-const DefaultLiveBlockCacheMaxBlocks = 8192
+const (
+	DefaultLiveBlockCacheMaxBlocks = 8192
+	DefaultLiveBlockCacheMaxBytes  = 512 << 20
+)
 
 // LiveBlockCache keeps recently published block artifacts in memory. Reads are
 // lock-free: entries are immutable once stored, publishers replace them
 // wholesale under publishMu, and eviction runs in publish order (blocks age out
 // naturally, so FIFO matches the access pattern without touching on reads).
-// The eviction heap contains only removable entries: pinned checkpoint blocks
+// The eviction heaps contain only removable entries: pinned checkpoint blocks
 // never get scanned when the cache temporarily grows beyond its soft limit.
+// All removable entries are bounded by count. Flushed entries are also bounded
+// by the bytes of their block data and proofs: blocks re-read from packages
+// stay cached until pushed out, and a count bound alone lets large blocks hold
+// gigabytes. Transient entries are not byte bounded: their proofs are not
+// stored until registration, so byte pressure from history reads must not push
+// them out. Pinned bytes are not counted, a checkpoint flush releases them.
 type LiveBlockCache struct {
-	max int
+	max      int
+	maxBytes int64
 
 	blocks     sync.Map // BlockRootHash -> *LiveBlockCacheBlock
 	nextBlocks sync.Map // BlockRootHash of prev -> liveBlockCacheNext
 
-	publishMu sync.Mutex
-	nextOrder uint64
-	entries   map[BlockRootHash]*liveBlockCacheEvictionEntry
-	evictable liveBlockCacheEvictionHeap
-	prevKeys  map[BlockRootHash][]BlockRootHash // BlockRootHash of next -> prev keys pointing at it
+	publishMu    sync.Mutex
+	nextOrder    uint64
+	entries      map[BlockRootHash]*liveBlockCacheEvictionEntry
+	evictable    liveBlockCacheEvictionHeap // transient and empty entries
+	flushed      liveBlockCacheEvictionHeap // entries whose artifacts are stored
+	flushedBytes int64
+	prevKeys     map[BlockRootHash][]BlockRootHash // BlockRootHash of next -> prev keys pointing at it
 }
 
 type liveBlockCacheEvictionEntry struct {
 	key       BlockRootHash
 	order     uint64
+	bytes     int64                       // block data and proof bytes of the stored block
+	heap      *liveBlockCacheEvictionHeap // nil while the block is pinned
 	heapIndex int
 }
 
@@ -100,12 +114,10 @@ type CachedBlockData struct {
 	ArtifactFlushed bool
 }
 
-func NewLiveBlockCache(max int) *LiveBlockCache {
-	if max <= 0 {
-		max = DefaultLiveBlockCacheMaxBlocks
-	}
+func NewLiveBlockCache(max int, maxBytes int64) *LiveBlockCache {
 	return &LiveBlockCache{
 		max:      max,
+		maxBytes: maxBytes,
 		entries:  map[BlockRootHash]*liveBlockCacheEvictionEntry{},
 		prevKeys: map[BlockRootHash][]BlockRootHash{},
 	}
@@ -162,10 +174,22 @@ func (c *LiveBlockCache) PublishLiveBlockArtifacts(artifacts LiveBlockCacheArtif
 		c.nextOrder++
 		c.entries[key] = entry
 	}
-	if evictable := liveBlockCacheBlockEvictable(block); evictable && entry.heapIndex < 0 {
-		heap.Push(&c.evictable, entry)
-	} else if !evictable && entry.heapIndex >= 0 {
-		heap.Remove(&c.evictable, entry.heapIndex)
+	target := c.evictionHeap(block)
+	if entry.heap == &c.flushed {
+		c.flushedBytes -= entry.bytes
+	}
+	if entry.heap != target {
+		if entry.heap != nil {
+			heap.Remove(entry.heap, entry.heapIndex)
+		}
+		entry.heap = target
+		if target != nil {
+			heap.Push(target, entry)
+		}
+	}
+	entry.bytes = liveBlockCacheBlockBytes(block)
+	if target == &c.flushed {
+		c.flushedBytes += entry.bytes
 	}
 	if block.meta != nil {
 		for _, prev := range block.meta.PrevRefs {
@@ -416,23 +440,46 @@ func selectLiveBlockCacheSplitNext(prev ton.BlockIDExt, current ton.BlockIDExt, 
 }
 
 func (c *LiveBlockCache) evictLocked() {
-	for len(c.entries) > c.max && len(c.evictable) > 0 {
-		entry := heap.Pop(&c.evictable).(*liveBlockCacheEvictionEntry)
-		c.deleteBlockLocked(entry.key)
+	for c.flushedBytes > c.maxBytes {
+		c.deleteBlockLocked(c.flushed[0].key)
+	}
+
+	for len(c.entries) > c.max && len(c.evictable)+len(c.flushed) > 0 {
+		oldest := c.evictable
+		if len(oldest) == 0 || len(c.flushed) > 0 && c.flushed[0].order < oldest[0].order {
+			oldest = c.flushed
+		}
+		c.deleteBlockLocked(oldest[0].key)
 	}
 }
 
-func liveBlockCacheBlockEvictable(block *LiveBlockCacheBlock) bool {
-	if block == nil || block.artifactFlushed || block.transient {
-		return true
+// evictionHeap returns the heap block may be evicted from, nil while it is
+// pinned until a checkpoint flush.
+func (c *LiveBlockCache) evictionHeap(block *LiveBlockCacheBlock) *liveBlockCacheEvictionHeap {
+	if block.artifactFlushed {
+		return &c.flushed
 	}
-	return len(block.data) == 0 && len(block.proofs) == 0
+	if block.transient || len(block.data) == 0 && len(block.proofs) == 0 {
+		return &c.evictable
+	}
+	return nil
+}
+
+func liveBlockCacheBlockBytes(block *LiveBlockCacheBlock) int64 {
+	size := int64(len(block.data))
+	for _, proof := range block.proofs {
+		size += int64(len(proof))
+	}
+	return size
 }
 
 func (c *LiveBlockCache) deleteBlockLocked(key BlockRootHash) {
 	if entry := c.entries[key]; entry != nil {
-		if entry.heapIndex >= 0 {
-			heap.Remove(&c.evictable, entry.heapIndex)
+		if entry.heap == &c.flushed {
+			c.flushedBytes -= entry.bytes
+		}
+		if entry.heap != nil {
+			heap.Remove(entry.heap, entry.heapIndex)
 		}
 		delete(c.entries, key)
 	}

@@ -635,8 +635,11 @@ type broadcastTargetsSnapshot struct {
 	// roster size: the relay fires per received FEC part, so a roster-sized
 	// set multiplies egress by the roster (C++ forwards each part to
 	// propagate_broadcast_to=5 of its neighbours regardless of peer count).
-	relay    []overlay.BroadcastPeer
-	plumtree []PeerID
+	relay []overlay.BroadcastPeer
+	// simpleRelay is the same sample as relay without the relay budget, used
+	// to forward accepted simple broadcasts.
+	simpleRelay []overlay.BroadcastPeer
+	plumtree    []PeerID
 }
 
 // broadcastTargetsSnapshot returns the deduplicated union of neighbour and
@@ -721,12 +724,14 @@ func (s *overlaySubscription) buildBroadcastTargetsSnapshot() *broadcastTargetsS
 			plumtree = append(plumtree, peer.id)
 		}
 	}
+	relay := sampleBroadcastRelayTargets(broadcast, neighbourTargets)
 	return &broadcastTargetsSnapshot{
-		builtAt:   now,
-		peers:     receivers,
-		broadcast: broadcast,
-		relay:     s.budgetRelayPeers(sampleBroadcastRelayTargets(broadcast, neighbourTargets)),
-		plumtree:  plumtree,
+		builtAt:     now,
+		peers:       receivers,
+		broadcast:   broadcast,
+		relay:       s.budgetRelayPeers(relay),
+		simpleRelay: relay,
+		plumtree:    plumtree,
 	}
 }
 

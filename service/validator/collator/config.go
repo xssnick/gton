@@ -125,6 +125,48 @@ type chainConfig struct {
 	fwdPrices tlb.ConfigMsgForwardPrices
 }
 
+// loadBlockCreateFees refuses a non-minimal fee the way fetch_config_params
+// does: both fees go through block::tlb::t_Grams.as_integer_to
+// (transaction.cpp:4363-4367), whose VarUInteger 16 refuses a nonzero length
+// with a zero leading byte (block-parse.cpp:320-323). The generated ConfigParam
+// 14 in valid_config_data accepts that encoding, so a valid configuration can
+// still be refused here. Trailing data after the fees is not checked here; on
+// a configuration transition validateMasterConfigData has already refused it.
+func loadBlockCreateFees(raw tlb.BlockchainConfig) (tlb.BlockCreateFees, error) {
+	parameter, err := raw.GetParam(tlb.ConfigParamBlockCreateFees)
+	if err != nil {
+		return tlb.BlockCreateFees{}, err
+	}
+	s, err := parameter.BeginParse()
+	if err != nil {
+		return tlb.BlockCreateFees{}, err
+	}
+	if err = configTag(s, 0x6b, 8); err != nil {
+		return tlb.BlockCreateFees{}, err
+	}
+
+	var fees tlb.BlockCreateFees
+	for _, fee := range []*tlb.Coins{&fees.MasterchainBlockFee, &fees.BasechainBlockFee} {
+		length, err := s.PreloadUInt(4)
+		if err != nil {
+			return tlb.BlockCreateFees{}, err
+		}
+		if length != 0 {
+			head, err := s.PreloadUInt(12)
+			if err != nil {
+				return tlb.BlockCreateFees{}, err
+			}
+			if head&0xff == 0 {
+				return tlb.BlockCreateFees{}, fmt.Errorf("nonminimal Grams encoding")
+			}
+		}
+		if err = fee.LoadFromCell(s); err != nil {
+			return tlb.BlockCreateFees{}, err
+		}
+	}
+	return fees, nil
+}
+
 // PrepareConfig derives immutable collation data for one config epoch.
 // configAddress is the actual contract from McStateExtra.ConfigParams, which
 // may differ from the optional relocation request in parameter 0.
@@ -142,7 +184,7 @@ func PrepareConfig(execution *tvm.PreparedBlockchainConfig, configAddress [32]by
 	if err != nil {
 		return nil, err
 	}
-	createFees, err := raw.GetBlockCreateFees()
+	createFees, err := loadBlockCreateFees(raw)
 	if err != nil {
 		return nil, fmt.Errorf("%w: load block creation fees: %v", ErrInvalidInput, err)
 	}

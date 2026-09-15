@@ -313,13 +313,14 @@ func (c *consensusCollector) Collect(ch chan<- prometheus.Metric) {
 
 	c.mu.Lock()
 	for key, stats := range readings {
-		c.accumulateLocked(key, stats)
-	}
-	for key := range c.last {
-		if _, live := sessions[key]; !live {
-			// Its contribution is already in the totals.
-			delete(c.last, key)
+		if c.sessions[key] != sessions[key] {
+			// Unregistered while it was being read: unregister has already added
+			// its final reading and dropped its baseline, and the key may belong
+			// to a newer source by now.
+			delete(readings, key)
+			continue
 		}
+		c.accumulateLocked(key, stats)
 	}
 	totals := c.totals
 	c.mu.Unlock()

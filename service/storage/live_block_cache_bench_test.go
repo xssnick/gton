@@ -27,7 +27,7 @@ func benchLiveBlockCacheBlock(i int) ton.BlockIDExt {
 func benchFilledLiveBlockCache(b *testing.B, blocks int) (*LiveBlockCache, []ton.BlockIDExt) {
 	b.Helper()
 
-	cache := NewLiveBlockCache(blocks)
+	cache := NewLiveBlockCache(blocks, DefaultLiveBlockCacheMaxBytes)
 	ids := make([]ton.BlockIDExt, 0, blocks)
 	data := bytes.Repeat([]byte{0x01}, 1024)
 	for i := 0; i < blocks; i++ {

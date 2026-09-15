@@ -440,7 +440,9 @@ func (c *collation) speculateGenerated(plan *generatedPlan) {
 		plan.lane = lane
 		plan.fresh = true
 	}
-	plan.result, plan.execErr = c.emulate(lane, plan.prepared, plan.item.lt)
+	// The same floor executePrepared applies on the sequential path; it is read
+	// here, by key, from a map nothing writes during the phase.
+	plan.result, plan.execErr = c.emulate(lane, plan.prepared, max(plan.item.lt, c.importAfterLT(lane)))
 }
 
 func (c *collation) commitGeneratedPlan(plan *generatedPlan) (*tvm.TransactionExecutionResult, *accountLane, error) {

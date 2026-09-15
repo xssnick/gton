@@ -406,8 +406,8 @@ func (n *destinationState) applyDeltaLocked(run *sourceRun, source ShardIdent, r
 }
 
 // addValidatedToRun rejects duplicates against the whole run before inserting
-// any of them, then appends when the batch is strictly newer than everything
-// live and merges otherwise. The name carries the precondition: the batch must
+// any of them, then appends when the batch is strictly newer than every entry
+// and merges otherwise. The name carries the precondition: the batch must
 // already have passed validateSorted, which is the single owner of in-batch
 // uniqueness — every path in here (applyDeltaLocked, addCandidate) runs it
 // first, so a second in-batch detector here would be dead weight.
@@ -421,8 +421,10 @@ func addValidatedToRun(run *sourceRun, added []*InternalMessage) error {
 		}
 	}
 
-	last := lastLive(run.entries)
-	if last != nil && CompareLtHash(last, added[0]) >= 0 {
+	// The tail is compared with tombstones included: a transit addition may
+	// order below already dequeued entries, and appending it behind them
+	// would break the sorted slice mergeRunAdditions and cuts rely on.
+	if tail := len(run.entries); tail > 0 && CompareLtHash(run.entries[tail-1].msg, added[0]) >= 0 {
 		return mergeRunAdditions(run, added)
 	}
 	for _, message := range added {
@@ -1354,16 +1356,6 @@ const (
 	maxTrackedCandidates = 64
 	maxSourceRefHistory  = 256
 )
-
-// lastLive returns the last non-removed message of a run, or nil.
-func lastLive(entries []runEntry) *InternalMessage {
-	for i := len(entries) - 1; i >= 0; i-- {
-		if entries[i].removedAt == 0 {
-			return entries[i].msg
-		}
-	}
-	return nil
-}
 
 func (e *runEntry) visibleAt(seqno uint32) bool {
 	return e.msg.SourceSeqno <= seqno && (e.removedAt == 0 || e.removedAt > seqno)

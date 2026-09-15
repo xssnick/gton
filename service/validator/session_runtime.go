@@ -870,23 +870,30 @@ func (r *sessionRuntime) Update(ctx context.Context, state SessionState) error {
 		return fmt.Errorf("validator runtime: update session backend: %w", err)
 	}
 
-	var paramsErr error
-	if !r.runnerLaunched {
-		// Nothing serves the runner queue yet, so the engine is still exclusively
-		// ours to touch directly under lifecycleMu.
-		paramsErr = r.engine.UpdateParams(state.Params)
-	} else {
-		paramsErr = r.runner.UpdateParams(state.Params)
-	}
-	if paramsErr != nil {
-		terminalErr := fmt.Errorf("validator runtime: update simplex params after backend commit: %w", paramsErr)
-		r.fail(terminalErr)
+	// The supervisor updates every session on every masterchain block, while the
+	// simplex parameters almost never change. The engine and both resolvers were
+	// last given r.state.Params (written only here, under lifecycleMu), so an
+	// unchanged set has nothing to install, and its round trip through the runner
+	// would wait behind queued votes with lifecycleMu held.
+	if state.Params != r.state.Params {
+		var paramsErr error
+		if !r.runnerLaunched {
+			// Nothing serves the runner queue yet, so the engine is still exclusively
+			// ours to touch directly under lifecycleMu.
+			paramsErr = r.engine.UpdateParams(state.Params)
+		} else {
+			paramsErr = r.runner.UpdateParams(state.Params)
+		}
+		if paramsErr != nil {
+			terminalErr := fmt.Errorf("validator runtime: update simplex params after backend commit: %w", paramsErr)
+			r.fail(terminalErr)
 
-		return terminalErr
-	}
+			return terminalErr
+		}
 
-	r.candidates.updateParams(state.Params)
-	r.states.updateParams(state.Params)
+		r.candidates.updateParams(state.Params)
+		r.states.updateParams(state.Params)
+	}
 
 	r.stateMu.Lock()
 	r.state = state

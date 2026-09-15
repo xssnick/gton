@@ -374,7 +374,12 @@ func (e *Engine) Start() error {
 
 	// Re-sign and re-apply our own votes in the original order; they are
 	// already durable and were possibly already delivered, so no broadcast.
+	// Votes of slots already finalized are skipped before signing, as the
+	// reference does when slot_at has no slot for them.
 	for _, v := range bs.OurVotes {
+		if v.Slot() < e.slots.firstNonFinalized {
+			continue
+		}
 		e.castVote(v, true)
 	}
 
@@ -704,8 +709,18 @@ func (e *Engine) handleMessage(src PeerID, srcValidator int, data []byte) {
 			return
 		}
 		tooNew := cert.Vote.Slot() >= firstTooNewSlot
-		if !tooNew {
-			// Cheap dedup before the expensive signature checks.
+		// Cheap dedup before the expensive signature checks. A slot from far
+		// ahead is only peeked, so nothing is allocated for it before the
+		// certificate checks out; but a copy of a certificate it already holds
+		// or is saving is dropped here, as the needs check after verification
+		// would drop it anyway. During catch-up every node that stored the
+		// certificate gossips it on, and each copy would otherwise pay the
+		// whole quorum of ed25519 checks.
+		if tooNew {
+			if slot := e.slots.peek(cert.Vote.Slot()); slot != nil && !slot.needs(cert.Vote) {
+				return
+			}
+		} else {
 			slot := e.slots.at(cert.Vote.Slot())
 			if slot == nil || !slot.needs(cert.Vote) {
 				return

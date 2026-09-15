@@ -94,7 +94,10 @@ func newPlumtreeRuntime(sub *overlaySubscription) (*plumtreeRuntime, error) {
 		origin:       origin,
 		stats:        stats,
 		wake:         make(chan struct{}, 1),
-		outbound:     make(chan plumtreeWireBatch, plumtreeOutboundBatchLimit),
+		// A batch holds at least one send, so any burst the outbound queue can
+		// admit fits here. The engine has already recorded these sends, and a
+		// dropped batch is never retried.
+		outbound: make(chan plumtreeWireBatch, plumtreeOutboundQueueLimit),
 	}, nil
 }
 

@@ -17,6 +17,12 @@ import (
 
 var errFinalizedLineageAhead = errors.New("validator runtime: finalized lineage anchor is not an ancestor")
 
+// errStateBelowFinalization ends an uncertified observer flight finalization
+// has left behind. It is a not-ready error on purpose: a window base joined to
+// that flight retries, and the retry resolves the candidate again from what the
+// finalization walk has established by then instead of failing the session.
+var errStateBelowFinalization = fmt.Errorf("%w: uncertified candidate is below finalization", ErrBlockNotReady)
+
 const consensusExtraDataTag = uint64(0x638eb292)
 
 // ResolvedState is one cached candidate-parent state. GenUtime is zero for
@@ -93,6 +99,9 @@ type stateFlight struct {
 	// Ordinary readers wait on done, which remains gated by notarization.
 	prepared       chan struct{}
 	preparedResult ResolvedState
+	// awaitingNotarization marks an observer flight whose successor is already
+	// computed and which now waits only for its candidate's certificate.
+	awaitingNotarization bool
 }
 
 type finalizedState struct {
@@ -604,6 +613,21 @@ func (r *stateResolver) notifyFinalized(slot uint32, budgetFloor uint32) retenti
 			case <-flight.done:
 				delete(r.states, id)
 			default:
+				// An observer flight still waiting for a certificate this far below
+				// the finalized slot waits for a candidate the committee left behind,
+				// and until the TTL it pinned the successor state it prepared. It is
+				// cancelled rather than removed, so the loop still owns the cleanup.
+				// A candidate the finalization walk has reached is kept: that walk
+				// fetches the certificate which completes this flight.
+				if !flight.awaitingNotarization || flight.cancelErr != nil || r.finalized[id.ID] != nil {
+					continue
+				}
+				if flight.timer != nil {
+					flight.timer.Stop()
+					flight.timer = nil
+				}
+				flight.cancelErr = errStateBelowFinalization
+				flight.cancel()
 			}
 		}
 	}
@@ -860,6 +884,7 @@ func (r *stateResolver) resolveInner(
 			close(flight.prepared)
 		}
 	}
+	flight.awaitingNotarization = true
 	r.mu.Unlock()
 
 	// The shared flight's ordinary lifetime bounds both computation and this
@@ -1363,6 +1388,42 @@ func (r *stateResolver) finalizeInner(
 			return errors.New("validator runtime: finalization vote mismatch")
 		}
 		certifiedCandidate = artifact
+	}
+	// A persisted shard marker is written once its acceptance has been queued,
+	// so it is replayed only if the node never applied the block. A block the
+	// node can read proves every finalized block at or below its slot applied
+	// too, which keeps a restart to the crash gap instead of walking the session
+	// back to its genesis; the reference loads its markers as done and stops.
+	// The state read here is kept for the acceptance of the child that asked.
+	if replay && !r.shard.IsMasterchain() {
+		request := ChainStateRequest{
+			Shard:          r.shard,
+			Blocks:         []ton.BlockIDExt{artifact.Candidate.Block},
+			MinMasterchain: r.genesis.minMasterchain,
+		}
+		data, loadErr := r.backend.LoadChainState(r.ctx, request)
+		if loadErr == nil {
+			loaded, stateErr := newChainState(request, data)
+			if stateErr != nil {
+				return stateErr
+			}
+
+			r.mu.Lock()
+			for persisted := range r.persisted {
+				if state := r.finalized[persisted]; persisted.Slot <= id.Slot && state.inFlight == nil {
+					state.reconciled = true
+				}
+			}
+			if !artifact.Candidate.Empty {
+				r.rememberAppliedStateLocked(id, r.finalized[id], loaded)
+			}
+			r.mu.Unlock()
+
+			return nil
+		}
+		if !errors.Is(loadErr, ErrBlockNotReady) && !errors.Is(loadErr, context.DeadlineExceeded) {
+			return loadErr
+		}
 	}
 	if err = r.candidates.store(r.ctx, id); err != nil {
 		return fmt.Errorf("validator runtime: store finalized candidate: %w", err)

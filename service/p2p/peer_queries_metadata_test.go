@@ -317,7 +317,7 @@ func metadataQueryErrorTestSubscription(
 	return testOverlaySubscription(&overlaySubscription{
 		node: &Node{
 			peerStorage:    store,
-			liveBlockCache: tnstore.NewLiveBlockCache(1),
+			liveBlockCache: tnstore.NewLiveBlockCache(1, tnstore.DefaultLiveBlockCacheMaxBytes),
 		},
 		spec: overlaySpec{Name: "masterchain"},
 		log:  discardLogger(),

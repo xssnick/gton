@@ -351,6 +351,20 @@ func (r *nextSyncRunner) run() (*storage.CurrentState, uint32, error) {
 
 	downloads := r.startMasterSource()
 	applied := r.startMasterApply(downloads)
+	// Deferred after the shard stage stop, so it runs first: the master stages
+	// read this run's cell window and publish applied masters to the shared
+	// caches, so they must not outlive the run either. Both close their output
+	// on exit and send nothing once canceled, so draining the apply output
+	// waits for that stage, and draining the downloads then waits for the
+	// source it stopped reading.
+	defer func() {
+		r.cancel()
+		for range applied {
+		}
+		for range downloads {
+		}
+	}()
+
 	current, err := r.commitCurrent(applied)
 	return current, r.committed, err
 }
@@ -426,9 +440,6 @@ func (r *nextSyncRunner) runTargetMasterSource(out chan<- nextMasterDownload) {
 		if item.err != nil {
 			return
 		}
-	}
-	if err := r.ctx.Err(); err != nil {
-		r.sendMasterDownload(out, nextMasterDownload{err: err})
 	}
 }
 
@@ -538,6 +549,11 @@ func (r *nextSyncRunner) waitBootstrapRetry(wake <-chan struct{}) bool {
 }
 
 func (r *nextSyncRunner) sendMasterDownload(out chan<- nextMasterDownload, item nextMasterDownload) bool {
+	// Checked first: with room in out, the select below picks at random
+	// between the send and a closed Done.
+	if r.ctx.Err() != nil {
+		return false
+	}
 	select {
 	case out <- item:
 		return true
@@ -559,6 +575,11 @@ func (r *nextSyncRunner) startMasterApply(downloads <-chan nextMasterDownload) <
 		defer close(out)
 		master := start
 		for item := range downloads {
+			// A canceled run commits nothing more: applying would only publish
+			// masters no commit follows, on the cell window being released.
+			if r.ctx.Err() != nil {
+				return
+			}
 			if item.err != nil {
 				r.sendAppliedMaster(out, nextAppliedMaster{err: item.err})
 				return
@@ -706,6 +727,10 @@ func (r *nextSyncRunner) applyMaster(master *storage.BlockState, item nextMaster
 }
 
 func (r *nextSyncRunner) sendAppliedMaster(out chan<- nextAppliedMaster, item nextAppliedMaster) bool {
+	// Checked first for the same reason as sendMasterDownload.
+	if r.ctx.Err() != nil {
+		return false
+	}
 	select {
 	case out <- item:
 		return true
@@ -1452,7 +1477,7 @@ func (r *nextSyncRunner) shouldReturnAfterCommit() bool {
 		return false
 	}
 
-	latest, err := r.latestTarget(r.current.Masterchain.Block.SeqNo)
+	latest, err := r.latestTarget(r.current.Masterchain.Block)
 	if err != nil {
 		latest = r.current.Masterchain.Block
 	}
@@ -1472,13 +1497,16 @@ func (r *nextSyncRunner) shouldReturnAfterCommit() bool {
 	return true
 }
 
-func (r *nextSyncRunner) latestTarget(currentSeqno uint32) (ton.BlockIDExt, error) {
-	latest, err := r.service.knownMasterchainTarget(currentSeqno)
+// latestTarget returns the newest known masterchain target past head. The
+// caller passes its own view of the head: the apply goroutine must not read
+// r.current, which the commit goroutine replaces without synchronization.
+func (r *nextSyncRunner) latestTarget(head ton.BlockIDExt) (ton.BlockIDExt, error) {
+	latest, err := r.service.knownMasterchainTarget(head.SeqNo)
 	if errors.Is(err, storage.ErrNotFound) {
 		if r.mode == nextSyncToTarget {
 			return r.target, nil
 		}
-		return r.current.Masterchain.Block, nil
+		return head, nil
 	}
 	if err != nil {
 		return ton.BlockIDExt{}, err
@@ -1498,7 +1526,7 @@ func (r *nextSyncRunner) logMasterApplied(item nextAppliedMaster) {
 		return
 	}
 
-	latest, err := r.latestTarget(item.master.Block.SeqNo)
+	latest, err := r.latestTarget(item.master.Block)
 	if err != nil {
 		latest = item.master.Block
 	}
@@ -1543,7 +1571,7 @@ func (r *nextSyncRunner) logShardCommit(item nextAppliedMaster, shardStats nextS
 		return
 	}
 
-	latest, err := r.latestTarget(r.current.Masterchain.Block.SeqNo)
+	latest, err := r.latestTarget(r.current.Masterchain.Block)
 	if err != nil {
 		latest = r.current.Masterchain.Block
 	}
@@ -1600,7 +1628,7 @@ func (r *nextSyncRunner) logProgressIfNeeded() {
 	shardClientSeqno := r.current.Masterchain.Block.SeqNo
 	windowElapsed := now.Sub(r.timing.windowStarted)
 
-	latest, err := r.latestTarget(shardClientSeqno)
+	latest, err := r.latestTarget(r.current.Masterchain.Block)
 	if err != nil {
 		latest = r.current.Masterchain.Block
 	}

@@ -109,6 +109,9 @@ type Pool struct {
 	totalBytes int64
 	streams    map[uint64]*ExternalStream
 	nextStream uint64
+	// refillCandidates is the scratch buffer every stream refill selects from.
+	// Like the streams, it is only touched under mu.
+	refillCandidates []selectionCandidate
 
 	stats statCounters
 

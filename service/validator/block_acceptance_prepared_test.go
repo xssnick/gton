@@ -126,7 +126,7 @@ func TestPreparedLocalBlockAcceptanceStopsAfterBackendClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend.controlMu.Lock()
-	backend.closed = true
+	backend.closed.Store(true)
 	backend.controlMu.Unlock()
 	if err = prepared.Submit(t.Context()); !errors.Is(err, ErrLocalSessionBackendClosed) {
 		t.Fatalf("submit after close error = %v, want ErrLocalSessionBackendClosed", err)

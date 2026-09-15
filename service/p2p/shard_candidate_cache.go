@@ -129,7 +129,7 @@ func (c *shardBlockCandidateCache) StoreCandidate(downloaded DownloadedBlock, no
 	return assembled, err
 }
 
-func (c *shardBlockCandidateCache) StoreProofs(proofs []ShardDescriptionProof, now time.Time) ([]DownloadedBlock, error) {
+func (c *shardBlockCandidateCache) StoreProofs(proofs []ShardDescriptionProof, held func(ton.BlockIDExt) bool, now time.Time) ([]DownloadedBlock, error) {
 	if len(proofs) == 0 {
 		return nil, nil
 	}
@@ -194,6 +194,13 @@ func (c *shardBlockCandidateCache) StoreProofs(proofs []ShardDescriptionProof, n
 	assembled := make([]DownloadedBlock, 0, len(assemblies))
 	var errs error
 	for _, assembly := range assemblies {
+		// The finality broadcast usually lands first and already put this block
+		// into the hot shard cache from the same candidate: release the pair
+		// behind its marker instead of decoding the candidate a second time.
+		if held(assembly.proof.block) {
+			c.completeAssembly(assembly.key, true)
+			continue
+		}
 		blocks, err := assembleShardCandidate(assembly.candidate, assembly.proof)
 		c.completeAssembly(assembly.key, err == nil)
 		if err != nil {
@@ -435,7 +442,7 @@ func (n *Node) RememberShardDescriptionProofs(proofs []ShardDescriptionProof) {
 
 	// A partial failure still hands back the links that did assemble; deliver
 	// them before logging, since their payloads are already released.
-	assembled, err := n.shardCandidateCache.StoreProofs(proofs, time.Now())
+	assembled, err := n.shardCandidateCache.StoreProofs(proofs, n.shardBroadcastCache.HasBlock, time.Now())
 	n.rememberAssembledShardCandidates(assembled)
 	if err != nil {
 		n.log.Debug().

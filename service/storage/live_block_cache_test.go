@@ -12,7 +12,7 @@ import (
 )
 
 func TestLiveBlockCachePinsUnflushedArtifactsUntilFlush(t *testing.T) {
-	cache := NewLiveBlockCache(1)
+	cache := NewLiveBlockCache(1, DefaultLiveBlockCacheMaxBytes)
 	first := testLiveBlockCacheBlockID(1)
 	second := testLiveBlockCacheBlockID(2)
 	firstData := []byte{0x11}
@@ -58,7 +58,7 @@ func TestLiveBlockCachePinsUnflushedArtifactsUntilFlush(t *testing.T) {
 }
 
 func TestLiveBlockCacheEvictsFlushedArtifacts(t *testing.T) {
-	cache := NewLiveBlockCache(1)
+	cache := NewLiveBlockCache(1, DefaultLiveBlockCacheMaxBytes)
 	first := testLiveBlockCacheBlockID(1)
 	second := testLiveBlockCacheBlockID(2)
 
@@ -86,7 +86,7 @@ func TestLiveBlockCacheEvictsFlushedArtifacts(t *testing.T) {
 }
 
 func TestLiveBlockCacheEvictsByOriginalPublishOrderAfterFlushTransition(t *testing.T) {
-	cache := NewLiveBlockCache(3)
+	cache := NewLiveBlockCache(3, DefaultLiveBlockCacheMaxBytes)
 	first := testLiveBlockCacheBlockID(1)
 	second := testLiveBlockCacheBlockID(2)
 	third := testLiveBlockCacheBlockID(3)
@@ -126,7 +126,7 @@ func TestLiveBlockCacheEvictsByOriginalPublishOrderAfterFlushTransition(t *testi
 }
 
 func TestLiveBlockCacheDoesNotEvictBlockThatBecamePinned(t *testing.T) {
-	cache := NewLiveBlockCache(3)
+	cache := NewLiveBlockCache(3, DefaultLiveBlockCacheMaxBytes)
 	first := testLiveBlockCacheBlockID(1)
 
 	if err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{Block: first}); err != nil {
@@ -170,7 +170,7 @@ func TestLiveBlockCacheDoesNotEvictBlockThatBecamePinned(t *testing.T) {
 }
 
 func TestLiveBlockCacheFlushRemovesEvictionCandidate(t *testing.T) {
-	cache := NewLiveBlockCache(2)
+	cache := NewLiveBlockCache(2, DefaultLiveBlockCacheMaxBytes)
 	first := testLiveBlockCacheBlockID(1)
 	second := testLiveBlockCacheBlockID(2)
 	third := testLiveBlockCacheBlockID(3)
@@ -193,8 +193,8 @@ func TestLiveBlockCacheFlushRemovesEvictionCandidate(t *testing.T) {
 		}
 	}
 
-	if len(cache.evictable) != 0 {
-		t.Fatalf("evictable entries = %d, want 0", len(cache.evictable))
+	if len(cache.evictable)+len(cache.flushed) != 0 {
+		t.Fatalf("eviction entries = %d, want 0", len(cache.evictable)+len(cache.flushed))
 	}
 	for _, block := range []ton.BlockIDExt{second, third} {
 		if _, err := cache.BlockData(t.Context(), block); err != nil {
@@ -210,7 +210,7 @@ func TestLiveBlockCacheEvictionMatchesPublishOrderModel(t *testing.T) {
 		steps     = 10000
 	)
 
-	cache := NewLiveBlockCache(maxBlocks)
+	cache := NewLiveBlockCache(maxBlocks, DefaultLiveBlockCacheMaxBytes)
 	model := newTestLiveBlockCacheModel(maxBlocks)
 	rnd := rand.New(rand.NewSource(1))
 
@@ -246,7 +246,7 @@ func TestLiveBlockCacheEvictionMatchesPublishOrderModel(t *testing.T) {
 }
 
 func TestLiveBlockCacheCachedBlockDataReportsArtifactFlushState(t *testing.T) {
-	cache := NewLiveBlockCache(1)
+	cache := NewLiveBlockCache(1, DefaultLiveBlockCacheMaxBytes)
 	block := testLiveBlockCacheBlockID(1)
 	data := []byte{0x11}
 
@@ -283,7 +283,7 @@ func TestLiveBlockCacheCachedBlockDataReportsArtifactFlushState(t *testing.T) {
 }
 
 func TestLiveBlockCacheRejectsInvalidBlockID(t *testing.T) {
-	cache := NewLiveBlockCache(1)
+	cache := NewLiveBlockCache(1, DefaultLiveBlockCacheMaxBytes)
 
 	err := cache.PublishLiveBlockArtifacts(LiveBlockCacheArtifacts{
 		Block:     ton.BlockIDExt{},
@@ -295,7 +295,7 @@ func TestLiveBlockCacheRejectsInvalidBlockID(t *testing.T) {
 }
 
 func TestLiveBlockCacheRequiresFullBlockIDOnRead(t *testing.T) {
-	cache := NewLiveBlockCache(2)
+	cache := NewLiveBlockCache(2, DefaultLiveBlockCacheMaxBytes)
 	block := testLiveBlockCacheBlockID(1)
 	prev := testLiveBlockCacheBlockID(0)
 	data := []byte{0x11}
@@ -461,22 +461,23 @@ func assertLiveBlockCacheMatchesModel(t *testing.T, step int, cache *LiveBlockCa
 		if !ok {
 			t.Fatalf("step %d block %d is missing from read map", step, seqno)
 		}
-		evictable := liveBlockCacheBlockEvictable(loaded.(*LiveBlockCacheBlock))
-		if (entry.heapIndex >= 0) != evictable {
-			t.Fatalf("step %d block %d heap membership = %t, want %t", step, seqno, entry.heapIndex >= 0, evictable)
+		if entry.heap != cache.evictionHeap(loaded.(*LiveBlockCacheBlock)) {
+			t.Fatalf("step %d block %d is in the wrong eviction heap", step, seqno)
 		}
-		if entry.heapIndex >= 0 && cache.evictable[entry.heapIndex] != entry {
+		if entry.heap != nil && (*entry.heap)[entry.heapIndex] != entry {
 			t.Fatalf("step %d block %d heap index points to another entry", step, seqno)
 		}
 	}
-	for idx, entry := range cache.evictable {
-		if entry.heapIndex != idx {
-			t.Fatalf("step %d heap entry %d index = %d", step, idx, entry.heapIndex)
-		}
-		if idx > 0 {
-			parent := (idx - 1) / 2
-			if cache.evictable[parent].order > entry.order {
-				t.Fatalf("step %d heap order is invalid at index %d", step, idx)
+	for _, evictionHeap := range []liveBlockCacheEvictionHeap{cache.evictable, cache.flushed} {
+		for idx, entry := range evictionHeap {
+			if entry.heapIndex != idx {
+				t.Fatalf("step %d heap entry %d index = %d", step, idx, entry.heapIndex)
+			}
+			if idx > 0 {
+				parent := (idx - 1) / 2
+				if evictionHeap[parent].order > entry.order {
+					t.Fatalf("step %d heap order is invalid at index %d", step, idx)
+				}
 			}
 		}
 	}
@@ -485,7 +486,7 @@ func assertLiveBlockCacheMatchesModel(t *testing.T, step int, cache *LiveBlockCa
 func TestLiveBlockCacheBoundsTransientArtifactsAndPinsAppliedBlocks(t *testing.T) {
 	for _, applyFirst := range []bool{false, true} {
 		t.Run(fmt.Sprintf("applyFirst=%t", applyFirst), func(t *testing.T) {
-			cache := NewLiveBlockCache(2)
+			cache := NewLiveBlockCache(2, DefaultLiveBlockCacheMaxBytes)
 			applied := testLiveBlockCacheBlockID(1)
 			proof := []byte{0x21}
 			publish := func(block ton.BlockIDExt, transient bool) {

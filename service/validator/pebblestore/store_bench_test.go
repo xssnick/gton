@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"testing"
+	"time"
 
 	"github.com/xssnick/gton/service/validator"
 	"github.com/xssnick/gton/service/validator/simplex"
@@ -62,6 +63,43 @@ func BenchmarkJournalVoteWriteAfterCandidatePack(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkRecoverableWriteBehindVote measures a restart-recoverable write
+// submitted right behind a durable vote, as the collator marker of slot s+1 is
+// queued while the notarize vote of slot s commits. recoverable-ns/op is how long
+// that write waits for its completion; ns/op also includes the vote's fsync.
+func BenchmarkRecoverableWriteBehindVote(b *testing.B) {
+	store := openBenchStore(b)
+	defer closeBenchStore(b, store)
+
+	j := store.Validator().Journal(testSession(3), 8)
+	voteResult := make(chan error, 1)
+	recoverableResult := make(chan error, 1)
+	slot := uint32(0)
+	var recoverable time.Duration
+
+	b.ReportAllocs()
+	for b.Loop() {
+		slot++
+		j.SaveOurVote(simplex.SkipVote(slot), func(err error) { voteResult <- err })
+
+		start := time.Now()
+		certificate := &simplex.Certificate{
+			Vote:       simplex.SkipVote(slot),
+			Signatures: []simplex.VoteSignature{{Signature: bytes.Repeat([]byte{1}, 64)}},
+		}
+		j.SaveCertificate(certificate, func(err error) { recoverableResult <- err })
+		if err := <-recoverableResult; err != nil {
+			b.Fatal(err)
+		}
+		recoverable += time.Since(start)
+
+		if err := <-voteResult; err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportMetric(float64(recoverable.Nanoseconds())/float64(b.N), "recoverable-ns/op")
 }
 
 // BenchmarkCandidatePackWrite is the candidate store half on its own.

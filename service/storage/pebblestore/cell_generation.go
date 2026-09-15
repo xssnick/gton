@@ -604,7 +604,7 @@ func parseCellGenerationShardDirName(name string) (uint64, error) {
 func (s *Store) removeDetachedCellGeneration(generation uint64, cells *cellStore) {
 	var closeErr error
 	if cells != nil {
-		closeErr = cells.closeAggressively()
+		closeErr = cells.closeDetached(s.log.With().Uint64("cell_generation", generation).Logger())
 	}
 	removeErr := s.removeCellGenerationDirs(generation)
 	if err := errors.Join(closeErr, removeErr); err != nil {

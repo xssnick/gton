@@ -238,14 +238,19 @@ func dispatchAccountInShard(shard msgpool.ShardIdent, account DispatchAccount) b
 	return shard.Contains(account.Workchain, prefix)
 }
 
+// minimumDispatchAccount is get_dispatch_queue_min_lt_account (block.cpp): it
+// follows the root minimum lt down the augmentation and prefers the left branch
+// when both hold it, which selects the lexicographically first such account.
+// The collated proof records what the walk opens, and it opens what the C++
+// prefix cuts open: every fork on the path, its left child, and its right child
+// only when the left one does not hold the minimum.
 func minimumDispatchAccount(queue *tlb.DispatchQueueAugDict) (DispatchAccount, error) {
 	if queue == nil || queue.IsEmpty() {
 		return DispatchAccount{}, fmt.Errorf("%w: dispatch queue has no minimum account", ErrInvalidInput)
 	}
 
-	current := queue.AugmentedDictionary.Copy()
 	var rootExtra cell.Slice
-	if err := current.LoadRootExtraInto(&rootExtra); err != nil {
+	if err := queue.LoadRootExtraInto(&rootExtra); err != nil {
 		return DispatchAccount{}, fmt.Errorf("%w: load dispatch queue root augmentation: %v", ErrInvalidInput, err)
 	}
 	minimumLT, err := dispatchMinimumLT(&rootExtra)
@@ -253,91 +258,42 @@ func minimumDispatchAccount(queue *tlb.DispatchQueueAugDict) (DispatchAccount, e
 		return DispatchAccount{}, fmt.Errorf("%w: dispatch queue root augmentation: %v", ErrInvalidInput, err)
 	}
 
-	accountKey := cell.BeginCell()
-	for {
-		common, commonErr := current.GetCommonPrefix()
-		if commonErr != nil {
-			return DispatchAccount{}, fmt.Errorf("%w: load dispatch queue common prefix: %v", ErrInvalidInput, commonErr)
-		}
-		remaining := current.GetKeySize()
-		if common.BitsSize() > remaining || common.RefsNum() != 0 {
-			return DispatchAccount{}, fmt.Errorf("%w: invalid dispatch queue common prefix", ErrInvalidInput)
-		}
-		var commonBuilder cell.Builder
-		common.ToBuilderInto(&commonBuilder)
-		if err = accountKey.StoreBuilder(&commonBuilder); err != nil {
-			return DispatchAccount{}, fmt.Errorf("%w: append dispatch account prefix: %v", ErrInvalidInput, err)
-		}
-		if common.BitsSize() == remaining {
-			if accountKey.BitsUsed() != 256 {
-				return DispatchAccount{}, fmt.Errorf("%w: dispatch account key has %d bits", ErrInvalidInput, accountKey.BitsUsed())
+	// Every node visited after the root is a child of the last fork that held
+	// the minimum: its left child first, then its right child once the left one
+	// was skipped. A subtree holding the minimum ends in its leaf or in an error,
+	// so the right sibling of a matching left child is never opened.
+	var selected DispatchAccount
+	root := true
+	right := false
+	err = queue.TraverseExtraBorrowed(func(keyPrefix, extra, value *cell.Slice) (int, error) {
+		if !root {
+			lt, ltErr := dispatchMinimumLT(extra)
+			if ltErr != nil {
+				return 0, fmt.Errorf("dispatch queue branch augmentation: %v", ltErr)
 			}
-			var key cell.Slice
-			loadErr := accountKey.EndCell().BeginParseInto(&key)
-			var selected DispatchAccount
-			if loadErr == nil {
-				loadErr = key.LoadSliceInto(selected.AccountID[:], 256)
+			if lt != minimumLT {
+				if right {
+					return 0, fmt.Errorf("right dispatch queue branch does not contain the root minimum")
+				}
+				right = true
+				return 0, nil
 			}
-			if loadErr != nil || key.BitsLeft() != 0 || key.RefsNum() != 0 {
-				return DispatchAccount{}, fmt.Errorf("%w: invalid dispatch account key", ErrInvalidInput)
-			}
-			return selected, nil
 		}
+		root = false
+		right = false
 
-		// The fork augmentation is min(left, right). Prefer the left branch
-		// when both sides contain the same minimum, which gives the canonical
-		// lexicographically smallest account.
-		common.ToBuilderInto(&commonBuilder)
-		leftPrefix := commonBuilder.MustStoreUInt(0, 1).EndCell()
-		left := current.Copy()
-		ok, cutErr := left.CutPrefixSubdict(leftPrefix, true)
-		if cutErr != nil {
-			return DispatchAccount{}, fmt.Errorf("%w: cut left dispatch queue branch: %v", ErrInvalidInput, cutErr)
+		if value == nil {
+			return 6, nil // left child first, then right
 		}
-		if !ok || left.IsEmpty() {
-			return DispatchAccount{}, fmt.Errorf("%w: left dispatch queue branch is absent", ErrInvalidInput)
+		if loadErr := keyPrefix.LoadSliceInto(selected.AccountID[:], 256); loadErr != nil {
+			return 0, fmt.Errorf("invalid dispatch account key: %v", loadErr)
 		}
-		var leftExtra cell.Slice
-		loadErr := left.LoadRootExtraInto(&leftExtra)
-		if loadErr != nil {
-			return DispatchAccount{}, fmt.Errorf("%w: load left dispatch queue augmentation: %v", ErrInvalidInput, loadErr)
-		}
-		leftMinimum, loadErr := dispatchMinimumLT(&leftExtra)
-		if loadErr != nil {
-			return DispatchAccount{}, fmt.Errorf("%w: left dispatch queue augmentation: %v", ErrInvalidInput, loadErr)
-		}
-
-		branch := uint64(0)
-		if leftMinimum == minimumLT {
-			current = left
-		} else {
-			branch = 1
-			common.ToBuilderInto(&commonBuilder)
-			rightPrefix := commonBuilder.MustStoreUInt(1, 1).EndCell()
-			ok, cutErr = current.CutPrefixSubdict(rightPrefix, true)
-			if cutErr != nil {
-				return DispatchAccount{}, fmt.Errorf("%w: cut right dispatch queue branch: %v", ErrInvalidInput, cutErr)
-			}
-			if !ok || current.IsEmpty() {
-				return DispatchAccount{}, fmt.Errorf("%w: right dispatch queue branch is absent", ErrInvalidInput)
-			}
-			var rightExtra cell.Slice
-			rightErr := current.LoadRootExtraInto(&rightExtra)
-			if rightErr != nil {
-				return DispatchAccount{}, fmt.Errorf("%w: load right dispatch queue augmentation: %v", ErrInvalidInput, rightErr)
-			}
-			rightMinimum, rightErr := dispatchMinimumLT(&rightExtra)
-			if rightErr != nil {
-				return DispatchAccount{}, fmt.Errorf("%w: right dispatch queue augmentation: %v", ErrInvalidInput, rightErr)
-			}
-			if rightMinimum != minimumLT {
-				return DispatchAccount{}, fmt.Errorf("%w: right dispatch queue branch does not contain the root minimum", ErrInvalidInput)
-			}
-		}
-		if err = accountKey.StoreUInt(branch, 1); err != nil {
-			return DispatchAccount{}, fmt.Errorf("%w: append dispatch account branch: %v", ErrInvalidInput, err)
-		}
+		return 1, nil
+	})
+	if err != nil {
+		return DispatchAccount{}, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
+	return selected, nil
 }
 
 func dispatchMinimumLT(extra *cell.Slice) (uint64, error) {
@@ -509,6 +465,7 @@ func (c *collation) processDeferredMessage(
 		parsed:           message,
 		metadata:         envelope.Metadata,
 		dispatchEnvelope: emittedEnvelope,
+		dispatchParsed:   &envelope,
 	})
 	c.limits.extraOutMsgs++
 	c.unprocessedDeferred[source.AccountID]++

@@ -386,10 +386,11 @@ func TestComputeMintedDisablesOnMalformedEntry(t *testing.T) {
 }
 
 // TestComputeMintedDisablesOnZeroLengthAmount is the shape an ordinary
-// VarUInteger decode accepts and the reference does not. The leaf below carries
-// a five-bit length of zero: VarUInteger::validate_skip allows len == 0,
-// VarUIntegerPos::validate_skip requires len > 0, and parameter 7 is declared
-// over VarUIntegerPos 32 (block-parse.h ExtraCurrencyCollection). Decoding it
+// VarUInteger decode accepts and compute_minted_amount does not. The leaf below
+// carries a five-bit length of zero: the generated ConfigParam 7 is VarUInteger
+// 32 and allows len == 0, but compute_minted_amount validates through the
+// handwritten ExtraCurrencyCollection over VarUIntegerPos 32 (block-parse.h),
+// which requires len > 0. Decoding it
 // as an amount yields a harmless 0 whose delta is skipped, which is exactly why
 // this needs the type gate rather than the entry scan to catch it: the other
 // entry would otherwise mint.

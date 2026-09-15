@@ -624,7 +624,12 @@ func (s *Service) OnBlockApplied(ctx context.Context, ev hooks.BlockAppliedEvent
 		if err = s.feed.Reconcile(msgpool.NewTopology(result.Snapshot)); err != nil {
 			return fmt.Errorf("reconcile internal-message destinations: %w", err)
 		}
-		if s.reconcileConsensus(result.Snapshot) && s.isStarted() {
+		// Admission is latched once, but starting the services it admits can
+		// fail. Deciding on the admitted state lets the runner's retry of this
+		// event and every later masterchain block retry that start, which is a
+		// no-op once it succeeded. An ended run context never starts them, and
+		// its error would hold block apply in the runner's retry loop forever.
+		if s.reconcileConsensus(result.Snapshot) && s.isStarted() && s.runCtx.Err() == nil {
 			if err = s.startConsensusServices(); err != nil {
 				return fmt.Errorf("start validator consensus services: %w", err)
 			}
@@ -780,6 +785,9 @@ func (s *Service) reconcileInitialGroupSnapshot(snapshot *groups.Snapshot) error
 	return nil
 }
 
+// reconcileConsensus reports whether consensus is admitted, not whether this
+// snapshot admitted it: a failed start of the admitted services is retried on
+// every later masterchain block.
 func (s *Service) reconcileConsensus(snapshot *groups.Snapshot) bool {
 	if s.sessions == nil {
 		return false
@@ -787,7 +795,7 @@ func (s *Service) reconcileConsensus(snapshot *groups.Snapshot) bool {
 	if s.consensusAdmitted.Load() {
 		s.sessions.Reconcile(snapshot)
 
-		return false
+		return true
 	}
 
 	now := time.Now()
@@ -812,7 +820,11 @@ func (s *Service) reconcileConsensus(snapshot *groups.Snapshot) bool {
 		return false
 	}
 
-	return s.admitConsensus(snapshot)
+	// Admission is one-way: when a concurrent admission wins the latch, consensus
+	// is admitted all the same.
+	s.admitConsensus(snapshot)
+
+	return true
 }
 
 func (s *Service) admitConsensus(snapshot *groups.Snapshot) bool {

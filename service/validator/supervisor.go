@@ -1466,6 +1466,12 @@ func resetSessionRetryTimer(
 		if _, exists := desired[id]; !exists || managed[id] != nil || preparing[id] != nil {
 			continue
 		}
+		// reconcileDesired skips a preparation while the limit is reached, so an
+		// overdue deadline would re-arm a zero delay on every pass. A slot frees
+		// only through a preparation result, and that reconciles by itself.
+		if len(preparing) >= maxConcurrentSessionPreparations {
+			continue
+		}
 		if earliest.IsZero() || retry.at.Before(earliest) {
 			earliest = retry.at
 		}

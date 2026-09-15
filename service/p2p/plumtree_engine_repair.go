@@ -24,9 +24,15 @@ func (e *plumtreeEngine) HandleIHave(
 	from PeerID,
 	message BroadcastPlumtreeIHave,
 ) (plumtreeActions, error) {
-	if e.isOriginalSender {
+	// First, as in C++: an original sender drops IHAVEs without validating them.
+	// The producer lease flips the role while QUIC handlers run, hence the lock.
+	e.mu.Lock()
+	isOriginalSender := e.isOriginalSender
+	e.mu.Unlock()
+	if isOriginalSender {
 		return plumtreeActions{}, nil
 	}
+
 	if from.IsZero() {
 		return plumtreeActions{}, fmt.Errorf("missing Plumtree immediate sender")
 	}
@@ -159,19 +165,25 @@ func (e *plumtreeEngine) recordIHaveLocked(
 	}
 
 	// With no eager peer there is no payload path worth waiting for. Hand the
-	// announcers to the same verification boundary as delayed repairs; a freshly
-	// verified first IHAVE hits the verifier tuple cache there.
-	actions := plumtreeActions{
+	// announcers not asked yet to the same verification boundary as delayed
+	// repairs; a freshly verified first IHAVE hits the verifier tuple cache there.
+	// The part stays missing until its deadline, as in C++, so the peers already
+	// asked keep counting against the announcer cap and are not asked again.
+	return plumtreeActions{
 		Candidates: e.takeCandidatesLocked(missing, nil),
 	}
-	e.eraseMissingLocked(key)
-	return actions
 }
 
 func (e *plumtreeEngine) ignoreIHaveLocked(
 	key plumtreePartKey,
 	from PeerID,
 ) bool {
+	// Again under the lock that records the IHAVE: the role can flip while the
+	// signature is verified off the lock, and a record made after the switch
+	// would find the slots cleared and ask for a repair at once.
+	if e.isOriginalSender {
+		return true
+	}
 	if e.isSettledBroadcastLocked(key.broadcastID) {
 		return true
 	}

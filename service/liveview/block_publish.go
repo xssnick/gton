@@ -10,14 +10,21 @@ import (
 )
 
 func (s *Store) PublishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts) error {
-	return s.publishLiveBlockArtifacts(artifacts, false)
+	if err := s.publishLiveBlockArtifacts(artifacts, false); err != nil {
+		return err
+	}
+	if s.nonFinalEnabled {
+		s.promoteNonfinalWaiting()
+	}
+	return nil
 }
 
 // publishLiveBlockArtifacts is the one publish body. accepted marks a
 // publication this node produced itself and has not yet committed anywhere, so
 // it is additionally enrolled in the accepted-state bound — see
 // accepted_state.go for why that enrolment is mandatory rather than an
-// optimization.
+// optimization. The non-final promotion the publication may unblock is left to
+// the caller, so the accepted path can notify its observers first.
 func (s *Store) publishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts, accepted bool) error {
 	prepared, err := prepareLiveBlockArtifacts(artifacts)
 	if err == nil {
@@ -78,10 +85,6 @@ func (s *Store) publishLiveBlockArtifacts(artifacts storage.LiveBlockArtifacts, 
 	// loader re-enters the read lock.
 	if deferredPrewarm != nil {
 		s.scheduleFragmentPrewarm(prepared.block, deferredPrewarm)
-	}
-
-	if s.nonFinalEnabled {
-		s.promoteNonfinalWaiting()
 	}
 	return nil
 }
@@ -284,6 +287,7 @@ func (s *Store) publishLiveBlockArtifactsPreparedLocked(prepared livePreparedBlo
 		stateFlushed:    prepared.stateFlushed || flushed.state,
 		fragments:       prepared.fragments,
 		acceptedOwner:   prepared.accepted,
+		nonfinalOwner:   prepared.nonfinal,
 	}, prepared.state)
 	published := s.publishPendingCurrentLocked()
 	if s.current != nil && blockIDEqual(s.current.Masterchain.Block, prepared.block) {
@@ -320,7 +324,10 @@ func (s *Store) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 			close(s.notify)
 			s.notify = make(chan struct{})
 		}
-	} else {
+	} else if !s.coveredByCurrentStateLocked(block) {
+		// Only a later publication of the block consumes the marker, and the
+		// producers of an unflushed block publish it before the applied current
+		// state passes it, so a marker for a covered block would never be consumed.
 		flushed := s.flushed[key]
 		flushed.artifact = true
 		s.flushed[key] = flushed

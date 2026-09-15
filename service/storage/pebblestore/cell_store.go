@@ -22,7 +22,7 @@ const (
 	initialCellGenerationID       = 1
 	cellGenerationManifestVersion = 1
 	cellGenerationDirTemplate     = "gen%d-shard%d"
-	cellStoreAggressiveCloseGrace = 500 * time.Millisecond
+	cellStoreDrainWarnAfter       = 500 * time.Millisecond
 )
 
 type cellStore struct {
@@ -38,6 +38,7 @@ type cellStore struct {
 	drained     chan struct{}
 	drainOnce   sync.Once
 	closed      bool
+	flushMu     sync.Mutex
 	mu          sync.Mutex
 	dirty       [cellDBShardCount]bool
 }
@@ -208,7 +209,11 @@ func (c *cellStore) closeWithLogger(logger zerolog.Logger) error {
 	return err
 }
 
-func (c *cellStore) closeAggressively() error {
+// closeDetached closes a generation already removed from the store. New
+// acquires fail once closing is set, but earlier holders may still be inside
+// pebble calls that panic on a closed DB, so it waits for every ref and only
+// warns about slow holders.
+func (c *cellStore) closeDetached(logger zerolog.Logger) error {
 	c.closeMu.Lock()
 	defer c.closeMu.Unlock()
 	if c.closed {
@@ -218,10 +223,15 @@ func (c *cellStore) closeAggressively() error {
 	if c.refs.Load() == 0 {
 		c.signalDrained()
 	}
-	timer := time.NewTimer(cellStoreAggressiveCloseGrace)
+	timer := time.NewTimer(cellStoreDrainWarnAfter)
 	select {
 	case <-c.drained:
 	case <-timer.C:
+		logger.Warn().
+			Int64("refs", c.refs.Load()).
+			Dur("waited", cellStoreDrainWarnAfter).
+			Msg("waiting for detached celldb generation refs before close")
+		<-c.drained
 	}
 	timer.Stop()
 	c.closed = true
@@ -343,6 +353,12 @@ func (c *cellStore) newBatchWriter(shardBatchInitialSize int) *cellBatchWriter {
 }
 
 func (c *cellStore) flush() error {
+	// A flush clears the dirty flags before its pebble flushes finish, so a
+	// concurrent caller would see clean shards and return while the memtable
+	// holding its cells is still being written.
+	c.flushMu.Lock()
+	defer c.flushMu.Unlock()
+
 	c.mu.Lock()
 	dirty := c.dirty
 	for i := range c.dirty {

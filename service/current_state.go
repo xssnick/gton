@@ -260,7 +260,7 @@ func (s *SyncCoordinator) queueMasterchainBroadcastCandidateFromSource(block Ver
 	if bytes > nextMasterchainQueueMaxBytes {
 		return
 	}
-	if s.queuedMasterchainBlockTooFarFromCurrent(prev.SeqNo) {
+	if s.queuedMasterchainBlockBehindCurrent(prev.SeqNo) || s.queuedMasterchainBlockTooFarFromCurrent(prev.SeqNo) {
 		return
 	}
 
@@ -316,7 +316,7 @@ func (s *SyncCoordinator) queuePreparedMasterchainBlockFromSource(block Prepared
 	if bytes > nextMasterchainQueueMaxBytes {
 		return
 	}
-	if s.queuedMasterchainBlockTooFarFromCurrent(prev.SeqNo) {
+	if s.queuedMasterchainBlockBehindCurrent(prev.SeqNo) || s.queuedMasterchainBlockTooFarFromCurrent(prev.SeqNo) {
 		return
 	}
 
@@ -431,17 +431,30 @@ func queuedMasterchainBlockTooFar(queue map[storage.BlockRootHash]queuedMasterch
 	return prevSeqno-minSeqno >= nextMasterchainQueueLimit
 }
 
+// pruneQueuedMasterchainBlocksLocked drops expired entries and the ones behind
+// the published head. Left in place, an entry the pipeline applied through
+// another source would hold the queuedMasterchainBlockTooFar window below the
+// head until its TTL and refuse every block that far ahead of it.
 func (s *SyncCoordinator) pruneQueuedMasterchainBlocksLocked(now time.Time) {
 	for key, entry := range s.nextMasterchainQueue {
-		if now.Sub(entry.queuedAt) >= nextMasterchainQueueTTL {
+		if now.Sub(entry.queuedAt) >= nextMasterchainQueueTTL || s.queuedMasterchainBlockBehindCurrent(queuedMasterchainPrevSeqno(entry)) {
 			s.deleteQueuedMasterchainBlockLocked(key)
 		}
 	}
 	for key, entry := range s.nextMasterchainCandidates {
-		if now.Sub(entry.queuedAt) >= nextMasterchainQueueTTL {
+		if now.Sub(entry.queuedAt) >= nextMasterchainQueueTTL || s.queuedMasterchainBlockBehindCurrent(queuedMasterchainCandidatePrevSeqno(entry)) {
 			s.deleteQueuedMasterchainCandidateLocked(key)
 		}
 	}
+}
+
+// queuedMasterchainBlockBehindCurrent reports that the block builds on a
+// master behind the published head. Every master up to that head is applied
+// already, so the pipeline has no use for such an entry: it was taken, or the
+// block came through another source.
+func (s *SyncCoordinator) queuedMasterchainBlockBehindCurrent(prevSeqno uint32) bool {
+	currentSeqno, ok := s.status.currentMasterchainSeqno()
+	return ok && prevSeqno < currentSeqno
 }
 
 func (s *SyncCoordinator) deleteQueuedMasterchainBlockLocked(key storage.BlockRootHash) {

@@ -58,6 +58,10 @@ type successorPort struct {
 	policy       CandidateState
 	exclude      [][32]byte
 	slot         uint32
+	// externalWaitEnd is where this build's wait for externals ends: the instant
+	// its request names, or the build's start when that instant had already
+	// passed. The successor's floor is taken from it; see acceptHandoff.
+	externalWaitEnd time.Time
 
 	// mu guards offered, which is written on the block-BOC branch and read by
 	// whichever goroutine discovers that this block will not be the one
@@ -208,6 +212,8 @@ type SuccessorOffer struct {
 
 	predecessorSlot uint32
 	handoffAt       time.Time
+	// externalWaitEnd is the predecessor port's.
+	externalWaitEnd time.Time
 }
 
 // successorSlot is where a handed-over successor waits for the producer to

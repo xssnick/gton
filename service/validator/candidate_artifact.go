@@ -211,13 +211,22 @@ func (c *candidateCodec) decode(wire []byte, expected *simplex.CandidateID) (*Ca
 // after the signature check now, so an unsigned forgery costs a parse and a
 // verify and no more; and on the receive path they are deferred past that, to
 // the first consumer that asks, by decodeDeferred or decodeBroadcastDeferred.
+//
+// The wire is a candidate query answer or a storage read, and it is parsed
+// without copying for the reason decodeBroadcast gives: decoding only reads it
+// (tl.ParseNoCopy, the LZ4 and BOC decompression do not write their input), the
+// compressed candidate is consumed before this returns, and decodeBlock and
+// decodeEmpty copy the byte fields the artifact keeps. The caller may keep the
+// wire afterwards; the artifact holds nothing that aliases it. The delegation
+// is the one kept field they do not build, so it is copied here, as
+// decodeBroadcast copies its own.
 func (c *candidateCodec) decodeVerified(wire []byte, expected *simplex.CandidateID) (*CandidateArtifact, error) {
-	wrapped, err := simplex.ParseCandidateWrapped(wire)
+	wrapped, err := simplex.ParseCandidateWrappedNoCopy(wire)
 	if err != nil {
 		return nil, fmt.Errorf("validator runtime: decode candidate: %w", err)
 	}
 
-	return c.decodeVerifiedData(wrapped.Data, wrapped.Delegation, expected)
+	return c.decodeVerifiedData(wrapped.Data, cloneDelegation(wrapped.Delegation), expected)
 }
 
 // decodeBroadcast verifies the bare candidate data delivered by the private

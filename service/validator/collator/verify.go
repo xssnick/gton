@@ -1350,7 +1350,7 @@ func verifyCollatedData(
 	// into the signed candidate id, and one this node produced or resumed. The
 	// reference never re-derives this digest at all — validate-query.cpp reads
 	// collated_file_hash for statistics and re-verifies only the block file
-	// hash, which candidate_prepared_validation.go still checks on every path.
+	// hash, which prepareBlock skips under the same seal.
 	if !candidate.digested {
 		hash := sha256.Sum256(candidate.CollatedData)
 		if hash != candidate.CollatedFileHash {

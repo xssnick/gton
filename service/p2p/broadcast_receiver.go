@@ -120,7 +120,7 @@ func (n *Node) newOverlaySubscriptionWithPrivate(
 		receiver.EnableBroadcastFECRelay(n.localID.Bytes(), overlayFECRelayPeerSet{sub: sub})
 	}
 	if spec.relaysSimpleBroadcasts() {
-		receiver.EnableBroadcastSimpleRelay(n.localID.Bytes(), overlayFECRelayPeerSet{sub: sub})
+		receiver.EnableBroadcastSimpleRelay(n.localID.Bytes(), overlaySimpleRelayPeerSet{sub: sub})
 	}
 	return sub, nil
 }

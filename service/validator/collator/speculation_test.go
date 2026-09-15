@@ -1104,7 +1104,7 @@ func TestAdoptedSpeculativeFirstSlotHandsOffToTheSecond(t *testing.T) {
 		// the finished predecessor over before anything is serialized. A
 		// speculative build reaches this with no producer in existence, which is
 		// the case the parked offer is for.
-		runtimeHandOffSuccessor(request, candidate, nil, nil)
+		runtimeHandOffSuccessor(request, candidate, time.Now(), nil, nil)
 
 		return candidate, nil
 	}

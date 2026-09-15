@@ -268,6 +268,26 @@ func BenchmarkArchiveStateCellOverlayLoader(b *testing.B) {
 	})
 }
 
+// BenchmarkCachedLazyCell is the record decode behind every window cache memo
+// miss and every nextMasterApplyCellWindow load.
+func BenchmarkCachedLazyCell(b *testing.B) {
+	root := benchmarkStateCellTree(b, 4)
+	records := mustPreparedReachableStateCells(b, root)
+	hash := root.HashKey()
+	data := records.Data(hash)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		loaded, err := cachedLazyCell(hash, data, rejectingBenchmarkCellLoader)
+		if err != nil {
+			b.Fatalf("decode cached lazy cell: %v", err)
+		}
+		if loaded.HashKey() != hash {
+			b.Fatalf("decoded hash mismatch")
+		}
+	}
+}
+
 func benchmarkStateCellTree(tb testing.TB, leaves int) *cell.Cell {
 	tb.Helper()
 

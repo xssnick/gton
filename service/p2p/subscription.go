@@ -290,8 +290,9 @@ type overlayPeer struct {
 	release        func()
 
 	// prioritySend is raised while this node's own candidate symbol is being
-	// written to the peer; relay writes to the peer defer to it.
-	prioritySend quicPrioritySendLatch
+	// written to the peer; relay writes to the peer defer to it. It is the
+	// pooled transport's latch, shared with the peer's other overlays.
+	prioritySend *quicPrioritySendLatch
 
 	// Lock-free counters feeding the persistent peer cache: srcScore counts
 	// first-accepted broadcasts delivered by this peer, outboundOK marks that

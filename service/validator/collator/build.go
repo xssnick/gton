@@ -560,11 +560,11 @@ func validateCollationRequest(req *collationRequest) error {
 }
 
 func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, error) {
-	usage, err := openPredecessorReadSet(req, b.readSetHint())
+	usage, err := openPredecessorReadSet(req, b.readSetHint(MetricChainShardchain))
 	if err != nil {
 		return nil, err
 	}
-	storageCells, storageProofCells := b.storageHints()
+	storageCells, storageProofCells := b.storageHints(MetricChainShardchain)
 	fullCollated := req.Masterchain.Config.capabilities&capFullCollatedData != 0
 	var collatedProofEstimate *proofSizeEstimator
 	if fullCollated {
@@ -574,7 +574,7 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 		// opened without the callback would silently lose those hashes from the
 		// proof, which peers report back as a pruned branch while the block
 		// still verifies locally. collated_proof_selection_test.go pins it.
-		collatedProofEstimate = newProofSizeEstimator(b.readSetHint())
+		collatedProofEstimate = newProofSizeEstimator(b.readSetHint(MetricChainShardchain))
 		usage.SetRecordCallback(collatedProofEstimate.addLoadedCell)
 		usage.SetRecordManyCallback(collatedProofEstimate.addLoadedCells)
 	}
@@ -1256,6 +1256,7 @@ func (c *collation) finish() (*Candidate, error) {
 	// that holds a cell crosses from one collation to the next.
 	storageCells, storageProofCells := c.limits.storage.CellCounts()
 	c.builder.observeBuildSizes(
+		metricChain(c.master != nil),
 		c.usage.Size(),
 		int(storageCells),
 		int(storageProofCells),
@@ -2067,5 +2068,6 @@ func (c *collation) handOffSuccessor(fileHash [32]byte, blockRoot *cell.Cell, pa
 		Exclude:         consumedExternals(c.externals),
 		predecessorSlot: port.slot,
 		handoffAt:       time.Now(),
+		externalWaitEnd: port.externalWaitEnd,
 	})
 }

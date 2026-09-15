@@ -34,3 +34,16 @@ func (set overlayFECRelayPeerSet) Peers() []overlay.BroadcastPeer {
 	// (~550 Mbit/s) of pure relay egress at head rates.
 	return set.sub.broadcastTargetsSnapshot().relay
 }
+
+// overlaySimpleRelayPeerSet forwards accepted simple broadcasts — external
+// messages of a few hundred bytes — to the same bounded sample, outside the
+// relay budget: metered, they were dropped with the FEC parts whenever the
+// flood spent the budget, for a few Mbit/s of egress at most. The C++
+// reference forwards them to propagate_broadcast_to neighbours unmetered.
+type overlaySimpleRelayPeerSet struct {
+	sub *overlaySubscription
+}
+
+func (set overlaySimpleRelayPeerSet) Peers() []overlay.BroadcastPeer {
+	return set.sub.broadcastTargetsSnapshot().simpleRelay
+}

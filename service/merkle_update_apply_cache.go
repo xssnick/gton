@@ -232,11 +232,20 @@ func (c *stateCellEncodedCache) foldLayers(remove, budget int) (int, bool) {
 			return folded, true
 		}
 
-		flat := c.layers[0].flat
+		layer := c.layers[0]
+		flat := layer.flat
 		next := min(len(flat), c.layerFolded+budget)
 		for i := c.layerFolded; i < next; i++ {
 			c.layerBytes -= uint64(len(flat[i].Data))
 			c.setRecordLocked(flat[i].Hash, flat[i].Data)
+
+			// The layer's decoded cell came from exactly the bytes just folded, so
+			// it moves into the base slot instead of being dropped with the layer
+			// and decoded again on the next read. A cell the base already holds
+			// for the same bytes stays; a replaced record had its slot reset above.
+			if decoded := layer.decoded[i].Load(); decoded != nil {
+				c.decoded[c.index[flat[i].Hash]].CompareAndSwap(nil, decoded)
+			}
 		}
 		budget -= next - c.layerFolded
 		c.layerFolded = next
@@ -611,32 +620,33 @@ func (w *stateCellWindowCache) loader() cell.LazyCellLoader {
 	return load
 }
 
+// retainedLoader stays registered in the service loader for the whole run, so
+// it reads the window's current caches on every call instead of pinning the
+// ones present at registration: a checkpoint swap replaces the active cache,
+// and a completed checkpoint must stop being retained. The top level never
+// falls through to base, which is the service loader this one is registered in.
 func (w *stateCellWindowCache) retainedLoader(base cell.LazyCellLoader) cell.LazyCellLoader {
-	sources := w.loaderSources()
 	metrics := w.metrics
 	var refs cell.LazyCellLoader
-	refs = func(hash cell.Hash) (*cell.Cell, error) {
-		loaded, err := loadStateCellEncodedCaches(sources.active, sources.pending, hash, refs)
-		if err == nil {
-			metrics.observeStateWindow()
-			return loaded, nil
-		}
-		if !errors.Is(err, storage.ErrNotFound) {
-			return nil, err
-		}
-		if base == nil {
-			return nil, storage.ErrNotFound
-		}
-		return base(hash)
-	}
-
-	return func(hash cell.Hash) (*cell.Cell, error) {
-		loaded, err := loadStateCellEncodedCaches(sources.active, sources.pending, hash, refs)
+	load := func(hash cell.Hash) (*cell.Cell, error) {
+		w.mu.RLock()
+		loaded, err := loadStateCellEncodedCaches(w.active, w.pending, hash, refs)
+		w.mu.RUnlock()
 		if err == nil {
 			metrics.observeStateWindow()
 		}
 		return loaded, err
 	}
+
+	refs = func(hash cell.Hash) (*cell.Cell, error) {
+		loaded, err := load(hash)
+		if base == nil || !errors.Is(err, storage.ErrNotFound) {
+			return loaded, err
+		}
+		return base(hash)
+	}
+
+	return load
 }
 
 func (w *stateCellWindowCache) loaderSources() stateCellWindowLoaderSources {
@@ -736,8 +746,7 @@ func (w *stateCellWindowCache) releaseRecordsToBase(base cell.LazyCellLoader) {
 }
 
 func cachedLazyCell(hash cell.Hash, encoded []byte, loader cell.LazyCellLoader) (*cell.Cell, error) {
-	record := storage.DecodeCellRecordTrusted(hash[:], encoded)
-	return storage.LazyCellRecord(record, loader)
+	return storage.DecodeLazyCellRecordTrusted(hash[:], encoded, loader)
 }
 
 func (c *stateCellCheckpointCache) records() []storage.EncodedCellRecord {

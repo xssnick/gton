@@ -323,18 +323,27 @@ func (p *Pool) refillExternalStreamLocked(stream *ExternalStream) {
 		return
 	}
 
-	// Sized for what the loop below appends, which is every eligible entry in
-	// the pool rather than what the stream has room for: free*2 described the
-	// take, not the scan, so a full pool grew this slice from a few hundred to
-	// thousands one doubling at a time.
-	candidates := make([]selectionCandidate, 0, p.totalCount)
-	levels := make([]selectionLevel, 0, len(p.prioDesc))
+	// Each level is selected right after its scan, in p.refillCandidates, a buffer
+	// shared by all streams and touched only under p.mu. Selecting before the
+	// lower levels are scanned gives the same result as collecting all levels
+	// first: a hash lives in exactly one slab (only insertLocked and
+	// movePriorityLocked write slab entries, the latter after removing it from the
+	// old slab), and offerLocked changes only the stream, never pool entries or
+	// slabs. The buffer therefore only has to fit the largest level, and it is
+	// cleared after each level, so it never keeps a removed message alive.
+	//
+	// Every entry is reactivated. Once the stream has no room left and is already
+	// marked dirty, reactivation is the only work the rest of the scan does.
+	candidates := p.refillCandidates
 	now := p.clock.Now()
 	p.expireLocked(now)
 	for _, priority := range p.prioDesc {
-		start := len(candidates)
+		candidates = candidates[:0]
 		for _, e := range p.slabs[priority].entries {
 			p.reactivateDueLocked(e, now)
+			if free == 0 && stream.dirty {
+				continue
+			}
 			if !e.retryAt.IsZero() || !stream.shard.Contains(e.msg.Workchain, e.msg.AddrPrefix) {
 				continue
 			}
@@ -344,38 +353,35 @@ func (p *Pool) refillExternalStreamLocked(stream *ExternalStream) {
 			if _, exists := stream.seen[e.msg.Hash]; exists {
 				continue
 			}
+			if free == 0 {
+				stream.dirty = true
+				continue
+			}
 			candidates = append(candidates, selectionCandidate{
 				msg:        e.msg,
 				generation: e.generation,
 				expiresAt:  e.deleteAt.UnixNano(),
 			})
 		}
-		if len(candidates) > start {
-			levels = append(levels, selectionLevel{start: start, end: len(candidates)})
+		if len(candidates) == 0 {
+			continue
 		}
-	}
 
-	remaining := free
-	for _, bounds := range levels {
-		if remaining == 0 {
-			stream.dirty = true
-			break
+		for i := range candidates {
+			candidates[i].rank = selectionRank(candidates[i].msg.Hash, stream.seed)
 		}
-		level := candidates[bounds.start:bounds.end]
-		for i := range level {
-			level[i].rank = selectionRank(level[i].msg.Hash, stream.seed)
-		}
-		take := min(remaining, len(level))
-		selectFirst(level, take)
+		take := min(free, len(candidates))
+		selectFirst(candidates, take)
 		for i := 0; i < take; i++ {
-			stream.offerLocked(level[i].msg.snapshot(level[i].generation, level[i].expiresAt))
+			stream.offerLocked(candidates[i].msg.snapshot(candidates[i].generation, candidates[i].expiresAt))
 		}
-		remaining -= take
-		if take < len(level) {
+		free -= take
+		if take < len(candidates) {
 			stream.dirty = true
-			break
 		}
+		clear(candidates)
 	}
+	p.refillCandidates = candidates[:0]
 }
 
 func (p *Pool) externalSnapshotCandidatesLocked(

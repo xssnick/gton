@@ -1471,32 +1471,49 @@ func (o *ConsensusObserver) watchRuntime(
 	// Released before Close blocks on the runtime goroutines: the flush workers
 	// must observe the cancellation as early as possible.
 	runCancel()
-	closeErr := runtime.Close()
 	lifetime, lifetimeErr := o.runningContext()
+
+	// The session is failed and handed to its restart owner before Close drains
+	// the dead runtime. Until then it would still read as active, and a
+	// masterchain update would reach the dead runtime and return its terminal
+	// error into the applied-block hook. The restart attempt closes the same
+	// runtime idempotently and waits for this watcher before replacing it.
+	session.mu.Lock()
+	// A newer activation may already own session.runtime together with its own
+	// runCancel, and retirement owns the teardown of a retiring session.
+	owned := session.runtime == runtime && !session.retireRequested &&
+		session.phase != observerSessionRetiring && session.phase != observerSessionRetired
+	if owned {
+		if runErr == nil {
+			runErr = errors.New("validator consensus observer: runtime stopped unexpectedly")
+		}
+		session.phase = observerSessionFailed
+		session.terminal = runErr
+		session.runCancel = nil
+		o.log.Warn().Err(runErr).Hex("session_id", session.config.SessionID[:]).
+			Dur("retry_after", sessionRestartDelay).Msg("consensus observer runtime stopped; restarting")
+		if lifetimeErr == nil {
+			o.scheduleRestart(lifetime, session)
+		}
+	}
+	session.mu.Unlock()
+
+	closeErr := runtime.Close()
+	if !owned {
+		return
+	}
+
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.runtime != runtime {
-		// A newer activation already installed its own runtime together with its
-		// own runCancel; neither field belongs to this run anymore.
 		return
 	}
-	if session.retireRequested || session.phase == observerSessionRetiring || session.phase == observerSessionRetired {
+	if closeErr != nil {
+		session.terminal = errors.Join(session.terminal, closeErr)
+
 		return
 	}
-	if runErr == nil {
-		runErr = errors.New("validator consensus observer: runtime stopped unexpectedly")
-	}
-	session.phase = observerSessionFailed
-	session.terminal = errors.Join(runErr, closeErr)
-	session.runCancel = nil
-	if closeErr == nil {
-		session.runtime = nil
-	}
-	o.log.Warn().Err(session.terminal).Hex("session_id", session.config.SessionID[:]).
-		Dur("retry_after", sessionRestartDelay).Msg("consensus observer runtime stopped; restarting")
-	if lifetimeErr == nil {
-		o.scheduleRestart(lifetime, session)
-	}
+	session.runtime = nil
 }
 
 func observerSessionStart(activation collator.SessionActivation) SessionStart {

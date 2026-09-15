@@ -351,20 +351,21 @@ func (s *overlaySubscription) newOverlayPeer(pooled *pooledPeer, announced *over
 	}
 
 	peer := &overlayPeer{
-		node:        s.node,
-		id:          pooled.id,
-		addr:        pooled.addr,
-		route:       pooled.route,
-		pub:         pooled.pub,
-		overlayID:   s.spec.ShortID,
-		announced:   cloneOverlayNode(announced),
-		fixedMember: fixedMember,
-		overlay:     adnlOverlay,
-		rldp:        pooled.rldp,
-		rldpOverlay: rldpOverlay,
-		release:     release,
-		alive:       !fixedMember,
-		attachedAt:  time.Now(),
+		node:         s.node,
+		id:           pooled.id,
+		addr:         pooled.addr,
+		route:        pooled.route,
+		pub:          pooled.pub,
+		overlayID:    s.spec.ShortID,
+		announced:    cloneOverlayNode(announced),
+		fixedMember:  fixedMember,
+		overlay:      adnlOverlay,
+		rldp:         pooled.rldp,
+		rldpOverlay:  rldpOverlay,
+		release:      release,
+		alive:        !fixedMember,
+		attachedAt:   time.Now(),
+		prioritySend: &pooled.prioritySend,
 	}
 	if s.spec.UseQUIC {
 		peer.queryTransport = quicPeerQueryTransport{

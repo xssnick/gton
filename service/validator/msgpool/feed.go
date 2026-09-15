@@ -394,15 +394,12 @@ func (f *Feed) source(source ShardIdent) *feedSource {
 }
 
 // Reconcile publishes one masterchain projection as the destination topology.
-// It is exclusive against every concurrent feed, so a block feed and a topology
-// transition observe one generation together.
+// Publishing is exclusive against every concurrent feed, so a block feed and a
+// topology transition observe one generation together.
 func (f *Feed) Reconcile(topology Topology) error {
 	if f.disableInternals {
 		return nil
 	}
-
-	f.topologyMu.Lock()
-	defer f.topologyMu.Unlock()
 
 	// The projection is a pure function of the shard configuration, which only
 	// moves on a split, a merge or a session rotation, while this runs
@@ -414,6 +411,22 @@ func (f *Feed) Reconcile(topology Topology) error {
 	// projection actually changes. That is memory-only and self-healing: a cut
 	// serves only the sources its request names, so an unreferenced run can
 	// never reach a candidate.
+	//
+	// The comparison runs under the read lock first. A feed holds that lock for
+	// its whole delta or reseed, and a writer waiting for the exclusive lock
+	// stalls every new feed of every source behind it for a projection that did
+	// not change. Two reconciles can both pass the read-locked comparison, so it
+	// is repeated under the exclusive lock.
+	f.topologyMu.RLock()
+	unchanged := f.topology != nil && f.topology.Equal(topology)
+	f.topologyMu.RUnlock()
+	if unchanged {
+		return nil
+	}
+
+	f.topologyMu.Lock()
+	defer f.topologyMu.Unlock()
+
 	if f.topology != nil && f.topology.Equal(topology) {
 		return nil
 	}

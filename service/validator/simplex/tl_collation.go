@@ -185,14 +185,17 @@ func (c *ConsensusCandidateWrapped) Serialize() ([]byte, error) {
 	return wrapCandidateData(data, c.Delegation)
 }
 
-// ParseCandidateWrapped decodes both the v3 bare non-delegated form and the
-// delegation-aware consensus.candidate wrapper.
-func ParseCandidateWrapped(data []byte) (*ConsensusCandidateWrapped, error) {
+// ParseCandidateWrappedNoCopy decodes both the v3 bare non-delegated form and
+// the delegation-aware consensus.candidate wrapper under the aliasing rule of
+// ParseCandidateDataNoCopy: every byte field of the result — the delegation's
+// collator key and signature included — points into data, so a caller that
+// keeps any of them past its own call copies that field itself.
+func ParseCandidateWrappedNoCopy(data []byte) (*ConsensusCandidateWrapped, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("simplex/tl: candidate data is too short")
 	}
 	if binary.LittleEndian.Uint32(data[:4]) != idCandidateWrapped {
-		inner, rest, err := parseCandidateData(data)
+		inner, rest, err := parseCandidateDataMode(data, true)
 		if err != nil {
 			return nil, err
 		}
@@ -210,14 +213,14 @@ func ParseCandidateWrapped(data []byte) (*ConsensusCandidateWrapped, error) {
 		return nil, fmt.Errorf("simplex/tl: unknown candidate wrapper flags %#x", flags)
 	}
 
-	inner, rest, err := parseCandidateData(data[8:])
+	inner, rest, err := parseCandidateDataMode(data[8:], true)
 	if err != nil {
 		return nil, err
 	}
 	out := &ConsensusCandidateWrapped{Data: inner}
 	if flags&1 != 0 {
 		var wire ConsensusDelegation
-		if rest, err = tl.Parse(&wire, rest, true); err != nil {
+		if rest, err = tl.ParseNoCopy(&wire, rest, true); err != nil {
 			return nil, fmt.Errorf("simplex/tl: parse delegation: %w", err)
 		}
 		if out.Delegation, err = delegationFromTL(wire); err != nil {
@@ -233,7 +236,7 @@ func ParseCandidateWrapped(data []byte) (*ConsensusCandidateWrapped, error) {
 // ParseCandidateData decodes one bare consensus.block or consensus.empty.
 // Private-overlay broadcasts carry this form and keep an optional delegation
 // in BroadcastExtra; storage and resolver wires may instead use the wrapper
-// accepted by ParseCandidateWrapped.
+// accepted by ParseCandidateWrappedNoCopy.
 func ParseCandidateData(data []byte) (tl.Serializable, error) {
 	return parseBareCandidateData(data, false)
 }
@@ -261,10 +264,6 @@ func parseBareCandidateData(data []byte, noCopy bool) (tl.Serializable, error) {
 	}
 
 	return inner, nil
-}
-
-func parseCandidateData(data []byte) (tl.Serializable, []byte, error) {
-	return parseCandidateDataMode(data, false)
 }
 
 func parseCandidateDataMode(data []byte, noCopy bool) (tl.Serializable, []byte, error) {

@@ -192,8 +192,11 @@ type LocalSessionBackend struct {
 	// attachment after the collator reports a terminal lifecycle failure.
 	// Consensus validation keeps using the authenticated session updates; only
 	// retirement may reset the collator, matching C++ producer-task isolation.
-	collatorUnavailable bool
-	closed              bool
+	// It and closed are written under controlMu, but block acceptance reads them
+	// lock-free: controlMu is held across producer barrier waits and leader-window
+	// handoffs, and the finalization chain must not queue behind them.
+	collatorUnavailable atomic.Bool
+	closed              atomic.Bool
 	collatorRetired     bool
 	releaseRoute        func()
 
@@ -396,7 +399,7 @@ func (b *LocalSessionBackend) ObserveConsensusProgress(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if b.closed {
+	if b.closed.Load() {
 		return ErrLocalSessionBackendClosed
 	}
 	if b.progress == nil {
@@ -421,7 +424,7 @@ func (b *LocalSessionBackend) ObserveConsensusProgress(
 	if err != nil {
 		return fmt.Errorf("validator local backend: convert consensus progress: %w", err)
 	}
-	if b.collatorUnavailable {
+	if b.collatorUnavailable.Load() {
 		applyConsensusWindow(&b.update, progress.Window, progress.StartAt)
 		b.publishValidationView()
 
@@ -453,7 +456,7 @@ func (b *LocalSessionBackend) ActivateSession(ctx context.Context, start Session
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if b.closed {
+	if b.closed.Load() {
 		return ErrLocalSessionBackendClosed
 	}
 
@@ -466,7 +469,7 @@ func (b *LocalSessionBackend) ActivateSession(ctx context.Context, start Session
 		return collator.ErrSessionConflict
 	}
 	activated := false
-	if b.validator != nil && !b.collatorDeferred.Load() && !b.collatorUnavailable {
+	if b.validator != nil && !b.collatorDeferred.Load() && !b.collatorUnavailable.Load() {
 		if err := b.collator.ActivateSession(ctx, activation); err != nil {
 			if !errors.Is(err, collator.ErrSessionUnavailable) {
 				return fmt.Errorf("validator local backend: activate collator session: %w", err)
@@ -542,7 +545,7 @@ func (b *LocalSessionBackend) UpdateSession(ctx context.Context, state SessionSt
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if b.closed {
+	if b.closed.Load() {
 		return ErrLocalSessionBackendClosed
 	}
 
@@ -564,7 +567,7 @@ func (b *LocalSessionBackend) UpdateSession(ctx context.Context, state SessionSt
 	finalizedAdvanced := next.HasFinalizedBlock &&
 		(!b.update.HasFinalizedBlock || next.FinalizedBlock.SeqNo > b.update.FinalizedBlock.SeqNo)
 	if b.validator != nil {
-		if b.collatorUnavailable {
+		if b.collatorUnavailable.Load() {
 			b.state = state
 			b.update = next
 			b.publishValidationView()
@@ -591,7 +594,7 @@ func (b *LocalSessionBackend) UpdateSession(ctx context.Context, state SessionSt
 		default:
 			return fmt.Errorf("validator local backend: update collator session: %w", updateErr)
 		}
-		if !b.collatorUnavailable && b.collatorDeferred.Load() && b.activation != nil {
+		if !b.collatorUnavailable.Load() && b.collatorDeferred.Load() && b.activation != nil {
 			if err := b.collator.ActivateSession(ctx, *b.activation); err != nil {
 				if !errors.Is(err, collator.ErrSessionUnavailable) {
 					return fmt.Errorf("validator local backend: activate recovered collator session: %w", err)
@@ -600,7 +603,7 @@ func (b *LocalSessionBackend) UpdateSession(ctx context.Context, state SessionSt
 				b.quarantineCollator(&next)
 			}
 		}
-		if !b.collatorUnavailable && finalizedAdvanced {
+		if !b.collatorUnavailable.Load() && finalizedAdvanced {
 			b.markAppliedWindowRecheck()
 		}
 		if b.collatorDeferred.Load() && b.pendingWindow != nil {
@@ -620,7 +623,7 @@ func (b *LocalSessionBackend) UpdateSession(ctx context.Context, state SessionSt
 // the authenticated consensus view needed by local validation. Callers hold
 // controlMu and commit update after this returns.
 func (b *LocalSessionBackend) quarantineCollator(update *collator.SessionUpdate) {
-	b.collatorUnavailable = true
+	b.collatorUnavailable.Store(true)
 	b.clearWindowRoute(0)
 	deferred := b.pendingWindow
 	if b.recheckWindow != nil &&
@@ -1014,10 +1017,7 @@ func (b *LocalSessionBackend) PrepareBlockAcceptance(
 	ctx context.Context,
 	acceptance BlockAcceptance,
 ) (PreparedBlockAcceptance, error) {
-	b.controlMu.Lock()
-	closed := b.closed
-	b.controlMu.Unlock()
-	if closed {
+	if b.closed.Load() {
 		return nil, ErrLocalSessionBackendClosed
 	}
 
@@ -1036,13 +1036,10 @@ func (b *LocalSessionBackend) PrepareBlockAcceptance(
 
 func (p *localBlockAcceptance) Submit(ctx context.Context) error {
 	b := p.backend
-	b.controlMu.Lock()
-	if b.closed {
-		b.controlMu.Unlock()
+	if b.closed.Load() {
 		return ErrLocalSessionBackendClosed
 	}
-	observeFinalized := b.finalized != nil && !b.collatorDeferred.Load() && !b.collatorUnavailable
-	b.controlMu.Unlock()
+	observeFinalized := b.finalized != nil && !b.collatorDeferred.Load() && !b.collatorUnavailable.Load()
 
 	if err := p.prepared.Submit(ctx); err != nil {
 		return err
@@ -1051,7 +1048,23 @@ func (p *localBlockAcceptance) Submit(ctx context.Context) error {
 	// persisted this progress. Replaying it before UpdateSession activates the
 	// collator would make crash recovery retry forever.
 	if observeFinalized && p.prepared.final {
-		if err := b.finalized(ctx, p.prepared.link.block); err != nil {
+		err := b.finalized(ctx, p.prepared.link.block)
+		// The block has already crossed local ingress. A validator's producer that
+		// failed terminally since the backend last reached it is quarantined as on
+		// every other backend path; failing the acceptance instead would make the
+		// finalization chain re-ingress this block until the next session update.
+		// An observer has no producer here, its callback feeds the controller.
+		if b.validator != nil && errors.Is(err, collator.ErrSessionUnavailable) {
+			b.controlMu.Lock()
+			if !b.closed.Load() && !b.collatorUnavailable.Load() {
+				b.quarantineCollator(&b.update)
+				b.publishValidationView()
+			}
+			b.controlMu.Unlock()
+
+			return nil
+		}
+		if err != nil {
 			return fmt.Errorf("validator local backend: observe consensus finalization: %w", err)
 		}
 	}
@@ -1060,10 +1073,7 @@ func (p *localBlockAcceptance) Submit(ctx context.Context) error {
 }
 
 func (p *localBlockAcceptance) Describe(ctx context.Context) error {
-	p.backend.controlMu.Lock()
-	closed := p.backend.closed
-	p.backend.controlMu.Unlock()
-	if closed {
+	if p.backend.closed.Load() {
 		return ErrLocalSessionBackendClosed
 	}
 
@@ -1083,7 +1093,7 @@ func (b *LocalSessionBackend) HandleLeaderWindow(ctx context.Context, window Lea
 		b.controlMu.Unlock()
 		return err
 	}
-	if b.closed {
+	if b.closed.Load() {
 		b.controlMu.Unlock()
 		return ErrLocalSessionBackendClosed
 	}
@@ -1105,13 +1115,13 @@ func (b *LocalSessionBackend) HandleLeaderWindow(ctx context.Context, window Lea
 			b.controlMu.Unlock()
 			return err
 		}
-		if b.closed {
+		if b.closed.Load() {
 			b.controlMu.Unlock()
 			return ErrLocalSessionBackendClosed
 		}
 	}
 	defer b.controlMu.Unlock()
-	if b.collatorUnavailable {
+	if b.collatorUnavailable.Load() {
 		return nil
 	}
 	if b.recheckWindow != nil && b.recheckWindow.window == window.Window {
@@ -1396,7 +1406,7 @@ func (b *LocalSessionBackend) HandleMisbehavior(
 
 func (b *LocalSessionBackend) Close() error {
 	b.controlMu.Lock()
-	if b.closed {
+	if b.closed.Load() {
 		b.controlMu.Unlock()
 
 		return nil
@@ -1411,7 +1421,7 @@ func (b *LocalSessionBackend) Close() error {
 		b.releaseRoute()
 		b.releaseRoute = nil
 	}
-	b.closed = true
+	b.closed.Store(true)
 	b.pendingWindow = nil
 	b.appliedWindow = nil
 	b.handledWindow = nil
@@ -1451,7 +1461,7 @@ func (b *LocalSessionBackend) Retire() error {
 // hold controlMu. Session/activation and the arrays referenced by update are
 // immutable after publication.
 func (b *LocalSessionBackend) publishValidationView() {
-	if b.activation == nil || b.collatorDeferred.Load() || b.closed {
+	if b.activation == nil || b.collatorDeferred.Load() || b.closed.Load() {
 		b.validation.Store(nil)
 		b.signalValidationChanged()
 		return
@@ -1481,7 +1491,7 @@ func (b *LocalSessionBackend) waitValidationView(ctx context.Context) (*localVal
 
 	for {
 		b.controlMu.Lock()
-		if b.closed {
+		if b.closed.Load() {
 			b.controlMu.Unlock()
 
 			return nil, ErrLocalSessionBackendClosed

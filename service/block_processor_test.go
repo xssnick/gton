@@ -19,7 +19,7 @@ func TestInternalShardProofReadableBeforeStateAndMasterchainApply(t *testing.T) 
 			downloaded := testBroadcastShardBlock(t, 402)
 			downloaded.ProofBOC = []byte{0x51, 0x52}
 			downloaded.IsLink = true
-			cache := storage.NewLiveBlockCache(2)
+			cache := storage.NewLiveBlockCache(2, storage.DefaultLiveBlockCacheMaxBytes)
 			coordinator := &SyncCoordinator{
 				log:               zerolog.Nop(),
 				liveBlockCache:    cache,

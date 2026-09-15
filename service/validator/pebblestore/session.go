@@ -65,10 +65,11 @@ func (s *ValidatorStore) SaveCandidate(
 				return err
 			}
 
-			// The integrity checks below describe this session's stored
-			// candidate records, so they reject only this request. Reaching
-			// them means nothing beyond ensureSession's idempotent namespace
-			// bootstrap has been written into the shared batch.
+			// The integrity checks and the pack I/O below concern only this
+			// session's candidate records, so they reject only this request.
+			// Reaching them means nothing beyond ensureSession's idempotent
+			// namespace bootstrap has been written into the shared batch, and a
+			// failed append leaves at most a pack tail that no pointer names.
 			indexKey := candidateIndexKey(namespace, candidate.ID)
 			storedValue, err := getBatchCopy(batch, indexKey)
 			isNew := errors.Is(err, pebble.ErrNotFound)
@@ -83,7 +84,7 @@ func (s *ValidatorStore) SaveCandidate(
 				if _, readErr := s.candidatePacks.read(namespace, pointer); readErr == nil {
 					return nil
 				} else if !errors.Is(readErr, storage.ErrNotFound) {
-					return readErr
+					return rejectRequest(readErr)
 				}
 				// The pointer itself committed atomically, but its unsynced pack
 				// tail may have been lost in a machine crash. Appending the wire
@@ -95,7 +96,7 @@ func (s *ValidatorStore) SaveCandidate(
 
 			pointer, err := s.candidatePacks.append(namespace, wire, wireHash)
 			if err != nil {
-				return err
+				return rejectRequest(err)
 			}
 			if err = batch.Set(indexKey, encodeCandidatePackPointer(pointer), nil); err != nil {
 				return fmt.Errorf("validator pebblestore: save candidate index: %w", err)
@@ -431,6 +432,11 @@ func (s *ValidatorStore) DeleteSession(ctx context.Context, session validator.Se
 		return validator.ErrSessionClosed
 	}
 	s.deleting[namespace] = struct{}{}
+	// Writes the gate admitted before it closed must reach the queue ahead of
+	// the tombstones, or they would recreate the namespace behind them.
+	for s.admitting[namespace] > 0 {
+		s.admitted.Wait()
+	}
 	s.namespaceMu.Unlock()
 
 	// Once accepted, deletion must remain gated until its durable completion;
@@ -487,24 +493,30 @@ func (s *ValidatorStore) DeleteSession(ctx context.Context, session validator.Se
 		if err = batch.Delete(sessionKey(namespace), nil); err != nil {
 			return fmt.Errorf("validator pebblestore: delete session descriptor: %w", err)
 		}
-		if err = s.candidatePacks.delete(namespace); err != nil {
-			return err
-		}
 
-		return nil
+		// The writer owns the open segment, so it closes it here. The segment
+		// files are removed only after this batch commits.
+		return s.candidatePacks.closeNamespace(namespace)
 	})
-	if err == nil {
+	committed := err == nil
+	if committed {
 		s.journalMu.Lock()
 		if existing := s.journals[namespace]; existing != nil {
 			existing.markDeleted()
 			delete(s.journals, namespace)
 		}
 		s.journalMu.Unlock()
+
+		// No committed record names the packs any more. Removing them here keeps
+		// gigabyte segments off the writer goroutine, where the removal would
+		// delay the votes of every live session, and the still closed deletion
+		// gate keeps SaveCandidate from recreating the directory meanwhile.
+		err = s.candidatePacks.delete(namespace)
 	}
 
 	s.namespaceMu.Lock()
 	delete(s.deleting, namespace)
-	if err == nil {
+	if committed {
 		s.deleted[namespace] = struct{}{}
 	}
 	s.namespaceMu.Unlock()

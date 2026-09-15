@@ -125,8 +125,8 @@ func TestClassifyRelaysHeldShardBlockBroadcastWithoutDecode(t *testing.T) {
 			if result.accepted.event != nil {
 				t.Fatalf("held block broadcast produced an application event: %+v", result.accepted.event)
 			}
-			if result.accepted.block == nil || !result.accepted.block.Equals(&block) {
-				t.Fatalf("held block broadcast block = %+v, want %s", result.accepted.block, tnstore.FormatBlockRef(block))
+			if result.accepted.block != nil {
+				t.Fatalf("held block broadcast feeds the undecoded payload of %s to the custom and FastSync fanout", tnstore.FormatBlockRef(*result.accepted.block))
 			}
 			if result.accepted.rebroadcast == nil {
 				t.Fatal("held block broadcast lost its relay payload")

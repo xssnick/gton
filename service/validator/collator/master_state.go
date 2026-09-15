@@ -201,7 +201,7 @@ func (c *collation) buildMasterStateAndBlockParts() (blockParts, error) {
 	// buildShardStateAndBlockParts for why the published root comes from here.
 	stateUpdate, stateRoot, memoCells, err := c.usage.CreateMerkleUpdateAppliedSized(
 		stateRoot,
-		c.builder.updateMemoHint(),
+		c.builder.updateMemoHint(MetricChainMasterchain),
 		collationParallelism,
 	)
 	if err != nil {

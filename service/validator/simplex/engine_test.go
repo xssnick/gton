@@ -338,6 +338,52 @@ func TestTooNewVotesDroppedCertsAccepted(t *testing.T) {
 	env.requireNoFatal()
 }
 
+// TestTooNewCertificateCopiesDroppedBeforeVerification: every node that stores
+// a certificate gossips it on, so during catch-up a slot from beyond the desync
+// horizon receives many copies of one it already holds. Those are dropped
+// before the quorum signature check — a forged copy that goes unbanned is what
+// proves the check did not run — while a slot that is untracked or still lacks
+// the certificate's kind keeps verifying first, and allocates nothing for a
+// forgery.
+func TestTooNewCertificateCopiesDroppedBeforeVerification(t *testing.T) {
+	p := DefaultParams()
+	p.MaxLeaderWindowDesync = 2
+	var dj *deferredJournal
+	env := newTestEnv(t, withLocal(1), withParams(p), func(env *testEnv, cfg *Config) {
+		dj = newDeferredJournal(env.journal, "cert")
+		cfg.Journal = dj
+	})
+	env.start()
+
+	farSlot := (env.eng.now/env.spw + p.MaxLeaderWindowDesync + 1) * env.spw
+	farID := candID(farSlot, 0x9a)
+	forged := func(v Vote) []byte {
+		cert := env.buildCert(v, 0, 2, 3)
+		cert.Signatures[0].Signature = make([]byte, 64)
+		return cert.Serialize()
+	}
+
+	env.eng.HandleMessage(peer(4), ObserverIndex, forged(NotarizeVote(farID)))
+	requireEqual(t, env.eng.Stats().Bans, uint64(1), "forged certificate for an untracked slot verified")
+	requireEqual(t, env.eng.slots.peek(farSlot) == nil, true, "forged certificate allocated no slot")
+
+	env.eng.HandleMessage(peer(3), 3, env.buildCert(NotarizeVote(farID), 0, 2, 3).Serialize())
+	requireEqual(t, len(dj.pending), 1, "certificate save in flight")
+
+	env.eng.HandleMessage(peer(5), ObserverIndex, forged(NotarizeVote(farID)))
+	requireEqual(t, env.eng.Stats().Bans, uint64(1), "copy of a saving certificate dropped unverified")
+
+	dj.releaseAt(t, 0)
+	requireEqual(t, len(env.hooks.notarized), 1, "future certificate accepted")
+
+	env.eng.HandleMessage(peer(6), ObserverIndex, forged(NotarizeVote(farID)))
+	requireEqual(t, env.eng.Stats().Bans, uint64(1), "copy of a stored certificate dropped unverified")
+
+	env.eng.HandleMessage(peer(7), ObserverIndex, forged(SkipVote(farSlot)))
+	requireEqual(t, env.eng.Stats().Bans, uint64(2), "forged certificate of a missing kind verified")
+	env.requireNoFatal()
+}
+
 // TestBadSignatureBans: an invalid vote signature bans the transport peer
 // until the ban expires.
 func TestBadSignatureBans(t *testing.T) {

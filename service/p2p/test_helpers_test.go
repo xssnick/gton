@@ -91,6 +91,9 @@ func testOverlaySubscription(sub *overlaySubscription) *overlaySubscription {
 		if peer.release == nil {
 			peer.release = func() {}
 		}
+		if peer.prioritySend == nil {
+			peer.prioritySend = &quicPrioritySendLatch{}
+		}
 	}
 	if sub.node.runCtx == nil {
 		ctx, cancel := context.WithCancel(context.Background())

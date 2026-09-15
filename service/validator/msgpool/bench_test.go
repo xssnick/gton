@@ -329,6 +329,44 @@ func buildExtMsgBenchFee(wc int32, addr [32]byte, importFee uint64) testMsgB {
 	return testMsgB{raw: c.ToBOC(), root: c}
 }
 
+// BenchmarkExternalStreamRefill is one collation's stream over a pool deeper
+// than the stream: the refill the open does, then the one a full batch leaves
+// behind. The pool is spread evenly over four shards, so a quarter-shard stream
+// scans four times the messages it could ever be offered.
+func BenchmarkExternalStreamRefill(b *testing.B) {
+	const (
+		pooled   = 8192
+		capacity = 500
+	)
+	p := New(Config{MempoolLimit: 1 << 30, PerAddressLimit: 1 << 30, MempoolBytesLimit: 1 << 40})
+	b.Cleanup(p.Close)
+	for i := range pooled {
+		var addr [32]byte
+		addr[0] = byte(i)
+		copy(addr[1:], fmt.Sprintf("%016d-refill-bench", i))
+		msg := buildExtMsgBench(addr)
+		if _, err := p.AddExternal(len(msg.raw), msg.root, nil, 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	for _, shard := range []ShardIdent{allShard, {Workchain: 0, Shard: 0x2000000000000000}} {
+		b.Run(fmt.Sprintf("shard=%016x", shard.Shard), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				stream, err := p.OpenExternalStream(shard, capacity)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if taken := len(stream.TakeReady(capacity)); taken != capacity {
+					b.Fatalf("took %d of %d", taken, capacity)
+				}
+				_ = stream.Close()
+			}
+		})
+	}
+}
+
 // BenchmarkTakeReadyFromDeepPool is the shape the collator meets in a slot: a
 // mempool far deeper than the stream buffer, drained a batch at a time.
 //

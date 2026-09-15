@@ -16,14 +16,21 @@ import (
 // each, so one ~200 kB two-step symbol of a 1.4 MB candidate occupies the
 // connection for ~90 ms; behind up to 14 relayed symbols of other leaders it
 // waited ~1.3 s (candidate_transport_send_duration p50 0.10 s, p90 1.84 s,
-// p99 4.97 s). One nominal symbol time, not two: on the validator private
-// overlays the only relay writer is tonutils' two-step relay dispatcher, and
-// every forward it makes runs under DefaultTwoStepRelayPeerTimeout = 750 ms
-// (adnl/overlay/broadcast-two-step.go), so the wait is paid out of that
-// budget; the 5 s peerRebroadcastTimeout of the flexserver rebroadcast loops
-// never applies there (relaysFECBroadcasts, relaysSimpleBroadcasts and
-// runsTwoStepRebroadcastWorker are all false for a private overlay without
-// legacy broadcasts). The latch orders only stream openings: quic-go's framer
+// p99 4.97 s). One nominal symbol time, not two. The latch is shared per peer
+// of the private network (see quicPrioritySendLatch), so every QUIC relay
+// write of that network to the peer defers to the candidate, and the tightest
+// budget among them is the consensus overlays' one: a consensus overlay is a
+// private overlay without legacy broadcasts (relaysFECBroadcasts,
+// relaysSimpleBroadcasts and runsTwoStepRebroadcastWorker are all false), so
+// its only relay writer is tonutils' two-step relay dispatcher, and every
+// forward it makes runs under DefaultTwoStepRelayPeerTimeout = 750 ms
+// (adnl/overlay/broadcast-two-step.go), which pays for the wait. The FastSync
+// overlays of the same network defer too: their two-step rebroadcast worker
+// and FEC rebroadcast run under the 5 s peerRebroadcastTimeout, and ForgetPeer
+// goes through the same write. The bound fits those budgets as well, and
+// since a write waits only while the latch is raised, the parts of one FEC
+// burst together lose at most the time the candidate takes to reach the peer.
+// The latch orders only stream openings: quic-go's framer
 // keeps round-robining STREAM frames of the relay streams already in flight,
 // so the candidate rarely has the connection to itself and a longer wait
 // mostly turns forwards that would have finished in the last part of their
@@ -34,10 +41,12 @@ const quicPrioritySendWaitBound = 100 * time.Millisecond
 // The wait is reported through the broadcast pipeline observer, the p2p
 // package's only Prometheus hook: gton_p2p_broadcast_pipeline_stage_duration_
 // seconds{stage="priority_send_wait",kind="quic_relay_write",delivery="two_step"}
-// with the result saying how the wait ended. The delivery is the one the
-// deferred write carries: the latch is raised only on the private overlay's
-// peers, and every relay write there forwards a two-step symbol. Only writes
-// that actually waited are observed; the fast path records nothing.
+// with the result saying how the wait ended. The delivery names the prevalent
+// deferred write, not the only one: the latch is raised only on the private
+// network's peers, where every consensus overlay relay write forwards a
+// two-step symbol, while the FEC parts and ForgetPeer of the FastSync overlays
+// on the same network are reported under the same label. Only writes that
+// actually waited are observed; the fast path records nothing.
 const (
 	prioritySendWaitStage    = "priority_send_wait"
 	prioritySendWaitKind     = "quic_relay_write"
@@ -74,6 +83,11 @@ func prioritySendWaitResultLabel(result prioritySendWaitResult) string {
 // theirs, the candidate write never does. C++ has no send priority either
 // (ADNL priority_ is an address category); this changes only the order per
 // connection, everyone still receives everything.
+//
+// The node has one QUIC connection per peer for all of its overlays, so the
+// latch lives on the peer's pooled transport and every overlay attachment of
+// the peer points at it: the masterchain session's relays defer to a shard
+// session's candidate written to the same peer.
 //
 // The zero value is idle and ready to use.
 type quicPrioritySendLatch struct {
@@ -193,7 +207,7 @@ func (p quicPriorityBroadcastPeer) ID() []byte {
 }
 
 func (p quicPriorityBroadcastPeer) SendCustomMessage(ctx context.Context, req tl.Serializable) error {
-	latch := &p.route.peer.prioritySend
+	latch := p.route.peer.prioritySend
 	latch.raise()
 	defer latch.lower()
 
@@ -205,7 +219,7 @@ func (p quicPriorityBroadcastPeer) SendCustomMessage(ctx context.Context, req tl
 }
 
 func (p quicPriorityBroadcastPeer) SendPreparedCustomMessage(ctx context.Context, body []byte) error {
-	latch := &p.route.peer.prioritySend
+	latch := p.route.peer.prioritySend
 	latch.raise()
 	defer latch.lower()
 

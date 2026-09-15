@@ -129,6 +129,11 @@ type liveBlock struct {
 	// ordinary publication of a block that had one clears it, which is exactly the
 	// transfer of ownership being recorded.
 	acceptedOwner bool
+	// nonfinalOwner is the same ownership for the non-final cache: set only by a
+	// non-final publication and cleared by any other one, so releasing a pending
+	// non-final entry takes the live block with it only while that entry is what
+	// published it. See deleteNonfinalBlockLocked.
+	nonfinalOwner bool
 }
 
 type liveBlockFlush struct {
@@ -156,6 +161,9 @@ type livePreparedBlockArtifacts struct {
 	// committed anywhere. It becomes liveBlock.acceptedOwner, which is what the
 	// accepted-state bookkeeping is allowed to release.
 	accepted bool
+	// nonfinal marks a publication of the non-final cache. It becomes
+	// liveBlock.nonfinalOwner.
+	nonfinal bool
 }
 
 type liveMasterchainInfo struct {
@@ -215,7 +223,7 @@ func New(store Backing, opts ...Options) *Store {
 	}
 	liveBlockCache := cfg.LiveBlockCache
 	if liveBlockCache == nil {
-		liveBlockCache = storage.NewLiveBlockCache(storage.DefaultLiveBlockCacheMaxBlocks)
+		liveBlockCache = storage.NewLiveBlockCache(storage.DefaultLiveBlockCacheMaxBlocks, storage.DefaultLiveBlockCacheMaxBytes)
 	}
 
 	var fragmentBuildSlots, fragmentMasterSlots chan struct{}
