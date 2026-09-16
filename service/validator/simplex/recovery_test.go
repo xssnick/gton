@@ -74,6 +74,54 @@ func TestRestartReplaysVotesWithoutRebroadcast(t *testing.T) {
 	env2.requireNoFatal()
 }
 
+func TestRestartReservesSkipsBeforeNotarizationReplay(t *testing.T) {
+	for _, finalized := range []bool{false, true} {
+		name := "notarized"
+		if finalized {
+			name = "finalized"
+		}
+		t.Run(name, func(t *testing.T) {
+			env := newTestEnv(t, withLocal(1), func(env *testEnv, cfg *Config) {
+				cfg.Journal = newDeferredJournal(env.journal, "cert")
+			})
+			env.start()
+			cand := env.makeCandidate(0, Genesis(), 0x32)
+			if err := env.eng.SubmitCandidate(cand); err != nil {
+				t.Fatal(err)
+			}
+			env.completeValidation(cand.ID, nil)
+			env.deliverVote(2, NotarizeVote(cand.ID))
+			env.deliverVote(3, NotarizeVote(cand.ID))
+			if finalized {
+				if err := env.journal.saveCertificate(env.buildCert(FinalizeVote(cand.ID), 0, 2, 3)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The notarization certificate is durable, but its completion has
+			// not reached the voter, so no finalize or skip intent exists yet.
+			env.eng.Stop()
+			restarted := restartEnv(t, env, 1)
+			restarted.start()
+			state, err := restarted.journal.Bootstrap()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, vote := range state.OurVotes {
+				if vote.Kind == VoteFinalize {
+					t.Fatalf("recovery cast %s before reserving interrupted-window skips", vote)
+				}
+			}
+			wantSkips := int(env.spw)
+			if finalized {
+				wantSkips--
+				requireEqual(t, restarted.eng.slots.firstNonFinalized, uint32(1), "finality restored")
+			}
+			requireEqual(t, restarted.trans.countVotes(VoteSkip), wantSkips, "only unfinished slots skipped")
+			restarted.requireNoFatal()
+		})
+	}
+}
+
 // TestCrashBetweenPersistAndSend: the vote intent is durable but the send
 // never happened (crash right after the journal fsync). After restart the
 // vote is in the pool, the journal dedups a re-cast, and no conflicting vote

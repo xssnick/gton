@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	adnloverlay "github.com/xssnick/tonutils-go/adnl/overlay"
@@ -22,11 +23,12 @@ import (
 
 const (
 	consensusOutboundQueueSize = 256
-	consensusPeerQueueSize     = 256
-	// C++ ADNL get_peer_node keeps an outbound message pending for up to ten
-	// seconds while peer discovery completes. The per-peer worker provides the
-	// same bound without creating an unbounded goroutine per vote.
-	consensusPeerSendTimeout = 10 * time.Second
+	// Like C++ fire-and-forget messages, sends to the same peer are independent.
+	// Bound active sends, not a backlog of old votes behind a blocked stream.
+	consensusPeerMaxInFlight = 64
+	// This budget includes the dispatcher queue: stale votes must not acquire
+	// a fresh timeout after newer protocol traffic has already arrived.
+	consensusPeerSendTimeout = time.Second
 	// Detaching the fan-out from the producing slot moves the memory bound
 	// here: at most candidateOutboundQueueSize candidates wait by reference
 	// plus candidateSenderWorkerCount fan-outs waiting for their quorum, each
@@ -44,10 +46,10 @@ const (
 	// send deadline on the source side at all
 	// (cppnode/ton/overlay/broadcast-twostep.cpp:263-265). Go keeps a bounded
 	// background sender instead, so it needs exactly one guard: a wedged
-	// connection must not own a worker forever. That guard sits above every
-	// transport bound - tonutils keeps the QUIC MaxIdleTimeout at 15s
-	// (adnl/quic/transport.go) - so it can only fire on a connection that is
-	// already dead, never on a delivery that is merely slower than one slot.
+	// connection must not own a worker forever. Keep enough time for the QUIC
+	// MaxIdleTimeout (15s in adnl/quic/transport.go), but count queueing against
+	// the same budget: a backlogged candidate must not get another 15s when a
+	// worker becomes free.
 	// The previous 750ms was a latency policy in disguise: it cut 58% of
 	// fan-outs mid-flight and then charged the expiry to the peers.
 	candidateTransportSendBudget = 15 * time.Second
@@ -141,12 +143,13 @@ type sessionEndpoint struct {
 }
 
 // One enqueue copy separates the caller-owned consensus buffer from the
-// endpoint. Peer queues share that immutable copy; transport sends must not
+// endpoint. Independent sends share that immutable copy; transports must not
 // mutate it.
 type outboundConsensusMessage struct {
 	wire           []byte
 	count          uint32
 	validatorsOnly bool
+	deadline       time.Time
 }
 
 // Candidate buffers are already immutable runtime-owned encodings. Enqueueing
@@ -160,14 +163,17 @@ type outboundCandidateMessage struct {
 }
 
 type consensusPeerSender struct {
-	cancel context.CancelFunc
-	queue  chan []byte
+	// ctx is the peer membership lifetime, canceled when it leaves the session.
+	ctx            context.Context
+	cancel         context.CancelFunc
+	inFlight       chan struct{}
+	lastFailureLog atomic.Int64
 }
 
 type consensusPeerSenders struct {
 	endpoint *sessionEndpoint
 	ctx      context.Context
-	peers    map[p2p.PeerID]consensusPeerSender
+	peers    map[p2p.PeerID]*consensusPeerSender
 	spec     sessionSpec
 	// validatorPeers is the standstill-drain fan-out target set, derived once
 	// per spec generation instead of on every message.
@@ -518,7 +524,7 @@ func (e *sessionEndpoint) Start(ctx context.Context, receiver validator.SessionR
 	senders := &consensusPeerSenders{
 		endpoint: e,
 		ctx:      runCtx,
-		peers:    make(map[p2p.PeerID]consensusPeerSender),
+		peers:    make(map[p2p.PeerID]*consensusPeerSender),
 	}
 	senders.reconcile()
 	if spec.canOriginateCandidate() {
@@ -692,6 +698,7 @@ func (e *sessionEndpoint) enqueueConsensus(count uint32, validatorsOnly bool, me
 		wire:           append([]byte(nil), message...),
 		count:          count,
 		validatorsOnly: validatorsOnly,
+		deadline:       time.Now().Add(consensusPeerSendTimeout),
 	}
 	e.stateMu.Lock()
 	defer e.stateMu.Unlock()
@@ -706,6 +713,10 @@ func (e *sessionEndpoint) enqueueConsensus(count uint32, validatorsOnly bool, me
 }
 
 func (s *consensusPeerSenders) dispatch(message outboundConsensusMessage) {
+	if s.ctx.Err() != nil || !time.Now().Before(message.deadline) {
+		return
+	}
+
 	s.reconcile()
 	peers := s.spec.peers
 	if message.validatorsOnly {
@@ -721,16 +732,18 @@ func (s *consensusPeerSenders) dispatch(message outboundConsensusMessage) {
 		if !ok {
 			// reconcile above rebuilds the target sets and the sender map from
 			// the same spec generation, so this cannot happen. Without the check
-			// a mismatch would report a zero-value sender's nil queue as a full
-			// queue forever.
+			// a mismatched roster could dereference a missing sender.
 			s.endpoint.warnPeer("consensus fan-out target has no sender", peer, nil)
 			continue
 		}
 		select {
-		case sender.queue <- message.wire:
+		case sender.inFlight <- struct{}{}:
 		default:
-			s.endpoint.warnPeer("dropping consensus message because the peer queue is full", peer, nil)
+			s.endpoint.warnPeer("dropping consensus message because the peer in-flight limit is reached", peer, nil)
+			continue
 		}
+		s.endpoint.sendWG.Add(1)
+		go s.endpoint.sendConsensusMessage(sender.ctx, peer, message, sender)
 	}
 }
 
@@ -758,13 +771,12 @@ func (s *consensusPeerSenders) reconcile() {
 		}
 
 		peerCtx, cancel := context.WithCancel(s.ctx)
-		sender := consensusPeerSender{
-			cancel: cancel,
-			queue:  make(chan []byte, consensusPeerQueueSize),
+		sender := &consensusPeerSender{
+			ctx:      peerCtx,
+			cancel:   cancel,
+			inFlight: make(chan struct{}, consensusPeerMaxInFlight),
 		}
 		s.peers[peer] = sender
-		s.endpoint.sendWG.Add(1)
-		go s.endpoint.runConsensusPeerSender(peerCtx, peer, sender.queue)
 	}
 	s.validatorPeers = validatorPeers
 	for peer, sender := range s.peers {
@@ -783,42 +795,37 @@ func (s *consensusPeerSenders) stop() {
 	}
 }
 
-func (e *sessionEndpoint) runConsensusPeerSender(
+func (e *sessionEndpoint) sendConsensusMessage(
 	ctx context.Context,
 	peer p2p.PeerID,
-	queue <-chan []byte,
+	message outboundConsensusMessage,
+	sender *consensusPeerSender,
 ) {
 	defer e.sendWG.Done()
+	defer func() { <-sender.inFlight }()
 
-	var lastFailureLog time.Time
-	for {
-		var message []byte
-		select {
-		case <-ctx.Done():
-			return
-		case message = <-queue:
-		}
-
-		// C++ detaches every fire-and-forget quic.message and accounts a failed
-		// send as a drop; it does not retry an old vote ahead of newer protocol
-		// traffic. Keep one bounded sender per peer in Go, but preserve that
-		// failure policy so an unavailable route cannot head-of-line block the
-		// session indefinitely.
-		sendCtx, cancel := context.WithTimeout(ctx, consensusPeerSendTimeout)
-		err := e.hub.sendMessageRaw(sendCtx, peer, message)
-		cancel()
-		if ctx.Err() != nil {
-			return
-		}
-		if err != nil && time.Since(lastFailureLog) >= time.Second {
-			e.hub.manager.log.Debug().
-				Err(err).
-				Hex("session_id", e.hub.id[:]).
-				Hex("peer_id", peer[:]).
-				Msg("send consensus message")
-			lastFailureLog = time.Now()
-		}
+	sendCtx, cancel := context.WithDeadline(ctx, message.deadline)
+	defer cancel()
+	if sendCtx.Err() != nil {
+		return
 	}
+
+	// One attempt per message. An expired send must neither retry nor delay a
+	// later vote to this peer, and other peers have independent admission.
+	err := e.hub.sendMessageRaw(sendCtx, peer, message.wire)
+	if err == nil || ctx.Err() != nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := sender.lastFailureLog.Load()
+	if now-last < int64(time.Second) || !sender.lastFailureLog.CompareAndSwap(last, now) {
+		return
+	}
+	e.hub.manager.log.Debug().
+		Err(err).
+		Hex("session_id", e.hub.id[:]).
+		Hex("peer_id", peer[:]).
+		Msg("send consensus message")
 }
 
 func (e *sessionEndpoint) BroadcastCandidate(
@@ -952,8 +959,19 @@ func (e *sessionEndpoint) runCandidateSender(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			sendCtx, cancel := context.WithTimeout(ctx, candidateTransportSendBudget)
+			deadline := message.queuedAt.Add(candidateTransportSendBudget)
 			started := time.Now()
+			if !started.Before(deadline) {
+				if e.hub.manager.candidateMetrics != nil {
+					e.hub.manager.candidateMetrics.AddCandidateOutboundDrop(
+						message.chain,
+						CandidateOutboundDropExpired,
+					)
+				}
+				continue
+			}
+
+			sendCtx, cancel := context.WithDeadline(ctx, deadline)
 			outcome, err := e.hub.broadcastTwoStep(sendCtx, message.signer, message.data, message.extra)
 			cancel()
 			e.observeCandidateSend(message.chain, started, outcome, err)

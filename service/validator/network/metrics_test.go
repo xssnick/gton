@@ -37,6 +37,10 @@ func TestPrometheusCandidateTransportMetrics(t *testing.T) {
 		collator.MetricChainShardchain,
 		CandidateOutboundDropQueueFull,
 	)
+	observer.AddCandidateOutboundDrop(
+		collator.MetricChainShardchain,
+		CandidateOutboundDropExpired,
+	)
 	observer.ObserveCandidateTransportSend(CandidateTransportSendObservation{
 		Chain:    collator.MetricChainMasterchain,
 		Result:   CandidateTransportSendPartial,
@@ -79,6 +83,12 @@ func TestPrometheusCandidateTransportMetrics(t *testing.T) {
 		map[string]string{"chain": "shardchain", "reason": "queue_full"},
 	).GetCounter().GetValue(); got != 1 {
 		t.Fatalf("full shard candidate queue drops = %v, want 1", got)
+	}
+	if got := candidateTransportMetric(
+		byName["gton_validator_candidate_outbound_dropped_total"],
+		map[string]string{"chain": "shardchain", "reason": "expired"},
+	).GetCounter().GetValue(); got != 1 {
+		t.Fatalf("expired shard candidate queue drops = %v, want 1", got)
 	}
 	if got := candidateTransportMetric(
 		byName["gton_validator_candidate_transport_send_duration_seconds"],

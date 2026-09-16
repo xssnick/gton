@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	adnloverlay "github.com/xssnick/tonutils-go/adnl/overlay"
@@ -1262,9 +1263,8 @@ func TestConsensusPeerSenderDropsFailedMessageAndContinues(t *testing.T) {
 		}
 		attemptsMu.Lock()
 		attempts++
-		attempt := attempts
 		attemptsMu.Unlock()
-		if attempt == 1 {
+		if wire[0] == 1 {
 			return errors.New("private peer is not attached yet")
 		}
 		delivered <- append([]byte(nil), wire...)
@@ -1284,6 +1284,11 @@ func TestConsensusPeerSenderDropsFailedMessageAndContinues(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("failed consensus message blocked newer traffic")
 	}
+	waitForCondition(t, func() bool {
+		attemptsMu.Lock()
+		defer attemptsMu.Unlock()
+		return attempts == 2
+	})
 	attemptsMu.Lock()
 	gotAttempts := attempts
 	attemptsMu.Unlock()
@@ -1292,71 +1297,60 @@ func TestConsensusPeerSenderDropsFailedMessageAndContinues(t *testing.T) {
 	}
 }
 
-func TestConsensusPeerQueueBoundsStalledFanout(t *testing.T) {
-	manager, opener, validatorSpec, _ := testSessionManager(t)
-	endpoint, err := manager.prepare(context.Background(), validatorSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	startTestEndpoint(t, endpoint, &testSessionReceiver{})
-	handle := opener.latest()
-	blocked := validatorSpec.peers[0]
-	slowStarted := make(chan struct{})
-	releaseSlow := make(chan struct{})
-	fastDelivered := make(chan struct{}, consensusPeerQueueSize+2)
-	var callsMu sync.Mutex
-	slowCalls := 0
-	handle.mu.Lock()
-	handle.send = func(_ context.Context, peer p2p.PeerID, _ []byte) error {
-		if peer != blocked {
-			select {
-			case fastDelivered <- struct{}{}:
-			default:
+func TestConsensusPeerInFlightLimitBoundsStalledFanout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		manager, opener, validatorSpec, _ := testSessionManager(t)
+		endpoint, err := manager.prepare(context.Background(), validatorSpec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		startTestEndpoint(t, endpoint, &testSessionReceiver{})
+		handle := opener.latest()
+		blocked := validatorSpec.peers[0]
+		releaseSlow := make(chan struct{})
+		var callsMu sync.Mutex
+		var slowCalls, fastCalls int
+		handle.mu.Lock()
+		handle.send = func(ctx context.Context, peer p2p.PeerID, _ []byte) error {
+			callsMu.Lock()
+			if peer != blocked {
+				fastCalls++
+				callsMu.Unlock()
+				return nil
 			}
+			slowCalls++
+			callsMu.Unlock()
 
-			return nil
+			select {
+			case <-releaseSlow:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		handle.mu.Unlock()
+
+		const messages = consensusPeerMaxInFlight + 10
+		for i := range messages {
+			endpoint.BroadcastToAll([]byte{byte(i)})
+			// Finish each fast send while the slow peer remains blocked.
+			synctest.Wait()
+		}
+		if slowCalls != consensusPeerMaxInFlight || fastCalls != messages {
+			t.Fatalf("sends = slow %d fast %d, want %d and %d",
+				slowCalls, fastCalls, consensusPeerMaxInFlight, messages)
 		}
 
-		callsMu.Lock()
-		slowCalls++
-		call := slowCalls
-		callsMu.Unlock()
-		if call == 1 {
-			close(slowStarted)
-			<-releaseSlow
+		close(releaseSlow)
+		synctest.Wait()
+		if slowCalls != consensusPeerMaxInFlight {
+			t.Fatalf("replayed dropped messages after recovery: %d sends", slowCalls)
 		}
-
-		return nil
-	}
-	handle.mu.Unlock()
-
-	endpoint.BroadcastToAll([]byte{0})
-	select {
-	case <-slowStarted:
-	case <-time.After(time.Second):
-		t.Fatal("stalled peer worker did not start")
-	}
-	select {
-	case <-fastDelivered:
-	case <-time.After(time.Second):
-		t.Fatal("stalled peer blocked an independent peer")
-	}
-	for i := range consensusPeerQueueSize + 10 {
-		endpoint.BroadcastToAll([]byte{byte(i + 1)})
-	}
-	waitForCondition(t, func() bool { return len(endpoint.outbound) == 0 })
-	callsMu.Lock()
-	gotSlowCalls := slowCalls
-	callsMu.Unlock()
-	if gotSlowCalls != 1 {
-		t.Fatalf("concurrent sends to stalled peer = %d, want 1", gotSlowCalls)
-	}
-
-	close(releaseSlow)
-	waitForCondition(t, func() bool {
-		callsMu.Lock()
-		defer callsMu.Unlock()
-		return slowCalls == 1+consensusPeerQueueSize
+		endpoint.BroadcastToAll([]byte{255})
+		synctest.Wait()
+		if slowCalls != consensusPeerMaxInFlight+1 || fastCalls != messages+1 {
+			t.Fatalf("fresh message after recovery: slow %d fast %d", slowCalls, fastCalls)
+		}
 	})
 }
 
@@ -1547,7 +1541,8 @@ func TestCandidateRequestFallsBackToFullMembership(t *testing.T) {
 }
 
 // Standstill drain fans one message out to every shard validator, so its target
-// selection runs per message on a roster-sized membership.
+// selection runs per message on a roster-sized membership. Include the full
+// independent-send lifecycle against an in-memory transport, not just enqueue.
 func BenchmarkConsensusValidatorFanoutDispatch(b *testing.B) {
 	manager, _, validatorSpec, _ := testSessionManager(b)
 	spec := validatorSpec
@@ -1566,34 +1561,22 @@ func BenchmarkConsensusValidatorFanoutDispatch(b *testing.B) {
 	}
 
 	hub := newSession(manager, spec)
+	var delivered sync.WaitGroup
+	handle := &testPrivateOverlay{send: func(context.Context, p2p.PeerID, []byte) error {
+		delivered.Done()
+		return nil
+	}}
+	hub.installInitialHandles(handle, nil, spec)
+	b.Cleanup(func() { _ = hub.closeHandles() })
 	endpoint := hub.endpoint(sessionKindValidator)
-	senders := &consensusPeerSenders{
-		endpoint: endpoint,
-		ctx:      context.Background(),
-		peers:    make(map[p2p.PeerID]consensusPeerSender, len(spec.peers)),
-	}
-	// Seed the sender map before reconcile so it adopts the spec generation
-	// without starting real per-peer workers: this measures target selection and
-	// hand-off, not the transport underneath it.
-	for _, peer := range spec.peers {
-		senders.peers[peer] = consensusPeerSender{cancel: func() {}, queue: make(chan []byte, 1)}
-	}
-	senders.reconcile()
-	targets := make([]p2p.PeerID, 0, len(spec.validatorByADNL))
-	for _, peer := range spec.peers {
-		if _, validatorPeer := spec.validatorByADNL[peer]; validatorPeer {
-			targets = append(targets, peer)
-		}
-	}
-	message := outboundConsensusMessage{wire: make([]byte, 64), validatorsOnly: true}
+	startTestEndpoint(b, endpoint, &testSessionReceiver{})
+	wire := make([]byte, 64)
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		senders.dispatch(message)
-		for _, peer := range targets {
-			<-senders.peers[peer].queue
-		}
+	for b.Loop() {
+		delivered.Add(len(spec.validatorByADNL))
+		endpoint.BroadcastToValidators(wire)
+		delivered.Wait()
 	}
 }
 

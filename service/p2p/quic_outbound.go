@@ -54,9 +54,8 @@ type quicBroadcastSource struct {
 // instead resolved and handshook a cold peer inside its own send budget spent
 // that budget on transport setup and then reported the expiry as a peer fault.
 // Connection setup belongs to the paths that can afford to wait for it: the
-// attach-time prewarm, requestBackgroundQUICDial, and the per-peer consensus
-// senders, which dial under their own budget every slot and so keep a live
-// validator's path warm.
+// attach-time prewarm, requestBackgroundQUICDial, and the background dial shared
+// by consensus messages. A vote's short delivery deadline never owns a dial.
 type quicRouteBroadcastPeer struct {
 	peer     *overlayPeer
 	envelope *quicOverlayEnvelope
@@ -330,6 +329,10 @@ func (p quicPeerPath) dialBounded(ctx context.Context) (*adnlquic.Peer, error) {
 		return turn.peer, nil
 	}
 
+	return p.dialClaimedBounded(ctx)
+}
+
+func (p quicPeerPath) dialClaimedBounded(ctx context.Context) (*adnlquic.Peer, error) {
 	slots := p.node.quicOutboundDialSlots
 	if slots == nil {
 		return p.dialClaimed(ctx)
@@ -344,6 +347,35 @@ func (p quicPeerPath) dialBounded(ctx context.Context) (*adnlquic.Peer, error) {
 	}
 
 	return p.dialClaimed(ctx)
+}
+
+// dialForMessage lets independent latency-bounded messages share one background
+// reachability attempt. Expiring a vote only stops its wait: it must not abort
+// a healthy cold handshake or arm the route's retry gate for later votes.
+func (p quicPeerPath) dialForMessage(ctx context.Context) (*adnlquic.Peer, error) {
+	for {
+		if err := p.node.runCtx.Err(); err != nil {
+			return nil, err
+		}
+
+		turn, err := p.awaitQUICDialTurn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !turn.owner {
+			return turn.peer, nil
+		}
+
+		spawned := p.node.runAsync(func() {
+			dialCtx, cancel := context.WithTimeout(p.node.runCtx, quicRelayDialTimeout)
+			defer cancel()
+			_, _ = p.dialClaimedBounded(dialCtx)
+		})
+		if !spawned {
+			p.route.FinishQUICDial()
+			return nil, context.Canceled
+		}
+	}
 }
 
 func (s *overlaySubscription) quicPeerPath(id PeerID) (quicPeerPath, error) {

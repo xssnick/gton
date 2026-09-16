@@ -58,11 +58,11 @@ type collation struct {
 	waves          waveState
 	externalWaves  externalWaveState
 	generatedWaves generatedWaveState
-	// outboundVisited is recordOutboundMessageReads' dedup set, kept across the
-	// messages of a collation rather than allocated per message. Only the retire
-	// goroutine walks emitted messages, so one scratch set serves them all.
-	outboundVisited       map[cell.Hash]struct{}
-	outboundSafetyVisited map[*cell.Cell]struct{}
+	// treeReadVisited is recordCellTreeReads' hash dedup set, kept across roots
+	// rather than allocated for every transaction action list and message. The
+	// retire goroutine owns both scratch sets.
+	treeReadVisited   map[cell.Hash]struct{}
+	treeSafetyVisited map[*cell.Cell]struct{}
 
 	ctx      context.Context
 	builder  *Builder

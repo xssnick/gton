@@ -10,12 +10,13 @@ import (
 )
 
 // CandidateOutboundDropReason classifies candidates which were published on
-// the public path but could not enter the private two-step sender queue.
+// the public path but were dropped before private two-step delivery started.
 type CandidateOutboundDropReason uint8
 
 const (
 	CandidateOutboundDropQueueFull CandidateOutboundDropReason = iota
 	CandidateOutboundDropUnavailable
+	CandidateOutboundDropExpired
 	candidateOutboundDropReasonCount
 )
 
@@ -56,8 +57,8 @@ type CandidateTransportSendObservation struct {
 }
 
 // CandidateTransportObserver exposes the bounded source queue and the actual
-// two-step send budget. Queue age is sampled when an item leaves the queue for
-// a send attempt; shutdown drains only correct the live queue-depth gauge.
+// two-step send budget. Queue age is sampled when a worker dequeues an item,
+// including expired ones; shutdown drains only correct the live queue-depth gauge.
 type CandidateTransportObserver interface {
 	AddCandidateOutboundQueue(collator.MetricChain, int)
 	ObserveCandidateOutboundQueueAge(collator.MetricChain, time.Duration)
@@ -101,7 +102,7 @@ func NewPrometheusCandidateTransportMetrics(
 		Namespace: namespace,
 		Subsystem: "validator",
 		Name:      "candidate_outbound_dropped_total",
-		Help:      "Candidates which could not enter the source-side private two-step transport queue.",
+		Help:      "Candidates dropped before source-side private two-step delivery started.",
 	}, []string{"chain", "reason"})
 	sendDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: namespace,
@@ -255,6 +256,8 @@ func candidateOutboundDropReasonLabel(reason CandidateOutboundDropReason) string
 	switch reason {
 	case CandidateOutboundDropQueueFull:
 		return "queue_full"
+	case CandidateOutboundDropExpired:
+		return "expired"
 	default:
 		return "unavailable"
 	}

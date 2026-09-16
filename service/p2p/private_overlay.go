@@ -350,7 +350,8 @@ func (o *PrivateOverlay) SendMessage(
 // SendMessageRaw sends a boxed message the caller no longer mutates. Over QUIC
 // the envelope prefix and the body are written as two segments: a session
 // fans one consensus message out to every committee peer, and joining them
-// would copy the whole message once per recipient.
+// would copy the whole message once per recipient. Cold connection setup is
+// shared background work and can outlive this message's delivery deadline.
 func (o *PrivateOverlay) SendMessageRaw(
 	ctx context.Context,
 	peerID PeerID,
@@ -364,7 +365,7 @@ func (o *PrivateOverlay) SendMessageRaw(
 		return peer.overlay.SendCustomMessage(ctx, tl.Raw(boxed))
 	}
 
-	quicPeer, err := peer.dialQUIC(ctx)
+	quicPeer, err := peer.quicPath().dialForMessage(ctx)
 	if err != nil {
 		return err
 	}
@@ -448,21 +449,29 @@ func (o *PrivateOverlay) BroadcastTwoStep(
 	if signer == nil {
 		signer = o.signer
 	}
+	// The configured roster bounds the fan-out. A smaller dispatch cap
+	// would make later recipients wait for earlier network writes.
+	peers := o.twoStepPeerSet()
 
 	// No per-peer send budget. C++ pushes every recipient into the transport
 	// actor and returns, with no deadline on the source side at all
 	// (cppnode/ton/overlay/broadcast-twostep.cpp:263-265). The caller's context
 	// is the only bound, and it belongs to a background sender rather than to
 	// the slot that produced the candidate.
-	result, err := overlay.SendBroadcastTwoStep(ctx, overlay.BroadcastTwoStepSendRequest{
-		Signer:      signer,
-		Certificate: overlay.CertificateEmpty{},
-		LocalADNLID: o.sub.node.localID.Bytes(),
-		Payload:     payload,
-		Extra:       []byte(extra),
-		Flags:       flags,
-		PeerSet:     o.twoStepPeerSet(),
-	}, overlay.WithBroadcastTwoStepQuorumMargin(privateTwoStepQuorumMargin))
+	result, err := overlay.SendBroadcastTwoStep(
+		ctx,
+		overlay.BroadcastTwoStepSendRequest{
+			Signer:      signer,
+			Certificate: overlay.CertificateEmpty{},
+			LocalADNLID: o.sub.node.localID.Bytes(),
+			Payload:     payload,
+			Extra:       []byte(extra),
+			Flags:       flags,
+			PeerSet:     peers,
+		},
+		overlay.WithBroadcastTwoStepSendConcurrency(len(peers)),
+		overlay.WithBroadcastTwoStepQuorumMargin(privateTwoStepQuorumMargin),
+	)
 
 	return o.sub.twoStepSendOutcome(result), err
 }

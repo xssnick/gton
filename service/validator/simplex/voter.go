@@ -46,9 +46,9 @@ func newVoterState(firstBlockTimeout time.Duration) *voterState {
 	}
 }
 
-// bootstrapVoter restores per-slot voting flags from the journaled own votes,
-// dropping records that violate local invariants (a pre-crash bug may have
-// stored conflicting votes; recovery must not corrupt slot invariants).
+// bootstrapVoter restores per-slot voting flags and reserves interrupted-window
+// skips. Records that violate local invariants are dropped (a pre-crash bug may
+// have stored conflicting votes; recovery must not corrupt slot invariants).
 func (e *Engine) bootstrapVoter(votes []Vote) {
 	v := e.voter
 	for _, vote := range votes {
@@ -78,12 +78,27 @@ func (e *Engine) bootstrapVoter(votes []Vote) {
 			slot.votedSkip = true
 		}
 	}
+
+	if e.firstNonAnnouncedWindow == 0 {
+		return
+	}
+	// The reference reserves recovery skips in the voter's startup before
+	// replayed notarizations can trigger a finalize. Persist and broadcast
+	// them later, once certificate replay has pruned already finalized slots.
+	windowEnd := e.firstNonAnnouncedWindow * e.spw
+	for i := windowEnd - e.spw; i < windowEnd; i++ {
+		slot := v.slots.at(i)
+		if slot != nil && !slot.votedFinal {
+			slot.votedSkip = true
+		}
+	}
 }
 
 // castStartupWindowSkips re-casts skip votes for every non-finalized slot of
 // the last announced leader window. This is the crash-recovery move that
 // lets the network get past a window whose production we may have
-// interrupted; already-journaled votes deduplicate in the journal.
+// interrupted. The flags are reserved by bootstrapVoter before certificate
+// replay; already-journaled votes deduplicate in the journal.
 func (e *Engine) castStartupWindowSkips() {
 	if e.firstNonAnnouncedWindow == 0 {
 		return
@@ -95,7 +110,6 @@ func (e *Engine) castStartupWindowSkips() {
 		if slot == nil || slot.votedFinal {
 			continue
 		}
-		slot.votedSkip = true
 		e.castVote(SkipVote(i), false)
 	}
 }
@@ -109,11 +123,14 @@ func (e *Engine) voterWindowObserved(startSlot uint32) {
 	v.currentWindow = newWindow
 
 	if v.previousWindowHadSkip {
-		scaled := time.Duration(float64(v.firstBlockTimeout) * e.params.FirstBlockTimeoutMultiplier)
-		if scaled > e.params.FirstBlockTimeoutCap {
-			scaled = e.params.FirstBlockTimeoutCap
+		// Cap the floating-point value before converting to nanoseconds, as
+		// the reference does: a finite multiplier can overflow time.Duration.
+		scaled := float64(v.firstBlockTimeout) * e.params.FirstBlockTimeoutMultiplier
+		if scaled >= float64(e.params.FirstBlockTimeoutCap) {
+			v.firstBlockTimeout = e.params.FirstBlockTimeoutCap
+		} else {
+			v.firstBlockTimeout = time.Duration(scaled)
 		}
-		v.firstBlockTimeout = scaled
 	} else {
 		v.firstBlockTimeout = e.params.FirstBlockTimeout
 	}

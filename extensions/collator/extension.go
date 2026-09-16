@@ -82,7 +82,6 @@ func New(options Options) hooks.ExtensionFactory {
 			return nil, errors.New("collator extension: node store is required")
 		}
 
-		hooks.RaiseGCPercent(node.Logger.With().Str("component", "collator").Logger())
 		extension := &Extension{
 			controller:       options.Controller,
 			history:          node.Store,

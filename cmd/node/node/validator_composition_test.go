@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"math"
+	"runtime/debug"
 	"testing"
 	"time"
 
@@ -471,6 +472,24 @@ func TestValidatorStackCompositionRequiresP2PCapabilities(t *testing.T) {
 	})(node)
 	if err == nil {
 		t.Fatal("validator stack accepted a node without private-overlay capabilities")
+	}
+}
+
+func TestValidatorStackCompositionPreservesGCPercent(t *testing.T) {
+	t.Setenv("GOGC", "")
+	const gcPercent = 123
+	previous := debug.SetGCPercent(gcPercent)
+	t.Cleanup(func() { debug.SetGCPercent(previous) })
+
+	_, err := newValidatorStackFactory(validatorStackComposition{
+		localValidator: &localValidatorComposition{},
+	})(hooks.Node{})
+	if err == nil {
+		t.Fatal("validator stack accepted missing P2P capabilities")
+	}
+
+	if got := debug.SetGCPercent(gcPercent); got != gcPercent {
+		t.Fatalf("validator composition changed GC percent to %d, want %d", got, gcPercent)
 	}
 }
 

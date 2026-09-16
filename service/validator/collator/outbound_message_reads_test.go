@@ -7,7 +7,7 @@ import (
 )
 
 // outboundReadsCollation is the smallest collation that can record: a read set
-// and nothing else. recordOutboundMessageReads only ever reaches
+// and nothing else. recordCellTreeReads only ever reaches
 // recordExecutionRead, and that writes the read set and, when present, the
 // collated-size estimator.
 func outboundReadsCollation() *collation {
@@ -49,7 +49,9 @@ func TestOutboundMessageReadsRecordTheSameSetDetachedOrNot(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			c := outboundReadsCollation()
-			c.recordOutboundMessageReads(test.root, false)
+			if _, err := c.recordCellTreeReads(test.root, false); err != nil {
+				t.Fatal(err)
+			}
 			got := map[cell.Hash]struct{}{}
 			for hash := range want {
 				if c.usage.RecordedCell(hash) != nil {
@@ -80,8 +82,12 @@ func TestOutboundMessageReadsRecordEveryMessageThroughTheSharedScratch(t *testin
 	secondRoot := cell.BeginCell().MustStoreRef(second).MustStoreRef(shared).EndCell()
 
 	c := outboundReadsCollation()
-	c.recordOutboundMessageReads(firstRoot, false)
-	c.recordOutboundMessageReads(secondRoot, false)
+	if _, err := c.recordCellTreeReads(firstRoot, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.recordCellTreeReads(secondRoot, false); err != nil {
+		t.Fatal(err)
+	}
 
 	for name, want := range map[string]*cell.Cell{
 		"first message leaf":  first,
@@ -102,7 +108,10 @@ func TestGeneratedParallelSafetyRejectsTracedChildren(t *testing.T) {
 	root := cell.BeginCell().MustStoreRef(child).EndCell()
 
 	c := outboundReadsCollation()
-	parallelSafe := c.recordOutboundMessageReads(root, true)
+	parallelSafe, err := c.recordCellTreeReads(root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if c.usage.RecordedCell(root.HashKey()) == nil {
 		t.Fatal("root was not recorded")
 	}
@@ -122,7 +131,10 @@ func TestGeneratedParallelSafetyRejectsEqualHashTraceWrappers(t *testing.T) {
 	root := cell.BeginCell().MustStoreRef(raw).MustStoreRef(traced).EndCell()
 
 	c := outboundReadsCollation()
-	parallelSafe := c.recordOutboundMessageReads(root, true)
+	parallelSafe, err := c.recordCellTreeReads(root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if loads != 0 {
 		t.Fatalf("canonical hash-dedup walk notified the second equal-hash wrapper %d times", loads)
 	}
@@ -151,22 +163,92 @@ func TestGeneratedParallelSafetyRejectsVirtualizedCells(t *testing.T) {
 	}
 
 	c := outboundReadsCollation()
-	if c.recordOutboundMessageReads(body, true) {
+	parallelSafe, err := c.recordCellTreeReads(body, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parallelSafe {
 		t.Fatal("generated safety certification accepted a virtualized cell")
 	}
 }
 
-func TestGeneratedParallelSafetyRejectsMessagesBeyondTheWalkDepth(t *testing.T) {
+func TestCellTreeReadsDescendThroughSpecialCells(t *testing.T) {
+	root := cell.BeginCell().
+		MustStoreUInt(0xBEEF, 16).
+		MustStoreRef(cell.BeginCell().MustStoreUInt(1, 1).EndCell()).
+		EndCell()
+	proof, err := root.CreateProof(cell.CreateProofSkeleton())
+	if err != nil {
+		t.Fatalf("create proof: %v", err)
+	}
+	if !proof.IsSpecial() {
+		t.Fatal("proof root is ordinary")
+	}
+	child, err := proof.PeekRef(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := outboundReadsCollation()
+	if _, err = c.recordCellTreeReads(proof, false); err != nil {
+		t.Fatal(err)
+	}
+	if c.usage.RecordedCell(child.HashKey()) == nil {
+		t.Fatal("child of special cell was not recorded")
+	}
+}
+
+func TestCellTreeReadsMaterializeLazyReferences(t *testing.T) {
+	leaf := cell.BeginCell().MustStoreUInt(0x41, 8).EndCell()
+	child := cell.BeginCell().MustStoreUInt(0x42, 8).MustStoreRef(leaf).EndCell()
+	root := cell.BeginCell().MustStoreUInt(0x43, 8).MustStoreRef(child).EndCell()
+	lazyRoot, err := cell.FromBOCWithOptions(root.ToBOC(), cell.BOCParseOptions{Lazy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lazyChild, err := lazyRoot.PeekRef(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !lazyChild.IsLazy() {
+		t.Fatal("fixture child is resident")
+	}
+
+	c := outboundReadsCollation()
+	parallelSafe, err := c.recordCellTreeReads(lazyRoot, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parallelSafe {
+		t.Fatal("generated safety certification accepted a lazy reference")
+	}
+	for name, want := range map[string]*cell.Cell{
+		"root":  root,
+		"child": child,
+		"leaf":  leaf,
+	} {
+		if c.usage.RecordedCell(want.HashKey()) == nil {
+			t.Fatalf("%s was not materialized and recorded", name)
+		}
+	}
+}
+
+func TestGeneratedParallelSafetyAcceptsMessagesWithinCellDepthLimit(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(1, 1).EndCell()
-	for range maxOutboundMessageRecordDepth + 1 {
+	const depth = 600
+	for range depth {
 		root = cell.BeginCell().MustStoreRef(root).EndCell()
 	}
 
 	c := outboundReadsCollation()
-	if c.recordOutboundMessageReads(root, true) {
-		t.Fatal("generated safety certification accepted a message beyond the walk depth")
+	parallelSafe, err := c.recordCellTreeReads(root, true)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got, want := c.usage.Size(), maxOutboundMessageRecordDepth+1; got != want {
-		t.Fatalf("recorded %d cells before the depth bound, want %d", got, want)
+	if !parallelSafe {
+		t.Fatal("generated safety certification rejected a message within the cell depth limit")
+	}
+	if got, want := c.usage.Size(), depth+1; got != want {
+		t.Fatalf("recorded %d cells, want %d", got, want)
 	}
 }

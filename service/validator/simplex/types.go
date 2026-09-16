@@ -269,11 +269,12 @@ func (p Params) Validate() error {
 	switch {
 	case p.TargetRate <= 0:
 		return fmt.Errorf("simplex: target rate must be positive")
-	case p.FirstBlockTimeout <= 0:
-		return fmt.Errorf("simplex: first block timeout must be positive")
-	case p.FirstBlockTimeoutMultiplier <= 0 || math.IsNaN(p.FirstBlockTimeoutMultiplier) ||
+	case p.FirstBlockTimeout < 0:
+		// Zero removes the extra grace; the first slot still gets TargetRate.
+		return fmt.Errorf("simplex: first block timeout must not be negative")
+	case p.FirstBlockTimeoutMultiplier < 0 || math.IsNaN(p.FirstBlockTimeoutMultiplier) ||
 		math.IsInf(p.FirstBlockTimeoutMultiplier, 0):
-		return fmt.Errorf("simplex: first block timeout multiplier must be finite and positive")
+		return fmt.Errorf("simplex: first block timeout multiplier must be finite and nonnegative")
 	case p.CandidateResolveTimeoutMultiplier <= 0 || math.IsNaN(p.CandidateResolveTimeoutMultiplier) ||
 		math.IsInf(p.CandidateResolveTimeoutMultiplier, 0):
 		return fmt.Errorf("simplex: candidate resolve timeout multiplier must be finite and positive")

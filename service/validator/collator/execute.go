@@ -820,6 +820,33 @@ func (c *collation) commitExecution(
 	}
 	var err error
 
+	// The action phase can traverse predecessor-backed cells which the compute
+	// phase only moved by reference. Record the whole action tree even when an
+	// action failed and therefore produced no OutMessage.
+	if _, err := c.recordCellTreeReads(result.Actions, false); err != nil {
+		return fmt.Errorf("record transaction action reads: %w", err)
+	}
+	// Without a bound storage-stat dictionary, changing c4 makes the state-limit
+	// check walk the whole resulting tree. An inline continuation can move a
+	// predecessor subtree into c4 without preserving its trace, just as it can
+	// for an action message. The c4 root can still carry a trace while one of its
+	// moved descendants does not, so the root trace alone cannot make this walk
+	// conditional. A valid bound stat stops on known hashes; unchanged c4 skips
+	// the state-limit walk entirely.
+	var previousData *cell.Cell
+	if state := lane.current.State(); state.StateInit != nil {
+		previousData = state.StateInit.Data
+	}
+	dataChanged := (previousData == nil) != (result.Data == nil)
+	if previousData != nil && result.Data != nil {
+		dataChanged = previousData.HashKey() != result.Data.HashKey()
+	}
+	if (lane.storageStat == nil || result.StorageStatRecomputed) && dataChanged && result.Data != nil {
+		if _, err := c.recordCellTreeReads(result.Data, false); err != nil {
+			return fmt.Errorf("record transaction data reads: %w", err)
+		}
+	}
+
 	lane.touched = true
 	c.trackAccountStorageProof(lane)
 	// A repeated lt would replace an earlier transaction rather than add one; it
@@ -1085,7 +1112,10 @@ func (c *collation) registerOutputs(
 	metadataResolved := false
 	for index, output := range result.OutMessages {
 		certifyParallel := certifyGenerated && output.Msg.MsgType == tlb.MsgTypeInternal
-		parallelSafe := c.recordOutboundMessageReads(output.Cell, certifyParallel)
+		parallelSafe, err := c.recordCellTreeReads(output.Cell, certifyParallel)
+		if err != nil {
+			return fmt.Errorf("record outbound message %d reads: %w", index, err)
+		}
 		lt := uint64(0)
 		var messageMetadata *tlb.MsgMetadata
 		switch output.Msg.MsgType {
@@ -1457,135 +1487,131 @@ func currencyZero(value tlb.CurrencyCollection) bool {
 	return value.Coins.IsZero() && value.ExtraCurrencies.IsEmpty()
 }
 
-// recordExecutionRead adds a cell the machine loaded to the predecessor read
-// record. The machine reports every first load with the cell in hand, because
-// gas has to charge a first load differently from a repeat, so this is an exact
-// account of what execution read — and, unlike the traversal record, it holds
-// even when the cell reached the machine through a route that lost the trace.
-//
-// It is the union that makes an account's code or data impossible to omit from
-// the collated proof: those are exactly the cells a validator's own replay
-// reads, and a missing one is what a peer reports as a pruned branch.
-//
-// Reads are unbilled: execution also loads the inbound message and cells it
-// built itself, which are not part of the predecessor tree and can never appear
-// in its proof, so charging them to the collated-size estimate would shrink the
-// block for bytes that are never emitted.
-// recordOutboundMessageReads records everything reachable from an emitted
-// message. When certifyParallel is set, the same descent also verifies that no
-// cell can carry a trace or another shape unsafe to inspect from a generated
-// worker.
+// recordCellTreeReads records everything reachable from a post-execution cell
+// tree. When certifyParallel is set for an emitted message, the same descent
+// also verifies that no cell can carry a trace or another shape unsafe to
+// inspect from a generated worker.
 //
 // A contract can put a predecessor subtree into a message without the machine
 // ever opening it: PUSHREF pushes a reference without registering a load, and a
 // continuation window drops the recording trace, so neither the traversal record
-// nor the machine's load reports see those cells. The fee accounting then walks
-// the whole message to size it, and the reference validator walks it the same
-// way — so a cell missing here is a pruned branch on the far side.
+// nor the machine's load reports see those cells. The action phase then walks
+// the whole proposed message to size it before it knows whether SENDRAWMSG will
+// succeed. Failed and ignored sends never reach OutMessages, but the reference
+// validator still performs that walk — so a cell missing here is a pruned
+// branch on the far side. Walking Actions at commit covers those sends; walking
+// successful outputs again certifies them for generated-wave workers.
 //
 // The walk costs one more pass over cells the fee accounting already traverses,
-// bounded by the message size limit. Cells the transaction built are recorded
-// too and are simply inert: the proof selects by hash over the predecessor tree
-// and never finds them.
-// It runs on the goroutine that retires a transaction, once per emitted message,
-// so both of its costs are paid serially in the middle of a phase: the visited
-// set is scratch reused across messages rather than allocated per message, and
-// the descent starts from a detached root.
+// bounded by the cell depth limit. Cells the transaction built are recorded too
+// and are simply inert: the proof selects by hash over the predecessor tree and
+// never finds them. It runs on the goroutine that retires a transaction, so the
+// visited set is scratch reused across roots rather than allocated per walk.
 //
-// Detached because PeekRef on a traced cell copies the cell and creates a trace
-// node for every reference it hands back (tvm/cell/cell.go, PeekRef), and this
-// walk wants none of it. What it records, it records explicitly through
-// recordExecutionRead; propagating the lane's trace down an emitted message
-// would instead record the same cells a second way — billed, through the
-// traversal record — which is exactly what recording them unbilled is avoiding.
-// Only the root is copied; PeekRef on an untraced cell returns the reference
-// itself.
+// Every node is parsed without its lane trace: what this walk records goes
+// explicitly through recordExecutionRead and stays unbilled. Parsing also
+// materializes lazy boundaries and validates their hash and depth before their
+// descendants are recorded. An unavailable or mismatched boundary aborts the
+// candidate instead of silently emitting an incomplete proof.
 //
 // Recording and certification deliberately keep different visited sets. The
 // proof record deduplicates by hash, while certification deduplicates by
 // pointer: equal-hash wrappers may carry different traces, and skipping the
 // traced wrapper would let a worker write into a serial lane recorder. The two
 // recursion flags preserve both rules while sharing one PeekRef walk.
-func (c *collation) recordOutboundMessageReads(root *cell.Cell, certifyParallel bool) bool {
+func (c *collation) recordCellTreeReads(root *cell.Cell, certifyParallel bool) (bool, error) {
 	if root == nil {
-		return false
+		return false, nil
 	}
-	// Cleared per message, though recording is idempotent and a stale set would
+	// Cleared per root, though recording is idempotent and a stale set would
 	// mostly just skip cells already in the record. The one place it would not
-	// is the depth bound: a subtree truncated at maxOutboundMessageRecordDepth
-	// in one message and reachable shallowly in the next would stay truncated.
+	// is the depth bound: a subtree truncated at maxCellTreeRecordDepth in one
+	// root and reachable shallowly in the next would stay truncated.
 	// Clearing a map of tens of entries is cheaper than reasoning about that.
-	if c.outboundVisited == nil {
-		c.outboundVisited = make(map[cell.Hash]struct{}, 64)
+	if c.treeReadVisited == nil {
+		c.treeReadVisited = make(map[cell.Hash]struct{}, 64)
 	} else {
-		clear(c.outboundVisited)
+		clear(c.treeReadVisited)
 	}
 	if certifyParallel {
-		if c.outboundSafetyVisited == nil {
-			c.outboundSafetyVisited = make(map[*cell.Cell]struct{}, 64)
+		if c.treeSafetyVisited == nil {
+			c.treeSafetyVisited = make(map[*cell.Cell]struct{}, 64)
 		} else {
-			clear(c.outboundSafetyVisited)
+			clear(c.treeSafetyVisited)
 		}
 	}
 
 	parallelSafe := certifyParallel && root.Trace() == nil
-	return c.walkOutboundMessage(root.WithoutTrace(), 0, true, parallelSafe) && parallelSafe
+	walkSafe, err := c.walkCellTree(root.WithoutTrace(), 0, true, parallelSafe)
+	return walkSafe && parallelSafe, err
 }
 
-func (c *collation) walkOutboundMessage(cur *cell.Cell, depth int, record, certify bool) bool {
+func (c *collation) walkCellTree(cur *cell.Cell, depth int, record, certify bool) (bool, error) {
 	if cur == nil || (!record && !certify) {
-		return true
+		return true, nil
 	}
-	if depth > maxOutboundMessageRecordDepth {
-		return !certify
+	if depth > maxCellTreeRecordDepth {
+		return false, fmt.Errorf("cell tree exceeds depth limit %d", maxCellTreeRecordDepth)
 	}
+
+	wasLazy := cur.IsLazy()
+	var slice cell.Slice
+	if err := cur.BeginParseIntoWithoutTrace(&slice); err != nil {
+		return false, err
+	}
+	loaded := slice.BaseCell()
 
 	recordChildren := false
 	if record {
-		hash := cur.HashKey()
-		if _, seen := c.outboundVisited[hash]; !seen {
-			c.outboundVisited[hash] = struct{}{}
-			c.recordExecutionRead(cur)
-			recordChildren = !cur.IsSpecial()
+		hash := loaded.HashKey()
+		if _, seen := c.treeReadVisited[hash]; !seen {
+			c.treeReadVisited[hash] = struct{}{}
+			c.recordExecutionRead(loaded)
+			recordChildren = true
 		}
 	}
 
 	certifyChildren := false
 	parallelSafe := true
 	if certify {
-		unsafe := cur.Trace() != nil || cur.IsSpecial() || cur.IsLazy() ||
-			cur.IsVirtualized() || cur.Level() != 0
+		unsafe := cur.Trace() != nil || wasLazy || loaded.IsSpecial() ||
+			loaded.IsVirtualized() || loaded.Level() != 0
 		if unsafe {
 			parallelSafe = false
-		} else if _, seen := c.outboundSafetyVisited[cur]; !seen {
-			c.outboundSafetyVisited[cur] = struct{}{}
+		} else if _, seen := c.treeSafetyVisited[cur]; !seen {
+			c.treeSafetyVisited[cur] = struct{}{}
 			certifyChildren = true
 		}
 	}
 	if !recordChildren && !certifyChildren {
-		return parallelSafe
+		return parallelSafe, nil
 	}
 
-	for i := 0; i < int(cur.RefsNum()); i++ {
-		ref, err := cur.PeekRef(i)
+	for i := 0; i < int(loaded.RefsNum()); i++ {
+		ref, err := loaded.PeekRef(i)
 		if err != nil {
-			if certifyChildren {
-				parallelSafe = false
-			}
-			return parallelSafe
+			return false, err
 		}
-		if !c.walkOutboundMessage(ref, depth+1, recordChildren, certifyChildren) {
+		childSafe, err := c.walkCellTree(ref, depth+1, recordChildren, certifyChildren)
+		if err != nil {
+			return false, err
+		}
+		if !childSafe {
 			parallelSafe = false
 			certifyChildren = false
 		}
 	}
-	return parallelSafe
+	return parallelSafe, nil
 }
 
-// maxOutboundMessageRecordDepth bounds the walk at the cell depth limit, so a
+// maxCellTreeRecordDepth bounds the walk at the cell depth limit, so a
 // malformed message cannot turn recording into unbounded recursion.
-const maxOutboundMessageRecordDepth = 512
+const maxCellTreeRecordDepth = maxCollatedBOCDepth
 
+// recordExecutionRead adds a loaded cell to the predecessor read record. The
+// proof later selects matching hashes from the predecessor tree, so cells built
+// by the transaction are inert. These reads stay unbilled because charging
+// cells which cannot appear in that tree would overstate the collated size.
 func (c *collation) recordExecutionRead(loaded *cell.Cell) {
 	c.usage.RecordUnbilled(loaded)
 	if c.collatedProofEstimate != nil {

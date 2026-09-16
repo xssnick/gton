@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
@@ -156,6 +157,30 @@ func testExtensionOptions(t *testing.T, options Options) Options {
 	options.Feed = msgpool.NewFeed(msgpool.FeedOptions{Pool: options.Messages})
 
 	return options
+}
+
+func TestExtensionPreservesGCPercent(t *testing.T) {
+	t.Setenv("GOGC", "")
+	const gcPercent = 123
+	previous := debug.SetGCPercent(gcPercent)
+	t.Cleanup(func() { debug.SetGCPercent(previous) })
+
+	extension, err := New(testExtensionOptions(t, Options{
+		Controller: &testController{},
+		ShardTops:  &testShardTopSink{},
+	}))(hooks.Node{Store: &testNodeStore{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := extension.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+
+	if got := debug.SetGCPercent(gcPercent); got != gcPercent {
+		t.Fatalf("collator extension changed GC percent to %d, want %d", got, gcPercent)
+	}
 }
 
 func TestExtensionBootstrapsAndAppliesMasterchain(t *testing.T) {

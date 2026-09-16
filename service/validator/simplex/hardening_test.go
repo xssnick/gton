@@ -192,8 +192,7 @@ func TestParamsValidation(t *testing.T) {
 	base := DefaultParams()
 	cases := map[string]func(*Params){
 		"zero target rate":                      func(p *Params) { p.TargetRate = 0 },
-		"zero first block":                      func(p *Params) { p.FirstBlockTimeout = 0 },
-		"zero first block multiplier":           func(p *Params) { p.FirstBlockTimeoutMultiplier = 0 },
+		"negative first block":                  func(p *Params) { p.FirstBlockTimeout = -time.Nanosecond },
 		"negative first block multiplier":       func(p *Params) { p.FirstBlockTimeoutMultiplier = -1 },
 		"nan first block multiplier":            func(p *Params) { p.FirstBlockTimeoutMultiplier = math.NaN() },
 		"infinite first block multiplier":       func(p *Params) { p.FirstBlockTimeoutMultiplier = math.Inf(1) },

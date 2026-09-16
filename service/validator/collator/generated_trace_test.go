@@ -44,7 +44,10 @@ func TestGeneratedOutputTraceCertificationRejectsTracedRoot(t *testing.T) {
 	root := cell.BeginCell().MustStoreUInt(0x71, 8).EndCell().WithTrace(trace)
 
 	c := outboundReadsCollation()
-	parallelSafe := c.recordOutboundMessageReads(root, true)
+	parallelSafe, err := c.recordCellTreeReads(root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if c.usage.RecordedCell(root.HashKey()) == nil {
 		t.Fatal("traced root was not recorded by the canonical outbound read walk")
 	}

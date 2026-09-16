@@ -53,13 +53,25 @@ type publishingOutboundRouteDHT struct {
 	calls     atomic.Int32
 }
 
+func TestQUICMessageDialStopsWithNode(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	path := quicPeerPath{node: &Node{runCtx: ctx}}
+	if _, err := path.dialForMessage(t.Context()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("dial on stopped node = %v, want canceled", err)
+	}
+}
+
 func (d *publishingOutboundRouteDHT) FindAddresses(
 	context.Context,
 	[]byte,
 ) (*adnladdr.List, ed25519.PublicKey, error) {
 	d.calls.Add(1)
+	// Publish the call only after choosing its result; otherwise the test can
+	// make the first lookup succeed before it has returned the missing value.
+	ready := d.ready.Load()
 	d.once.Do(func() { close(d.started) })
-	if !d.ready.Load() {
+	if !ready {
 		return nil, nil, dht.ErrDHTValueIsNotFound
 	}
 

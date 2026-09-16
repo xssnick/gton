@@ -350,14 +350,9 @@ func (t *Tracker) project(previous *Snapshot, input ApplyInput) (ApplyResult, er
 		// No tentative generation is derived on a rotation state: previous
 		// tentatives are promoted into the freshly rotated active sessions and
 		// the next generation is prepared only after observing the following
-		// state. This is a local choice, not a protocol rule —
-		// ValidatorManagerImpl::update_shards runs its future_shards loop over
-		// get_next_validator_set on every masterchain block, rotation states
-		// included, and gates only the session GC lists on rotated_all_shards.
-		// It costs one masterchain block of tentative pre-warm. Lifting it is
-		// not a local edit: Snapshot.Future also feeds the message pool
-		// destination set and the shard-top next-validator-set lookup, both of
-		// which would then change at every rotation block.
+		// state. This matches WorkchainState::update_future in the reference
+		// validator-group.cpp: rotated_all_shards clears future groups and
+		// returns before deriving the next generation.
 		if !state.RotatedAllShards {
 			future, err = t.buildFutureSessions(state, config, input.AsOf, rotationID)
 			if err != nil {
