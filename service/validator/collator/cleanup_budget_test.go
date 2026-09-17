@@ -320,6 +320,39 @@ func TestQueueCleanupBudgetIsDerivedFromTheBuildStartInstant(t *testing.T) {
 	}
 }
 
+// Candidate completion has a later producer deadline than shard admission.
+// BuildCandidate must feed the C++ soft_timeout boundary to queue cleanup and
+// internal-message admission, never the extra target rate reserved for state
+// updates, proofs and serialization.
+func TestCollationPhaseBudgetsDoNotUseCandidateAwaitDeadline(t *testing.T) {
+	var fields []string
+	forEachCall(t, "local_acquisition_build.go", "BuildCandidate", func(call *ast.CallExpr) {
+		callee, ok := call.Fun.(*ast.Ident)
+		if !ok || (callee.Name != "queueCleanupUntil" && callee.Name != "internalMsgUntil") {
+			return
+		}
+		if len(call.Args) < 2 {
+			fields = append(fields, "<missing>")
+			return
+		}
+		selector, ok := call.Args[1].(*ast.SelectorExpr)
+		if !ok {
+			fields = append(fields, "<not a selector>")
+			return
+		}
+		fields = append(fields, selector.Sel.Name)
+	})
+
+	if len(fields) != 4 {
+		t.Fatalf("BuildCandidate derives %d queue/internal phase budgets, want two per chain", len(fields))
+	}
+	for i, field := range fields {
+		if field != "CollationSoftDeadline" {
+			t.Fatalf("phase budget %d uses %q, want CollationSoftDeadline", i, field)
+		}
+	}
+}
+
 // staleOwnQueueRequest builds the shape the six budget tests above never build,
 // which is why none of them caught the defect this test pins. budgetProfile's
 // 1200 queue entries are all masterchain-bound and its predecessor carries no

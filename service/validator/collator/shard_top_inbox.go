@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/shard"
@@ -20,7 +22,20 @@ const (
 	defaultShardTopInboxEntries      = 4096
 	defaultShardTopInboxEntriesShard = 32
 	shardTopSameTimestampVersion     = 13
+	shardTopPreloadParallelism       = 8
+	shardTopPreloadTimeout           = 30 * time.Second
 )
+
+// shardTopReadinessPreloader warms immutable block/state artifacts as soon as
+// a verified descriptor is observed. It must not build or retain a mutable
+// MerkleProofBuilder: every masterchain attempt owns a fresh traced view.
+type shardTopReadinessPreloader interface {
+	preloadShardTop(context.Context, ton.BlockIDExt) error
+}
+
+type shardTopReadinessRegistrar interface {
+	setShardTopReadinessPreloader(shardTopReadinessPreloader)
+}
 
 // ShardTopValidatorSet identifies the validator set accepted for a shard in a
 // particular masterchain view.
@@ -78,6 +93,15 @@ type ShardTopInbox struct {
 	shardEntries       map[shardRegistryKey]int
 	groups             map[shardTopInboxGroupKey]*shardTopInboxGroup
 	order              list.List
+	preloader          shardTopReadinessPreloader
+	preloading         map[[32]byte]struct{}
+	preloadPending     []shardTopPreloadRequest
+	preloadActive      int
+}
+
+type shardTopPreloadRequest struct {
+	key   [32]byte
+	block ton.BlockIDExt
 }
 
 type shardTopInboxEntry struct {
@@ -146,7 +170,28 @@ func NewShardTopInbox(options ShardTopInboxOptions) (*ShardTopInbox, error) {
 		entries:            make(map[cell.Hash]*shardTopInboxEntry, options.MaxEntries),
 		shardEntries:       make(map[shardRegistryKey]int),
 		groups:             make(map[shardTopInboxGroupKey]*shardTopInboxGroup),
+		preloading:         make(map[[32]byte]struct{}),
 	}, nil
+}
+
+// setShardTopReadinessPreloader attaches the local immutable block cache after
+// the inbox and acquisition have been constructed. Existing latest entries are
+// warmed too, which keeps setup order from deciding whether the optimization is
+// active.
+func (i *ShardTopInbox) setShardTopReadinessPreloader(preloader shardTopReadinessPreloader) {
+	i.mu.Lock()
+	i.preloader = preloader
+	blocks := make([]ton.BlockIDExt, 0, len(i.groups))
+	for _, group := range i.groups {
+		if group.latest != nil {
+			blocks = append(blocks, cloneBlockID(group.latest.description.Block))
+		}
+	}
+	i.mu.Unlock()
+
+	for _, block := range blocks {
+		i.scheduleShardTopPreload(block)
+	}
 }
 
 // StoreShardTopDescription retains the exact outer root and a private semantic
@@ -200,16 +245,18 @@ func (i *ShardTopInbox) StoreShardTopDescription(
 	key := root.HashKey()
 
 	i.mu.Lock()
-	defer i.mu.Unlock()
-
 	group = i.groups[groupKey]
 	if group != nil && description.Block.SeqNo <= group.latest.description.Block.SeqNo {
 		// The first installed descriptor wins at equal height. Besides being the
 		// canonical rule, this prevents a same-seq fork from replacing a
 		// descriptor while its queue readiness check is in flight.
+		i.mu.Unlock()
+
 		return nil
 	}
 	if existing := i.entries[key]; existing != nil {
+		i.mu.Unlock()
+
 		return fmt.Errorf("%w: shard top descriptor root belongs to another inbox key", ErrInvalidInput)
 	}
 
@@ -237,8 +284,85 @@ func (i *ShardTopInbox) StoreShardTopDescription(
 	for len(i.entries) > i.maxEntries {
 		i.removeOldestLocked()
 	}
+	i.mu.Unlock()
+
+	i.scheduleShardTopPreload(stored.Block)
 
 	return nil
+}
+
+// scheduleShardTopPreload starts a bounded, deduplicated best-effort warm. The
+// descriptor store must never wait for storage I/O, and a failed warm changes
+// no readiness state: Select performs the same load authoritatively and keeps
+// an already-ready lower top available in the meantime.
+func (i *ShardTopInbox) scheduleShardTopPreload(block ton.BlockIDExt) {
+	key, err := blockRootKey(block)
+	if err != nil {
+		return
+	}
+
+	i.mu.Lock()
+	preloader := i.preloader
+	if preloader == nil {
+		i.mu.Unlock()
+
+		return
+	}
+	if _, exists := i.preloading[key]; exists {
+		i.mu.Unlock()
+
+		return
+	}
+	request := shardTopPreloadRequest{key: key, block: cloneBlockID(block)}
+	i.preloading[key] = struct{}{}
+	if i.preloadActive >= shardTopPreloadParallelism {
+		// Keep the queue bounded by the inbox itself. If a burst also evicts
+		// descriptors faster than warming can consume them, prefer its newest
+		// retained tops over stale pending work.
+		if len(i.preloadPending) == i.maxEntries {
+			delete(i.preloading, i.preloadPending[0].key)
+			i.preloadPending[0] = shardTopPreloadRequest{}
+			i.preloadPending = i.preloadPending[1:]
+		}
+		i.preloadPending = append(i.preloadPending, request)
+		i.mu.Unlock()
+
+		return
+	}
+	i.preloadActive++
+	i.mu.Unlock()
+
+	i.startShardTopPreload(preloader, request)
+}
+
+func (i *ShardTopInbox) startShardTopPreload(
+	preloader shardTopReadinessPreloader,
+	request shardTopPreloadRequest,
+) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), shardTopPreloadTimeout)
+		defer cancel()
+		_ = preloader.preloadShardTop(ctx, request.block)
+
+		i.mu.Lock()
+		delete(i.preloading, request.key)
+		if len(i.preloadPending) == 0 {
+			i.preloadActive--
+			i.mu.Unlock()
+
+			return
+		}
+		next := i.preloadPending[0]
+		i.preloadPending[0] = shardTopPreloadRequest{}
+		i.preloadPending = i.preloadPending[1:]
+		if len(i.preloadPending) == 0 {
+			i.preloadPending = nil
+		}
+		nextPreloader := i.preloader
+		i.mu.Unlock()
+
+		i.startShardTopPreload(nextPreloader, next)
+	}()
 }
 
 // Select returns a deterministic batch that ShardRegistry can atomically apply
@@ -262,6 +386,9 @@ func (i *ShardTopInbox) Select(ctx context.Context, input ShardTopSelection) ([]
 		ready, err := input.Provider.ShardTopReady(ctx, snapshot.description.Block)
 		if err != nil {
 			i.finishReadyCheck(snapshot, false)
+			if errors.Is(err, ErrAcquisitionNotReady) {
+				continue
+			}
 			block := snapshot.description.Block
 
 			return nil, fmt.Errorf("check shard top %d:%016x:%d readiness: %w",
@@ -305,6 +432,9 @@ func (i *ShardTopInbox) Select(ctx context.Context, input ShardTopSelection) ([]
 			// the ready descriptor without demoting it or exposing a fallback.
 			ready, err := input.Provider.ShardTopReady(ctx, snapshot.description.Block)
 			if err != nil {
+				if errors.Is(err, ErrAcquisitionNotReady) {
+					continue
+				}
 				block := snapshot.description.Block
 
 				return nil, fmt.Errorf("materialize ready shard top %d:%016x:%d: %w",

@@ -283,8 +283,8 @@ func TestInternalMsgTimeoutTruncatesTheDrain(t *testing.T) {
 		activeContract{address: receiver, code: externalAcceptCode(t), balance: 100_000_000_000},
 	))
 	// An instant already in the past. internalMsgUntil derives this from
-	// BuildSoftDeadline on the live path; a deterministic entry point leaves it
-	// zero, which is why every other test in this package is unaffected.
+	// CollationSoftDeadline on the live path; a deterministic entry point leaves
+	// it zero, which is why every other test in this package is unaffected.
 	req.InternalMsgUntil = time.Now().Add(-time.Second)
 
 	c, err := testBuilder().prepare(context.Background(), req)

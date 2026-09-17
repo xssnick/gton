@@ -57,6 +57,20 @@ func newLocalShardTopProvider(acquisition *LocalAcquisition, master *localMaster
 	}
 }
 
+// preloadShardTop warms only the immutable, content-addressed block/state
+// source. ShardTopReady still creates and owns the request-local neighbor view,
+// including a fresh Merkle proof builder when the selected masterchain view
+// requires FullCollatedData.
+func (a *LocalAcquisition) preloadShardTop(ctx context.Context, block ton.BlockIDExt) error {
+	if a.store == nil {
+		return nil
+	}
+
+	_, err := a.blockSource(ctx, block, acquisitionReadImmediate)
+
+	return err
+}
+
 func (p *localShardTopProvider) ValidatorSets(
 	ctx context.Context,
 	masterchain ton.BlockIDExt,
@@ -399,28 +413,17 @@ func (a *LocalAcquisition) acquireMasterMessages(
 	}
 
 	destination := targetShardIdent(groups.ShardID{Workchain: masterchainWorkchainID, Shard: sharddomain.Root})
-	localSources := make(map[msgpool.ShardIdent]struct{}, len(tops))
-	localRuns := make([][]*msgpool.InternalMessage, 0, len(tops))
-	for i := range tops {
-		source := blockShardIdent(tops[i].Block)
-		view := views[source]
-		localSources[source] = struct{}{}
-		messages, seedErr := a.localSeedCut(destination, source, view)
-		if seedErr != nil {
-			return localAcquiredMessages{}, seedErr
-		}
-		if len(messages) > 0 {
-			localRuns = append(localRuns, messages)
-		}
-	}
 	// Masterchain: always allowed. Neither kind of build that must refuse runs
 	// here — the handoff declines masterchain outright and speculation is
-	// shard-only — so there is never a block of ours waiting on this mutex.
-	committed, err := a.cutViews(branch, destination, views, candidateBase, candidateTip, localSources, true, hints)
+	// shard-only — so there is never a block of ours waiting on this mutex. A
+	// selected shard top takes the same exact-source path as every other
+	// registered neighbor: PinSource reuses a prepared immutable run, while a
+	// restart, feed lag, or compacted history rebuilds only this branch's run
+	// from the authenticated state root.
+	cut, err := a.cutViews(branch, destination, views, candidateBase, candidateTip, nil, true, hints)
 	if err != nil {
 		return localAcquiredMessages{}, err
 	}
-	cut := mergeLocalCuts(committed, localRuns)
 	endLT, err := a.historicalShardEndLT(
 		ctx,
 		master,
@@ -928,10 +931,15 @@ func (a *LocalAcquisition) cutViews(
 		}
 		sources[source] = msgpool.CutSource{Visible: ref}
 	}
+	limit := internalCutPageSize
+	if a.accountPrewarmer != nil {
+		limit = max(limit, a.accountPrewarmCapacity)
+	}
 	cut, err := branch.Cut(msgpool.CutRequest{
 		Sources:          sources,
 		CandidateTip:     cloneHashPointer(candidateTip),
 		CandidateSources: candidateSources,
+		Limit:            limit,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("acquire exact internal-message cut: %w", err)
@@ -974,121 +982,6 @@ func (a *LocalAcquisition) ensureInternalSource(
 	}
 
 	return fmt.Errorf("%w: internal-message destination is absent from topology", ErrAcquisitionNotReady)
-}
-
-func (a *LocalAcquisition) localSeedCut(
-	destination, source msgpool.ShardIdent,
-	view *localNeighborView,
-) ([]*msgpool.InternalMessage, error) {
-	ref, err := localSourceRef(view.previous.ID)
-	if err != nil {
-		return nil, err
-	}
-	// Narrowed to the one destination this acquisition is for. The full form
-	// decodes every entry of the source queue into a message and routes it to
-	// whichever destinations cover it, and this caller then keeps one run and
-	// drops the rest — which on a masterchain build meant materializing a whole
-	// shard's outbound queue to collect the few entries bound for us.
-	messages, err := a.messages.Internals().SeedsForDestination(source, ref, view.previous.State, destination)
-	if err != nil {
-		if errors.Is(err, msgpool.ErrNotFound) {
-			return nil, fmt.Errorf("%w: masterchain destination is absent from internal-message topology", ErrAcquisitionNotReady)
-		}
-		return nil, fmt.Errorf("derive request-local shard-top queue: %w", err)
-	}
-
-	return messages, nil
-}
-
-// mergeLocalCuts interleaves the committed cut with the request-local
-// shard-top runs in canonical order. There is no cut limit: a locally chosen
-// bound would make the resulting block a function of node configuration, and
-// the validation side carries no counterpart to check it against.
-func mergeLocalCuts(committed *msgpool.Cut, local [][]*msgpool.InternalMessage) *msgpool.Cut {
-	total := len(committed.Messages)
-	for index := range local {
-		total += len(local[index])
-	}
-
-	heap := make(internalMessageHeap, 0, len(local)+1)
-	heap.pushRun(0, committed.Messages)
-	for index := range local {
-		heap.pushRun(index+1, local[index])
-	}
-
-	messages := make([]*msgpool.InternalMessage, 0, total)
-	for len(heap) > 0 {
-		cursor := heap.pop()
-		messages = append(messages, cursor.messages[cursor.index])
-		cursor.index++
-		if cursor.index < len(cursor.messages) {
-			heap.push(cursor)
-		}
-	}
-
-	return &msgpool.Cut{Messages: messages, More: committed.More}
-}
-
-type internalMessageCursor struct {
-	run      int
-	index    int
-	messages []*msgpool.InternalMessage
-}
-
-type internalMessageHeap []internalMessageCursor
-
-func (h *internalMessageHeap) pushRun(run int, messages []*msgpool.InternalMessage) {
-	if len(messages) == 0 {
-		return
-	}
-
-	h.push(internalMessageCursor{run: run, messages: messages})
-}
-
-func (h *internalMessageHeap) push(cursor internalMessageCursor) {
-	*h = append(*h, cursor)
-	index := len(*h) - 1
-	for index > 0 {
-		parent := (index - 1) / 2
-		if !internalCursorLess((*h)[index], (*h)[parent]) {
-			break
-		}
-		(*h)[index], (*h)[parent] = (*h)[parent], (*h)[index]
-		index = parent
-	}
-}
-
-func (h *internalMessageHeap) pop() internalMessageCursor {
-	root := (*h)[0]
-	last := len(*h) - 1
-	(*h)[0] = (*h)[last]
-	*h = (*h)[:last]
-	for index := 0; ; {
-		left := index*2 + 1
-		if left >= len(*h) {
-			break
-		}
-		smallest := left
-		if right := left + 1; right < len(*h) && internalCursorLess((*h)[right], (*h)[left]) {
-			smallest = right
-		}
-		if !internalCursorLess((*h)[smallest], (*h)[index]) {
-			break
-		}
-		(*h)[index], (*h)[smallest] = (*h)[smallest], (*h)[index]
-		index = smallest
-	}
-
-	return root
-}
-
-func internalCursorLess(left, right internalMessageCursor) bool {
-	order := msgpool.CompareLtHash(left.messages[left.index], right.messages[right.index])
-	if order != 0 {
-		return order < 0
-	}
-
-	return left.run < right.run
 }
 
 // errQueueScanBudget stops a budgeted prefix walk. It never leaves

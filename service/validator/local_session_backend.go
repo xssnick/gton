@@ -106,7 +106,7 @@ type localSelfWindowCollator interface {
 // that sizes its blocks to the committee's pace, measured from the
 // certificates on its own candidates; see collator/committee_pace.go.
 type localNotarizationPaceCollator interface {
-	ObserveConsensusNotarized(groups.ShardID, simplex.CandidateID, time.Time)
+	ObserveConsensusNotarized([32]byte, simplex.CandidateID, time.Time)
 }
 
 type localWindowRoute struct {
@@ -1004,7 +1004,7 @@ func (b *LocalSessionBackend) nextWindowBet(
 // own. It runs on the consensus hook and blocks on nothing.
 func (b *LocalSessionBackend) ObserveConsensusNotarized(id simplex.CandidateID, at time.Time) {
 	if b.pace != nil {
-		b.pace.ObserveConsensusNotarized(b.config.Shard, id, at)
+		b.pace.ObserveConsensusNotarized(b.config.SessionID, id, at)
 	}
 }
 

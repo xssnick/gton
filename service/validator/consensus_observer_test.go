@@ -500,7 +500,7 @@ func newObserverFixture(
 		Progressed: progressed,
 		Finalized:  func(context.Context, collator.ConsensusFinalization) error { return nil },
 		Speculated: func(context.Context, collator.SpeculativeWindowRequest) error { return nil },
-		Notarized:  func(groups.ShardID, simplex.CandidateID, time.Time) {},
+		Notarized:  func([32]byte, simplex.CandidateID, time.Time) {},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1307,7 +1307,7 @@ func TestConsensusObserverStartCleanupCanRetry(t *testing.T) {
 		Progressed: func(context.Context, collator.ConsensusProgress) error { return nil },
 		Finalized:  func(context.Context, collator.ConsensusFinalization) error { return nil },
 		Speculated: func(context.Context, collator.SpeculativeWindowRequest) error { return nil },
-		Notarized:  func(groups.ShardID, simplex.CandidateID, time.Time) {},
+		Notarized:  func([32]byte, simplex.CandidateID, time.Time) {},
 	})
 	if !errors.Is(err, startErr) || !errors.Is(err, cleanupErr) {
 		t.Fatalf("start error = %v, want joined start and cleanup errors", err)

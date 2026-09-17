@@ -155,8 +155,8 @@ type localAcquisitionSession struct {
 type localCandidateState struct {
 	block        PreviousBlock
 	storageStats AccountStorageStats
-	// queueBase is the committed predecessor set of the first speculative
-	// queue delta in this chain. A later candidate's block is a valid state
+	// queueBase carries only the committed predecessor identities of the first
+	// speculative queue delta in this chain. A later candidate's block is a valid state
 	// predecessor, but must not replace this committed queue view: the delta
 	// chain itself supplies that transition to msgpool.Cut.
 	queueBase []PreviousBlock
@@ -208,7 +208,7 @@ func NewLocalAcquisition(options LocalAcquisitionOptions) (*LocalAcquisition, er
 		dispatch = *options.Dispatch
 	}
 
-	return &LocalAcquisition{
+	acquisition := &LocalAcquisition{
 		builder:                options.Builder,
 		log:                    options.Logger,
 		collationObserver:      options.CollationObserver,
@@ -227,7 +227,12 @@ func NewLocalAcquisition(options LocalAcquisitionOptions) (*LocalAcquisition, er
 		configs:                localConfigCache{log: options.Logger, entries: make(map[localConfigKey]localPreparedConfig)},
 		blocks:                 localBlockCache{entries: make(map[[32]byte]*localBlockSource)},
 		sessions:               make(map[[32]byte]*localAcquisitionSession),
-	}, nil
+	}
+	if registrar, ok := options.ShardTops.(shardTopReadinessRegistrar); ok {
+		registrar.setShardTopReadinessPreloader(acquisition)
+	}
+
+	return acquisition, nil
 }
 
 func (a *LocalAcquisition) PrepareSession(ctx context.Context, session Session, update SessionUpdate) error {
@@ -531,6 +536,7 @@ func (a *LocalAcquisition) AdvanceConsensusBase(
 			}
 		}
 		if request.Base != nil {
+			baseState.queueBase = cloneQueueBase(baseState.queueBase)
 			managed.candidates[request.Base.candidate] = baseState
 			managed.blocks[baseKey] = baseState
 		}

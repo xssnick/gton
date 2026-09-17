@@ -667,6 +667,7 @@ func (c *candidateCodec) finishPayload(
 	// PreparedBlockCandidate.BlockBOC.
 	var preparedBlock *tnstore.PreparedBlockCandidate
 	var blockBOC []byte
+	blockRoot := roots[0]
 	if c.protocolVersion == 1 {
 		preparedBlock, err = tnstore.PrepareBlockCandidateSized(
 			c.shard.Workchain,
@@ -679,6 +680,9 @@ func (c *candidateCodec) finishPayload(
 			err = fmt.Errorf("validator runtime: prepare candidate block: %w", err)
 		} else {
 			blockBOC = preparedBlock.CanonicalBlockBOC()
+			// Validation can retain the block as a chain tip. Reuse the detached
+			// graph so that tip cannot pin the combined collated-proof arena.
+			blockRoot = preparedBlock.Root()
 		}
 	} else {
 		// This is the byte form emitted by reference std_boc_serialize(root, 31):
@@ -739,7 +743,7 @@ func (c *candidateCodec) finishPayload(
 		fileHash:         fileHash,
 		collatedFileHash: collatedFileHash,
 		preparedBlock:    preparedBlock,
-		blockRoot:        roots[0],
+		blockRoot:        blockRoot,
 		collatedRoots:    roots[1:],
 		generationTimeMS: generationTimeMS,
 	}

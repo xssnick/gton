@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/validator/collator"
-	"github.com/xssnick/gton/service/validator/groups"
 	"github.com/xssnick/gton/service/validator/simplex"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -164,12 +163,12 @@ func TestObserverRejectsInvalidParentBeforeCertification(t *testing.T) {
 func TestConsensusObserverForwardsNotarizationPace(t *testing.T) {
 	fixture := newObserverFixture(t, nil, nil)
 	t.Cleanup(func() { _ = fixture.observer.Close(context.Background()) })
-	var gotShard groups.ShardID
+	var gotSession [32]byte
 	var gotID simplex.CandidateID
 	var gotAt time.Time
 	fixture.observer.mu.Lock()
-	fixture.observer.events.Notarized = func(shard groups.ShardID, id simplex.CandidateID, at time.Time) {
-		gotShard, gotID, gotAt = shard, id, at
+	fixture.observer.events.Notarized = func(sessionID [32]byte, id simplex.CandidateID, at time.Time) {
+		gotSession, gotID, gotAt = sessionID, id, at
 	}
 	fixture.observer.mu.Unlock()
 	if err := fixture.observer.PrepareSession(t.Context(), fixture.descriptor); err != nil {
@@ -183,8 +182,8 @@ func TestConsensusObserverForwardsNotarizationPace(t *testing.T) {
 	id := simplex.CandidateID{Slot: 1, Hash: [32]byte{0x95}}
 	before := time.Now()
 	runtime.OnNotarized(id, runtimeTestSeal(t, runtime.config, fixture.validatorKey, simplex.NotarizeVote(id)))
-	if gotID != id || gotShard != runtime.config.Shard || gotAt.Before(before) || gotAt.After(time.Now()) {
-		t.Fatalf("notarization feedback = %v %v %v", gotShard, gotID, gotAt)
+	if gotID != id || gotSession != runtime.config.SessionID || gotAt.Before(before) || gotAt.After(time.Now()) {
+		t.Fatalf("notarization feedback = %x %v %v", gotSession, gotID, gotAt)
 	}
 }
 

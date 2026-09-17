@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/validator/groups"
 	"github.com/xssnick/gton/service/validator/simplex"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -53,11 +52,16 @@ func TestControllerForwardsNotarizationToCommitteePace(t *testing.T) {
 	_, backend, observer := newControllerTestFixture(t)
 	service := &Service{}
 	backend.notarized = service.ObserveConsensusNotarized
-	shard := groups.ShardID{Workchain: 0, Shard: -1 << 63}
-	pace := service.pace(shard)
+	sessionID := [32]byte{0x51}
+	pace := service.pace(sessionID)
 	start := time.Unix(1_700_000_000, 0)
 	for slot := uint32(0); slot < 3; slot++ {
-		pace.noteEmitted(paceCandidate(slot), start.Add(time.Duration(slot)*250*time.Millisecond), 400)
+		pace.noteEmitted(paceCandidate(slot), paceEmission{
+			at:             start.Add(time.Duration(slot) * 250 * time.Millisecond),
+			targetRate:     400 * time.Millisecond,
+			transactions:   400,
+			transactionCap: 400,
+		})
 	}
 	observer.mu.Lock()
 	notarized := observer.events.Notarized
@@ -66,7 +70,7 @@ func TestControllerForwardsNotarizationToCommitteePace(t *testing.T) {
 		t.Fatal("controller installed no notarization callback")
 	}
 	for slot := uint32(0); slot < 3; slot++ {
-		notarized(shard, paceCandidate(slot), start.Add(500*time.Millisecond+time.Duration(slot)*466*time.Millisecond))
+		notarized(sessionID, paceCandidate(slot), start.Add(500*time.Millisecond+time.Duration(slot)*466*time.Millisecond))
 	}
 	_, samples := pace.estimate()
 	if samples != 2 {

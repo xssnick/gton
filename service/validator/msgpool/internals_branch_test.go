@@ -59,6 +59,13 @@ func TestBranchCandidateLineageAndBoundedCut(t *testing.T) {
 	if !cut.More {
 		t.Fatal("bounded branch cut did not report its remaining candidate addition")
 	}
+	if loaded := cut.LoadMore(2); loaded != 1 {
+		t.Fatalf("candidate continuation loaded %d messages, want 1", loaded)
+	}
+	requireLts(t, cut, 1_001, 1_002, 1_200)
+	if cut.More {
+		t.Fatal("candidate continuation did not drain")
+	}
 
 	cut, err = branch.Cut(CutRequest{
 		Sources:      map[ShardIdent]CutSource{baseSource: {Visible: base}},
@@ -69,6 +76,76 @@ func TestBranchCandidateLineageAndBoundedCut(t *testing.T) {
 	}
 	requireLts(t, cut, 1_001, 1_002, 1_200)
 }
+
+func TestBranchBoundedCutLoadsImmutablePages(t *testing.T) {
+	pool, branch, base := branchFixture(t, 5)
+	defer pool.Close()
+
+	cut, err := branch.Cut(CutRequest{
+		Sources: map[ShardIdent]CutSource{baseSource: {Visible: base}},
+		Limit:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLts(t, cut, 1_000, 1_001)
+	if !cut.More {
+		t.Fatal("first page reported a drained cut")
+	}
+
+	// The continuation owns the immutable cursor snapshots, not the branch
+	// registry. Closing the session after acquisition must not change the input
+	// a build already owns.
+	branch.Close()
+	if loaded := cut.LoadMore(2); loaded != 2 {
+		t.Fatalf("second page loaded %d messages, want 2", loaded)
+	}
+	requireLts(t, cut, 1_000, 1_001, 1_002, 1_003)
+	if !cut.More {
+		t.Fatal("second page reported a drained cut")
+	}
+
+	if loaded := cut.LoadMore(2); loaded != 1 {
+		t.Fatalf("final page loaded %d messages, want 1", loaded)
+	}
+	requireLts(t, cut, 1_000, 1_001, 1_002, 1_003, 1_004)
+	if cut.More {
+		t.Fatal("final page left the cut incomplete")
+	}
+	if loaded := cut.LoadMore(2); loaded != 0 {
+		t.Fatalf("drained cut loaded %d extra messages", loaded)
+	}
+}
+
+func BenchmarkBranchCutMaterialization(b *testing.B) {
+	pool, branch, base := branchFixture(b, 8_192)
+	defer pool.Close()
+	defer branch.Close()
+	request := CutRequest{
+		Sources: map[ShardIdent]CutSource{baseSource: {Visible: base}},
+	}
+
+	b.Run("whole_queue", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := branch.Cut(request); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("front_page", func(b *testing.B) {
+		b.ReportAllocs()
+		paged := request
+		paged.Limit = internalCutBenchmarkPageSize
+		for b.Loop() {
+			if _, err := branch.Cut(paged); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+const internalCutBenchmarkPageSize = 256
 
 func TestBranchMergeBaseAndCandidateRetry(t *testing.T) {
 	pool := New(Config{})

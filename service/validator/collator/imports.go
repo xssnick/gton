@@ -13,6 +13,12 @@ import (
 	"github.com/xssnick/gton/service/validator/msgpool"
 )
 
+// internalCutPageSize is the continuation page for a session's immutable
+// internal queue. The first page may be raised to the configured account
+// prewarm horizon; later pages are requested only after the current one is
+// consumed, so a deep backlog is not materialized wholesale.
+const internalCutPageSize = 256
+
 // validateInternalInputs checks the shape and canonical (lt, hash) order of
 // the pool cut before collation starts.
 func validateInternalInputs(inputs []*msgpool.InternalMessage) error {
@@ -25,6 +31,26 @@ func validateInternalInputs(inputs []*msgpool.InternalMessage) error {
 		}
 	}
 	return nil
+}
+
+func loadMoreInternalInputs(cut *msgpool.Cut) (bool, error) {
+	if cut == nil {
+		return false, nil
+	}
+
+	previous := len(cut.Messages)
+	if cut.LoadMore(internalCutPageSize) == 0 {
+		return false, nil
+	}
+	loaded := cut.Messages[previous:]
+	if err := validateInternalInputs(loaded); err != nil {
+		return false, err
+	}
+	if previous > 0 && !internalOrderAdvances(cut.Messages[previous-1], loaded[0]) {
+		return false, fmt.Errorf("%w: internal %d breaks the (lt, hash) order", ErrInvalidInput, previous)
+	}
+
+	return true, nil
 }
 
 func internalOrderAdvances(prev, next *msgpool.InternalMessage) bool {
@@ -78,7 +104,8 @@ func (c *collation) processInternals() error {
 // internalsRemain reports whether the canonical order has messages the block
 // has not imported yet.
 func (c *collation) internalsRemain() bool {
-	return c.internalsCursor < len(c.req.internalMessages())
+	return c.internalsCursor < len(c.req.internalMessages()) ||
+		(c.req.internals != nil && c.req.internals.CanLoadMore())
 }
 
 // topUpInternals resumes the inbound import against the raised mark, once per
@@ -137,50 +164,75 @@ func (c *collation) processInternalsFrom(from int) error {
 	if c.haveUnprocessedDispatchQueue {
 		return nil
 	}
-	all := c.req.internalMessages()
-	if from >= len(all) {
-		return nil
+	var records []tlb.ProcessedUptoRecord
+	recordsLoaded := false
+	workers := c.internalWaveParallelism()
+	if workers > 0 {
+		c.waves.start(c, 1)
+		defer c.waves.stop()
 	}
-	inputs := all[from:]
-	if len(inputs) == 0 {
-		return nil
-	}
-	records, err := c.parentProcessedRecords()
-	if err != nil {
-		return err
-	}
-	if workers := c.internalWaveParallelism(); workers > 0 {
-		return c.processInternalsInWaves(inputs, records, workers, from)
-	}
+	for {
+		all := c.req.internalMessages()
+		if from >= len(all) {
+			loaded, err := loadMoreInternalInputs(c.req.internals)
+			if err != nil {
+				return err
+			}
+			if !loaded {
+				return nil
+			}
+			all = c.req.internalMessages()
+		}
+		if !recordsLoaded {
+			var err error
+			records, err = c.parentProcessedRecords()
+			if err != nil {
+				return err
+			}
+			recordsLoaded = true
+		}
 
-	for i, msg := range inputs {
-		c.updateCollatedEstimate()
-		if !c.limits.fits(c.fullMark()) {
-			c.blockFull = true
-			c.internalsCursor = from + i
-			return nil
+		inputs := all[from:]
+		if workers > 0 {
+			if err := c.processInternalsInWaves(inputs, records, workers, from); err != nil {
+				return err
+			}
+			if c.blockFull || c.internalsCursor < len(c.req.internalMessages()) {
+				return nil
+			}
+			from = c.internalsCursor
+			continue
 		}
-		// collator.cpp:4141-4146: the reference stops importing at the soft
-		// boundary and sets block_full_, so the rest of the collation behaves as
-		// if a limit axis had filled — the remaining generated messages are
-		// enqueued rather than delivered — and the block still publishes.
-		if c.internalMsgExpired() {
-			c.blockFull = true
-			c.blockFullTimeout = true
-			c.stats.InternalMsgTimeouts++
-			c.internalsCursor = from + i
-			return nil
+
+		for i, msg := range inputs {
+			c.updateCollatedEstimate()
+			if !c.limits.fits(c.fullMark()) {
+				c.blockFull = true
+				c.internalsCursor = from + i
+				return nil
+			}
+			// collator.cpp:4141-4146: the reference stops importing at the soft
+			// boundary and sets block_full_, so the rest of the collation behaves as
+			// if a limit axis had filled — the remaining generated messages are
+			// enqueued rather than delivered — and the block still publishes.
+			if c.internalMsgExpired() {
+				c.blockFull = true
+				c.blockFullTimeout = true
+				c.stats.InternalMsgTimeouts++
+				c.internalsCursor = from + i
+				return nil
+			}
+			if err := c.ctx.Err(); err != nil {
+				return err
+			}
+			if err := c.importInternal(msg, records); err != nil {
+				return err
+			}
+			c.internalsCursor = from + i + 1
+			c.updatePeakLoad()
 		}
-		if err = c.ctx.Err(); err != nil {
-			return err
-		}
-		if err = c.importInternal(msg, records); err != nil {
-			return err
-		}
-		c.internalsCursor = from + i + 1
-		c.updatePeakLoad()
+		from = c.internalsCursor
 	}
-	return nil
 }
 
 // importInternal handles one queued message: validate the envelope against its

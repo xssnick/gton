@@ -30,7 +30,7 @@ func openLocalTestBranch(t testing.TB, pool *msgpool.Pool, destination msgpool.S
 	return branch
 }
 
-func TestLocalShardTopQueueIsRequestLocal(t *testing.T) {
+func TestMasterShardTopFallbackIsBranchLocal(t *testing.T) {
 	fixture := newMasterBuildFixture(t, false)
 	pool := msgpool.New(msgpool.Config{})
 	defer pool.Close()
@@ -43,11 +43,27 @@ func TestLocalShardTopQueueIsRequestLocal(t *testing.T) {
 		t.Fatal(err)
 	}
 	acquisition := &LocalAcquisition{messages: pool}
-	if _, err = acquisition.localSeedCut(destination, destination, view); err != nil {
+	branch := openLocalTestBranch(t, pool, destination)
+	if _, err = acquisition.cutCommittedViews(
+		branch,
+		destination,
+		map[msgpool.ShardIdent]*localNeighborView{destination: view},
+		nil,
+		nil,
+		true,
+		&prewarmHints{},
+	); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = pool.Internals().SourceTop(destination, destination); !errors.Is(err, msgpool.ErrNotFound) {
-		t.Fatalf("request-local shard top changed finalized internals: %v", err)
+		t.Fatalf("branch-local shard top changed finalized internals: %v", err)
+	}
+	ref, err := localSourceRef(fixture.request.Previous.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !branch.SourcePinnable(destination, ref) {
+		t.Fatal("fallback did not retain the exact shard-top snapshot in its branch")
 	}
 }
 
@@ -455,45 +471,6 @@ func TestLocalCandidateCutTracksPromotedPoolBase(t *testing.T) {
 		&prewarmHints{},
 	); err != nil {
 		t.Fatalf("cut after parent promotion: %v", err)
-	}
-}
-
-// The merge interleaves every run in canonical order and must not mutate its
-// inputs: the committed cut and the request-local runs are borrowed.
-func TestMergeLocalCutsInterleavesRunsInCanonicalOrder(t *testing.T) {
-	message := func(lt uint64, hash byte) *msgpool.InternalMessage {
-		var key msgpool.QueueKey
-		key[len(key)-1] = hash
-
-		return &msgpool.InternalMessage{EnqueuedLT: lt, Key: key}
-	}
-	committed := &msgpool.Cut{Messages: []*msgpool.InternalMessage{
-		message(10, 1),
-		message(40, 4),
-	}}
-	local := [][]*msgpool.InternalMessage{
-		{message(20, 2), message(50, 5)},
-		{message(30, 3), message(60, 6)},
-	}
-
-	cut := mergeLocalCuts(committed, local)
-	if len(cut.Messages) != 6 {
-		t.Fatalf("merged cut = %+v", cut)
-	}
-	for index, want := range []uint64{10, 20, 30, 40, 50, 60} {
-		if cut.Messages[index].EnqueuedLT != want {
-			t.Fatalf("message %d lt = %d, want %d", index, cut.Messages[index].EnqueuedLT, want)
-		}
-	}
-	if len(committed.Messages) != 2 || len(local[0]) != 2 || len(local[1]) != 2 {
-		t.Fatal("merge mutated an input run")
-	}
-
-	// More is carried from the committed cut alone; there is no local cap that
-	// could truncate a run.
-	committed.More = true
-	if !mergeLocalCuts(committed, local).More {
-		t.Fatal("merged cut dropped the committed More flag")
 	}
 }
 

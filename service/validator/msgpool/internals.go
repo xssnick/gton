@@ -154,13 +154,15 @@ type sourceRun struct {
 	// queueSize tracks the full source out-queue size (every destination),
 	// the cheap drift detector against the size stored in states.
 	queueSize int64
-	// entries is (EnqueuedLT, MsgHash)-sorted; tombstones are compacted
-	// once they outnumber half of the slice. Compaction advances seedSeqno,
-	// because cuts before that point can no longer reconstruct removals.
+	// entries is (EnqueuedLT, MsgHash)-sorted. Ratio compaction advances
+	// seedSeqno; periodic expiry only drops tombstones below that floor.
 	entries      []runEntry
 	byKey        map[QueueKey]int
 	byEnv        map[[32]byte]int
 	removedCount int
+	// lastExpiryFloor amortizes the full ordered-run scan across a history
+	// window, including runs whose removals never reach the ratio threshold.
+	lastExpiryFloor uint32
 }
 
 func (r *sourceRun) live() int { return len(r.entries) - r.removedCount }
@@ -290,13 +292,14 @@ func (n *destinationState) seed(source ShardIdent, top SourceRef, msgs []*Intern
 	n.stats.seeds++
 
 	run := &sourceRun{
-		top:       top,
-		seedSeqno: top.Seqno,
-		refs:      []SourceRef{top},
-		queueSize: int64(queueTotal),
-		entries:   make([]runEntry, len(msgs)),
-		byKey:     make(map[QueueKey]int, len(msgs)),
-		byEnv:     make(map[[32]byte]int, len(msgs)),
+		top:             top,
+		seedSeqno:       top.Seqno,
+		lastExpiryFloor: top.Seqno,
+		refs:            []SourceRef{top},
+		queueSize:       int64(queueTotal),
+		entries:         make([]runEntry, len(msgs)),
+		byKey:           make(map[QueueKey]int, len(msgs)),
+		byEnv:           make(map[[32]byte]int, len(msgs)),
 	}
 	for i, msg := range msgs {
 		run.entries[i] = runEntry{msg: msg}
@@ -537,6 +540,7 @@ func (n *destinationState) compactLocked(run *sourceRun) {
 	run.entries = compacted
 	run.removedCount = 0
 	run.seedSeqno = run.top.Seqno
+	run.lastExpiryFloor = run.seedSeqno
 	run.refs = []SourceRef{run.top}
 	clear(run.byKey)
 	clear(run.byEnv)
@@ -872,8 +876,41 @@ type Cut struct {
 	// pool retains them and never mutates a message after publication, and
 	// callers must not either — no per-message copies are made.
 	Messages []*InternalMessage
-	// More reports that Limit cut the stream short.
+	// More reports that the cut has an unmaterialized canonical tail. A cut
+	// returned by Branch.Cut with a positive Limit owns an immutable cursor for
+	// that tail; LoadMore appends the next page from the same snapshot. Manually
+	// constructed cuts and destination-level cuts may report More without a
+	// loader, which is the ordinary "the source was truncated" contract.
 	More bool
+
+	loadMore func(int) ([]*InternalMessage, bool)
+}
+
+// CanLoadMore reports whether More is backed by an immutable continuation.
+// More alone also covers deliberately truncated/manual cuts whose tail is not
+// available to this consumer.
+func (c *Cut) CanLoadMore() bool {
+	return c != nil && c.More && c.loadMore != nil
+}
+
+// LoadMore appends at most limit messages from the immutable snapshot behind
+// this cut. It returns how many were appended. Zero means either that the
+// snapshot is exhausted or that this cut only carries the More marker and has
+// no continuation. A cut and its continuation have one owner and must not be
+// consumed concurrently.
+func (c *Cut) LoadMore(limit int) int {
+	if limit <= 0 || !c.CanLoadMore() {
+		return 0
+	}
+
+	messages, more := c.loadMore(limit)
+	c.Messages = append(c.Messages, messages...)
+	c.More = more
+	if !more {
+		c.loadMore = nil
+	}
+
+	return len(messages)
 }
 
 // Cut merges the requested source views into the canonical import order.
@@ -1000,6 +1037,37 @@ func (n *destinationState) trimSourceHistoryLocked(run *sourceRun) {
 	copy(run.refs, run.refs[drop:])
 	run.refs = run.refs[:maxSourceRefHistory]
 	run.seedSeqno = max(run.seedSeqno, run.refs[0].Seqno)
+
+	if run.removedCount == 0 {
+		run.lastExpiryFloor = run.seedSeqno
+		return
+	}
+	if run.seedSeqno-run.lastExpiryFloor < maxSourceRefHistory {
+		return
+	}
+	run.lastExpiryFloor = run.seedSeqno
+
+	// A removed message can retain its entire source BOC through one cell.
+	// Even a single tombstone must therefore expire after its last supported
+	// cut, independently of the live/removed ratio. Sweep once per history
+	// window, not once per applied block; no admissible cut loses coverage.
+	// Existing cuts and branch pins own separate message-pointer snapshots.
+	compacted := run.entries[:0]
+	removed := 0
+	for index, entry := range run.entries {
+		if entry.removedAt != 0 && entry.removedAt <= run.seedSeqno {
+			removed++
+			continue
+		}
+		if entry.removedAt == 0 && index != len(compacted) {
+			run.byKey[entry.msg.Key] = len(compacted)
+			run.byEnv[entry.msg.EnvHash] = len(compacted)
+		}
+		compacted = append(compacted, entry)
+	}
+	clear(run.entries[len(compacted):])
+	run.entries = compacted
+	run.removedCount -= removed
 }
 
 func (n *destinationState) validateVisibleLocked(source ShardIdent, visible SourceRef) error {

@@ -104,12 +104,11 @@ type Service struct {
 	runCtx   context.Context
 	cancel   context.CancelFunc
 	sessions map[[32]byte]*managedCollatorSession
-	// paces is the committee's measured cost per transaction for every shard
-	// this service has produced for; see committee_pace.go. Keyed by shard
-	// rather than by session because the committee, and its pace, outlive the
-	// session rotation.
+	// paces is the measured cost per transaction for every consensus session
+	// this service has produced for; see committee_pace.go. A validator-set
+	// rotation starts with a fresh estimate even when it keeps the same shard.
 	pacesMu sync.Mutex
-	paces   map[groups.ShardID]*committeePace
+	paces   map[[32]byte]*committeePace
 	retired map[[32]byte]struct{}
 	// retiredOrder mirrors the keys of retired in insertion order so the fence
 	// can be evicted oldest-first. Both are mutated only under mu.
@@ -1859,28 +1858,35 @@ func (s *Service) ObserveConsensusFinalized(
 
 // RetireSession cancels production, retires the pipeline, and removes durable
 // session state. Pipeline and storage operations are idempotent by contract.
-// pace is the committee-pace estimate for shard, created on first use.
-func (s *Service) pace(shard groups.ShardID) *committeePace {
+// pace is the committee-pace estimate for sessionID, created on first use.
+func (s *Service) pace(sessionID [32]byte) *committeePace {
 	s.pacesMu.Lock()
 	defer s.pacesMu.Unlock()
 
 	if s.paces == nil {
-		s.paces = make(map[groups.ShardID]*committeePace)
+		s.paces = make(map[[32]byte]*committeePace)
 	}
-	pace := s.paces[shard]
+	pace := s.paces[sessionID]
 	if pace == nil {
 		pace = newCommitteePace()
-		s.paces[shard] = pace
+		s.paces[sessionID] = pace
 	}
 
 	return pace
 }
 
-// transactionCap is the number of transactions a build for shard may admit:
+func (s *Service) existingPace(sessionID [32]byte) *committeePace {
+	s.pacesMu.Lock()
+	defer s.pacesMu.Unlock()
+
+	return s.paces[sessionID]
+}
+
+// transactionCap is the number of transactions a build for session may admit:
 // what the committee validates inside a slot at its measured pace, and for the
 // first slot of a window the smaller of that and firstSlotTransactions.
-func (s *Service) transactionCap(shard groups.ShardID, targetRate time.Duration, first bool) uint32 {
-	cap := s.pace(shard).transactionCap(targetRate)
+func (s *Service) transactionCap(sessionID [32]byte, targetRate time.Duration, first bool) uint32 {
+	cap := s.pace(sessionID).transactionCap(targetRate)
 	if first {
 		return firstSlotTransactionCap(cap)
 	}
@@ -1891,8 +1897,10 @@ func (s *Service) transactionCap(shard groups.ShardID, targetRate time.Duration,
 // ObserveConsensusNotarized records the committee's certificate on a candidate.
 // Only candidates this service emitted with transactions become samples; the
 // rest are a map miss. It runs on the consensus hook and blocks on nothing.
-func (s *Service) ObserveConsensusNotarized(shard groups.ShardID, id simplex.CandidateID, at time.Time) {
-	s.pace(shard).noteCertified(id, at)
+func (s *Service) ObserveConsensusNotarized(sessionID [32]byte, id simplex.CandidateID, at time.Time) {
+	if pace := s.existingPace(sessionID); pace != nil {
+		pace.noteCertified(id, at)
+	}
 }
 
 func (s *Service) RetireSession(ctx context.Context, sessionID [32]byte) error {
@@ -1980,6 +1988,11 @@ func (s *Service) RetireSession(ctx context.Context, sessionID [32]byte) error {
 	delete(s.sessions, sessionID)
 	s.fenceRetiredLocked(sessionID)
 	s.mu.Unlock()
+
+	s.pacesMu.Lock()
+	delete(s.paces, sessionID)
+	s.pacesMu.Unlock()
+
 	return nil
 }
 
@@ -2330,31 +2343,22 @@ func (s *Service) SpeculateWindow(ctx context.Context, request SpeculativeWindow
 		Parent:  simplex.Parent(request.Base.candidate),
 		// The first slot of the window this bets on, so the cap the scheduled
 		// first slot carries applies here too; see firstSlotTransactions.
-		MaxTransactions: s.transactionCap(record.Session.Shard, record.Update.TargetRate, true),
+		MaxTransactions: s.transactionCap(record.Session.ID, record.Update.TargetRate, true),
 	}
 	build.speculative = &speculativeBase{state: request.Base, at: request.StartAt}
 	// The schedule of the window this is for, derived from the estimate rather
 	// than from the session — which still describes the window before it.
 	//
-	// The two external instants are deliberately different, and the difference is
-	// the whole reason a speculative first slot can carry externals where an
-	// observed one cannot. ExternalWaitUntil is left at the estimate, already
-	// expiring, so this build never idles waiting for messages to arrive — it is
-	// running against a window that may open at any moment. ExternalProcessUntil
-	// gets a real budget, so the messages that are ALREADY in the pool get
-	// executed instead of being refused by a deadline that passed before the
-	// build began.
-	//
-	// The observed first slot cannot do this: its build starts at the window
-	// start and must broadcast at the window start, so there is no interval to
-	// process anything in. A speculative build starts before the window and is
-	// the only first slot with room. Its cost is bounded by the same block limits
-	// every other slot obeys: internals fill to the soft byte limit, externals
-	// carry the block to the medium one, and one ready batch is all it takes
-	// because the wait above never grants a second.
+	// A speculative first slot uses the predicted slot start exactly as the
+	// reference producer uses the observed one: shard admission ends there, while
+	// the producer may await the completed candidate for one more target rate.
+	// Starting before the prediction is the head start; it must not turn into an
+	// extra admission slot after it. The external wait and processing boundary
+	// therefore coincide with the collation soft deadline.
 	build.ExternalWaitUntil = request.StartAt
-	build.ExternalProcessUntil = request.StartAt.Add(record.Update.TargetRate)
-	build.BuildSoftDeadline = request.StartAt.Add(record.Update.TargetRate)
+	build.ExternalProcessUntil = request.StartAt
+	build.CollationSoftDeadline = request.StartAt
+	build.CandidateAwaitDeadline = request.StartAt.Add(record.Update.TargetRate)
 	build.PaceStartedAt = request.StartAt
 
 	// The build's own deadline is the one the slot would have: the producer
@@ -2453,19 +2457,20 @@ func (s *Service) SpeculateSessionStart(ctx context.Context, request Speculative
 		Slot:            0,
 		Leader:          request.Leader,
 		Parent:          simplex.Genesis(),
-		MaxTransactions: s.transactionCap(record.Session.Shard, record.Update.TargetRate, true),
+		MaxTransactions: s.transactionCap(record.Session.ID, record.Update.TargetRate, true),
 	}
+	predicted := record
+	predicted.Update.CurrentWindowStart = 0
+	predicted.Update.CurrentWindowStartAt = request.StartAt
 	build.sessionStartAt = request.StartAt
-	build.ExternalWaitUntil = request.StartAt
-	build.ExternalProcessUntil = request.StartAt.Add(record.Update.TargetRate)
-	build.BuildSoftDeadline = request.StartAt.Add(record.Update.TargetRate)
+	build.ExternalWaitUntil = externalWaitUntil(predicted, 0)
+	build.ExternalProcessUntil = externalProcessUntil(predicted, 0)
+	build.CollationSoftDeadline = collationSoftDeadline(predicted, 0)
+	build.CandidateAwaitDeadline = candidateAwaitDeadline(predicted, 0)
 	build.PaceStartedAt = request.StartAt
 	handoff := &speculativeHandoff{}
 	build.onSuccessor = handoff.park
 	build.revokeSuccessor = handoff.withdraw
-	predicted := record
-	predicted.Update.CurrentWindowStart = 0
-	predicted.Update.CurrentWindowStartAt = request.StartAt
 	future := s.startBuildFuture(s.runCtx, build, hardBuildDeadline(predicted, 0))
 	if !managed.speculation.install(&speculativeProduction{
 		startSlot: 0,
@@ -3623,22 +3628,18 @@ func (p *windowProducer) offerNextWindow(offer SuccessorOffer) PipelineHandoffOu
 		PreviousPending: &pending,
 		crossWindowBet:  true,
 		// The first slot of the next window; see firstSlotTransactions.
-		MaxTransactions: p.service.transactionCap(p.record.Session.Shard, targetRate, true),
+		MaxTransactions: p.service.transactionCap(p.record.Session.ID, targetRate, true),
 	}
 	request.excludeExternals = offer.Exclude
-	// Never idle. An in-window successor waits out the rest of its slot on the
-	// external stream because its slot start is known; this one is running
-	// against a window that may open at any moment, and the estimate above is
-	// the only thing it could wait for. Waiting on it would spend the whole head
-	// start and still publish late whenever the estimate is late — and this is
-	// the first block of a window, the one every later slot's notarization
-	// chains behind. So the wait is already expired and only the processing
-	// budget is real: the externals already pooled are executed, the ones that
-	// arrive during the wait this build does not take go to the next slot.
+	// Never idle on the estimated window opening: this bet starts from the
+	// predecessor's handoff and consumes what is already pooled. Its admission
+	// boundaries still stop at the predicted slot start, exactly like an
+	// ordinary shard build; only candidate completion may run one rate beyond it.
 	now := time.Now()
 	request.ExternalWaitUntil = now
-	request.ExternalProcessUntil = predicted.Update.CurrentWindowStartAt.Add(targetRate)
-	request.BuildSoftDeadline = predicted.Update.CurrentWindowStartAt.Add(targetRate)
+	request.ExternalProcessUntil = predicted.Update.CurrentWindowStartAt
+	request.CollationSoftDeadline = predicted.Update.CurrentWindowStartAt
+	request.CandidateAwaitDeadline = predicted.Update.CurrentWindowStartAt.Add(targetRate)
 	// The pace is measured from the instant this build really begins rather than
 	// from the slot it is for. The clamp exists so a build started ahead of
 	// schedule reports what an on-time build would have; here there is no
@@ -4120,7 +4121,7 @@ func (p *windowProducer) runSlot(slot uint32) error {
 		p.future = p.service.startBuildFuture(p.job.ctx, request, hardBuildDeadline(p.record, slot))
 	}
 
-	result, softTimeout, waitErr := awaitBuildUntil(p.job.ctx, p.future, softBuildDeadline(p.record, slot))
+	result, softTimeout, waitErr := awaitBuildUntil(p.job.ctx, p.future, request.CandidateAwaitDeadline)
 	if waitErr != nil {
 		return waitErr
 	}
@@ -4661,7 +4662,13 @@ func (s *Service) persistAndEmit(
 	if commit != nil && commit.Built != nil {
 		// The certificate for this candidate, when it comes, measures the
 		// committee from this instant; see committee_pace.go.
-		s.pace(record.Session.Shard).noteEmitted(artifact.Candidate.ID, time.Now(), commit.Built.Stats.Transactions)
+		s.pace(record.Session.ID).noteEmitted(artifact.Candidate.ID, paceEmission{
+			at:             time.Now(),
+			targetRate:     commit.Request.Update.TargetRate,
+			transactions:   commit.Built.Stats.Transactions,
+			transactionCap: commit.Request.MaxTransactions,
+			artificialCap:  commit.Request.Slot == commit.Request.Update.CurrentWindowStart,
+		})
 	}
 	stageStarted = s.metricStageStarted()
 	if err := s.opts.Emit(deliveryCtx, artifact); err != nil {
@@ -5202,17 +5209,18 @@ func slotBuildRequest(
 	notBefore time.Time,
 ) BuildRequest {
 	request := BuildRequest{
-		Session:              session,
-		Update:               record.Update,
-		Slot:                 slot,
-		Leader:               window.Leader,
-		Parent:               parent,
-		Previous:             previous,
-		ExternalWaitUntil:    externalWaitUntil(record, slot),
-		ExternalProcessUntil: externalProcessUntil(record, slot),
-		BuildSoftDeadline:    softBuildDeadline(record, slot),
-		MaxTransactions:      maxTransactions,
-		PaceStartedAt:        buildStartTime(record, slot),
+		Session:                session,
+		Update:                 record.Update,
+		Slot:                   slot,
+		Leader:                 window.Leader,
+		Parent:                 parent,
+		Previous:               previous,
+		ExternalWaitUntil:      externalWaitUntil(record, slot),
+		ExternalProcessUntil:   externalProcessUntil(record, slot),
+		CollationSoftDeadline:  collationSoftDeadline(record, slot),
+		CandidateAwaitDeadline: candidateAwaitDeadline(record, slot),
+		MaxTransactions:        maxTransactions,
+		PaceStartedAt:          buildStartTime(record, slot),
 	}
 	// The schedule is the window's, computed from its start; when the window
 	// opened late the early slots' schedule is already in the past, and a build
@@ -5225,7 +5233,11 @@ func slotBuildRequest(
 	if !notBefore.IsZero() && !request.ExternalWaitUntil.IsZero() {
 		request.ExternalWaitUntil = laterOf(request.ExternalWaitUntil, notBefore)
 		request.ExternalProcessUntil = laterOf(request.ExternalProcessUntil, notBefore)
-		request.BuildSoftDeadline = laterOf(request.BuildSoftDeadline, notBefore.Add(record.Update.TargetRate))
+		request.CollationSoftDeadline = laterOf(request.CollationSoftDeadline, notBefore)
+		request.CandidateAwaitDeadline = laterOf(
+			request.CandidateAwaitDeadline,
+			notBefore.Add(record.Update.TargetRate),
+		)
 	}
 
 	return request
@@ -5256,11 +5268,11 @@ func (p *windowProducer) underloadedNotBefore() time.Time {
 }
 
 // transactionCap is the cap the build for slot may admit: the committee-paced
-// cap for this shard (Service.transactionCap), which for the first slot of the
+// cap for this session (Service.transactionCap), which for the first slot of the
 // window is further bounded by firstSlotTransactions.
 func (p *windowProducer) transactionCap(slot uint32) uint32 {
 	return p.service.transactionCap(
-		p.record.Session.Shard,
+		p.record.Session.ID,
 		p.record.Update.TargetRate,
 		slot == p.job.window.ID.StartSlot,
 	)
@@ -5379,11 +5391,17 @@ func slotStartTime(record SessionRecord, slot uint32) time.Time {
 	return record.Update.CurrentWindowStartAt.Add(offset)
 }
 
-func softBuildDeadline(record SessionRecord, slot uint32) time.Time {
-	slotStart := record.Update.CurrentWindowStartAt.Add(
-		time.Duration(slot-record.Update.CurrentWindowStart) * record.Update.TargetRate,
-	)
-	return slotStart.Add(record.Update.TargetRate)
+func collationSoftDeadline(record SessionRecord, slot uint32) time.Time {
+	start := slotStartTime(record, slot)
+	if record.Session.Shard.IsMasterchain() {
+		return start.Add(record.Update.TargetRate)
+	}
+
+	return start
+}
+
+func candidateAwaitDeadline(record SessionRecord, slot uint32) time.Time {
+	return slotStartTime(record, slot).Add(record.Update.TargetRate)
 }
 
 func hardBuildDeadline(record SessionRecord, slot uint32) time.Time {

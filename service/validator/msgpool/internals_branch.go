@@ -848,7 +848,8 @@ func lineageLive(tip *branchCandidate) func(*InternalMessage) bool {
 }
 
 // mergeBranchCursors drains cursors in canonical order until limit messages are
-// taken.
+// taken. A positive limit keeps the merge heap as the cut's immutable
+// continuation instead of materializing the rest of the queue up front.
 func mergeBranchCursors(cursors []*branchCursor, limit int) *Cut {
 	ready := cursors[:0]
 	for _, cursor := range cursors {
@@ -856,21 +857,44 @@ func mergeBranchCursors(cursors []*branchCursor, limit int) *Cut {
 			ready = append(ready, cursor)
 		}
 	}
-	result := &Cut{}
-	merge := branchCursorHeap(ready)
-	heap.Init(&merge)
-	for merge.Len() > 0 && len(result.Messages) < limit {
-		top := merge[0]
-		result.Messages = append(result.Messages, top.current)
-		if top.advance() {
-			heap.Fix(&merge, 0)
-		} else {
-			heap.Pop(&merge)
-		}
+	pager := &branchCutPager{merge: branchCursorHeap(ready)}
+	heap.Init(&pager.merge)
+	if limit <= 0 {
+		limit = int(^uint(0) >> 1)
 	}
-	result.More = merge.Len() > 0
+
+	messages, more := pager.next(limit)
+	result := &Cut{Messages: messages, More: more}
+	if more {
+		result.loadMore = pager.next
+	}
 
 	return result
+}
+
+// branchCutPager owns a merge already positioned after the preceding page.
+// Its cursors point only at immutable branch snapshots, so Retain, rebase and
+// feed advancement cannot change a later page of an in-flight cut.
+type branchCutPager struct {
+	merge branchCursorHeap
+}
+
+func (p *branchCutPager) next(limit int) ([]*InternalMessage, bool) {
+	// Bounded first pages may follow the account-prewarm horizon (576 by
+	// default), while an unbounded cut passes MaxInt. Avoid growth for the
+	// former without preallocating the latter's whole queue.
+	messages := make([]*InternalMessage, 0, min(limit, 1024))
+	for p.merge.Len() > 0 && len(messages) < limit {
+		top := p.merge[0]
+		messages = append(messages, top.current)
+		if top.advance() {
+			heap.Fix(&p.merge, 0)
+		} else {
+			heap.Pop(&p.merge)
+		}
+	}
+
+	return messages, p.merge.Len() > 0
 }
 
 func orderKey(message *InternalMessage) branchOrderKey {

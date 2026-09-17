@@ -2057,7 +2057,7 @@ func (c *collation) handOffSuccessor(fileHash [32]byte, blockRoot *cell.Cell, pa
 			StorageStats: c.storageStats,
 			Externals:    c.externals,
 		},
-		QueueBase:    clonePreviousBlocks(queueBase),
+		QueueBase:    cloneQueueBase(queueBase),
 		CandidateTip: cloneHashPointer(port.candidateTip),
 		Previous:     clonePreviousBlocks(port.previous),
 		Policy: CandidateState{

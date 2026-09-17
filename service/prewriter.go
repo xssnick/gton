@@ -189,8 +189,9 @@ func (w *prewriter[T]) popJob() (prewriteJob[T], bool) {
 		w.jobs = nil
 		w.head = 0
 	} else if w.head > 1024 && w.head*2 >= len(w.jobs) {
-		copy(w.jobs, w.jobs[w.head:])
-		w.jobs = w.jobs[:len(w.jobs)-w.head]
+		remaining := copy(w.jobs, w.jobs[w.head:])
+		clear(w.jobs[remaining:])
+		w.jobs = w.jobs[:remaining]
 		w.head = 0
 	}
 	w.broadcastDone()

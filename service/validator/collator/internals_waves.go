@@ -175,9 +175,6 @@ func (w *waveState) take(msg *msgpool.InternalMessage) *internalPlan {
 // order, so a resumed pass reports the cursor in the caller's terms rather than
 // in those of the tail it was handed.
 func (c *collation) processInternalsInWaves(inputs []*msgpool.InternalMessage, records []tlb.ProcessedUptoRecord, workers, base int) error {
-	c.waves.start(c, 1)
-	defer c.waves.stop()
-
 	next := 0
 	for next < len(inputs) {
 		// The same three questions the retire loop asks before every plan, asked

@@ -1234,7 +1234,7 @@ func TestStateCellEncodedCacheMemoInvalidatedOnRecordReplacement(t *testing.T) {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 
-	idx := cache.index[root.HashKey()]
+	idx := stateCellCacheRecordPosition(t, cache, root.HashKey())
 	if cache.decoded[idx].Load() != first {
 		t.Fatal("decoded slot does not hold the memoized cell")
 	}

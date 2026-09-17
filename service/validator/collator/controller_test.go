@@ -84,7 +84,7 @@ type controllerTestBackend struct {
 	closeFails   int
 	speculated   []SpeculativeWindowRequest
 	speculateErr error
-	notarized    func(groups.ShardID, simplex.CandidateID, time.Time)
+	notarized    func([32]byte, simplex.CandidateID, time.Time)
 }
 
 type controllerEmptyHistory struct{}
@@ -2175,8 +2175,8 @@ func TestControllerStatusHonorsContextWhileSessionIsBusy(t *testing.T) {
 	}
 }
 
-func (b *controllerTestBackend) ObserveConsensusNotarized(shard groups.ShardID, id simplex.CandidateID, at time.Time) {
+func (b *controllerTestBackend) ObserveConsensusNotarized(sessionID [32]byte, id simplex.CandidateID, at time.Time) {
 	if b.notarized != nil {
-		b.notarized(shard, id, at)
+		b.notarized(sessionID, id, at)
 	}
 }

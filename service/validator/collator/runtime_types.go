@@ -302,12 +302,18 @@ type BuildRequest struct {
 	// slot start for shardchain and three quarters of one target rate after slot
 	// start for masterchain. Restore requests leave it zero.
 	ExternalProcessUntil time.Time
-	// BuildSoftDeadline is the instant awaitBuildUntil gives up waiting for this
-	// build. It is carried in so the collation can size its own internal
-	// budgets — today only out-queue cleanup — the way the reference collator
-	// derives them from params_.soft_timeout. Restore requests leave it zero,
-	// which leaves those budgets inert.
-	BuildSoftDeadline time.Time
+	// CollationSoftDeadline is the reference collator's params_.soft_timeout.
+	// Queue cleanup and internal-message admission derive their phase budgets
+	// from it. For a shard it is the slot start; for the masterchain it is one
+	// target rate after the slot start. Restore requests leave it zero, which
+	// leaves those budgets inert.
+	CollationSoftDeadline time.Time
+	// CandidateAwaitDeadline is the later producer boundary at which
+	// awaitBuildUntil stops waiting for the complete candidate. The C++ window
+	// producer gives a shard collator one target rate after its admission phases
+	// close to finish state updates, proofs and serialization. It coincides with
+	// CollationSoftDeadline on the masterchain.
+	CandidateAwaitDeadline time.Time
 	// MaxTransactions caps the transactions the build admits; zero leaves the
 	// block bounded by its limits alone. The producer sets it for the first slot
 	// of a leader window, whose block has to be notarized inside the committee's

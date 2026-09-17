@@ -1916,12 +1916,23 @@ func TestRuntimeRetiredSessionCanBePreparedAgain(t *testing.T) {
 	defer fixture.close(t)
 	session, update := fixture.session(43, 1, 0, time.Now())
 	fixture.prepare(t, session, update)
+	oldPace := fixture.service.pace(session.ID)
 
 	if err := fixture.service.RetireSession(context.Background(), session.ID); err != nil {
 		t.Fatal(err)
 	}
+	if pace := fixture.service.existingPace(session.ID); pace != nil {
+		t.Fatal("retirement retained the old committee pace")
+	}
+	fixture.service.ObserveConsensusNotarized(session.ID, paceCandidate(1), time.Now())
+	if pace := fixture.service.existingPace(session.ID); pace != nil {
+		t.Fatal("a late certificate recreated the retired committee pace")
+	}
 	if err := fixture.service.PrepareSession(context.Background(), session, update); err != nil {
 		t.Fatalf("prepare next session generation: %v", err)
+	}
+	if pace := fixture.service.pace(session.ID); pace == oldPace {
+		t.Fatal("reopened session reused the retired committee pace")
 	}
 	record, err := fixture.service.Session(context.Background(), session.ID)
 	if err != nil {

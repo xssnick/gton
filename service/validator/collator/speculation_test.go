@@ -859,16 +859,11 @@ func TestSpeculationAdoptsAFinishedBuildWithItsResultIntact(t *testing.T) {
 	}
 }
 
-// The two external instants of a speculative first slot say different things,
-// and a change that collapses them silently costs the block its externals — the
-// difference measured in the field between ~260 and ~400 transactions in the
-// first slot of a window.
-//
-// The wait must stay at the estimate: a build racing a window that may open at
-// any moment must never idle for messages to arrive. The processing budget must
-// not, or the deadline has already passed when the first ready batch is offered
-// and every one of them is refused.
-func TestSpeculativeFirstSlotMayExecuteReadyExternalsButNeverWaitsForThem(t *testing.T) {
+// A speculative build gets its head start before the predicted slot start, not
+// by admitting more work after it. C++ closes every shard admission phase at
+// slot_start and awaits the finished candidate until slot_start+target_rate.
+// The bet must preserve those two distinct boundaries.
+func TestSpeculativeFirstSlotStopsAdmissionAtPredictedSlotStart(t *testing.T) {
 	requests := make(chan BuildRequest, 4)
 	pipeline := &runtimeTestPipeline{}
 	pipeline.build = func(ctx context.Context, request BuildRequest) (*Candidate, error) {
@@ -881,7 +876,16 @@ func TestSpeculativeFirstSlotMayExecuteReadyExternalsButNeverWaitsForThem(t *tes
 	defer fixture.close(t)
 
 	_, base := fixture.candidate(t, fixture.windowSize-1, 0xa9)
-	if err := fixture.speculate(t, base, fixture.windowSize); err != nil {
+	rate := fixture.update.TargetRate
+	startAt := time.Now().Add(rate)
+	if err := fixture.service.SpeculateWindow(context.Background(), SpeculativeWindowRequest{
+		SessionID: fixture.session.ID,
+		StartSlot: fixture.windowSize,
+		Leader:    0,
+		Base:      base,
+		StartAt:   startAt,
+		Deadline:  startAt.Add(5 * time.Second),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	var request BuildRequest
@@ -891,17 +895,19 @@ func TestSpeculativeFirstSlotMayExecuteReadyExternalsButNeverWaitsForThem(t *tes
 		t.Fatal("the speculative build never started")
 	}
 
-	rate := fixture.update.TargetRate
-	if request.ExternalProcessUntil.Sub(request.PaceStartedAt) != rate {
-		t.Fatalf("external processing budget = %v, want one target rate %v",
-			request.ExternalProcessUntil.Sub(request.PaceStartedAt), rate)
+	if !request.ExternalWaitUntil.Equal(startAt) {
+		t.Fatalf("external wait = %v, want predicted slot start %v", request.ExternalWaitUntil, startAt)
 	}
-	if !request.ExternalWaitUntil.Equal(request.PaceStartedAt) {
-		t.Fatalf("external wait = %v, want the estimate %v so the build never idles",
-			request.ExternalWaitUntil, request.PaceStartedAt)
+	if !request.ExternalProcessUntil.Equal(startAt) {
+		t.Fatalf("external processing deadline = %v, want predicted slot start %v",
+			request.ExternalProcessUntil, startAt)
 	}
-	if !request.ExternalProcessUntil.After(request.ExternalWaitUntil) {
-		t.Fatal("the processing budget did not outlive the wait; ready externals would be refused")
+	if !request.CollationSoftDeadline.Equal(startAt) {
+		t.Fatalf("collation soft deadline = %v, want predicted slot start %v",
+			request.CollationSoftDeadline, startAt)
+	}
+	if want := startAt.Add(rate); !request.CandidateAwaitDeadline.Equal(want) {
+		t.Fatalf("candidate await deadline = %v, want %v", request.CandidateAwaitDeadline, want)
 	}
 }
 
@@ -1211,6 +1217,49 @@ func (f *speculationFixture) speculateSessionStart(t *testing.T) error {
 		StartAt:   time.Now(),
 		Deadline:  time.Now().Add(5 * time.Second),
 	})
+}
+
+func TestSessionStartSpeculationSeparatesShardAdmissionAndAwaitDeadlines(t *testing.T) {
+	requests := make(chan BuildRequest, 1)
+	pipeline := &runtimeTestPipeline{}
+	pipeline.build = func(ctx context.Context, request BuildRequest) (*Candidate, error) {
+		requests <- request
+		<-ctx.Done()
+
+		return nil, ctx.Err()
+	}
+	fixture := newSessionStartFixture(t, pipeline, func(context.Context, CandidateArtifact) error { return nil })
+	defer fixture.close(t)
+
+	rate := fixture.update.TargetRate
+	startAt := time.Now().Add(rate)
+	if err := fixture.service.SpeculateSessionStart(context.Background(), SpeculativeSessionStartRequest{
+		SessionID: fixture.session.ID,
+		Leader:    0,
+		StartAt:   startAt,
+		Deadline:  startAt.Add(5 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var request BuildRequest
+	select {
+	case request = <-requests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the session-start speculative build never started")
+	}
+	if !request.ExternalWaitUntil.Equal(startAt) || !request.ExternalProcessUntil.Equal(startAt) {
+		t.Fatalf("session-start external deadlines = %v/%v, want slot start %v",
+			request.ExternalWaitUntil, request.ExternalProcessUntil, startAt)
+	}
+	if !request.CollationSoftDeadline.Equal(startAt) {
+		t.Fatalf("session-start collation soft deadline = %v, want slot start %v",
+			request.CollationSoftDeadline, startAt)
+	}
+	if want := startAt.Add(rate); !request.CandidateAwaitDeadline.Equal(want) {
+		t.Fatalf("session-start candidate await deadline = %v, want %v",
+			request.CandidateAwaitDeadline, want)
+	}
 }
 
 // Window zero of a fresh session has no candidate to bet on: its base is the

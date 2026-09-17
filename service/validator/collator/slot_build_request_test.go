@@ -47,8 +47,17 @@ func TestSlotBuildRequestFillsEveryScheduledField(t *testing.T) {
 	if got, want := request.ExternalProcessUntil, externalProcessUntil(record, 12); !got.Equal(want) {
 		t.Errorf("ExternalProcessUntil = %v, want %v", got, want)
 	}
-	if got, want := request.BuildSoftDeadline, softBuildDeadline(record, 12); !got.Equal(want) {
-		t.Errorf("BuildSoftDeadline = %v, want %v", got, want)
+	if got, want := request.CollationSoftDeadline, collationSoftDeadline(record, 12); !got.Equal(want) {
+		t.Errorf("CollationSoftDeadline = %v, want %v", got, want)
+	}
+	if got, want := request.CandidateAwaitDeadline, candidateAwaitDeadline(record, 12); !got.Equal(want) {
+		t.Errorf("CandidateAwaitDeadline = %v, want %v", got, want)
+	}
+	if !request.CollationSoftDeadline.Equal(request.ExternalWaitUntil) {
+		t.Error("shard collation phases outlive slot start")
+	}
+	if got, want := request.CandidateAwaitDeadline.Sub(request.CollationSoftDeadline), record.Update.TargetRate; got != want {
+		t.Errorf("shard candidate await tail = %v, want one target rate %v", got, want)
 	}
 	// On a shard the wait and the process instants are the same slot start, so
 	// swapping the two helpers is invisible there. On masterchain the wait is zero
@@ -62,6 +71,15 @@ func TestSlotBuildRequestFillsEveryScheduledField(t *testing.T) {
 	}
 	if got, want := master.ExternalProcessUntil, externalProcessUntil(masterRecord, 12); !got.Equal(want) {
 		t.Errorf("masterchain ExternalProcessUntil = %v, want %v", got, want)
+	}
+	if got, want := master.CollationSoftDeadline, collationSoftDeadline(masterRecord, 12); !got.Equal(want) {
+		t.Errorf("masterchain CollationSoftDeadline = %v, want %v", got, want)
+	}
+	if got, want := master.CandidateAwaitDeadline, candidateAwaitDeadline(masterRecord, 12); !got.Equal(want) {
+		t.Errorf("masterchain CandidateAwaitDeadline = %v, want %v", got, want)
+	}
+	if !master.CollationSoftDeadline.Equal(master.CandidateAwaitDeadline) {
+		t.Error("masterchain collation and candidate await deadlines differ")
 	}
 	if master.ExternalWaitUntil.Equal(master.ExternalProcessUntil) {
 		t.Error("the masterchain fixture cannot tell the two external instants apart")
@@ -201,8 +219,11 @@ func TestSlotBuildRequestSpacesAnUnderloadedSlotFromThePreviousEmission(t *testi
 	if !spaced.ExternalWaitUntil.Equal(late) || !spaced.ExternalProcessUntil.Equal(late) {
 		t.Fatalf("wait/process = %v/%v, want the floor %v", spaced.ExternalWaitUntil, spaced.ExternalProcessUntil, late)
 	}
-	if want := late.Add(record.Update.TargetRate); !spaced.BuildSoftDeadline.Equal(want) {
-		t.Fatalf("soft deadline = %v, want one rate past the floor %v", spaced.BuildSoftDeadline, want)
+	if !spaced.CollationSoftDeadline.Equal(late) {
+		t.Fatalf("collation soft deadline = %v, want the explicit floor %v", spaced.CollationSoftDeadline, late)
+	}
+	if want := late.Add(record.Update.TargetRate); !spaced.CandidateAwaitDeadline.Equal(want) {
+		t.Fatalf("candidate await deadline = %v, want one rate past the floor %v", spaced.CandidateAwaitDeadline, want)
 	}
 	if !spaced.PaceStartedAt.Equal(scheduled.PaceStartedAt) {
 		t.Fatal("the pace start is the schedule's and must not move with the floor")
@@ -210,7 +231,9 @@ func TestSlotBuildRequestSpacesAnUnderloadedSlotFromThePreviousEmission(t *testi
 
 	// A floor before the schedule leaves the schedule alone.
 	early := slotBuildRequest(session, record, window, 12, parent, &CandidateArtifact{}, 300, scheduled.ExternalWaitUntil.Add(-time.Second))
-	if !early.ExternalWaitUntil.Equal(scheduled.ExternalWaitUntil) || !early.BuildSoftDeadline.Equal(scheduled.BuildSoftDeadline) {
+	if !early.ExternalWaitUntil.Equal(scheduled.ExternalWaitUntil) ||
+		!early.CollationSoftDeadline.Equal(scheduled.CollationSoftDeadline) ||
+		!early.CandidateAwaitDeadline.Equal(scheduled.CandidateAwaitDeadline) {
 		t.Fatal("a floor before the schedule must not change the schedule")
 	}
 

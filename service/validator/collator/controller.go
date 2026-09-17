@@ -24,7 +24,7 @@ import (
 type ConsensusObserverEvents struct {
 	Progressed func(context.Context, ConsensusProgress) error
 	Finalized  func(context.Context, ConsensusFinalization) error
-	Notarized  func(groups.ShardID, simplex.CandidateID, time.Time)
+	Notarized  func([32]byte, simplex.CandidateID, time.Time)
 	// Speculated offers a first slot for a window that has not opened yet,
 	// built on a candidate the observer already holds. It is the standalone
 	// collator's counterpart to the bet a validator places from its own
@@ -79,7 +79,7 @@ type ControllerBackend interface {
 	Collator
 	ApplyConsensusProgress(context.Context, ConsensusProgress) error
 	ObserveConsensusFinalized(context.Context, [32]byte, ton.BlockIDExt) error
-	ObserveConsensusNotarized(groups.ShardID, simplex.CandidateID, time.Time)
+	ObserveConsensusNotarized([32]byte, simplex.CandidateID, time.Time)
 	SpeculateWindow(context.Context, SpeculativeWindowRequest) error
 }
 

@@ -188,7 +188,7 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 			offer:        request.onSuccessor,
 			revoke:       request.revokeSuccessor,
 			previous:     clonePreviousBlocks(resolved.previous),
-			queueBase:    clonePreviousBlocks(resolved.queueBase),
+			queueBase:    cloneQueueBase(resolved.queueBase),
 			candidateTip: cloneHashPointer(resolved.candidateTip),
 			policy:       CandidateState{BeforeSplit: beforeSplit},
 			slot:         request.Slot,
@@ -493,7 +493,7 @@ func (a *LocalAcquisition) resolveChain(
 				OutQueueSize: &queueSize,
 			}},
 			storage:      pending.StorageStats,
-			queueBase:    clonePreviousBlocks(pending.QueueBase),
+			queueBase:    cloneQueueBase(pending.QueueBase),
 			candidateTip: &tip,
 			master:       managed.master,
 		}, nil
@@ -512,7 +512,7 @@ func (a *LocalAcquisition) resolveChain(
 		return localResolvedChain{
 			previous:     []PreviousBlock{state.block},
 			storage:      state.storageStats,
-			queueBase:    clonePreviousBlocks(state.queueBase),
+			queueBase:    cloneQueueBase(state.queueBase),
 			candidateTip: cloneHashPointer(state.queueTip),
 			master:       state.master,
 		}, nil
@@ -531,7 +531,7 @@ func (a *LocalAcquisition) resolveChain(
 		return localResolvedChain{
 			previous:     []PreviousBlock{state.block},
 			storage:      state.storageStats,
-			queueBase:    clonePreviousBlocks(state.queueBase),
+			queueBase:    cloneQueueBase(state.queueBase),
 			candidateTip: cloneHashPointer(state.queueTip),
 			master:       state.master,
 		}, nil
@@ -993,19 +993,19 @@ func (a *LocalAcquisition) recordCandidateLocked(
 	}
 	state.queueTip = &queueID
 	if chain.candidateTip == nil {
-		state.queueBase = clonePreviousBlocks(chain.previous)
+		state.queueBase = cloneQueueBase(chain.previous)
 	} else if parent, exists := managed.blocks[*chain.candidateTip]; exists {
 		if parent.queueTip == nil {
 			return fmt.Errorf("%w: candidate queue parent is unavailable", ErrAcquisitionNotReady)
 		}
-		state.queueBase = clonePreviousBlocks(parent.queueBase)
+		state.queueBase = cloneQueueBase(parent.queueBase)
 	} else if len(chain.queueBase) != 0 {
 		// An adopted bet's tip is a foreign candidate: its node lives in the
 		// message branch, installed by the speculative lineage, but it was
 		// never recorded here — recordCandidateLocked only ever sees blocks
 		// this node built. The chain carries the lineage's committed root for
 		// exactly this case.
-		state.queueBase = clonePreviousBlocks(chain.queueBase)
+		state.queueBase = cloneQueueBase(chain.queueBase)
 	} else {
 		return fmt.Errorf("%w: candidate queue parent is unavailable", ErrAcquisitionNotReady)
 	}
@@ -1050,10 +1050,24 @@ func (a *LocalAcquisition) resolveArtifactBlock(
 	return localCandidateState{
 		block:        chain.previous[0],
 		storageStats: chain.storage,
-		queueBase:    clonePreviousBlocks(chain.queueBase),
+		queueBase:    cloneQueueBase(chain.queueBase),
 		queueTip:     cloneHashPointer(chain.candidateTip),
 		master:       chain.master,
 	}, nil
+}
+
+// cloneQueueBase keeps only the identities consumed by candidate queue cuts.
+// Retaining predecessor roots here pins an old state across committed rebases.
+func cloneQueueBase(previous []PreviousBlock) []PreviousBlock {
+	if len(previous) == 0 {
+		return nil
+	}
+	cloned := make([]PreviousBlock, len(previous))
+	for i := range previous {
+		cloned[i].ID = cloneBlockID(previous[i].ID)
+	}
+
+	return cloned
 }
 
 func clonePreviousBlocks(previous []PreviousBlock) []PreviousBlock {
@@ -1644,12 +1658,12 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 		// deadline. See TestQueueCleanupBudgetDoesNotDependOnAcquisitionLatency.
 		input.QueueCleanupUntil = queueCleanupUntil(
 			assembly,
-			request.BuildSoftDeadline,
+			request.CollationSoftDeadline,
 			request.ExternalWaitUntil,
 		)
 		input.InternalMsgUntil = internalMsgUntil(
 			assembly,
-			request.BuildSoftDeadline,
+			request.CollationSoftDeadline,
 			request.ExternalWaitUntil,
 		)
 		var assemblyDurations candidateAssemblyDurations
@@ -1705,12 +1719,12 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 	// parameters instead of a second rule.
 	input.QueueCleanupUntil = queueCleanupUntil(
 		assembly,
-		request.BuildSoftDeadline,
+		request.CollationSoftDeadline,
 		request.ExternalWaitUntil,
 	)
 	input.InternalMsgUntil = internalMsgUntil(
 		assembly,
-		request.BuildSoftDeadline,
+		request.CollationSoftDeadline,
 		request.ExternalWaitUntil,
 	)
 	// From assembly too: a build whose slot boundary had already passed when it

@@ -21,7 +21,7 @@ type stateCellEncodedCache struct {
 	// decoded content is identical for identical record data. A slot is reset
 	// whenever setRecordLocked replaces the record data.
 	decoded []atomic.Pointer[cell.Cell]
-	index   map[cell.Hash]int
+	index   stateCellCacheIndex
 	bytes   uint64
 	// layers are staged blocks not yet folded into the base map above, newest
 	// last. Staging is an O(1) append reusing the records' own hash index, so
@@ -138,7 +138,7 @@ func newStateCellEncodedCache(capacity int) *stateCellEncodedCache {
 	return &stateCellEncodedCache{
 		records: make([]storage.EncodedCellRecord, 0, capacity),
 		decoded: make([]atomic.Pointer[cell.Cell], 0, capacity),
-		index:   make(map[cell.Hash]int, capacity),
+		index:   newStateCellCacheIndex(capacity),
 	}
 }
 
@@ -244,7 +244,8 @@ func (c *stateCellEncodedCache) foldLayers(remove, budget int) (int, bool) {
 			// and decoded again on the next read. A cell the base already holds
 			// for the same bytes stays; a replaced record had its slot reset above.
 			if decoded := layer.decoded[i].Load(); decoded != nil {
-				c.decoded[c.index[flat[i].Hash]].CompareAndSwap(nil, decoded)
+				idx, _ := c.index.indexOf(c.records, flat[i].Hash)
+				c.decoded[idx].CompareAndSwap(nil, decoded)
 			}
 		}
 		budget -= next - c.layerFolded
@@ -272,7 +273,7 @@ func (c *stateCellEncodedCache) setRecordLocked(hash cell.Hash, encoded []byte) 
 	if len(encoded) == 0 {
 		return false
 	}
-	if idx, ok := c.index[hash]; ok {
+	if idx, err := c.index.indexOf(c.records, hash); err == nil {
 		if bytes.Equal(c.records[idx].Data, encoded) {
 			return false
 		}
@@ -282,7 +283,7 @@ func (c *stateCellEncodedCache) setRecordLocked(hash cell.Hash, encoded []byte) 
 		c.decoded[idx].Store(nil)
 		return true
 	}
-	c.index[hash] = len(c.records)
+	c.index.insert(hash, len(c.records))
 	c.records = append(c.records, storage.EncodedCellRecord{Hash: hash, Data: encoded})
 	c.decoded = append(c.decoded, atomic.Pointer[cell.Cell]{})
 	c.bytes += uint64(len(encoded))
@@ -357,8 +358,8 @@ func (c *stateCellEncodedCache) loadWith(hash cell.Hash, loader cell.LazyCellLoa
 		return loaded, nil
 	}
 
-	idx, ok := c.index[hash]
-	if !ok || len(c.records[idx].Data) == 0 {
+	idx, err := c.index.indexOf(c.records, hash)
+	if err != nil || len(c.records[idx].Data) == 0 {
 		return nil, storage.ErrNotFound
 	}
 	slot := &c.decoded[idx]

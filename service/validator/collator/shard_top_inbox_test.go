@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/shard"
@@ -25,6 +26,26 @@ type shardTopInboxTestProvider struct {
 	ancestorCall int
 	setsCall     int
 	readyCall    int
+}
+
+type shardTopInboxTestPreloader struct {
+	started chan ton.BlockIDExt
+	release <-chan struct{}
+}
+
+func (p *shardTopInboxTestPreloader) preloadShardTop(ctx context.Context, block ton.BlockIDExt) error {
+	select {
+	case p.started <- block:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case <-p.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (p *shardTopInboxTestProvider) ValidatorSets(
@@ -123,6 +144,96 @@ func TestShardTopInboxSelectsLinearTipWithoutMutatingRegistry(t *testing.T) {
 	registryTop := registry.Tops()[0]
 	if !sameShardBlock(registryTop.Block, oldBlock) {
 		t.Fatal("Select mutated the input registry")
+	}
+}
+
+func TestShardTopInboxPreloadsExistingLatestWithoutMarkingItReady(t *testing.T) {
+	oldBlock := masterShardTestBlock(0, shard.Root, 10, 0x31)
+	block := masterShardTestBlock(0, shard.Root, 11, 0x32)
+	masterchain := masterShardTestBlock(-1, shard.Root, 100, 0xa3)
+	description, root := shardTopInboxTestDescription(
+		t, block, []ton.BlockIDExt{oldBlock}, masterchain, 7, 77, 99,
+	)
+	inbox := shardTopInboxTestNew(t)
+	if err := inbox.StoreShardTopDescription(context.Background(), description, root); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	preloader := &shardTopInboxTestPreloader{
+		started: make(chan ton.BlockIDExt, 2),
+		release: release,
+	}
+	inbox.setShardTopReadinessPreloader(preloader)
+
+	select {
+	case warmed := <-preloader.started:
+		if !warmed.Equals(&block) {
+			t.Fatalf("preloaded block = %v, want %v", warmed, block)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("latest shard top was not preloaded")
+	}
+	group := inbox.groups[shardTopInboxGroupKey{shard: shardTopKey(block), catchainSeqno: 7}]
+	if group == nil || group.ready != nil {
+		t.Fatal("best-effort preload changed authoritative inbox readiness")
+	}
+	if err := inbox.StoreShardTopDescription(context.Background(), description, root); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case duplicate := <-preloader.started:
+		t.Fatalf("same descriptor started a duplicate preload for %v", duplicate)
+	default:
+	}
+	close(release)
+}
+
+func TestShardTopInboxQueuesPreloadBurstBeyondParallelism(t *testing.T) {
+	inbox := shardTopInboxTestNew(t)
+	release := make(chan struct{}, shardTopPreloadParallelism+4)
+	preloader := &shardTopInboxTestPreloader{
+		started: make(chan ton.BlockIDExt, shardTopPreloadParallelism+4),
+		release: release,
+	}
+	inbox.setShardTopReadinessPreloader(preloader)
+
+	for index := 0; index < shardTopPreloadParallelism+4; index++ {
+		inbox.scheduleShardTopPreload(masterShardTestBlock(0, shard.Root, uint32(index+1), byte(index+1)))
+	}
+	for index := 0; index < shardTopPreloadParallelism; index++ {
+		select {
+		case <-preloader.started:
+		case <-time.After(time.Second):
+			t.Fatalf("only %d preload workers started", index)
+		}
+	}
+	select {
+	case block := <-preloader.started:
+		t.Fatalf("preload parallelism exceeded for %v", block)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	release <- struct{}{}
+	select {
+	case <-preloader.started:
+	case <-time.After(time.Second):
+		t.Fatal("queued shard top was dropped instead of starting after a worker completed")
+	}
+	close(release)
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		inbox.mu.Lock()
+		remaining := len(inbox.preloading)
+		inbox.mu.Unlock()
+		if remaining == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d shard-top preloads did not finish", remaining)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -492,6 +603,47 @@ func TestShardTopInboxKeepsReadyLowerWhileHigherLoads(t *testing.T) {
 	}
 	if inbox.Len() != 2 {
 		t.Fatalf("latest/ready entry count = %d, want 2", inbox.Len())
+	}
+}
+
+func TestShardTopInboxKeepsReadyLowerOnTemporaryLatestError(t *testing.T) {
+	oldBlock := masterShardTestBlock(0, shard.Root, 10, 0xb3)
+	lower := masterShardTestBlock(0, shard.Root, 11, 0xb4)
+	higher := masterShardTestBlock(0, shard.Root, 12, 0xb5)
+	masterchain := masterShardTestBlock(-1, shard.Root, 100, 0xb6)
+	registry := shardTopInboxTestRegistry(t, oldBlock, masterShardTestDescriptorOptions{nextCatchainSeqno: 7})
+	lowerDescription, lowerRoot := shardTopInboxTestDescription(
+		t, lower, []ton.BlockIDExt{oldBlock}, masterchain, 7, 77, 98,
+	)
+	higherDescription, higherRoot := shardTopInboxTestTwoLinkDescription(
+		t, higher, lower, oldBlock, masterchain, 7, 77, 99,
+	)
+	inbox := shardTopInboxTestNew(t)
+	provider := shardTopInboxTestReadyProvider(7, 77)
+	selection := shardTopInboxTestSelection(masterchain, registry, provider, 100, 13)
+
+	if err := inbox.StoreShardTopDescription(context.Background(), lowerDescription, lowerRoot); err != nil {
+		t.Fatal(err)
+	}
+	if tops, err := inbox.Select(context.Background(), selection); err != nil || len(tops) != 1 {
+		t.Fatalf("prepare lower ready top: tops=%d err=%v", len(tops), err)
+	}
+	if err := inbox.StoreShardTopDescription(context.Background(), higherDescription, higherRoot); err != nil {
+		t.Fatal(err)
+	}
+	provider.readyCheck = func(_ context.Context, block ton.BlockIDExt) (bool, error) {
+		if block.Equals(&higher) {
+			return false, ErrAcquisitionNotReady
+		}
+
+		return true, nil
+	}
+	tops, err := inbox.Select(context.Background(), selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tops) != 1 || !tops[0].Block.Equals(&lower) {
+		t.Fatalf("selection after temporary latest failure = %+v, want lower", tops)
 	}
 }
 

@@ -76,8 +76,8 @@ type CellRecordEncoder struct {
 }
 
 type stateCellRecordRef struct {
-	cell    *cell.Cell
-	logical *cell.Cell
+	cell    stateCellRecordView
+	logical stateCellRecordView
 }
 
 type stateCellRecordRefs struct {
@@ -544,32 +544,36 @@ func PrepareStateUpdateCells(update *cell.Cell) (StateCellRecords, error) {
 
 func prepareReachableStateUpdateCells(root *cell.Cell) (StateCellRecords, error) {
 	var builder stateCellRecordBuilder
-	stack := []*cell.Cell{root.Virtualize(0)}
+	rootView := stateCellRecordView{cell: root}
+	stack := []stateCellRecordView{rootView.virtualize(0)}
 	for len(stack) > 0 {
 		current := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if current.IsLazy() {
-			loader, err := current.BeginParse()
+		if current.cell.IsLazy() {
+			loader, err := current.cell.BeginParse()
 			if err != nil {
-				return StateCellRecords{}, fmt.Errorf("load reachable state update cell %x: %w", current.Hash(), err)
+				return StateCellRecords{}, fmt.Errorf("load reachable state update cell %x: %w", current.hash(), err)
 			}
-			current = loader.BaseCell()
+			current = stateCellRecordView{cell: loader.BaseCell()}
 		}
 
-		if current.GetType() == cell.PrunedCellType && current.ActualLevel() == current.EffectiveLevel()+1 {
+		if current.cell.GetType() == cell.PrunedCellType && current.cell.ActualLevel() == current.effectiveLevel()+1 {
 			continue
 		}
 
-		hash := current.HashKey()
+		hash := current.hash()
 		if _, ok := builder.index[hash]; ok {
 			continue
 		}
 
 		var refs stateCellRecordRefs
-		if current.GetType() != cell.PrunedCellType {
-			refs.count = int(current.RefsNum())
+		if current.cell.GetType() != cell.PrunedCellType {
+			refs.count = int(current.cell.RefsNum())
+		}
+		if refs.count > 0 {
+			childLevel := current.childLevel()
 			for i := range refs.count {
-				ref, err := current.PeekRef(i)
+				ref, err := current.ref(i, childLevel)
 				if err != nil {
 					return StateCellRecords{}, fmt.Errorf(
 						"load reachable state update ref %d from %x: %w",
@@ -578,7 +582,7 @@ func prepareReachableStateUpdateCells(root *cell.Cell) (StateCellRecords, error)
 						err,
 					)
 				}
-				if ref.IsLazy() {
+				if ref.cell.IsLazy() {
 					return StateCellRecords{}, fmt.Errorf(
 						"reachable state update ref %d from %x is lazy",
 						i,
@@ -587,14 +591,14 @@ func prepareReachableStateUpdateCells(root *cell.Cell) (StateCellRecords, error)
 				}
 				refs.items[i] = stateCellRecordRef{
 					cell:    ref,
-					logical: stateCellLogicalRef(current, ref),
+					logical: current.logicalRef(ref, childLevel),
 				}
 			}
 		}
 
 		// GetMetadata builds hash, depth and ref slices for every cell. The
 		// state-update path only needs the encoded form, so write it directly.
-		record, err := prepareReachableStateUpdateCellRecord(current, refs, builder.alloc)
+		record, err := prepareReachableStateUpdateCellRecord(current, &refs, builder.alloc)
 		if err != nil {
 			return StateCellRecords{}, fmt.Errorf("build reachable state update cell record %x: %w", hash, err)
 		}
@@ -608,38 +612,38 @@ func prepareReachableStateUpdateCells(root *cell.Cell) (StateCellRecords, error)
 }
 
 func prepareReachableStateUpdateCellRecord(
-	cl *cell.Cell,
-	refs stateCellRecordRefs,
+	view stateCellRecordView,
+	refs *stateCellRecordRefs,
 	alloc func(int) []byte,
 ) (EncodedCellRecord, error) {
-	body := cl
-	if cl.GetType() == cell.PrunedCellType {
+	body := view.cell
+	if body.GetType() == cell.PrunedCellType {
 		var err error
-		body, err = materializePrunedStateCell(cl)
+		body, err = materializePrunedStateCell(view.materialize())
 		if err != nil {
 			return EncodedCellRecord{}, err
 		}
 	}
 
-	record := prepareEncodedStateCellRecord(cl, body, refs, alloc)
+	record := prepareEncodedStateCellRecord(view, body, refs, alloc)
 	return record, nil
 }
 
 func prepareEncodedStateCellRecord(
-	view *cell.Cell,
+	view stateCellRecordView,
 	body *cell.Cell,
-	refs stateCellRecordRefs,
+	refs *stateCellRecordRefs,
 	alloc func(int) []byte,
 ) EncodedCellRecord {
 	cellBits := body.BitsSize()
-	d1, d2 := cellRecordDescriptorsForLevelMask(body, view.LevelMask(), refs.count, cellBits)
+	d1, d2 := cellRecordDescriptorsForLevelMask(body, view.levelMask(), refs.count, cellBits)
 	layout, refsSize := encodedStateCellRefLayout(refs)
 	size := 2 + int(d2/2+d2%2) + refsSize
 
 	encoded := alloc(size)
 	encodeStateCellRecordTo(encoded, body, refs, d1, d2, layout)
 	return EncodedCellRecord{
-		Hash: view.HashKey(),
+		Hash: view.hash(),
 		Data: encoded,
 	}
 }
@@ -647,7 +651,7 @@ func prepareEncodedStateCellRecord(
 func encodeStateCellRecordTo(
 	buf []byte,
 	body *cell.Cell,
-	refs stateCellRecordRefs,
+	refs *stateCellRecordRefs,
 	d1 byte,
 	d2 byte,
 	layout encodedCellRecordRefLayout,
@@ -667,14 +671,14 @@ func encodeStateCellRecordTo(
 	}
 	for i := range refs.count {
 		logicalRef := refs.items[i].logical
-		levelMask := logicalRef.LevelMask()
+		levelMask := logicalRef.levelMask()
 		if layout.compactRefs && layout.slowRefs&(1<<uint(i)) == 0 {
-			hash := logicalRef.HashKeyAt(0)
+			hash := logicalRef.hashAt(0)
 			copy(buf[pos:pos+encodedCellRecordHashSize], hash[:])
 			pos += encodedCellRecordHashSize
 			binary.BigEndian.PutUint16(
 				buf[pos:pos+encodedCellRecordDepthSize],
-				logicalRef.Depth(0),
+				logicalRef.depth(0),
 			)
 			pos += encodedCellRecordDepthSize
 			continue
@@ -686,7 +690,7 @@ func encodeStateCellRecordTo(
 			if !levelMask.IsSignificant(level) {
 				continue
 			}
-			hash := logicalRef.HashKeyAt(level)
+			hash := logicalRef.hashAt(level)
 			copy(buf[pos:pos+encodedCellRecordHashSize], hash[:])
 			pos += encodedCellRecordHashSize
 		}
@@ -696,14 +700,14 @@ func encodeStateCellRecordTo(
 			}
 			binary.BigEndian.PutUint16(
 				buf[pos:pos+encodedCellRecordDepthSize],
-				logicalRef.Depth(level),
+				logicalRef.depth(level),
 			)
 			pos += encodedCellRecordDepthSize
 		}
 	}
 }
 
-func encodedStateCellRefLayout(refs stateCellRecordRefs) (encodedCellRecordRefLayout, int) {
+func encodedStateCellRefLayout(refs *stateCellRecordRefs) (encodedCellRecordRefLayout, int) {
 	if refs.count == 0 {
 		return encodedCellRecordRefLayout{}, 0
 	}
@@ -714,7 +718,7 @@ func encodedStateCellRefLayout(refs stateCellRecordRefs) (encodedCellRecordRefLa
 	var layout encodedCellRecordRefLayout
 	for i := range refs.count {
 		logicalRef := refs.items[i].logical
-		levelMask := logicalRef.LevelMask()
+		levelMask := logicalRef.levelMask()
 		hashesCount := CellRefHashesCount(levelMask.Mask)
 		refSize := 1 + hashesCount*(encodedCellRecordHashSize+encodedCellRecordDepthSize)
 		refsSize += refSize
@@ -731,33 +735,6 @@ func encodedStateCellRefLayout(refs stateCellRecordRefs) (encodedCellRecordRefLa
 		return layout, compactRefsSize
 	}
 	return layout, refsSize
-}
-
-func stateCellLogicalRef(parent *cell.Cell, ref *cell.Cell) *cell.Cell {
-	// Match tonutils cellRefView.logicalBoundaryRef: PeekRef already applies
-	// the parent view, while non-virtual Merkle parents shift children by one.
-	if parent.IsVirtualized() {
-		return ref
-	}
-
-	// A raw parent is its own view at its own level, and its children live at
-	// that level, not at zero. The distinction only exists inside a Merkle
-	// proof carried by the state — a message body proving a dictionary entry,
-	// say — where the walk reaches raw level-1 cells: PeekRef on the proof view
-	// hands the interior root back raw, because a level-1 cell viewed at level
-	// 1 is itself. Virtualizing its children to level 0 recorded every level-1
-	// child as a level-0 ref: the level-1 hash and depth were dropped, the
-	// parent's record then decoded to a depth at level 1 one deeper than the
-	// cell's own, and every lazy read of the proof's interior failed with
-	// "loaded lazy ref does not match placeholder: depth mismatch at level 1".
-	// On the stand that cost a shard block its slot 65 times in a row, on one
-	// inbound message whose body carried such a proof.
-	level := parent.Level()
-	switch parent.GetType() {
-	case cell.MerkleProofCellType, cell.MerkleUpdateCellType:
-		level++
-	}
-	return ref.Virtualize(uint8(level))
 }
 
 func materializePrunedStateCell(cl *cell.Cell) (*cell.Cell, error) {

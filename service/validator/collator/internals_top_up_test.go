@@ -167,6 +167,33 @@ func TestMediumMarkClearsOnlyALimitLatch(t *testing.T) {
 	}
 }
 
+func TestTopUpDoesNotTreatTruncatedCutAsPageable(t *testing.T) {
+	roomy := blockLimits{
+		bytes:        limitThresholds{1, 1 << 30, 1 << 31, 1 << 32},
+		gas:          limitThresholds{1, 1 << 30, 1 << 31, 1 << 32},
+		ltDelta:      limitThresholds{1, 1 << 30, 1 << 31, 1 << 32},
+		collatedData: limitThresholds{1, 1 << 30, 1 << 31, 1 << 32},
+	}
+	c := &collation{
+		ctx:       t.Context(),
+		req:       collationRequest{internals: &msgpool.Cut{More: true}},
+		limits:    newBlockLimitStatus(roomy, 0, nil, 0, 0),
+		queueSize: skipExternalsQueueSize + 1,
+		blockFull: true,
+	}
+
+	if err := c.topUpInternals(); err != nil {
+		t.Fatal(err)
+	}
+	if c.toppedUp || c.mediumMark || !c.blockFull {
+		t.Fatalf("truncated cut changed top-up state: topped=%v medium=%v full=%v",
+			c.toppedUp, c.mediumMark, c.blockFull)
+	}
+	if !c.req.internalsIncomplete() {
+		t.Fatal("truncated cut lost its incomplete ProcessedInfo contract")
+	}
+}
+
 func TestFullMarkIsTheSoftBoundaryUntilEscalation(t *testing.T) {
 	c := &collation{}
 	if got := c.fullMark(); got != LoadNormal {

@@ -1128,7 +1128,7 @@ func (o *ConsensusObserver) prepareRuntime(
 			events, state := o.events, o.state
 			o.mu.RUnlock()
 			if state == consensusObserverRunning {
-				events.Notarized(config.Shard, id, at)
+				events.Notarized(config.SessionID, id, at)
 			}
 		},
 	})

@@ -253,7 +253,10 @@ type ShardRequest struct {
 	// — queues never inspected) forces generated messages into the outbound
 	// queue, as when inbound queues are not
 	// drained: immediate delivery would advance the processed bound past
-	// the unimported queue tail and lose it.
+	// the unimported queue tail and lose it. A pageable cut is consumed in place:
+	// BuildShard may append pages to Messages and clear More. It must have one
+	// build owner and must not be used by concurrent builds; sequential retries
+	// and rebuilds remain valid.
 	Internals *msgpool.Cut
 
 	// Neighbors contains the individual processed frontiers of the topology
@@ -323,9 +326,11 @@ type MasterRequest struct {
 	MaxExternalAttempts int
 	StorageStats        AccountStorageStats
 	Dispatch            DispatchPolicy
-	Internals           *msgpool.Cut
-	Neighbors           []Neighbor
-	NeighborShardEndLT  tlb.ShardEndLTFunc
+	// Internals follows ShardRequest.Internals' completeness and single-owner
+	// paging contract. BuildMaster may materialize its continuation in place.
+	Internals          *msgpool.Cut
+	Neighbors          []Neighbor
+	NeighborShardEndLT tlb.ShardEndLTFunc
 	// FullCollatedProofs supplies the post-transition shard-neighbor block and
 	// state proofs when capFullCollatedData is active. The masterchain
 	// predecessor state is already authenticated by Previous.

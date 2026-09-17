@@ -152,6 +152,19 @@ func TestLastSlotHandsOffIntoTheNextDelegatedWindow(t *testing.T) {
 	if request.ExternalWaitUntil.After(time.Now()) {
 		t.Fatal("the cross-window build waits for externals until an estimated window start")
 	}
+	predictedStart := slotStartTime(SessionRecord{Session: session, Update: update}, 2)
+	if !request.ExternalProcessUntil.Equal(predictedStart) {
+		t.Fatalf("cross-window external processing deadline = %v, want predicted slot start %v",
+			request.ExternalProcessUntil, predictedStart)
+	}
+	if !request.CollationSoftDeadline.Equal(predictedStart) {
+		t.Fatalf("cross-window collation soft deadline = %v, want predicted slot start %v",
+			request.CollationSoftDeadline, predictedStart)
+	}
+	if want := predictedStart.Add(update.TargetRate); !request.CandidateAwaitDeadline.Equal(want) {
+		t.Fatalf("cross-window candidate await deadline = %v, want %v",
+			request.CandidateAwaitDeadline, want)
+	}
 
 	// Consensus now opens the predicted window on the candidate the previous
 	// window really emitted. The parked build must survive the old producer's

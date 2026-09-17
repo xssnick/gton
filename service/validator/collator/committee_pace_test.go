@@ -1,15 +1,33 @@
 package collator
 
 import (
+	"math"
 	"testing"
 	"time"
 
-	"github.com/xssnick/gton/service/validator/groups"
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
 func paceCandidate(slot uint32) simplex.CandidateID {
 	return simplex.CandidateID{Slot: slot, Hash: [32]byte{byte(slot + 1)}}
+}
+
+func emitPaceCandidate(
+	pace *committeePace,
+	id simplex.CandidateID,
+	at time.Time,
+	targetRate time.Duration,
+	transactions uint32,
+	transactionCap uint32,
+	artificialCap bool,
+) {
+	pace.noteEmitted(id, paceEmission{
+		at:             at,
+		targetRate:     targetRate,
+		transactions:   transactions,
+		transactionCap: transactionCap,
+		artificialCap:  artificialCap,
+	})
 }
 
 // The stand's measurement, replayed: blocks of 400 transactions certified at a
@@ -32,7 +50,15 @@ func TestCommitteePaceCapsToTheMeasuredCadence(t *testing.T) {
 	// committee's time on that block. The first certificate measures an idle
 	// committee from the emission and is not a sample.
 	for slot := uint32(0); slot < 12; slot++ {
-		pace.noteEmitted(paceCandidate(slot), start.Add(time.Duration(slot)*250*time.Millisecond), 400)
+		emitPaceCandidate(
+			pace,
+			paceCandidate(slot),
+			start.Add(time.Duration(slot)*250*time.Millisecond),
+			rate,
+			400,
+			400,
+			false,
+		)
 	}
 	cert := start.Add(500 * time.Millisecond)
 	for slot := uint32(0); slot < 12; slot++ {
@@ -60,36 +86,70 @@ func TestCommitteePaceCapsToTheMeasuredCadence(t *testing.T) {
 	}
 }
 
-// A certificate the committee produced while idle measures delivery and
-// whatever it was busy with before — the previous leader's tail, on the
-// stand — and never the block's cost: it is not a sample. A certificate that
-// keeps our own cadence proves only that the committee is at least that fast,
-// so it relaxes the estimate and the cap probes upward, from the start value
-// when nothing has been measured yet.
+// An underfilled candidate says nothing about whether the committee could
+// validate a larger block. It must not raise the cap merely because its
+// certificate arrived while the committee was idle or kept our cadence. The
+// first slot has a separate safety cap and is excluded for the same reason even
+// when it fills that artificial cap.
+func TestCommitteePaceRelaxesOnlyForNaturalCapBoundCandidates(t *testing.T) {
+	pace := newCommitteePace()
+	rate := 400 * time.Millisecond
+	start := time.Unix(1_700_000_000, 0)
+
+	// Underfilled and idle: only a quarter of the natural cap was used.
+	emitPaceCandidate(pace, paceCandidate(1), start, rate, 100, adaptiveTransactionStart, false)
+	if _, sampled := pace.noteCertified(paceCandidate(1), start.Add(383*time.Millisecond)); sampled {
+		t.Fatal("an idle committee's certificate became a cost sample")
+	}
+	if got := pace.transactionCap(rate); got != adaptiveTransactionStart {
+		t.Fatalf("cap after an underfilled idle candidate = %d, want the start value %d", got, adaptiveTransactionStart)
+	}
+
+	// The first slot fills its 100-transaction cap, but that cap exists for the
+	// first-block deadline rather than the committee's measured throughput.
+	emitPaceCandidate(pace, paceCandidate(2), start.Add(time.Second), rate, 100, 100, true)
+	if _, sampled := pace.noteCertified(paceCandidate(2), start.Add(1200*time.Millisecond)); sampled {
+		t.Fatal("the first-slot certificate became a cost sample")
+	}
+	if got := pace.transactionCap(rate); got != adaptiveTransactionStart {
+		t.Fatalf("cap after a first-slot candidate = %d, want the start value %d", got, adaptiveTransactionStart)
+	}
+
+	// A naturally cap-bound candidate is evidence that there was work available
+	// for a bigger block. Its timely certificate may probe upward. Twenty
+	// transactions is deliberately below the downward sample minimum: timely
+	// upward evidence is still useful even when a per-transaction cost sample
+	// would be too noisy.
+	emitPaceCandidate(pace, paceCandidate(3), start.Add(2*time.Second), rate, 20, 20, false)
+	if _, sampled := pace.noteCertified(paceCandidate(3), start.Add(2200*time.Millisecond)); sampled {
+		t.Fatal("a sub-minimum candidate became a cost sample")
+	}
+	if got := pace.transactionCap(rate); got <= adaptiveTransactionStart {
+		t.Fatalf("cap after a naturally bound candidate = %d, want above the start value %d", got, adaptiveTransactionStart)
+	}
+}
+
+// A cap-bound certificate that keeps our cadence proves only that the
+// committee is at least that fast, so it probes upward without treating the
+// fixed pipeline latency as the block's cost.
 func TestCommitteePaceRelaxesWhileTheCommitteeKeepsPace(t *testing.T) {
 	pace := newCommitteePace()
 	rate := 400 * time.Millisecond
 	start := time.Unix(1_700_000_000, 0)
 
-	// Idle: emitted, certified 383 ms later with nothing before it. On the
-	// stand this read as 2.8 ms per transaction and cut the cap to 76. It is
-	// not a sample; the committee had time to spare, so the cap grows.
-	pace.noteEmitted(paceCandidate(1), start, 100)
-	if _, sampled := pace.noteCertified(paceCandidate(1), start.Add(383*time.Millisecond)); sampled {
+	// Seed a natural cap-bound candidate while the committee is idle.
+	emitPaceCandidate(pace, paceCandidate(1), start, rate, 300, 300, false)
+	if _, sampled := pace.noteCertified(paceCandidate(1), start.Add(300*time.Millisecond)); sampled {
 		t.Fatal("an idle committee's certificate became a cost sample")
 	}
-	if got := pace.transactionCap(rate); got <= adaptiveTransactionStart {
-		t.Fatalf("cap after an idle certificate = %d, want above the start value: the committee had time to spare", got)
-	}
 
-	// Keeping pace: blocks every 400 ms, certificates every 400 ms, each block
-	// queued behind the previous certificate by a constant 1.1 s of pipeline
-	// latency. The cap climbs; the estimate never reads that latency as cost.
+	// Blocks every 400 ms, certificates every 400 ms, each block queued behind
+	// the previous certificate by a constant 1.1 s of pipeline latency.
 	emit := start.Add(time.Second)
 	cert := emit.Add(1100 * time.Millisecond)
 	previous := pace.transactionCap(rate)
 	for slot := uint32(2); slot < 14; slot++ {
-		pace.noteEmitted(paceCandidate(slot), emit, 300)
+		emitPaceCandidate(pace, paceCandidate(slot), emit, rate, 300, 300, false)
 		if _, sampled := pace.noteCertified(paceCandidate(slot), cert); sampled {
 			t.Fatalf("certificate %d on our own cadence became a cost sample", slot)
 		}
@@ -109,6 +169,28 @@ func TestCommitteePaceRelaxesWhileTheCommitteeKeepsPace(t *testing.T) {
 	}
 }
 
+// Relaxation starts from the cap implied by the actual session target rate.
+// A hard-coded 400 ms seed would make the same timely candidate jump much
+// further when a session uses a slower slot rate.
+func TestCommitteePaceRelaxSeedUsesTargetRate(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	rates := []time.Duration{400 * time.Millisecond, 800 * time.Millisecond}
+	var caps [2]uint32
+
+	for i, rate := range rates {
+		pace := newCommitteePace()
+		emitPaceCandidate(pace, paceCandidate(uint32(i)), start, rate, adaptiveTransactionStart, adaptiveTransactionStart, false)
+		pace.noteCertified(paceCandidate(uint32(i)), start.Add(200*time.Millisecond))
+		caps[i] = pace.transactionCap(rate)
+	}
+	if caps[0] != caps[1] {
+		t.Fatalf("cap after one timely certificate = %d at 400 ms and %d at 800 ms, want the same proportional probe", caps[0], caps[1])
+	}
+	if caps[0] <= adaptiveTransactionStart {
+		t.Fatalf("cap after one timely certificate = %d, want above the start value %d", caps[0], adaptiveTransactionStart)
+	}
+}
+
 // Certificates for candidates this node did not emit, for empty candidates, and
 // for blocks too small to measure the per-transaction cost leave the estimate
 // alone — though a small block's certificate still marks the committee busy.
@@ -118,11 +200,11 @@ func TestCommitteePaceIgnoresWhatItCannotMeasure(t *testing.T) {
 	if _, sampled := pace.noteCertified(paceCandidate(9), start); sampled {
 		t.Fatal("a certificate for a candidate never emitted became a sample")
 	}
-	pace.noteEmitted(paceCandidate(1), start, 0)
+	emitPaceCandidate(pace, paceCandidate(1), start, 400*time.Millisecond, 0, adaptiveTransactionStart, false)
 	if _, sampled := pace.noteCertified(paceCandidate(1), start.Add(50*time.Millisecond)); sampled {
 		t.Fatal("an empty candidate became a sample")
 	}
-	pace.noteEmitted(paceCandidate(2), start, 5)
+	emitPaceCandidate(pace, paceCandidate(2), start, 400*time.Millisecond, 5, adaptiveTransactionStart, false)
 	if _, sampled := pace.noteCertified(paceCandidate(2), start.Add(120*time.Millisecond)); sampled {
 		t.Fatal("a five-transaction block became a sample")
 	}
@@ -137,7 +219,7 @@ func TestCommitteePaceIgnoresWhatItCannotMeasure(t *testing.T) {
 	// certificate at +400 came 280 ms later — far behind the zero interval
 	// between the two emissions — so it is a sample measured from the previous
 	// certificate, not from its emission.
-	pace.noteEmitted(paceCandidate(3), start, 200)
+	emitPaceCandidate(pace, paceCandidate(3), start, 400*time.Millisecond, 200, adaptiveTransactionStart, false)
 	spent, sampled := pace.noteCertified(paceCandidate(3), start.Add(400*time.Millisecond))
 	if !sampled || spent != 280*time.Millisecond {
 		t.Fatalf("spent = %s sampled = %v, want 280 ms measured from the previous certificate", spent, sampled)
@@ -175,12 +257,12 @@ func TestCommitteePaceIsBoundedAtBothEnds(t *testing.T) {
 	fast := newCommitteePace()
 	emit := start
 	cert := start.Add(time.Second)
-	fast.noteEmitted(paceCandidate(1), emit, 300)
+	emitPaceCandidate(fast, paceCandidate(1), emit, rate, 300, 300, false)
 	fast.noteCertified(paceCandidate(1), cert)
 	for slot := uint32(2); slot < 80; slot++ {
 		emit = emit.Add(rate)
 		cert = cert.Add(rate)
-		fast.noteEmitted(paceCandidate(slot), emit, 300)
+		emitPaceCandidate(fast, paceCandidate(slot), emit, rate, 300, 300, false)
 		fast.noteCertified(paceCandidate(slot), cert)
 	}
 	if got := fast.transactionCap(rate); got != adaptiveTransactionCeiling {
@@ -192,11 +274,10 @@ func TestCommitteePaceIsBoundedAtBothEnds(t *testing.T) {
 }
 
 // The stand at a session start, replayed: one certificate 1.36 s after the
-// previous on a 125-transaction block, a stall that is not what the block
-// cost. It may at most double the estimate; and the next certificate, back in
-// 90 ms on a 63-transaction block, bounds the cost at 90/63 ms and pulls the
-// estimate straight down to it — the cap recovers in one certificate instead
-// of thirty.
+// previous on a 125-transaction block, a stall that is not what the block cost.
+// It may at most double the estimate. A later fast certificate only pulls that
+// estimate down when its candidate filled the natural adaptive cap; a fast but
+// underfilled block must not recreate the idle-load jump this pace prevents.
 func TestCommitteePaceStallIsSteppedAndUndoneByAFastCertificate(t *testing.T) {
 	pace := newCommitteePace()
 	rate := 400 * time.Millisecond
@@ -204,9 +285,9 @@ func TestCommitteePaceStallIsSteppedAndUndoneByAFastCertificate(t *testing.T) {
 
 	// A measured committee: 300-transaction blocks certified 400 ms apart
 	// while queued 1.1 s deep, one sample at 466 ms to set the estimate.
-	pace.noteEmitted(paceCandidate(1), start, 300)
+	emitPaceCandidate(pace, paceCandidate(1), start, rate, 300, adaptiveTransactionStart, false)
 	pace.noteCertified(paceCandidate(1), start.Add(1100*time.Millisecond))
-	pace.noteEmitted(paceCandidate(2), start.Add(400*time.Millisecond), 400)
+	emitPaceCandidate(pace, paceCandidate(2), start.Add(400*time.Millisecond), rate, 400, 400, false)
 	if _, sampled := pace.noteCertified(paceCandidate(2), start.Add(1566*time.Millisecond)); !sampled {
 		t.Fatal("a certificate 466 ms behind the previous one on a queued block is a sample")
 	}
@@ -216,7 +297,7 @@ func TestCommitteePaceStallIsSteppedAndUndoneByAFastCertificate(t *testing.T) {
 	}
 
 	// The stall: queued, certified 1362 ms after the previous certificate.
-	pace.noteEmitted(paceCandidate(3), start.Add(800*time.Millisecond), 125)
+	emitPaceCandidate(pace, paceCandidate(3), start.Add(800*time.Millisecond), rate, 125, 400, false)
 	if _, sampled := pace.noteCertified(paceCandidate(3), start.Add(2928*time.Millisecond)); !sampled {
 		t.Fatal("the stalled certificate is a sample, only a bounded one")
 	}
@@ -231,38 +312,54 @@ func TestCommitteePaceStallIsSteppedAndUndoneByAFastCertificate(t *testing.T) {
 		t.Fatalf("ms per transaction after a stall = %.3f, want above %.3f: the stall still counts", stalled, before)
 	}
 
-	// Recovery: the committee is idle and answers a 63-transaction block in
-	// 90 ms. The cost cannot exceed 90/63 = 1.43 ms; the estimate drops to it.
-	pace.noteEmitted(paceCandidate(4), start.Add(4*time.Second), 63)
+	// A fast underfilled block is not evidence that a larger block would be as
+	// fast. It leaves both the estimate and cap unchanged.
+	stalledCap := pace.transactionCap(rate)
+	emitPaceCandidate(pace, paceCandidate(4), start.Add(4*time.Second), rate, 63, 400, false)
 	if _, sampled := pace.noteCertified(paceCandidate(4), start.Add(4090*time.Millisecond)); sampled {
-		t.Fatal("an idle certificate is a bound, not a sample")
+		t.Fatal("an idle certificate became a cost sample")
 	}
-	bounded, _ := pace.estimate()
-	if bounded > 90.0/63+0.001 {
-		t.Fatalf("ms per transaction after a 90 ms certificate on 63 transactions = %.3f, want at most %.3f", bounded, 90.0/63)
+	underfilled, _ := pace.estimate()
+	if underfilled != stalled {
+		t.Fatalf("ms per transaction after a fast underfilled candidate = %.3f, want unchanged %.3f", underfilled, stalled)
 	}
-	if cap := pace.transactionCap(rate); cap < 150 {
-		t.Fatalf("cap after the fast certificate = %d, want at least 150", cap)
+	if cap := pace.transactionCap(rate); cap != stalledCap {
+		t.Fatalf("cap after a fast underfilled candidate = %d, want unchanged %d", cap, stalledCap)
 	}
 
-	// A queued certificate bounds from the previous certificate, not from
-	// the emission: 154 transactions certified 150 ms after the previous
-	// certificate bound the cost at 150/154 ms.
-	pace.noteEmitted(paceCandidate(5), start.Add(4050*time.Millisecond), 154)
-	pace.noteCertified(paceCandidate(5), start.Add(4240*time.Millisecond))
+	// A naturally cap-bound candidate does provide upward evidence. The idle
+	// certificate bounds from emission and recovers the cap immediately.
+	emitPaceCandidate(pace, paceCandidate(5), start.Add(5*time.Second), rate, stalledCap, stalledCap, false)
+	pace.noteCertified(paceCandidate(5), start.Add(5090*time.Millisecond))
+	bounded, _ := pace.estimate()
+	wantBound := math.Max(90.0/float64(stalledCap), committeeMinMillisPerTransaction)
+	if bounded > wantBound+0.001 {
+		t.Fatalf("ms per transaction after a fast cap-bound candidate = %.3f, want at most %.3f", bounded, wantBound)
+	}
+	recoveredCap := pace.transactionCap(rate)
+	if recoveredCap <= stalledCap {
+		t.Fatalf("cap after a fast cap-bound candidate = %d, want above %d", recoveredCap, stalledCap)
+	}
+
+	// A queued cap-bound certificate bounds from the previous certificate, not
+	// from emission.
+	emitPaceCandidate(pace, paceCandidate(6), start.Add(5050*time.Millisecond), rate, recoveredCap, recoveredCap, false)
+	pace.noteCertified(paceCandidate(6), start.Add(5240*time.Millisecond))
 	queuedBound, _ := pace.estimate()
-	if queuedBound > 150.0/154+0.001 {
-		t.Fatalf("ms per transaction after a 150 ms queued certificate on 154 transactions = %.3f, want at most %.3f", queuedBound, 150.0/154)
+	wantQueuedBound := math.Max(150.0/float64(recoveredCap), committeeMinMillisPerTransaction)
+	if queuedBound > wantQueuedBound+0.001 {
+		t.Fatalf("ms per transaction after a queued cap-bound certificate = %.3f, want at most %.3f", queuedBound, wantQueuedBound)
 	}
 }
 
-// The service hands every slot the shard's paced cap and the first slot the
-// smaller of that and firstSlotTransactions; shards do not share an estimate.
-func TestServiceTransactionCapPerShardAndFirstSlot(t *testing.T) {
+// The service hands every slot the session's paced cap and the first slot the
+// smaller of that and firstSlotTransactions. Validator-set rotations, even on
+// the same shard, do not inherit the previous committee's estimate.
+func TestServiceTransactionCapPerSessionAndFirstSlot(t *testing.T) {
 	service := &Service{}
 	rate := 400 * time.Millisecond
-	loaded := groups.ShardID{Workchain: 0, Shard: -1 << 63}
-	quiet := groups.ShardID{Workchain: 0, Shard: 1 << 62}
+	loaded := [32]byte{0x11}
+	quiet := [32]byte{0x12}
 
 	if got := service.transactionCap(loaded, rate, false); got != adaptiveTransactionStart {
 		t.Fatalf("cap with nothing measured = %d, want the start value", got)
@@ -276,7 +373,7 @@ func TestServiceTransactionCapPerShardAndFirstSlot(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0)
 	pace := service.pace(loaded)
 	for slot := uint32(0); slot < 4; slot++ {
-		pace.noteEmitted(paceCandidate(slot), start, 400)
+		emitPaceCandidate(pace, paceCandidate(slot), start, rate, 400, 400, false)
 	}
 	cert := start.Add(500 * time.Millisecond)
 	for slot := uint32(0); slot < 4; slot++ {
@@ -291,13 +388,13 @@ func TestServiceTransactionCapPerShardAndFirstSlot(t *testing.T) {
 		t.Fatalf("first-slot cap = %d, want %d while the paced cap is larger", got, firstSlotTransactions)
 	}
 	if got := service.transactionCap(quiet, rate, false); got != adaptiveTransactionStart {
-		t.Fatalf("another shard's cap = %d, want the start value: shards do not share an estimate", got)
+		t.Fatalf("next session's cap = %d, want the start value: sessions do not share an estimate", got)
 	}
 
 	// Through the public hook, the same sample path: a block emitted right
 	// after the others, queued behind the previous certificate, certified a
 	// second after it — far behind the emission cadence.
-	service.pace(loaded).noteEmitted(paceCandidate(40), start.Add(100*time.Millisecond), 400)
+	emitPaceCandidate(service.pace(loaded), paceCandidate(40), start.Add(100*time.Millisecond), rate, 400, 400, false)
 	service.ObserveConsensusNotarized(loaded, paceCandidate(40), cert.Add(time.Second))
 	if got := service.transactionCap(loaded, rate, false); got >= paced {
 		t.Fatalf("cap after a slower certificate = %d, want below %d", got, paced)
@@ -332,7 +429,7 @@ func TestCommitteePaceRecoversFromTheFloorWhenTheCommitteeIsIdle(t *testing.T) {
 	previous := floored
 	certificates := 0
 	for slot := uint32(3); slot < 40; slot++ {
-		pace.noteEmitted(paceCandidate(slot), emit, uint32(previous))
+		emitPaceCandidate(pace, paceCandidate(slot), emit, rate, uint32(previous), uint32(previous), false)
 		if _, sampled := pace.noteCertified(paceCandidate(slot), emit.Add(250*time.Millisecond)); sampled {
 			t.Fatalf("an idle committee's certificate %d became a sample", slot)
 		}
@@ -367,7 +464,7 @@ func pinEstimateAtTheClamp(pace *committeePace, start time.Time) {
 	// and these certificates are minutes apart.
 	const certificates = 16
 	for slot := uint32(1); slot <= certificates; slot++ {
-		pace.noteEmitted(paceCandidate(slot), start, 100)
+		emitPaceCandidate(pace, paceCandidate(slot), start, 400*time.Millisecond, 100, adaptiveTransactionStart, false)
 	}
 	cert := start.Add(300 * time.Millisecond)
 	for slot := uint32(1); slot <= certificates; slot++ {
