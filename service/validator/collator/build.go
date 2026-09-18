@@ -58,6 +58,7 @@ type collation struct {
 	waves          waveState
 	externalWaves  externalWaveState
 	generatedWaves generatedWaveState
+	admission      admissionPace
 	// treeReadVisited is recordCellTreeReads' hash dedup set, kept across roots
 	// rather than allocated for every transaction action list and message. The
 	// retire goroutine owns both scratch sets.
@@ -353,6 +354,10 @@ func newCollation(init *collationInit) (*collation, error) {
 // internal messages. It preserves inbound progress and queues generated
 // internals.
 func (b *Builder) BuildShard(ctx context.Context, req ShardRequest) (*Candidate, error) {
+	var paceStarted time.Time
+	if req.PaceBudget > 0 {
+		paceStarted = time.Now()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -375,6 +380,9 @@ func (b *Builder) BuildShard(ctx context.Context, req ShardRequest) (*Candidate,
 		req.successor.revokeOffered(PipelineHandoffAbandonedFailed)
 
 		return candidate, err
+	}
+	if !paceStarted.IsZero() {
+		candidate.Stats.PaceElapsed = time.Since(paceStarted)
 	}
 	if err = sealBuiltCandidate(candidate); err != nil {
 		return nil, err
@@ -444,6 +452,7 @@ func (b *Builder) prepareShardPhases(
 	req ShardRequest,
 	attempt collationAttempt,
 ) (*collation, error) {
+	admission := newAdmissionPace(req.PaceBudget, req.PaceFinishReserve)
 	timer := req.assembly.start(CollationStagePrepareState)
 	defer func() {
 		timer.stop()
@@ -459,6 +468,7 @@ func (b *Builder) prepareShardPhases(
 	if err != nil {
 		return nil, err
 	}
+	c.admission = admission
 	c.limits.applyAttempt(attempt)
 	if err = ctx.Err(); err != nil {
 		return nil, err
@@ -479,6 +489,7 @@ func (b *Builder) prepareShardPhases(
 		return nil, err
 	}
 	timer.stop()
+	c.admission.startWork()
 
 	timer = c.req.assembly.start(CollationStageExecuteInternalMessages)
 	if err = c.processDispatchQueue(); err != nil {
@@ -493,6 +504,7 @@ func (b *Builder) prepareShardPhases(
 }
 
 func (c *collation) finishShard() (*Candidate, error) {
+	c.admission.close()
 	// The neighbour proofs are built here, after execution, against the bound
 	// the block is about to claim — the reference's order (create_collated_data
 	// -> prepare_proofs, collator.cpp:6228). Before the block decided what to
@@ -1288,6 +1300,7 @@ func (c *collation) finish() (*Candidate, error) {
 	c.stats.Transactions = uint32(c.limits.transactions)
 	c.stats.GasUsed = c.limits.gas
 	c.stats.Load = max(c.peakLoad, c.limits.classify())
+	c.admission.observe(&c.stats)
 	candidate := &Candidate{
 		ID: ton.BlockIDExt{
 			Workchain: parts.header.Shard.WorkchainID,

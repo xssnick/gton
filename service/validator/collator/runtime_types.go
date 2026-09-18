@@ -319,6 +319,18 @@ type BuildRequest struct {
 	// of a leader window, whose block has to be notarized inside the committee's
 	// first-block timeout rather than inside a slot; see firstSlotTransactions.
 	MaxTransactions uint32
+	// PaceBudget bounds active shard assembly, excluding acquisition and waiting
+	// for external messages. Admission leaves PaceFinishReserve for the measured
+	// state/proof/serialization tail. These are local policy, not VM gas limits or
+	// consensus deadlines; zero keeps deterministic and masterchain paths inert.
+	PaceBudget        time.Duration
+	PaceFinishReserve time.Duration
+	// Feedback belongs to the controller and budget that actually started this
+	// future, even when a later slot adopts it or the session target rate changes.
+	paceOwner      *committeePace
+	paceRevision   uint64
+	paceTargetRate time.Duration
+	paceArtificial bool
 	// speculative marks a build started before its leader window was observed
 	// and carries the predecessor it bet on. It is unexported because the only
 	// legitimate producer of one is this package's speculation entry point:

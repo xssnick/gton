@@ -161,6 +161,10 @@ func (b *Builder) buildShardWithReadyExternals(
 	startedAt time.Time,
 	scheduledAt time.Time,
 ) (*Candidate, readyExternalStats, error) {
+	var paceStarted time.Time
+	if req.PaceBudget > 0 {
+		paceStarted = time.Now()
+	}
 	var live readyExternalStats
 	timer := req.assembly.start(CollationStagePrepareState)
 	defer func() {
@@ -227,6 +231,9 @@ func (b *Builder) buildShardWithReadyExternals(
 		candidate.Stats.ExternalWait = live.wait
 		candidate.Stats.ExternalBatches = live.batches
 		candidate.Stats.ExternalStop = live.stop
+		if !paceStarted.IsZero() {
+			candidate.Stats.PaceElapsed = max(time.Since(paceStarted)-live.wait, 0)
+		}
 	}
 	if err == nil {
 		err = sealBuiltCandidate(candidate)
@@ -298,6 +305,10 @@ func (b *Builder) buildShardReadyAttempt(
 	}
 	for {
 		for ready.stop == ExternalStopUnknown {
+			if c.admission.limited {
+				ready.stop = ExternalStopDeadline
+				break
+			}
 			// A closed intake takes nothing out of the pool at all. Every
 			// message TakeReady returned would get the same skip verdict, at
 			// the price of a snapshot, a parse and an account prewarm each —
@@ -347,6 +358,11 @@ func (b *Builder) buildShardReadyAttempt(
 		if !c.limits.fits(LoadSoft) {
 			timer.stop()
 			ready.stop = ExternalStopSoftLimit
+			break
+		}
+		if c.admission.limited || c.admission.exhausted() {
+			timer.stop()
+			ready.stop = ExternalStopDeadline
 			break
 		}
 		timer.stop()
@@ -402,7 +418,9 @@ func (b *Builder) buildShardReadyAttempt(
 		} else {
 			started := time.Now()
 			snapshots, nextErr = stream.Next(waitCtx, batchLimit)
-			live.wait += time.Since(started)
+			wait := time.Since(started)
+			live.wait += wait
+			c.admission.wait += wait
 		}
 		if nextErr != nil {
 			if errors.Is(nextErr, context.DeadlineExceeded) && errors.Is(waitCtx.Err(), context.DeadlineExceeded) {

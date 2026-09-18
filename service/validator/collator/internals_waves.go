@@ -202,6 +202,7 @@ func (c *collation) processInternalsInWaves(inputs []*msgpool.InternalMessage, r
 			return err
 		}
 
+		waveStarted := c.admission.beginWave()
 		plans, ready := c.planWave(inputs[next:], records)
 		if len(plans) == 0 {
 			// Unreachable by construction: the first message of a wave is always
@@ -216,6 +217,7 @@ func (c *collation) processInternalsInWaves(inputs []*msgpool.InternalMessage, r
 		waveWorkers := min(workers, ready)
 		c.waves.start(c, waveWorkers)
 		stop, err := c.runWave(plans, ready, waveWorkers, base+next)
+		c.admission.endWave(waveStarted)
 		if err != nil || stop {
 			return err
 		}
@@ -236,8 +238,9 @@ func (c *collation) planWave(inputs []*msgpool.InternalMessage, records []tlb.Pr
 	w.plans = w.plans[:0]
 	clear(w.tails)
 	ready := 0
+	limit := c.admission.waveLimit(c.internalWaveParallelism())
 	for _, msg := range inputs {
-		if len(w.plans) == internalWaveLength {
+		if len(w.plans) == limit {
 			break
 		}
 		plan := w.take(msg)

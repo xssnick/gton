@@ -11,7 +11,7 @@ import (
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
-func TestRuntimePaceReusedFutureKeepsBuildTransactionCap(t *testing.T) {
+func TestRuntimePaceReusedFutureKeepsBuildBudgetAndProvenance(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		release := make(chan struct{})
 		softRequests := make(chan SoftTimeoutRequest, 2)
@@ -81,8 +81,8 @@ func TestRuntimePaceReusedFutureKeepsBuildTransactionCap(t *testing.T) {
 		if secondTimeout.Active.Slot != 2 || secondTimeout.Current.Slot != 3 {
 			t.Fatalf("reused future slots = active %d current %d", secondTimeout.Active.Slot, secondTimeout.Current.Slot)
 		}
-		if secondTimeout.Current.MaxTransactions != adaptiveTransactionStart {
-			t.Fatalf("new slot cap = %d, want %d", secondTimeout.Current.MaxTransactions, adaptiveTransactionStart)
+		if secondTimeout.Current.MaxTransactions != 0 {
+			t.Fatalf("ordinary slot cap = %d, want protocol-only transaction limit", secondTimeout.Current.MaxTransactions)
 		}
 		close(release)
 
@@ -107,8 +107,16 @@ func TestRuntimePaceReusedFutureKeepsBuildTransactionCap(t *testing.T) {
 		pace.mu.Lock()
 		emission, recorded := pace.emitted[second.Candidate.ID]
 		pace.mu.Unlock()
-		if !recorded || emission.transactionCap != firstTimeout.Active.MaxTransactions {
+		original := firstTimeout.Active
+		if original.PaceBudget <= 0 || original.paceRevision == 0 || !original.paceArtificial {
+			t.Fatalf("first-slot future has no pacing provenance: %+v", original)
+		}
+		if !recorded || emission.budget.duration != original.PaceBudget ||
+			emission.budget.revision != original.paceRevision || !emission.artificial {
 			t.Fatalf("reused future feedback = %+v, recorded %t", emission, recorded)
+		}
+		if emission.window != second.WindowID || emission.parent != second.Candidate.Parent {
+			t.Fatal("reused future lost its published lineage")
 		}
 	})
 }
@@ -120,7 +128,7 @@ type runtimePaceWindowCase struct {
 	artificial  bool
 }
 
-func TestRuntimePaceArtificialCapUsesArtifactWindow(t *testing.T) {
+func TestRuntimePaceArtificialCapPreservesBuildAndArtifactWindow(t *testing.T) {
 	cases := []runtimePaceWindowCase{
 		{name: "first slot with an older update", slot: 16, updateStart: 0, artificial: true},
 		{name: "later slot with a newer update", slot: 17, updateStart: 17, artificial: false},
@@ -153,17 +161,14 @@ func TestRuntimePaceArtificialCapUsesArtifactWindow(t *testing.T) {
 			pace.mu.Lock()
 			emission, recorded := pace.emitted[commit.Artifact.Candidate.ID]
 			pace.mu.Unlock()
-			if !recorded || emission.artificialCap != test.artificial {
+			if !recorded || emission.artificial != test.artificial {
 				t.Fatalf("emission = %+v, recorded %t, want artificial cap %t", emission, recorded, test.artificial)
 			}
 
+			before := pace.budget(update.TargetRate)
 			fixture.service.ObserveConsensusNotarized(session.ID, commit.Artifact.Candidate.ID, emission.at.Add(40*time.Millisecond))
-			cap := pace.transactionCap(update.TargetRate)
-			if test.artificial && cap != adaptiveTransactionStart {
-				t.Fatalf("first-slot certificate raised cap to %d", cap)
-			}
-			if !test.artificial && cap <= adaptiveTransactionStart {
-				t.Fatalf("natural cap-bound certificate did not allow upward probing: cap %d", cap)
+			if after := pace.budget(update.TargetRate); after != before {
+				t.Fatalf("isolated certificate changed capacity without cadence evidence: %+v -> %+v", before, after)
 			}
 		})
 	}
@@ -206,8 +211,80 @@ func TestRuntimePaceFailedEmitCannotTrainEstimate(t *testing.T) {
 	if after := pace.snapshot(); after != before {
 		t.Fatalf("failed delivery trained the estimate: before %+v, after %+v", before, after)
 	}
-	if cap := pace.transactionCap(update.TargetRate); cap != adaptiveTransactionStart {
-		t.Fatalf("failed delivery changed transaction cap to %d", cap)
+}
+
+type runtimePaceCapacityCase struct {
+	name     string
+	cap      uint32
+	cancel   bool
+	deadline bool
+}
+
+func TestRuntimePaceCapacityWaitBeforeAcquisition(t *testing.T) {
+	cases := []runtimePaceCapacityCase{
+		{name: "certificate releases acquisition"},
+		{name: "abandoned future never acquires", cancel: true},
+		{name: "deadline never acquires", deadline: true},
+		{name: "first slot bypasses backlog", cap: firstSlotTransactions},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				built := make(chan BuildRequest, 1)
+				pipeline := &runtimeTestPipeline{}
+				pipeline.build = func(_ context.Context, request BuildRequest) (*Candidate, error) {
+					built <- request
+
+					return runtimeBuiltCandidate(request), nil
+				}
+				fixture := newRuntimeFixture(t, 1, 1, pipeline, nil, nil)
+				defer fixture.close(t)
+				session, update := fixture.session(0xa4, 16, 0, time.Now())
+				update.TargetRate = 400 * time.Millisecond
+				pace := fixture.service.pace(session, update.TargetRate)
+				for slot := range uint32(committeePaceOutstandingLimit) {
+					pace.noteEmitted(paceCandidate(slot), paceTestEmission(pace, slot, time.Now(), update.TargetRate))
+				}
+				request := BuildRequest{
+					Session: ActivatedSession{Session: session}, Update: update,
+					Slot: 4, MaxTransactions: test.cap,
+				}
+				future := fixture.service.startBuildFuture(t.Context(), request, time.Now().Add(time.Second))
+				defer future.stop()
+				synctest.Wait()
+				if test.cap == 0 && pipeline.buildCount() != 0 {
+					t.Fatal("acquired or built while the committee pipeline was full")
+				}
+				var wantErr error
+				switch {
+				case test.cancel:
+					future.cancel()
+					wantErr = context.Canceled
+				case test.deadline:
+					time.Sleep(time.Second)
+					wantErr = context.DeadlineExceeded
+				case test.cap == 0:
+					fixture.service.ObserveConsensusNotarized(session.ID, paceCandidate(0), time.Now())
+				}
+				result := <-future.result
+				if !errors.Is(result.err, wantErr) {
+					t.Fatalf("build error = %v, want %v", result.err, wantErr)
+				}
+				if wantErr != nil {
+					if pipeline.buildCount() != 0 || result.candidate != nil {
+						t.Fatal("canceled admission started a build")
+					}
+					return
+				}
+				actual := <-built
+				if actual.PaceBudget != future.request.PaceBudget || actual.paceRevision != future.request.paceRevision {
+					t.Fatal("waiting changed immutable build provenance")
+				}
+				if pipeline.buildCount() != 1 {
+					t.Fatalf("started %d builds, want one", pipeline.buildCount())
+				}
+			})
+		})
 	}
 }
 
@@ -221,16 +298,28 @@ func runtimePaceCommit(
 ) CandidateCommit {
 	t.Helper()
 	request := BuildRequest{
-		Session:         ActivatedSession{Session: session},
-		Update:          update,
-		Slot:            slot,
-		MaxTransactions: adaptiveTransactionStart,
+		Session: ActivatedSession{Session: session},
+		Update:  update,
+		Slot:    slot,
 	}
 	if slot == windowStart {
 		request.MaxTransactions = firstSlotTransactions
 	}
+	request.paceOwner = fixture.service.pace(session, update.TargetRate)
+	budget := request.paceOwner.budget(update.TargetRate)
+	request.PaceBudget = budget.duration
+	request.PaceFinishReserve = budget.finishReserve
+	request.paceRevision = budget.revision
+	request.paceTargetRate = update.TargetRate
+	request.paceArtificial = request.MaxTransactions != 0
 	built := runtimeBuiltCandidate(request)
-	built.Stats.Transactions = request.MaxTransactions
+	built.Stats.Transactions = 400
+	built.Stats.PaceLimited = true
+	built.Stats.PaceElapsed = request.PaceBudget
+	built.Stats.PaceTail = request.PaceFinishReserve
+	if request.paceArtificial {
+		built.Stats.Transactions = request.MaxTransactions
+	}
 	window := productionWindow{
 		ID:         WindowID{SessionID: session.ID, StartSlot: windowStart},
 		Leader:     0,

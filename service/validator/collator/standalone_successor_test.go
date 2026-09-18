@@ -55,12 +55,22 @@ func TestControllerForwardsNotarizationToCommitteePace(t *testing.T) {
 	sessionID := [32]byte{0x51}
 	pace := service.pace(Session{ID: sessionID}, 400*time.Millisecond)
 	start := time.Unix(1_700_000_000, 0)
+	budget := pace.budget(400 * time.Millisecond)
 	for slot := uint32(0); slot < 3; slot++ {
+		parent := simplex.Genesis()
+		if slot != 0 {
+			parent = simplex.Parent(paceCandidate(slot - 1))
+		}
 		pace.noteEmitted(paceCandidate(slot), paceEmission{
-			at:             start.Add(time.Duration(slot) * 250 * time.Millisecond),
-			targetRate:     400 * time.Millisecond,
-			transactions:   400,
-			transactionCap: 400,
+			at:           start.Add(time.Duration(slot) * 250 * time.Millisecond),
+			targetRate:   400 * time.Millisecond,
+			budget:       budget,
+			window:       WindowID{SessionID: sessionID},
+			parent:       parent,
+			transactions: 400,
+			limited:      true,
+			demand:       true,
+			elapsed:      budget.duration,
 		})
 	}
 	observer.mu.Lock()
@@ -72,11 +82,11 @@ func TestControllerForwardsNotarizationToCommitteePace(t *testing.T) {
 	for slot := uint32(0); slot < 3; slot++ {
 		notarized(sessionID, paceCandidate(slot), start.Add(500*time.Millisecond+time.Duration(slot)*466*time.Millisecond))
 	}
-	_, samples := pace.estimate()
+	samples := pace.snapshot().samples
 	if samples != 2 {
 		t.Fatalf("standalone committee samples = %d, want 2", samples)
 	}
-	if cap := pace.transactionCap(400 * time.Millisecond); cap == adaptiveTransactionStart {
-		t.Fatal("standalone transaction cap did not adapt to certification feedback")
+	if after := pace.budget(400 * time.Millisecond); after.duration >= budget.duration {
+		t.Fatal("standalone work budget did not respond to sustained slow certification")
 	}
 }

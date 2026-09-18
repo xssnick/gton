@@ -36,7 +36,7 @@ func TestSlotBuildRequestFillsEveryScheduledField(t *testing.T) {
 	parent := simplex.ParentID{Exists: true}
 	parent.ID.Slot = 11
 
-	request := slotBuildRequest(session, record, window, 12, parent, previous, adaptiveTransactionCeiling, time.Time{})
+	request := slotBuildRequest(session, record, window, 12, parent, previous, 1000, time.Time{})
 
 	if got, want := request.PaceStartedAt, buildStartTime(record, 12); !got.Equal(want) {
 		t.Errorf("PaceStartedAt = %v, want the scheduled build start %v", got, want)
@@ -65,7 +65,7 @@ func TestSlotBuildRequestFillsEveryScheduledField(t *testing.T) {
 	// the swap deletes the external phase's deadline outright.
 	masterRecord := record
 	masterRecord.Session.Shard = groups.ShardID{Workchain: -1, Shard: -1 << 63}
-	master := slotBuildRequest(session, masterRecord, window, 12, parent, previous, adaptiveTransactionCeiling, time.Time{})
+	master := slotBuildRequest(session, masterRecord, window, 12, parent, previous, 1000, time.Time{})
 	if got, want := master.ExternalWaitUntil, externalWaitUntil(masterRecord, 12); !got.Equal(want) {
 		t.Errorf("masterchain ExternalWaitUntil = %v, want %v", got, want)
 	}
@@ -92,6 +92,10 @@ func TestSlotBuildRequestFillsEveryScheduledField(t *testing.T) {
 	for i := 0; i < value.NumField(); i++ {
 		name := value.Type().Field(i).Name
 		switch name {
+		case "PaceBudget", "PaceFinishReserve", "paceOwner", "paceRevision", "paceTargetRate", "paceArtificial":
+			// startBuildFuture captures the current controller budget once, for
+			// ordinary production and both speculative entry points alike.
+			continue
 		case "FinalizedAnchor":
 			// The restore path, which does not go through a leader window.
 			continue

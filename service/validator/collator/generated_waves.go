@@ -167,9 +167,10 @@ func (c *collation) processNewMessagesInWaves(enqueueOnly bool, workers int) err
 			continue
 		}
 
+		waveStarted := c.admission.beginWave()
 		plans := c.planGeneratedWave()
 		planWorkers := workers
-		if workers > 1 && len(plans) < generatedWaveMinParallelWidth {
+		if workers > 1 && len(plans) < generatedWaveMinParallelWidth && c.admission.budget == 0 {
 			planWorkers = 0
 		}
 		if len(plans) == 0 {
@@ -180,7 +181,9 @@ func (c *collation) processNewMessagesInWaves(enqueueOnly bool, workers int) err
 		}
 
 		c.generatedWaves.start(c, planWorkers)
-		if err := c.runGeneratedPlans(plans, planWorkers, &enqueueOnly, true); err != nil {
+		err := c.runGeneratedPlans(plans, planWorkers, &enqueueOnly, true)
+		c.admission.endWave(waveStarted)
+		if err != nil {
 			return err
 		}
 	}
@@ -197,7 +200,8 @@ func (c *collation) planGeneratedWave() []*generatedPlan {
 	// and mutation order; already eligible predecessors may still run as a wave.
 	baseLT := c.new[0].lt
 	state := c.newGeneratedWavePlanState()
-	for c.new.Len() > 0 && len(w.plans) < internalWaveLength {
+	limit := c.admission.waveLimit(min(c.internalWaveParallelism(), generatedWaveWorkers))
+	for c.new.Len() > 0 && len(w.plans) < limit {
 		item := c.new[0]
 		if item.dispatchEnvelope != nil {
 			break

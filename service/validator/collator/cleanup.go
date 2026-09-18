@@ -448,10 +448,10 @@ func phaseTimeout(now, softDeadline, externalWaitUntil time.Time, divisor time.D
 // no time budget at all, so a slot that ran long was aborted wholesale by ctx
 // cancellation and published nothing.
 func (c *collation) internalMsgExpired() bool {
-	if c.req.internalMsgUntil.IsZero() {
-		return false
+	if !c.req.internalMsgUntil.IsZero() && !time.Now().Before(c.req.internalMsgUntil) {
+		return true
 	}
-	return !time.Now().Before(c.req.internalMsgUntil)
+	return c.paceExpired()
 }
 
 // queueCleanupExpired is the per-iteration budget check. C++ samples the clock

@@ -521,6 +521,9 @@ type CandidateObservation struct {
 	// Stats carries the counters only a producer has. It is read solely for
 	// CandidateOriginCollation; a validation leaves it zero.
 	Stats Stats
+	// Local admission policy is not part of a candidate's consensus payload.
+	PaceBudget        time.Duration
+	PaceFinishReserve time.Duration
 }
 
 type CandidateProductionObservation struct {
@@ -712,6 +715,8 @@ type PrometheusMetrics struct {
 	transactions       *prometheus.HistogramVec
 	latestTransactions *prometheus.GaugeVec
 	gasUsed            *prometheus.HistogramVec
+	paceDuration       *prometheus.GaugeVec
+	paceLimited        *prometheus.CounterVec
 	messages           *prometheus.HistogramVec
 	latestMessages     *prometheus.GaugeVec
 
@@ -821,6 +826,14 @@ func NewPrometheusMetrics(registry MetricsRegistry) (*PrometheusMetrics, error) 
 		gasUsed: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Subsystem: "collator", Name: "candidate_gas_used",
 			Help: "Gas used by a produced non-empty candidate.", Buckets: prometheus.ExponentialBuckets(1_000, 4, 13),
+		}, []string{"mode", "chain"}),
+		paceDuration: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace, Subsystem: "collator", Name: "pace_seconds",
+			Help: "Latest produced candidate's local active-work budget, finish reserve, elapsed body and finish tail.",
+		}, []string{"mode", "chain", "part"}),
+		paceLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Subsystem: "collator", Name: "pace_limited_total",
+			Help: "Produced candidates whose admission stopped on the local active-work budget.",
 		}, []string{"mode", "chain"}),
 		messages: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Subsystem: "collator", Name: "candidate_messages",
@@ -933,6 +946,7 @@ func NewPrometheusMetrics(registry MetricsRegistry) (*PrometheusMetrics, error) 
 		metrics.candidates, metrics.productionDuration, metrics.candidateSize, metrics.candidateSizeTotal,
 		metrics.transactions,
 		metrics.latestTransactions, metrics.gasUsed, metrics.messages, metrics.latestMessages,
+		metrics.paceDuration, metrics.paceLimited,
 		metrics.shardBlocks, metrics.shardTransactions, metrics.shardMessages,
 		metrics.shardLatestTransactions, metrics.shardLatestBytes,
 		metrics.outQueueMessages,
@@ -983,6 +997,8 @@ type prometheusObserver struct {
 	transactions       [metricChainCount][candidateOriginCount]prometheus.Observer
 	latestTransactions [metricChainCount]prometheus.Gauge
 	gasUsed            [metricChainCount]prometheus.Observer
+	paceDuration       [metricChainCount][4]prometheus.Gauge
+	paceLimited        [metricChainCount]prometheus.Counter
 	messages           [metricChainCount][candidateOriginCount][candidateMessageKindCount]prometheus.Observer
 	latestMessages     [metricChainCount][candidateMessageKindCount]prometheus.Gauge
 	outQueueMessages   [metricChainCount]prometheus.Observer
@@ -1077,6 +1093,10 @@ func (m *PrometheusMetrics) Observer(mode MetricsMode) CollationObserver {
 	o.stageLabels = stages
 	for chain := MetricChain(0); chain < metricChainCount; chain++ {
 		chainLabel := chains[chain]
+		for part, label := range [...]string{"budget", "finish_reserve", "elapsed", "tail"} {
+			o.paceDuration[chain][part] = m.paceDuration.WithLabelValues(modeLabel, chainLabel, label)
+		}
+		o.paceLimited[chain] = m.paceLimited.WithLabelValues(modeLabel, chainLabel)
 		o.buildsInflight[chain] = m.buildsInflight.WithLabelValues(modeLabel, chainLabel)
 		o.windowsInflight[chain] = m.windowsInflight.WithLabelValues(modeLabel, chainLabel)
 		for result := CollationResult(0); result < collationResultCount; result++ {
@@ -1228,6 +1248,15 @@ func (o *prometheusObserver) ObserveCollationCandidate(observation CandidateObse
 	}
 
 	stats := observation.Stats
+	paceDurations := [...]time.Duration{
+		observation.PaceBudget, observation.PaceFinishReserve, stats.PaceElapsed, stats.PaceTail,
+	}
+	for part, duration := range paceDurations {
+		o.paceDuration[chain][part].Set(nonNegativeSeconds(duration))
+	}
+	if stats.PaceLimited {
+		o.paceLimited[chain].Inc()
+	}
 	o.gasUsed[chain].Observe(float64(stats.GasUsed))
 	o.outQueueMessages[chain].Observe(float64(stats.OutQueueSize))
 	o.externalBatches[chain].Observe(float64(stats.ExternalBatches))

@@ -293,6 +293,12 @@ type ShardRequest struct {
 	// byte limits; see firstSlotTransactions. Zero, the deterministic default,
 	// leaves the block bounded by its limits alone.
 	MaxTransactions uint32
+	// PaceBudget bounds local active collation work, excluding acquisition and
+	// waiting for external messages. PaceFinishReserve leaves room for queue
+	// closure, proofs and serialization after admission stops. Zero disables
+	// this local policy; protocol limits and the build context remain unchanged.
+	PaceBudget        time.Duration
+	PaceFinishReserve time.Duration
 
 	accountPrewarmer AccountPrewarmer
 	assembly         *candidateAssemblyDurations
@@ -583,6 +589,14 @@ const (
 )
 
 type Stats struct {
+	// PaceElapsed includes the local build body and serialization, but not
+	// acquisition or explicit external waits. PaceTail starts when paced
+	// admission closes (before speculative workers join), or at finalization
+	// for a build which did not hit its pace budget. These are local timings,
+	// not protocol data. Zero means pacing was disabled.
+	PaceElapsed          time.Duration
+	PaceTail             time.Duration
+	PaceLimited          bool
 	Transactions         uint32
 	ExternalAttempts     uint32
 	ExternalIncluded     uint32

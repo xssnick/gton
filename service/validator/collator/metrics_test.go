@@ -53,8 +53,12 @@ func TestPrometheusCollationObserverExportsBoundedMetrics(t *testing.T) {
 			OutQueueSize:      9,
 			ExternalStop:      ExternalStopReadyDrained,
 			Load:              LoadNormal,
+			PaceElapsed:       180 * time.Millisecond,
+			PaceTail:          25 * time.Millisecond,
+			PaceLimited:       true,
 		},
 		BlockBytes: 1024, CollatedBytes: 512,
+		PaceBudget: 200 * time.Millisecond, PaceFinishReserve: 30 * time.Millisecond,
 	})
 	observer.ObserveCandidateProduction(CandidateProductionObservation{
 		Chain: MetricChainShardchain, Kind: CandidateKindBlock,
@@ -94,6 +98,8 @@ func TestPrometheusCollationObserverExportsBoundedMetrics(t *testing.T) {
 		"gton_collator_retries_total",
 		"gton_collator_alarms_total",
 		"gton_collator_windows_total",
+		"gton_collator_pace_seconds",
+		"gton_collator_pace_limited_total",
 	} {
 		if byName[name] == nil {
 			t.Fatalf("metric family %s was not exported", name)

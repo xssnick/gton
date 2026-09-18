@@ -45,10 +45,8 @@ func TestTransactionCapCountsAsFullBelowHard(t *testing.T) {
 	}
 }
 
-// slotBuildRequest carries the cap it is handed, and the first slot's cap is
-// the smaller of firstSlotTransactions and the committee-paced one: the first
-// block has to be notarized inside the committee's first-block alarm on its own,
-// while every later slot can spend the slack the slots before it left.
+// slotBuildRequest carries the independent first-slot safety cap. Ordinary
+// shards use a time budget, not a count that treats all transactions as equal.
 func TestFirstSlotBuildRequestCapsTransactions(t *testing.T) {
 	record := SessionRecord{
 		Update: SessionUpdate{
@@ -66,10 +64,11 @@ func TestFirstSlotBuildRequestCapsTransactions(t *testing.T) {
 	if request.MaxTransactions != 240 {
 		t.Fatalf("MaxTransactions = %d, want the cap handed in", request.MaxTransactions)
 	}
-	if got := firstSlotTransactionCap(240); got != firstSlotTransactions {
-		t.Fatalf("first-slot cap under a paced cap of 240 = %d, want %d", got, firstSlotTransactions)
+	producer := windowProducer{record: record, job: &productionJob{window: window}}
+	if got := producer.transactionCap(10); got != firstSlotTransactions {
+		t.Fatalf("first-slot cap = %d, want %d", got, firstSlotTransactions)
 	}
-	if got := firstSlotTransactionCap(firstSlotTransactions / 2); got != firstSlotTransactions/2 {
-		t.Fatalf("first-slot cap under a smaller paced cap = %d, want the paced cap", got)
+	if got := producer.transactionCap(11); got != 0 {
+		t.Fatalf("ordinary shard cap = %d, want protocol limits only", got)
 	}
 }

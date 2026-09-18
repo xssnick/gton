@@ -1,6 +1,7 @@
 package collator
 
 import (
+	"context"
 	"math"
 	"sync"
 	"time"
@@ -8,205 +9,161 @@ import (
 	"github.com/xssnick/gton/service/validator/simplex"
 )
 
-// The committee validates a shard's blocks one after another, and a leader
-// window is a fixed span of wall clock: slot j of a window must be notarized by
-// the window's observation plus FirstBlockTimeout plus (j+1) target rates
-// (simplex/voter.go voterNotarizationObserved). A leader whose blocks each cost
-// the committee more than one target rate to validate runs a debt that no head
-// start repays, because the deadline never moves and the validation is
-// sequential. Measured on the stand against the reference validators: blocks of
-// 400 transactions notarized at a 466 ms cadence against a 400 ms slot, the 887
-// ms of initial slack gone after fourteen slots, the fifteenth block missed by 32
-// ms and the sixteenth skipped — while a window of the same blocks that had
-// spilled a queue into the next one saw that window get no certificate at all.
-//
-// So the block is sized to the committee, not to the byte limits. What the
-// committee costs per transaction is measured from the only evidence this node
-// has — the certificates on its own candidates — and the cap is what keeps one
-// block inside a fraction of a target rate at that cost.
 const (
-	// adaptiveTransactionStart is the cap before the first certificate has been
-	// measured — on a fresh session of a shard this node has not produced for
-	// since it started. Measured on the stand 2026-09-05, one shard, blocks of
-	// the settled window: the estimator climbs to 416 and stays there (p50 416,
-	// p75 416, p90 421) while the committee certifies without complaint, and
-	// the reference's own blocks reach 458 at p90. A cold start at 300 gives
-	// away the first windows of every session to a cap the committee has never
-	// asked for, so start where the estimate settles and let the measured pace
-	// take it from there in either direction.
-	adaptiveTransactionStart uint32 = 400
-	// adaptiveTransactionCeiling is the most a measured pace may raise the cap
-	// to. It is deliberately far above what today's committee sustains: the
-	// cap must follow a faster committee up — a reference release with a
-	// quicker validation would otherwise be capped at yesterday's number — and
-	// what bounds a block beyond this is the byte and gas limits, which the
-	// reference obeys too. Its only job is to keep one absurd reading from
-	// producing a cap the limits would never let a block reach anyway.
-	adaptiveTransactionCeiling uint32 = 1000
-	// adaptiveTransactionFloor stops a run of slow certificates — a committee
-	// busy with someone else's queue — from shrinking blocks to nothing.
-	adaptiveTransactionFloor uint32 = 40
-	// A block is allowed to cost the committee one target rate plus the share
-	// of the first-block timeout that falls on each slot, less a reserve for
-	// jitter. Slot j of a window is due at the window's observation plus
-	// FirstBlockTimeout plus (j+1) target rates (simplex/voter.go), so the
-	// timeout is slack the committee may spend across the whole window: with
-	// the default 1 s over 16 slots, 62 ms per block. The reference collator
-	// sizes nothing to the committee and ships ~900 kB blocks that the stand's
-	// committee certifies at a 375-500 ms cadence, losing an occasional tail;
-	// the earlier target of 0.8 of a slot (320 ms) kept our windows full at
-	// half the reference's bytes per window — polished emptiness. Both slack
-	// and reserve are the default protocol parameters' figures; the collator
-	// does not see the session's simplex parameters.
-	//
-	// 112 ms, not the 62 ms that arithmetic gives, because the committee
-	// measurably does not use the rest and the cap is what our blocks stand in.
-	// Stand, 2026-09-04, one loaded shard, 300 externals/s, medians over blocks
-	// that are not a window's first slot:
-	//
-	//	slack   tx/block  cap  blocks at the cap  block kB  blocks/window
-	//	 62 ms       397  400               68%      1283           11.7
-	//	112 ms       416  434               22%      1359           11.8
-	//
-	// The window kept the same number of blocks and each carried 5% more, so
-	// the slack is not a risk this committee charges for. Read the effect on
-	// medians and not on a five-minute mean: a mean mixes in the first slot of
-	// every window, which is capped at firstSlotTransactions, and windows the
-	// committee truncated — both moved the two configurations to within 0.2
-	// transactions of each other and hid the difference entirely.
-	//
-	// The measurement that says the cap binds at all is the last column but
-	// one: at 62 ms four blocks in five sit exactly on it.
-	//
-	// 169 ms was tried on 2026-09-05 and reverted the same hour. It is the
-	// measurement that says this knob is finished, so do not take it again:
-	//
-	//	slack   tx/block  kB/block  blocks/window  last slot  tx/window
-	//	112 ms       416      1115           10.0        9.5       3121
-	//	169 ms       416      1128            8.4        7.4       2497
-	//
-	// The budget went up 15% and the block did not move at all: the estimate
-	// re-measured the cost from 0.918 to 1.055 ms per transaction and handed
-	// the whole raise back. The block's p90 was 424 against a cap that now
-	// stood for 478, so the block is not what the cap was holding — the cap
-	// only settles wherever the block already stops, which is why raising it
-	// cannot buy anything. What the raise did buy was a shorter window: the
-	// budget is also the wall clock a build may spend, so every block was
-	// emitted later and the committee's alarm arrived two slots earlier. The
-	// same shape as the block-limit multiplier on 2026-09-04, where
-	// transactions per window fell 4464, 3922, 3452 at 1.0, 1.05 and 1.2.
-	committeePaceWindowSlack   = 112 * time.Millisecond
-	committeePaceJitterReserve = 30 * time.Millisecond
-	// committeeFixedCost is the part of a certificate's latency that does not
-	// scale with the block: delivery, the vote round and the committee's own
-	// scheduling. Fitted on the stand: 5 transactions took 120 ms, 200 took 285,
-	// 400 in a full pipeline took 466 — one intercept fits all three within the
-	// noise, and it is what keeps a small block from reading as an expensive
-	// transaction.
-	committeeFixedCost = 100 * time.Millisecond
-	// committeePaceSampleMinTransactions is the smallest block whose
-	// certificate is a measurement of the per-transaction cost at all: below it
-	// the fixed cost dominates and the division amplifies its error.
-	committeePaceSampleMinTransactions = 50
-	// committeePaceSmoothing is the weight of the newest sample in the moving
-	// estimate. Windows are a minute apart per shard and a window yields a dozen
-	// samples, so this follows the committee within one window and forgets a
-	// stale reading within two.
-	committeePaceSmoothing = 0.3
-	// The per-transaction cost is clamped to a range that contains every
-	// reading ever taken on the stand with room to spare, so one absurd sample —
-	// a certificate delayed by something other than validation — cannot pin the
-	// cap at either end.
-	committeeMinMillisPerTransaction = 0.2
-	committeeMaxMillisPerTransaction = 5.0
-	// committeePaceEmissionRetention bounds the emitted-candidate table: a
-	// candidate whose certificate has not arrived within this span was skipped,
-	// and its record is only what a later cert for it would be matched against.
+	committeePaceStartFraction = 0.5
+	committeePaceMaxFraction   = 0.95
+	committeePaceMinFraction   = 0.125
+	committeePaceMinBudget     = 20 * time.Millisecond
+
 	committeePaceEmissionRetention = 30 * time.Second
-	// committeePaceSlack is how much longer than our own emission interval a
-	// certificate interval has to be before it says the committee fell behind.
-	// A committee that keeps pace certifies at exactly the cadence we emit at,
-	// give or take the vote round's jitter; that interval is our number, not
-	// theirs, and reading it as their cost is what collapsed the cap to 76
-	// transactions on the stand while the committee was certifying 300 in 330
-	// ms — a 1.1 s pipeline latency, flat across the window, mistaken for the
-	// validation time of every block.
-	committeePaceSlack = 50 * time.Millisecond
-	// committeePaceRelax is the factor the estimated cost shrinks by on every
-	// naturally cap-bound certificate that arrived on our cadence rather than
-	// behind it. The cap then probes upward, about five percent per block, until
-	// the committee is measured falling behind again — which is the only
-	// observation that says what a block really costs. An underfilled block has
-	// no evidence that a higher cap would have carried more work, so it never
-	// relaxes the estimate.
-	committeePaceRelax = 0.95
-	// committeePaceIdleRelax is the factor for a certificate the committee
-	// produced while idle — before our next block was even emitted — when the
-	// candidate filled the natural pace cap. Twelve such certificates take the
-	// cap from the floor back to the start value inside one window, where the
-	// pace-keeping factor needed forty.
-	committeePaceIdleRelax = 0.85
-	// committeePaceMaxSampleStep bounds how far one sample can raise the
-	// estimate relative to its current value.
-	committeePaceMaxSampleStep = 2.0
+	committeePaceEmissionLimit     = 256
+	committeePaceOutstandingLimit  = 4
 )
 
-// committeePace is one consensus committee's estimate of what it costs per
-// transaction of ours, and the transaction cap derived from it. Its owner must
-// scope its candidate and certificate bookkeeping by session. Only its numeric
-// estimate may seed a new session with an equivalent committee and schedule.
-type committeePace struct {
-	mu sync.Mutex
-	// millisPerTransaction is the moving estimate; zero until the first sample.
-	millisPerTransaction float64
-	samples              int
-	// lastSample marks local certificate evidence for the numeric history;
-	// inheriting an estimate must not renew its lifetime.
-	lastSample time.Time
-	// lastCertificate is when the committee last certified one of our blocks,
-	// and lastCertifiedEmission when that block had left this node. A block
-	// emitted before the previous certificate was queued behind it: the
-	// interval between the two certificates is then the committee's time on
-	// this block — but only when that interval exceeds the interval between the
-	// two emissions, because a committee that keeps pace certifies at the rate
-	// we emit and says nothing about its own.
-	lastCertificate       time.Time
-	lastCertifiedEmission time.Time
-	emitted               map[simplex.CandidateID]paceEmission
+// paceBudget bounds active collation work, not transaction count. The builder
+// leaves finishReserve inside duration for state/proof construction. revision
+// identifies the capacity decision, not the continuously measured finish cost.
+type paceBudget struct {
+	duration      time.Duration
+	finishReserve time.Duration
+	revision      uint64
 }
 
 type paceEmission struct {
-	at             time.Time
-	targetRate     time.Duration
-	transactions   uint32
-	transactionCap uint32
-	// artificialCap marks a safety cap unrelated to measured committee
-	// throughput, currently the first slot's firstSlotTransactions cap. Filling
-	// it is not evidence that the adaptive cap should grow.
-	artificialCap bool
+	at           time.Time
+	targetRate   time.Duration
+	budget       paceBudget
+	window       WindowID
+	parent       simplex.ParentID
+	transactions uint32
+	elapsed      time.Duration
+	tail         time.Duration
+	limited      bool
+	demand       bool
+	artificial   bool
 }
 
-func (e paceEmission) canProbeUpward() bool {
-	return !e.artificialCap && e.transactionCap != 0 && e.transactions >= e.transactionCap
+func (e paceEmission) saturated() bool {
+	return e.limited && e.transactions > 0 && !e.artificial
+}
+
+type paceCertificate struct {
+	id       simplex.CandidateID
+	at       time.Time
+	emission paceEmission
+}
+
+// committeePace has two timescales. Build completion measures the finish reserve
+// immediately; adjacent own certificates adjust the total work budget. Neither
+// divides by transaction count: a costly transaction consumes more of the same
+// wall-time budget. All candidate bookkeeping remains session-local.
+type committeePace struct {
+	mu sync.Mutex
+
+	fraction      float64
+	finishReserve time.Duration
+	tailMeasured  bool
+	revision      uint64
+	congested     bool
+	goodIntervals uint8
+	slowIntervals uint8
+	backpressured bool
+	samples       uint32
+	lastSample    time.Time
+	last          paceCertificate
+	emitted       map[simplex.CandidateID]paceEmission
+	capacityWake  chan struct{}
 }
 
 func newCommitteePace() *committeePace {
-	return &committeePace{emitted: make(map[simplex.CandidateID]paceEmission)}
+	return &committeePace{
+		fraction: committeePaceStartFraction,
+		revision: 1,
+		emitted:  make(map[simplex.CandidateID]paceEmission),
+	}
 }
 
-// noteEmitted records that a candidate carrying transactions left this node.
-// Empty candidates carry nothing to measure and are not recorded.
-func (p *committeePace) noteEmitted(id simplex.CandidateID, emission paceEmission) {
-	if emission.transactions == 0 {
-		return
-	}
+func (p *committeePace) budget(targetRate time.Duration) paceBudget {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for old, oldEmission := range p.emitted {
-		if emission.at.Sub(oldEmission.at) > committeePaceEmissionRetention {
-			delete(p.emitted, old)
+	if targetRate <= 0 {
+		return paceBudget{revision: p.revision}
+	}
+
+	duration := time.Duration(float64(targetRate) * clampPaceFraction(p.fraction, targetRate))
+	reserve := p.finishReserve
+	if reserve == 0 {
+		reserve = min(25*time.Millisecond, targetRate/10)
+	}
+
+	return paceBudget{
+		duration:      duration,
+		finishReserve: min(reserve, duration/2),
+		revision:      p.revision,
+	}
+}
+
+// noteBuilt is called once for a successful build, using its original budget.
+// Acquisition and external waiting are not included in elapsed or tail. A slow
+// finish gets its reserve immediately; a cheaper finish releases it gradually.
+// Reserve samples alone never renew committee-capacity history.
+func (p *committeePace) noteBuilt(
+	used paceBudget,
+	elapsed, tail time.Duration,
+	limited, artificial bool,
+) {
+	if !limited || artificial || elapsed <= 0 || tail < 0 || tail > elapsed {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if used.revision != p.revision || used.duration <= 0 {
+		return
+	}
+
+	// Bound the reserve so one exceptional finish cannot eliminate useful work.
+	// The remaining overrun is visible to certificate feedback and build metrics.
+	observed := min(tail+tail/4, used.duration/2)
+	reserve := p.finishReserve
+	if reserve == 0 {
+		reserve = used.finishReserve
+	}
+	if observed >= reserve {
+		p.finishReserve = observed
+		p.tailMeasured = true
+		return
+	}
+	p.finishReserve = reserve - (reserve-observed)/16
+	p.tailMeasured = true
+}
+
+func (p *committeePace) noteEmitted(id simplex.CandidateID, emission paceEmission) {
+	if emission.transactions == 0 || emission.targetRate <= 0 || emission.budget.duration <= 0 {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, exists := p.emitted[id]; exists {
+		return
+	}
+	var oldestID simplex.CandidateID
+	var oldestAt time.Time
+	for pending, previous := range p.emitted {
+		if emission.at.Sub(previous.at) > committeePaceEmissionRetention {
+			delete(p.emitted, pending)
+			continue
 		}
+		if oldestAt.IsZero() || previous.at.Before(oldestAt) {
+			oldestID, oldestAt = pending, previous.at
+		}
+	}
+	if len(p.emitted) >= committeePaceEmissionLimit {
+		delete(p.emitted, oldestID)
 	}
 	p.emitted[id] = emission
 }
@@ -216,180 +173,187 @@ func (p *committeePace) discardEmission(id simplex.CandidateID) {
 	defer p.mu.Unlock()
 
 	delete(p.emitted, id)
+	p.notifyCapacityLocked()
 }
 
-// noteCertified records the notarization certificate for one of our
-// candidates. It reports the interval the certificate was measured over and
-// whether it produced a cost sample.
-//
-// Only a block that was queued behind the previous certificate, and whose
-// certificate came later than our own emission cadence would have put it, is
-// a measurement: the committee was busy the whole interval and fell behind us
-// by the difference, so the interval is what the block cost it. A certificate
-// that keeps our cadence proves the committee is at least that fast and
-// nothing more; when its candidate filled the natural adaptive cap it relaxes
-// the estimate a little so the cap probes upward. A certificate for a block the
-// committee received while idle — the first of a window, after a gap — measures
-// delivery and their backlog from someone else's window, and is not a cost
-// sample. Blocks too small to measure a per-transaction cost may still provide
-// timely upward evidence when they filled a low natural cap; their certificates
-// also mark the committee busy.
+// waitForCapacity bounds the work already handed to a slower committee. It
+// waits before acquiring/building another natural candidate, never while
+// holding the controller lock. Already running speculative futures can finish;
+// this is backpressure, not cancellation of useful work or shrinking old debt.
+func (p *committeePace) waitForCapacity(ctx context.Context, targetRate time.Duration) error {
+	if targetRate <= 0 {
+		return nil
+	}
+	waited := false
+	for {
+		if waited {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		p.mu.Lock()
+		now := time.Now()
+		var pending int
+		var expires time.Time
+		for id, emission := range p.emitted {
+			deadline := emission.at.Add(committeePaceEmissionRetention)
+			if !deadline.After(now) {
+				delete(p.emitted, id)
+				p.notifyCapacityLocked()
+				continue
+			}
+			if !emission.demand || emission.artificial {
+				continue
+			}
+			pending++
+			if expires.IsZero() || deadline.Before(expires) {
+				expires = deadline
+			}
+		}
+		if pending < committeePaceOutstandingLimit {
+			p.mu.Unlock()
+			// An open gate preserves the existing pipeline cancellation path.
+			// Only actual capacity waits take ownership of cancellation here.
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			p.mu.Unlock()
+			return err
+		}
+		if p.capacityWake == nil {
+			p.capacityWake = make(chan struct{})
+		}
+		p.backpressured = true
+		wake := p.capacityWake
+		p.mu.Unlock()
+
+		waited = true
+		timer := time.NewTimer(time.Until(expires))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-wake:
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
+}
+
+func (p *committeePace) notifyCapacityLocked() {
+	if p.capacityWake != nil {
+		close(p.capacityWake)
+		p.capacityWake = nil
+	}
+}
+
+// noteCertified returns the adjacent certificate interval and whether it was
+// informative about current capacity. Only the growth of lag matters: an old,
+// constant queue is not charged repeatedly to newly timely blocks. Every change
+// gets a revision, so already emitted blocks cannot compound an old slowdown.
 func (p *committeePace) noteCertified(id simplex.CandidateID, at time.Time) (time.Duration, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	emission, known := p.emitted[id]
+	// A later certificate also retires skipped or superseded earlier slots.
+	// They must not hold admission closed until the retention timer: consensus
+	// has already moved past them, even when the new candidate was not ours.
+	for pending := range p.emitted {
+		if pending.Slot <= id.Slot {
+			delete(p.emitted, pending)
+		}
+	}
+	p.notifyCapacityLocked()
 	if !known {
 		return 0, false
 	}
-	delete(p.emitted, id)
-	queued := !p.lastCertificate.IsZero() && !emission.at.After(p.lastCertificate)
-	certInterval := at.Sub(p.lastCertificate)
-	emitInterval := emission.at.Sub(p.lastCertifiedEmission)
-	if at.After(p.lastCertificate) {
-		p.lastCertificate = at
-		p.lastCertifiedEmission = emission.at
-		p.lastSample = at
+	if at.Before(emission.at) || at.Sub(emission.at) > committeePaceEmissionRetention {
+		p.resetIntervalsLocked()
+		return 0, false
 	}
-	measurable := emission.transactions >= committeePaceSampleMinTransactions
-	// A naturally cap-bound certificate bounds the committee's cost from above:
-	// it cannot have spent longer on this block than the whole interval since it
-	// was free to start on it — since the previous certificate when the block was
-	// queued, since our emission when it was not — and that interval includes
-	// delivery and the vote round on top of validation. When the bound is below
-	// the estimate the estimate is wrong, and it drops to the bound at once. An
-	// underfilled candidate cannot provide this upward evidence: raising the cap
-	// after a quiet period is precisely what turns the next backlog into one
-	// oversized block.
-	busy := certInterval
-	if !queued {
-		busy = at.Sub(emission.at)
+	previous := p.last
+	if !previous.at.IsZero() && (id.Slot <= previous.id.Slot || !at.After(previous.at)) {
+		p.resetIntervalsLocked()
+		return 0, false
 	}
-	if measurable && emission.canProbeUpward() && busy > 0 && p.millisPerTransaction > 0 {
-		bound := float64(busy) / float64(time.Millisecond) / float64(emission.transactions)
-		if bound < p.millisPerTransaction {
-			p.millisPerTransaction = math.Max(bound, committeeMinMillisPerTransaction)
+	p.last = paceCertificate{id: id, at: at, emission: emission}
+
+	adjacent := emission.window == previous.emission.window &&
+		emission.parent == simplex.Parent(previous.id) && id.Slot == previous.id.Slot+1
+	fresh := emission.budget.revision == p.revision && previous.emission.budget.revision == p.revision
+	ordered := !previous.at.IsZero() && emission.at.After(previous.emission.at)
+	currentWork := emission.demand && !emission.artificial && emission.elapsed > 0
+	previousWork := previous.emission.demand && !previous.emission.artificial && previous.emission.elapsed > 0
+	if !adjacent || !fresh || !ordered || !currentWork || !previousWork {
+		p.resetIntervalsLocked()
+		return 0, false
+	}
+
+	interval := at.Sub(previous.at)
+	emitInterval := emission.at.Sub(previous.emission.at)
+	slack := max(20*time.Millisecond, emission.targetRate/10)
+	lagGrowth := interval - emitInterval
+	// Once admission is backpressured, emission follows the slow certificates
+	// and lag stops growing by construction. That does not make the old budget
+	// sustainable: fresh slow intervals still need to reduce it.
+	slow := interval > emission.targetRate+slack && (lagGrowth > slack || p.backpressured)
+	timely := interval <= emission.targetRate+slack && lagGrowth <= slack
+	if slow {
+		p.goodIntervals = 0
+		p.slowIntervals++
+		p.recordEvidenceLocked(at)
+		if p.slowIntervals >= 2 {
+			factor := math.Max(0.5, math.Min(0.8, float64(emission.targetRate)/float64(interval)))
+			p.congested = true
+			p.changeFractionLocked(p.fraction*factor, emission.targetRate)
+			p.resetIntervalsLocked()
 		}
+		return interval, true
 	}
-	if !queued {
-		// The committee was idle when this block reached it: it certified the
-		// previous one before this one was even emitted. That says nothing
-		// about what a block costs and everything about the committee having
-		// time to spare, so the estimate relaxes — harder than for a block
-		// that merely kept pace. Without this the cap froze: on the stand a
-		// shard sat at 44 transactions for four windows in a row with every
-		// naturally cap-bound block certified on time, because a certificate that
-		// arrives before our next emission never counted as keeping pace and the
-		// estimate had no way down. An underfilled or first-slot block has no such
-		// evidence and leaves the estimate alone.
-		if emission.canProbeUpward() {
-			p.relaxLocked(emission.targetRate, committeePaceIdleRelax)
-		}
+	p.slowIntervals = 0
+	if !timely || !emission.saturated() || emission.elapsed > emission.targetRate+slack {
+		p.goodIntervals = 0
+		return interval, false
+	}
 
-		return certInterval, false
+	p.recordEvidenceLocked(at)
+	p.goodIntervals++
+	threshold, factor := uint8(2), 1.5
+	if p.congested {
+		threshold, factor = 4, 1.08
 	}
-	if certInterval <= 0 {
-		return certInterval, false
+	if p.goodIntervals >= threshold {
+		p.changeFractionLocked(p.fraction*factor, emission.targetRate)
+		p.resetIntervalsLocked()
 	}
-	if certInterval <= emitInterval+committeePaceSlack {
-		// Keeping pace. A naturally cap-bound block cost at most this interval,
-		// and probably less; the estimate moves toward "less" until a
-		// certificate says otherwise. An underfilled or artificial first-slot cap
-		// does not justify a larger adaptive cap.
-		if emission.canProbeUpward() {
-			p.relaxLocked(emission.targetRate, committeePaceRelax)
-		}
-
-		return certInterval, false
-	}
-	if !measurable {
-		return certInterval, false
-	}
-	perTransaction := float64(certInterval-committeeFixedCost) / float64(time.Millisecond) / float64(emission.transactions)
-	perTransaction = math.Min(math.Max(perTransaction, committeeMinMillisPerTransaction), committeeMaxMillisPerTransaction)
-	if p.millisPerTransaction > 0 {
-		// One certificate may at most double the estimate. A committee that
-		// really got slower shows it on every certificate and the estimate
-		// follows in two or three; a single stall — a session start, a
-		// masterchain block landing mid-window — is not what a block costs,
-		// and without the limit it moved the estimate from 0.7 to 2 ms per
-		// transaction in one step.
-		perTransaction = math.Min(perTransaction, p.millisPerTransaction*committeePaceMaxSampleStep)
-	}
-	if p.samples == 0 {
-		p.millisPerTransaction = perTransaction
-	} else {
-		p.millisPerTransaction += committeePaceSmoothing * (perTransaction - p.millisPerTransaction)
-	}
-	p.samples++
-
-	return certInterval, true
+	return interval, true
 }
 
-// relaxLocked shrinks the estimate by factor, from the start value's implied
-// cost at the session's actual target rate when nothing has been measured yet.
-func (p *committeePace) relaxLocked(targetRate time.Duration, factor float64) {
-	if p.millisPerTransaction == 0 {
-		p.millisPerTransaction = impliedMillisPerTransaction(targetRate, adaptiveTransactionStart)
-		if p.millisPerTransaction <= 0 {
-			return
-		}
-	}
-	p.millisPerTransaction = math.Max(p.millisPerTransaction*factor, committeeMinMillisPerTransaction)
-}
-
-// pacedBudget is the committee time one block may cost, in nanoseconds as a
-// float: the slot, the window slack that falls on it, less the jitter reserve
-// and the fixed part of a certificate's latency.
-func pacedBudget(targetRate time.Duration) float64 {
-	return float64(targetRate+committeePaceWindowSlack-committeePaceJitterReserve) - float64(committeeFixedCost)
-}
-
-// impliedMillisPerTransaction is the per-transaction cost at which the paced
-// budget of one target-rate slot buys exactly cap transactions: the estimate a
-// cap stands for, used to start relaxing from the start value before any
-// certificate has measured the committee falling behind.
-func impliedMillisPerTransaction(targetRate time.Duration, cap uint32) float64 {
-	budget := pacedBudget(targetRate)
-	if budget <= 0 || cap == 0 {
-		return 0
-	}
-
-	return budget / float64(time.Millisecond) / float64(cap)
-}
-
-// transactionCap is the number of transactions one block may admit so that the
-// committee's time on it stays inside the paced budget of one slot, at the
-// measured per-transaction cost. With no measurement yet it is the start value;
-// a measured pace moves it anywhere between the floor and the ceiling.
-func (p *committeePace) transactionCap(targetRate time.Duration) uint32 {
-	p.mu.Lock()
-	perTransaction := p.millisPerTransaction
-	p.mu.Unlock()
-
-	if perTransaction <= 0 || targetRate <= 0 {
-		return adaptiveTransactionStart
-	}
-	budget := pacedBudget(targetRate)
-	if budget <= 0 {
-		return adaptiveTransactionFloor
-	}
-	cap := budget / float64(time.Millisecond) / perTransaction
-	switch {
-	case cap >= float64(adaptiveTransactionCeiling):
-		return adaptiveTransactionCeiling
-	case cap <= float64(adaptiveTransactionFloor):
-		return adaptiveTransactionFloor
-	default:
-		return uint32(cap)
+func (p *committeePace) recordEvidenceLocked(at time.Time) {
+	p.lastSample = at
+	if p.samples < math.MaxUint32 {
+		p.samples++
 	}
 }
 
-// estimate reports the moving per-transaction cost and the sample count, for
-// logs and tests.
-func (p *committeePace) estimate() (float64, int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (p *committeePace) resetIntervalsLocked() {
+	p.goodIntervals = 0
+	p.slowIntervals = 0
+}
 
-	return p.millisPerTransaction, p.samples
+func (p *committeePace) changeFractionLocked(fraction float64, targetRate time.Duration) {
+	fraction = clampPaceFraction(fraction, targetRate)
+	if p.fraction == fraction {
+		return
+	}
+	p.fraction = fraction
+	p.revision++
+	p.backpressured = false
+}
+
+func clampPaceFraction(fraction float64, targetRate time.Duration) float64 {
+	minimum := min(committeePaceMaxFraction,
+		max(committeePaceMinFraction, float64(committeePaceMinBudget)/float64(targetRate)))
+	return max(minimum, min(committeePaceMaxFraction, fraction))
 }

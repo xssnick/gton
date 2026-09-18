@@ -18,9 +18,11 @@ const (
 // delivery timestamps and the previous certificate belong to one session and
 // must never cross a rotation.
 type paceEstimate struct {
-	millisPerTransaction float64
-	samples              int
-	sampledAt            time.Time
+	fraction      float64
+	finishReserve time.Duration
+	congested     bool
+	samples       uint32
+	sampledAt     time.Time
 }
 
 type paceHistoryKey [sha256.Size]byte
@@ -112,9 +114,11 @@ func (p *committeePace) snapshot() paceEstimate {
 	defer p.mu.Unlock()
 
 	return paceEstimate{
-		millisPerTransaction: p.millisPerTransaction,
-		samples:              p.samples,
-		sampledAt:            p.lastSample,
+		fraction:      p.fraction,
+		finishReserve: p.finishReserve,
+		congested:     p.congested,
+		samples:       p.samples,
+		sampledAt:     p.lastSample,
 	}
 }
 
@@ -129,10 +133,13 @@ func (p *committeePace) seed(estimate paceEstimate, age time.Duration, targetRat
 		// A quiet interval is not proof that a previous peak is still safe.
 		// Keep a restrictive estimate, but bring an optimistic one back to
 		// the cold-start ceiling and require fresh evidence for fast growth.
-		estimate.millisPerTransaction = max(estimate.millisPerTransaction,
-			impliedMillisPerTransaction(targetRate, adaptiveTransactionStart))
+		estimate.fraction = min(estimate.fraction, committeePaceStartFraction)
 	}
-	p.millisPerTransaction = estimate.millisPerTransaction
+	p.changeFractionLocked(estimate.fraction, targetRate)
+	if !p.tailMeasured {
+		p.finishReserve = estimate.finishReserve
+	}
+	p.congested = estimate.congested
 	p.samples = estimate.samples
 	// lastSample remains unset: inherited estimates are not local evidence,
 	// and must not extend the history lifetime when a session stays idle.
@@ -157,7 +164,7 @@ func (s *Service) rememberPaceLocked(sessionID [32]byte, now time.Time) {
 		return
 	}
 	estimate := active.pace.snapshot()
-	if estimate.millisPerTransaction <= 0 || estimate.sampledAt.IsZero() || now.Sub(estimate.sampledAt) > paceHistoryRetention {
+	if estimate.sampledAt.IsZero() || now.Sub(estimate.sampledAt) > paceHistoryRetention {
 		return
 	}
 	if previous, exists := s.paceHistory[active.key]; exists {

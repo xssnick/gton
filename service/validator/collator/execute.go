@@ -391,6 +391,13 @@ func (c *collation) processExternalBatch(
 			}
 			return externalBatchResult{stop: ExternalStopDeadline, consumed: i}, nil
 		}
+		if c.paceExpired() {
+			for _, skipped := range externals[i:] {
+				c.recordExternal(skipped.Ref, msgpool.ExternalSkippedLimit)
+			}
+
+			return externalBatchResult{stop: ExternalStopDeadline, consumed: i}, nil
+		}
 		if err := c.ctx.Err(); err != nil {
 			return externalBatchResult{}, err
 		}

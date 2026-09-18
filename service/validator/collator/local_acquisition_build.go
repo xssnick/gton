@@ -175,6 +175,8 @@ func (a *LocalAcquisition) AcquireShard(ctx context.Context, request BuildReques
 		Neighbors:           messages.neighbors,
 		NeighborShardEndLT:  messages.shardEndLT,
 		MaxTransactions:     request.MaxTransactions,
+		PaceBudget:          request.PaceBudget,
+		PaceFinishReserve:   request.PaceFinishReserve,
 		accountPrewarmer:    a.accountPrewarmer,
 	}
 	if request.onSuccessor != nil {

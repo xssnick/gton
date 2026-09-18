@@ -163,11 +163,13 @@ func (c *collation) processExternalBatchInWaves(
 			return externalBatchResult{}, err
 		}
 
+		waveStarted := c.admission.beginWave()
 		plans, lastProcLT := c.planExternalWave(externals[next:])
 		if len(plans) == 0 {
 			return externalBatchResult{}, fmt.Errorf("%w: external wave planned no messages", ErrInvalidInput)
 		}
 		result, stop, err := c.runExternalWave(externals, next, plans, lastProcLT, deadline, workers)
+		c.admission.endWave(waveStarted)
 		if err != nil || stop {
 			return result, err
 		}
@@ -200,6 +202,13 @@ func (c *collation) externalBatchStops(
 
 		return true, externalBatchResult{stop: ExternalStopDeadline, consumed: at}
 	}
+	if c.paceExpired() {
+		for _, skipped := range externals[at:] {
+			c.recordExternal(skipped.Ref, msgpool.ExternalSkippedLimit)
+		}
+
+		return true, externalBatchResult{stop: ExternalStopDeadline, consumed: at}
+	}
 
 	return false, externalBatchResult{}
 }
@@ -220,8 +229,9 @@ func (c *collation) planExternalWave(externals []ExternalInput) ([]*externalPlan
 	w.plans = w.plans[:0]
 	clear(w.seen)
 	lastProcLT := c.lastProcLT
+	limit := c.admission.waveLimit(c.internalWaveParallelism())
 	for i := range externals {
-		if len(w.plans) == internalWaveLength {
+		if len(w.plans) == limit {
 			break
 		}
 		plan := w.take(externals[i])

@@ -1867,25 +1867,26 @@ func (s *Service) existingPace(sessionID [32]byte) *committeePace {
 	return nil
 }
 
-// transactionCap is the number of transactions a build for session may admit:
-// what the committee validates inside a slot at its measured pace, and for the
-// first slot of a window the smaller of that and firstSlotTransactions.
-func (s *Service) transactionCap(session Session, targetRate time.Duration, first bool) uint32 {
-	cap := s.pace(session, targetRate).transactionCap(targetRate)
-	if first {
-		return firstSlotTransactionCap(cap)
-	}
-
-	return cap
-}
-
 // ObserveConsensusNotarized records the committee's certificate on a candidate.
-// Only candidates this service emitted with transactions become samples; the
-// rest are a map miss. It runs on the consensus hook and blocks on nothing.
+// Only candidates this service emitted with transactions become samples.
+// Other certificates still release superseded slots from backpressure. It runs
+// on the consensus hook and never waits for admission or a build.
 func (s *Service) ObserveConsensusNotarized(sessionID [32]byte, id simplex.CandidateID, at time.Time) {
 	if pace := s.existingPace(sessionID); pace != nil {
+		before := pace.snapshot()
 		pace.noteCertified(id, at)
 		s.rememberPace(sessionID, pace, at)
+		after := pace.snapshot()
+		if before.fraction != after.fraction {
+			s.log.Info().
+				Hex("session_id", sessionID[:]).
+				Uint32("slot", id.Slot).
+				Float64("previous_fraction", before.fraction).
+				Float64("pace_fraction", after.fraction).
+				Dur("pace_finish_reserve", after.finishReserve).
+				Uint32("pace_samples", after.samples).
+				Msg("collation pace adjusted")
+		}
 	}
 }
 
@@ -2332,7 +2333,7 @@ func (s *Service) SpeculateWindow(ctx context.Context, request SpeculativeWindow
 		Parent:  simplex.Parent(request.Base.candidate),
 		// The first slot of the window this bets on, so the cap the scheduled
 		// first slot carries applies here too; see firstSlotTransactions.
-		MaxTransactions: s.transactionCap(record.Session, record.Update.TargetRate, true),
+		MaxTransactions: firstSlotTransactions,
 	}
 	build.speculative = &speculativeBase{state: request.Base, at: request.StartAt}
 	// The schedule of the window this is for, derived from the estimate rather
@@ -2446,7 +2447,7 @@ func (s *Service) SpeculateSessionStart(ctx context.Context, request Speculative
 		Slot:            0,
 		Leader:          request.Leader,
 		Parent:          simplex.Genesis(),
-		MaxTransactions: s.transactionCap(record.Session, record.Update.TargetRate, true),
+		MaxTransactions: firstSlotTransactions,
 	}
 	predicted := record
 	predicted.Update.CurrentWindowStart = 0
@@ -3617,7 +3618,7 @@ func (p *windowProducer) offerNextWindow(offer SuccessorOffer) PipelineHandoffOu
 		PreviousPending: &pending,
 		crossWindowBet:  true,
 		// The first slot of the next window; see firstSlotTransactions.
-		MaxTransactions: p.service.transactionCap(p.record.Session, targetRate, true),
+		MaxTransactions: firstSlotTransactions,
 	}
 	request.excludeExternals = offer.Exclude
 	// Never idle on the estimated window opening: this bet starts from the
@@ -4233,7 +4234,22 @@ func (p *windowProducer) runSlot(slot uint32) error {
 	// The future may have started before the latest feedback (or in an earlier
 	// slot). Feedback must describe the budget actually used to build it.
 	request.MaxTransactions = finishedFuture.request.MaxTransactions
+	request.PaceBudget = finishedFuture.request.PaceBudget
+	request.PaceFinishReserve = finishedFuture.request.PaceFinishReserve
+	request.paceOwner = finishedFuture.request.paceOwner
+	request.paceRevision = finishedFuture.request.paceRevision
+	request.paceTargetRate = finishedFuture.request.paceTargetRate
+	request.paceArtificial = finishedFuture.request.paceArtificial
 	built := p.service.ownBuiltCandidate(result.candidate)
+	if request.paceOwner != nil {
+		request.paceOwner.noteBuilt(
+			paceBudget{duration: request.PaceBudget, finishReserve: request.PaceFinishReserve, revision: request.paceRevision},
+			built.Stats.PaceElapsed,
+			built.Stats.PaceTail,
+			built.Stats.PaceLimited,
+			request.paceArtificial,
+		)
+	}
 	stageStarted := p.service.metricStageStarted()
 	artifact, err := p.service.signArtifact(
 		p.record.Session,
@@ -4317,6 +4333,15 @@ func (s *Service) startBuildFuture(
 	request BuildRequest,
 	hardDeadline time.Time,
 ) *candidateBuildFuture {
+	if !request.Session.Shard.IsMasterchain() && request.Update.TargetRate > 0 {
+		request.paceOwner = s.pace(request.Session.Session, request.Update.TargetRate)
+		budget := request.paceOwner.budget(request.Update.TargetRate)
+		request.PaceBudget = budget.duration
+		request.PaceFinishReserve = budget.finishReserve
+		request.paceRevision = budget.revision
+		request.paceTargetRate = request.Update.TargetRate
+		request.paceArtificial = request.MaxTransactions != 0
+	}
 	buildCtx, cancel := context.WithDeadline(ctx, hardDeadline)
 	future := &candidateBuildFuture{
 		request:      request,
@@ -4350,7 +4375,20 @@ func (s *Service) startBuildFuture(
 	}
 	go func() {
 		defer close(future.done)
-		candidate, err := s.opts.Pipeline.BuildCandidate(buildCtx, request)
+		var candidate *Candidate
+		var err error
+		if request.paceOwner != nil && !request.paceArtificial {
+			waiting := time.Now()
+			err = request.paceOwner.waitForCapacity(buildCtx, request.paceTargetRate)
+			if waited := time.Since(waiting); waited >= request.paceTargetRate {
+				s.log.Info().Hex("session_id", request.Session.ID[:]).
+					Uint32("slot", request.Slot).Dur("elapsed", waited).
+					Err(err).Msg("collation pace capacity wait")
+			}
+		}
+		if err == nil {
+			candidate, err = s.opts.Pipeline.BuildCandidate(buildCtx, request)
+		}
 		elapsed := time.Since(started)
 		if s.opts.Observer != nil && !bet {
 			s.opts.Observer.AddCollationBuildInflight(chain, -1)
@@ -4443,14 +4481,16 @@ func (s *Service) logCollatedCandidate(
 			kind = CandidateKindEmpty
 		}
 		s.opts.Observer.ObserveCollationCandidate(CandidateObservation{
-			Chain:         metricChain(request.Session.Shard.IsMasterchain()),
-			Origin:        CandidateOriginCollation,
-			Kind:          kind,
-			Shard:         shardMetricLabel(request.Session.Shard),
-			BlockBytes:    blockBytes,
-			CollatedBytes: collatedBytes,
-			Shape:         values.CollationShape(),
-			Stats:         values,
+			Chain:             metricChain(request.Session.Shard.IsMasterchain()),
+			Origin:            CandidateOriginCollation,
+			Kind:              kind,
+			Shard:             shardMetricLabel(request.Session.Shard),
+			BlockBytes:        blockBytes,
+			CollatedBytes:     collatedBytes,
+			Shape:             values.CollationShape(),
+			Stats:             values,
+			PaceBudget:        request.PaceBudget,
+			PaceFinishReserve: request.PaceFinishReserve,
 		})
 	}
 
@@ -4475,6 +4515,13 @@ func (s *Service) logCollatedCandidate(
 		Int("collated_bytes", collatedBytes).
 		Uint32("transactions", values.Transactions).
 		Uint32("tx_cap", request.MaxTransactions).
+		Dur("pace_budget", request.PaceBudget).
+		Dur("pace_finish_reserve", request.PaceFinishReserve).
+		Dur("pace_elapsed", values.PaceElapsed).
+		Dur("pace_tail", values.PaceTail).
+		Bool("pace_limited", values.PaceLimited).
+		Bool("pace_artificial", request.paceArtificial).
+		Uint64("pace_revision", request.paceRevision).
 		Uint32("external_messages", values.ExternalIncluded).
 		Uint32("internal_messages", values.InternalsImported).
 		Uint64("gas_used", values.GasUsed).
@@ -4652,16 +4699,26 @@ func (s *Service) persistAndEmit(
 		)
 	}
 	var emittedPace *committeePace
-	if commit != nil && commit.Built != nil && !record.Session.Shard.IsMasterchain() {
+	if commit != nil && commit.Built != nil && commit.Request.paceOwner != nil {
 		// The certificate for this candidate, when it comes, measures the
 		// committee from this instant; see committee_pace.go.
-		emittedPace = s.pace(record.Session, commit.Request.Update.TargetRate)
+		emittedPace = commit.Request.paceOwner
 		emittedPace.noteEmitted(artifact.Candidate.ID, paceEmission{
-			at:             time.Now(),
-			targetRate:     commit.Request.Update.TargetRate,
-			transactions:   commit.Built.Stats.Transactions,
-			transactionCap: commit.Request.MaxTransactions,
-			artificialCap:  artifact.Candidate.ID.Slot == artifact.WindowID.StartSlot,
+			at:         time.Now(),
+			targetRate: commit.Request.paceTargetRate,
+			budget: paceBudget{
+				duration:      commit.Request.PaceBudget,
+				finishReserve: commit.Request.PaceFinishReserve,
+				revision:      commit.Request.paceRevision,
+			},
+			window:       artifact.WindowID,
+			parent:       artifact.Candidate.Parent,
+			transactions: commit.Built.Stats.Transactions,
+			elapsed:      commit.Built.Stats.PaceElapsed,
+			tail:         commit.Built.Stats.PaceTail,
+			limited:      commit.Built.Stats.PaceLimited,
+			demand:       commit.Built.Stats.PaceLimited || commit.Built.Stats.Load >= LoadSoft,
+			artificial:   commit.Request.paceArtificial || artifact.Candidate.ID.Slot == artifact.WindowID.StartSlot,
 		})
 	}
 	stageStarted = s.metricStageStarted()
@@ -5264,19 +5321,22 @@ func (p *windowProducer) underloadedNotBefore() time.Time {
 	return p.lastEmittedAt.Add(p.record.Update.TargetRate)
 }
 
-// transactionCap is the cap the build for slot may admit: the committee-paced
-// cap for this session (Service.transactionCap), which for the first slot of the
-// window is further bounded by firstSlotTransactions.
+// transactionCap keeps the independent first-slot safety policy. Ordinary shard
+// blocks use the measured work budget and protocol limits, not a count of tx.
 func (p *windowProducer) transactionCap(slot uint32) uint32 {
-	return p.service.transactionCap(
-		p.record.Session,
-		p.record.Update.TargetRate,
-		slot == p.job.window.ID.StartSlot,
-	)
+	if slot == p.job.window.ID.StartSlot {
+		return firstSlotTransactions
+	}
+	if p.record.Session.Shard.IsMasterchain() {
+		// This controller is shard-only. Preserve the previous, untrained
+		// masterchain cap instead of changing masterchain policy implicitly.
+		return 400
+	}
+
+	return 0
 }
 
-// firstSlotTransactions bounds the first block of a leader window below the
-// committee-paced cap every slot gets.
+// firstSlotTransactions independently bounds the first block of a leader window.
 //
 // The committee's alarm for that slot is fixed by wall clock: the window as it
 // observed it, plus FirstBlockTimeout, plus one target rate (simplex/voter.go
@@ -5298,12 +5358,6 @@ func (p *windowProducer) transactionCap(slot uint32) uint32 {
 // then certifies it in about 200 ms, against 513 ms for the larger one, and
 // that difference is slack every later slot of the window gets to spend.
 const firstSlotTransactions = 100
-
-// firstSlotTransactionCap is the first slot's cap: firstSlotTransactions, or
-// the committee-paced cap when that is smaller still.
-func firstSlotTransactionCap(cap uint32) uint32 {
-	return min(firstSlotTransactions, cap)
-}
 
 // pipelinedBuildLeadSlots is how many slots ahead of its schedule a shard build
 // may begin, whether the handoff starts it or the producer loop does.
