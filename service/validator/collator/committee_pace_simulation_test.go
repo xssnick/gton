@@ -153,7 +153,7 @@ func TestCommitteePaceProtocolLimitMayDecreaseButNotIncrease(t *testing.T) {
 	pace := newCommitteePace()
 	rate := 400 * time.Millisecond
 	start := time.Unix(1_700_000_000, 0)
-	for slot := range uint32(3) {
+	for slot := range uint32(5) {
 		emission := paceTestEmission(pace, slot, start.Add(time.Duration(slot)*rate), rate)
 		emission.limited = false
 		certifyPaceTestEmission(pace, slot, emission,
@@ -163,7 +163,7 @@ func TestCommitteePaceProtocolLimitMayDecreaseButNotIncrease(t *testing.T) {
 	if reduced.duration >= rate/2 {
 		t.Fatal("protocol-full candidates could not reduce overloaded committee budget")
 	}
-	for slot := uint32(3); slot < 12; slot++ {
+	for slot := uint32(5); slot < 12; slot++ {
 		emission := paceTestEmission(pace, slot, start.Add(time.Duration(slot)*rate), rate)
 		emission.limited = false
 		certifyPaceTestEmission(pace, slot, emission, emission.at.Add(2*time.Second))

@@ -56,7 +56,7 @@ func TestControllerForwardsNotarizationToCommitteePace(t *testing.T) {
 	pace := service.pace(Session{ID: sessionID}, 400*time.Millisecond)
 	start := time.Unix(1_700_000_000, 0)
 	budget := pace.budget(400 * time.Millisecond)
-	for slot := uint32(0); slot < 3; slot++ {
+	for slot := uint32(0); slot < 5; slot++ {
 		parent := simplex.Genesis()
 		if slot != 0 {
 			parent = simplex.Parent(paceCandidate(slot - 1))
@@ -79,12 +79,12 @@ func TestControllerForwardsNotarizationToCommitteePace(t *testing.T) {
 	if notarized == nil {
 		t.Fatal("controller installed no notarization callback")
 	}
-	for slot := uint32(0); slot < 3; slot++ {
+	for slot := uint32(0); slot < 5; slot++ {
 		notarized(sessionID, paceCandidate(slot), start.Add(500*time.Millisecond+time.Duration(slot)*466*time.Millisecond))
 	}
 	samples := pace.snapshot().samples
-	if samples != 2 {
-		t.Fatalf("standalone committee samples = %d, want 2", samples)
+	if samples != 1 {
+		t.Fatalf("standalone committee samples = %d, want 1 complete slow span", samples)
 	}
 	if after := pace.budget(400 * time.Millisecond); after.duration >= budget.duration {
 		t.Fatal("standalone work budget did not respond to sustained slow certification")

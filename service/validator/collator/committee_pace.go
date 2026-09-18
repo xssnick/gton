@@ -67,6 +67,10 @@ type committeePace struct {
 	congested     bool
 	goodIntervals uint8
 	slowIntervals uint8
+	intervals     uint8
+	certifiedSpan time.Duration
+	emittedSpan   time.Duration
+	slowSpan      bool
 	backpressured bool
 	samples       uint32
 	lastSample    time.Time
@@ -294,37 +298,57 @@ func (p *committeePace) noteCertified(id simplex.CandidateID, at time.Time) (tim
 	emitInterval := emission.at.Sub(previous.emission.at)
 	slack := max(20*time.Millisecond, emission.targetRate/10)
 	lagGrowth := interval - emitInterval
+	p.intervals++
+	p.certifiedSpan += interval
+	p.emittedSpan += emitInterval
+	meanInterval := p.certifiedSpan / time.Duration(p.intervals)
+	meanLagGrowth := (p.certifiedSpan - p.emittedSpan) / time.Duration(p.intervals)
+	if interval > emission.targetRate+slack && (lagGrowth > slack || p.backpressured) {
+		p.slowIntervals++
+	}
 	// Once admission is backpressured, emission follows the slow certificates
 	// and lag stops growing by construction. That does not make the old budget
-	// sustainable: fresh slow intervals still need to reduce it.
-	slow := interval > emission.targetRate+slack && (lagGrowth > slack || p.backpressured)
+	// sustainable. Measure the whole span, not two individual delayed ACKs:
+	// delivery jitter can be followed by a batch of timely certificates.
+	slow := meanInterval > emission.targetRate+slack && (meanLagGrowth > slack || p.backpressured)
 	timely := interval <= emission.targetRate+slack && lagGrowth <= slack
-	if slow {
-		p.goodIntervals = 0
-		p.slowIntervals++
+	spanTimely := meanInterval <= emission.targetRate+slack && meanLagGrowth <= slack
+	// One exceptional interval is not sustained congestion. Repeated slow
+	// spans are: a heavy block every fourth slot must not evade the detector.
+	if p.intervals == 4 && slow && (p.slowIntervals >= 2 || p.slowSpan) {
 		p.recordEvidenceLocked(at)
-		if p.slowIntervals >= 2 {
-			factor := math.Max(0.5, math.Min(0.8, float64(emission.targetRate)/float64(interval)))
-			p.congested = true
-			p.changeFractionLocked(p.fraction*factor, emission.targetRate)
-			p.resetIntervalsLocked()
-		}
+		factor := math.Max(0.5, math.Min(0.8, float64(emission.targetRate)/float64(meanInterval)))
+		p.congested = true
+		p.changeFractionLocked(p.fraction*factor, emission.targetRate)
+		p.resetIntervalsLocked()
 		return interval, true
 	}
-	p.slowIntervals = 0
-	if !timely || !emission.saturated() || emission.elapsed > emission.targetRate+slack {
+	// Two short catch-up intervals must not erase an earlier long stall. The
+	// entire observed prefix must keep up before another upward probe is safe.
+	canGrow := timely && spanTimely && emission.saturated() && emission.elapsed <= emission.targetRate+slack
+	if !canGrow {
 		p.goodIntervals = 0
+		if p.intervals == 4 {
+			p.resetIntervalsLocked()
+			p.slowSpan = slow
+		}
 		return interval, false
 	}
 
 	p.recordEvidenceLocked(at)
 	p.goodIntervals++
-	threshold, factor := uint8(2), 1.5
+	factor := 1.5
 	if p.congested {
-		threshold, factor = 4, 1.08
+		// Leader windows are intermittent. Four samples per 8% step kept a
+		// recovered committee underfilled for minutes after one slowdown.
+		factor = 1.25
 	}
-	if p.goodIntervals >= threshold {
+	// After a slow span, verify a complete recovery span before probing.
+	// Otherwise two catch-up ACKs between periodic stalls erase the evidence.
+	if p.goodIntervals >= 2 && (!p.slowSpan || p.intervals == 4) {
 		p.changeFractionLocked(p.fraction*factor, emission.targetRate)
+		p.resetIntervalsLocked()
+	} else if p.intervals == 4 {
 		p.resetIntervalsLocked()
 	}
 	return interval, true
@@ -340,6 +364,10 @@ func (p *committeePace) recordEvidenceLocked(at time.Time) {
 func (p *committeePace) resetIntervalsLocked() {
 	p.goodIntervals = 0
 	p.slowIntervals = 0
+	p.intervals = 0
+	p.certifiedSpan = 0
+	p.emittedSpan = 0
+	p.slowSpan = false
 }
 
 func (p *committeePace) changeFractionLocked(fraction float64, targetRate time.Duration) {

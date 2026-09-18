@@ -1,6 +1,7 @@
 package collator
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -72,7 +73,7 @@ func TestCommitteePaceRecoversWithOldLagAndMicrosecondJitter(t *testing.T) {
 	}
 }
 
-func TestCommitteePaceRequiresTwoSlowIntervalsAndIgnoresStaleAcks(t *testing.T) {
+func TestCommitteePaceRequiresSustainedSlowSpanAndIgnoresStaleAcks(t *testing.T) {
 	t.Parallel()
 	rate := 400 * time.Millisecond
 	pace := newCommitteePace()
@@ -88,17 +89,22 @@ func TestCommitteePaceRequiresTwoSlowIntervalsAndIgnoresStaleAcks(t *testing.T) 
 		t.Fatalf("one slow interval changed budget: %+v", got)
 	}
 	pace.noteCertified(paceCandidate(2), start.Add(1900*time.Millisecond))
+	pace.noteCertified(paceCandidate(3), start.Add(2600*time.Millisecond))
+	if got := pace.budget(rate); got != initial {
+		t.Fatalf("incomplete slow span changed budget: %+v", got)
+	}
+	pace.noteCertified(paceCandidate(4), start.Add(3300*time.Millisecond))
 	reduced := pace.budget(rate)
 	if reduced.duration >= initial.duration || reduced.duration < initial.duration/2 {
-		t.Fatalf("two slow intervals produced unbounded reduction: %+v -> %+v", initial, reduced)
+		t.Fatalf("sustained slow span produced unbounded reduction: %+v -> %+v", initial, reduced)
 	}
-	for slot := uint32(3); slot < 15; slot++ {
+	for slot := uint32(5); slot < 15; slot++ {
 		pace.noteCertified(paceCandidate(slot), start.Add(500*time.Millisecond+time.Duration(slot)*700*time.Millisecond))
 	}
 	if got := pace.budget(rate); got != reduced {
 		t.Fatalf("old budget acknowledgments compounded slowdown: %+v -> %+v", reduced, got)
 	}
-	if pace.snapshot().samples != 2 {
+	if pace.snapshot().samples != 1 {
 		t.Fatalf("stale acknowledgments counted as fresh evidence: %+v", pace.snapshot())
 	}
 	// New-window current-revision evidence can recover despite the old queue.
@@ -106,8 +112,8 @@ func TestCommitteePaceRequiresTwoSlowIntervalsAndIgnoresStaleAcks(t *testing.T) 
 		emission := paceTestEmission(pace, slot, start.Add(time.Duration(slot)*rate), rate)
 		certifyPaceTestEmission(pace, slot, emission, emission.at.Add(10*time.Second))
 	}
-	if got := pace.budget(rate).duration; got <= reduced.duration || got > reduced.duration*109/100 {
-		t.Fatalf("steady recovery budget = %s, want one bounded 8%% probe above %s", got, reduced.duration)
+	if got := pace.budget(rate).duration; got != reduced.duration*125/100 {
+		t.Fatalf("steady recovery budget = %s, want one bounded 25%% probe above %s", got, reduced.duration)
 	}
 }
 
@@ -116,16 +122,129 @@ func TestCommitteePaceOneStallDoesNotPoisonRecovery(t *testing.T) {
 	rate := 400 * time.Millisecond
 	pace := newCommitteePace()
 	start := time.Unix(1_700_000_000, 0)
-	for slot := range uint32(7) {
+	for slot := range uint32(12) {
 		emission := paceTestEmission(pace, slot, start.Add(time.Duration(slot)*rate), rate)
 		lag := 500 * time.Millisecond
 		if slot > 0 {
 			lag = 1500 * time.Millisecond
 		}
 		certifyPaceTestEmission(pace, slot, emission, emission.at.Add(lag))
+		if got := pace.budget(rate).duration; got < rate/2 {
+			t.Fatalf("single stall reduced the work budget: %s", got)
+		}
 	}
 	if got := pace.budget(rate).duration; got != 380*time.Millisecond {
 		t.Fatalf("single stall poisoned subsequent steady cadence: %s", got)
+	}
+}
+
+func TestCommitteePaceCertificateBatchDoesNotReduceBudget(t *testing.T) {
+	t.Parallel()
+	pace := newCommitteePace()
+	rate := 400 * time.Millisecond
+	start := time.Unix(1_700_000_000, 0)
+	certified := start.Add(2 * time.Second)
+	initial := pace.budget(rate)
+	certifyPaceTestEmission(pace, 0, paceTestEmission(pace, 0, start, rate), certified)
+	// Two delayed ACKs are followed by catch-up. The whole span still meets
+	// the 440ms cadence allowance, so cutting on the two gaps would underfill.
+	for i, interval := range []time.Duration{800, 800, 50, 50} {
+		slot := uint32(i + 1)
+		certified = certified.Add(interval * time.Millisecond)
+		emission := paceTestEmission(pace, slot, start.Add(time.Duration(slot)*rate), rate)
+		certifyPaceTestEmission(pace, slot, emission, certified)
+		if got := pace.budget(rate).duration; got != initial.duration {
+			t.Fatalf("jitter changed budget at slot %d: %s -> %s", slot, initial.duration, got)
+		}
+	}
+}
+
+func TestCommitteePaceCatchUpCannotHideSustainedCongestion(t *testing.T) {
+	for _, fraction := range []float64{committeePaceStartFraction, committeePaceMaxFraction} {
+		t.Run(fmt.Sprintf("fraction=%.2f", fraction), func(t *testing.T) {
+			t.Parallel()
+			pace := newCommitteePace()
+			pace.fraction = fraction
+			rate := 400 * time.Millisecond
+			start := time.Unix(1_700_000_000, 0)
+			certified := start.Add(2 * time.Second)
+			initial := pace.budget(rate)
+			certifyPaceTestEmission(pace, 0, paceTestEmission(pace, 0, start, rate), certified)
+			for i, interval := range []time.Duration{1600, 50, 50, 1600} {
+				slot := uint32(i + 1)
+				certified = certified.Add(interval * time.Millisecond)
+				emission := paceTestEmission(pace, slot, start.Add(time.Duration(slot)*rate), rate)
+				certifyPaceTestEmission(pace, slot, emission, certified)
+				got := pace.budget(rate).duration
+				if slot < 4 && got != initial.duration {
+					t.Fatalf("catch-up hid the slow prefix: %s -> %s", initial.duration, got)
+				}
+			}
+			if got := pace.budget(rate).duration; got >= initial.duration {
+				t.Fatalf("sustained congestion did not reduce budget: %s -> %s", initial.duration, got)
+			}
+		})
+	}
+}
+
+func TestCommitteePaceSlowSpanDoesNotCrossLeaderWindow(t *testing.T) {
+	t.Parallel()
+	pace := newCommitteePace()
+	rate := 400 * time.Millisecond
+	start := time.Unix(1_700_000_000, 0)
+	initial := pace.budget(rate)
+	for slot := uint32(12); slot <= 16; slot++ {
+		emission := paceTestEmission(pace, slot, start.Add(time.Duration(slot)*rate), rate)
+		certifyPaceTestEmission(pace, slot, emission,
+			start.Add(2*time.Second+time.Duration(slot)*700*time.Millisecond))
+	}
+	if got := pace.budget(rate); got != initial {
+		t.Fatalf("partial spans from different windows were combined: %+v -> %+v", initial, got)
+	}
+}
+
+func TestCommitteePacePeriodicSingleSlowIntervalStillReduces(t *testing.T) {
+	t.Parallel()
+	pace := newCommitteePace()
+	rate := 400 * time.Millisecond
+	start := time.Unix(1_700_000_000, 0)
+	certified := start.Add(2 * time.Second)
+	initial := pace.budget(rate)
+	certifyPaceTestEmission(pace, 0, paceTestEmission(pace, 0, start, rate), certified)
+	for i, interval := range []time.Duration{2000, 50, 50, 50, 2000, 50, 50, 50} {
+		slot := uint32(i + 1)
+		certified = certified.Add(interval * time.Millisecond)
+		emission := paceTestEmission(pace, slot, start.Add(time.Duration(slot)*rate), rate)
+		certifyPaceTestEmission(pace, slot, emission, certified)
+		if slot <= 4 && pace.budget(rate).duration != initial.duration {
+			t.Fatal("single slow span was not given a chance to recover")
+		}
+	}
+	if got := pace.budget(rate).duration; got >= initial.duration {
+		t.Fatalf("periodic slowdown evaded consecutive-span evidence: %s -> %s", initial.duration, got)
+	}
+}
+
+func TestCommitteePaceSlowSpanMustClearBeforeGrowth(t *testing.T) {
+	t.Parallel()
+	pace := newCommitteePace()
+	pace.fraction = committeePaceMaxFraction
+	rate := 400 * time.Millisecond
+	start := time.Unix(1_700_000_000, 0)
+	certified := start.Add(2 * time.Second)
+	initial := pace.budget(rate)
+	certifyPaceTestEmission(pace, 0, paceTestEmission(pace, 0, start, rate), certified)
+	for i, interval := range []time.Duration{3000, 50, 50, 50, 50, 50, 3000, 50} {
+		slot := uint32(i + 1)
+		certified = certified.Add(interval * time.Millisecond)
+		emission := paceTestEmission(pace, slot, start.Add(time.Duration(slot)*rate), rate)
+		certifyPaceTestEmission(pace, slot, emission, certified)
+		if slot < 8 && pace.budget(rate).duration != initial.duration {
+			t.Fatal("two catch-up ACKs erased the previous slow span")
+		}
+	}
+	if got := pace.budget(rate).duration; got >= initial.duration {
+		t.Fatalf("periodic slowdown was mistaken for recovery: %s -> %s", initial.duration, got)
 	}
 }
 
