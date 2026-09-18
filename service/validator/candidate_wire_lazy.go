@@ -2,7 +2,9 @@ package validator
 
 import (
 	"crypto/sha256"
+	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
 
@@ -39,20 +41,35 @@ import (
 // holds the bytes and the digest, and it is stored and broadcast at once.
 type lazyCandidateWire struct {
 	once sync.Once
-	// The inputs. The roots are what make this cheap — building from the two
-	// BOCs instead would parse both again and re-serialize both to prove them
-	// canonical, which is the work the decode already did — and they are
-	// released once the bytes exist, so a materialized entry does not pin the
-	// decoded DAG a second time. The BOCs are shared with the artifact.
-	candidate     simplex.Candidate
-	blockRoot     *cell.Cell
-	collatedRoots []*cell.Cell
-	blockBOC      []byte
-	collatedData  []byte
+	// The roots avoid another parse for an active candidate. The resolver may
+	// release them when the candidate goes cold; materialization then rebuilds
+	// them from the immutable, already verified BOCs shared with the artifact.
+	// An atomic handoff lets cache eviction run without waiting for compression.
+	roots        atomic.Pointer[candidateWireRoots]
+	candidate    simplex.Candidate
+	blockBOC     []byte
+	collatedData []byte
 
 	wire []byte
 	hash [32]byte
 	err  error
+}
+
+type candidateWireRoots struct {
+	block    *cell.Cell
+	collated []*cell.Cell
+}
+
+// setRoots initializes the optional parsed cache before the wire is published.
+// The roots and their slice must remain immutable after this call.
+func (w *lazyCandidateWire) setRoots(block *cell.Cell, collated []*cell.Cell) {
+	w.roots.Store(&candidateWireRoots{block: block, collated: collated})
+}
+
+// releaseRoots drops only the cache's reference. An in-progress materialization
+// owns its roots independently and continues without reparsing or blocking.
+func (w *lazyCandidateWire) releaseRoots() {
+	w.roots.Store(nil)
 }
 
 // materialize builds the canonical wire on the calling goroutine, once. It is
@@ -61,10 +78,30 @@ type lazyCandidateWire struct {
 // consensus goroutine takes that lock.
 func (w *lazyCandidateWire) materialize() ([]byte, [32]byte, error) {
 	w.once.Do(func() {
+		roots := w.roots.Swap(nil)
+		if roots == nil {
+			// Only the verified decoder creates an unmaterialized lazy wire.
+			// Its BOCs are canonical and its digests were derived from those
+			// immutable bytes, so do not reserialize each half and rehash it as
+			// the external SerializeCandidate boundary must. Parsing is still
+			// checked, and PrepareCandidate binds the block root to the identity.
+			block, err := cell.FromBOCWithOptions(w.blockBOC, cell.BOCParseOptions{NoCopyPayload: true})
+			if err != nil {
+				w.err = fmt.Errorf("validator runtime: restore candidate block roots: %w", err)
+				return
+			}
+			collated, err := cell.FromBOCMultiRootWithOptions(w.collatedData, cell.BOCParseOptions{NoCopyPayload: true})
+			if err != nil {
+				w.err = fmt.Errorf("validator runtime: restore candidate collated roots: %w", err)
+				return
+			}
+			roots = &candidateWireRoots{block: block, collated: collated}
+		}
+
 		prepared, err := simplex.PrepareCandidate(
 			w.candidate.Block.SeqNo,
-			w.blockRoot,
-			w.collatedRoots,
+			roots.block,
+			roots.collated,
 			w.fileHash(),
 			w.candidate.CollatedFileHash,
 			simplex.PayloadCellHint(w.blockBOC, w.collatedData),
@@ -77,10 +114,6 @@ func (w *lazyCandidateWire) materialize() ([]byte, [32]byte, error) {
 		} else {
 			w.hash = sha256.Sum256(w.wire)
 		}
-		// The roots were the only reason to keep the DAG alive here. The BOCs
-		// are shared with the artifact and cost nothing extra to keep.
-		w.blockRoot = nil
-		w.collatedRoots = nil
 	})
 
 	return w.wire, w.hash, w.err

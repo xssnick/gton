@@ -153,13 +153,16 @@ const (
 
 // committeePace is one consensus committee's estimate of what it costs per
 // transaction of ours, and the transaction cap derived from it. Its owner must
-// scope it by session rather than shard: a validator-set rotation changes the
-// measured system even when the shard stays the same.
+// scope its candidate and certificate bookkeeping by session. Only its numeric
+// estimate may seed a new session with an equivalent committee and schedule.
 type committeePace struct {
 	mu sync.Mutex
 	// millisPerTransaction is the moving estimate; zero until the first sample.
 	millisPerTransaction float64
 	samples              int
+	// lastSample marks local certificate evidence for the numeric history;
+	// inheriting an estimate must not renew its lifetime.
+	lastSample time.Time
 	// lastCertificate is when the committee last certified one of our blocks,
 	// and lastCertifiedEmission when that block had left this node. A block
 	// emitted before the previous certificate was queued behind it: the
@@ -208,6 +211,13 @@ func (p *committeePace) noteEmitted(id simplex.CandidateID, emission paceEmissio
 	p.emitted[id] = emission
 }
 
+func (p *committeePace) discardEmission(id simplex.CandidateID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.emitted, id)
+}
+
 // noteCertified records the notarization certificate for one of our
 // candidates. It reports the interval the certificate was measured over and
 // whether it produced a cost sample.
@@ -239,6 +249,7 @@ func (p *committeePace) noteCertified(id simplex.CandidateID, at time.Time) (tim
 	if at.After(p.lastCertificate) {
 		p.lastCertificate = at
 		p.lastCertifiedEmission = emission.at
+		p.lastSample = at
 	}
 	measurable := emission.transactions >= committeePaceSampleMinTransactions
 	// A naturally cap-bound certificate bounds the committee's cost from above:

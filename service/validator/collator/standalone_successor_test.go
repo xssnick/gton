@@ -53,7 +53,7 @@ func TestControllerForwardsNotarizationToCommitteePace(t *testing.T) {
 	service := &Service{}
 	backend.notarized = service.ObserveConsensusNotarized
 	sessionID := [32]byte{0x51}
-	pace := service.pace(sessionID)
+	pace := service.pace(Session{ID: sessionID}, 400*time.Millisecond)
 	start := time.Unix(1_700_000_000, 0)
 	for slot := uint32(0); slot < 3; slot++ {
 		pace.noteEmitted(paceCandidate(slot), paceEmission{

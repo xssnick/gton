@@ -95,7 +95,7 @@ func TestReceivedCandidateWireIsBuiltOnFirstUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lazy.wire != nil || lazy.blockRoot == nil {
+	if lazy.wire != nil || lazy.roots.Load() == nil {
 		t.Fatal("the deferred decode built the wire on receipt; the deferral is not happening")
 	}
 

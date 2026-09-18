@@ -1916,7 +1916,7 @@ func TestRuntimeRetiredSessionCanBePreparedAgain(t *testing.T) {
 	defer fixture.close(t)
 	session, update := fixture.session(43, 1, 0, time.Now())
 	fixture.prepare(t, session, update)
-	oldPace := fixture.service.pace(session.ID)
+	oldPace := fixture.service.pace(session, update.TargetRate)
 
 	if err := fixture.service.RetireSession(context.Background(), session.ID); err != nil {
 		t.Fatal(err)
@@ -1931,7 +1931,7 @@ func TestRuntimeRetiredSessionCanBePreparedAgain(t *testing.T) {
 	if err := fixture.service.PrepareSession(context.Background(), session, update); err != nil {
 		t.Fatalf("prepare next session generation: %v", err)
 	}
-	if pace := fixture.service.pace(session.ID); pace == oldPace {
+	if pace := fixture.service.pace(session, update.TargetRate); pace == oldPace {
 		t.Fatal("reopened session reused the retired committee pace")
 	}
 	record, err := fixture.service.Session(context.Background(), session.ID)

@@ -82,6 +82,8 @@ func TestConsensusCollectorExportsSessionState(t *testing.T) {
 		Retention: ConsensusRetentionStats{
 			AnchorSlot: 392, AnchorKnown: true, Capped: true,
 			BudgetBytes: retentionFloorCapBytes, RetainedPayloads: 56, RetainedBytes: 27 << 20,
+			DecodedBytes: 32 << 20, DecodedBudgetBytes: candidateDecodedShardBudget,
+			DecodedDemotions: 7,
 		},
 	}}
 	source.stats.Stats.CertificatesByKind[simplex.VoteSkip] = 64
@@ -107,6 +109,8 @@ func TestConsensusCollectorExportsSessionState(t *testing.T) {
 		"gton_validator_consensus_retention_lag_slots":         0,
 		"gton_validator_consensus_retention_capped":            1,
 		"gton_validator_consensus_retained_payloads":           56,
+		"gton_validator_consensus_decoded_cache_bytes":         32 << 20,
+		"gton_validator_consensus_decoded_cache_budget_bytes":  float64(candidateDecodedShardBudget),
 		"gton_validator_consensus_retention_budget_bytes":      float64(retentionFloorCapBytes),
 		"gton_validator_consensus_first_block_timeout_seconds": 28,
 	} {
@@ -146,6 +150,7 @@ func TestConsensusCollectorExportsSessionState(t *testing.T) {
 		{"gton_validator_consensus_certificates_total", map[string]string{"chain": "shardchain", "kind": "finalize"}, 4},
 		{"gton_validator_consensus_certificate_signatures_total", map[string]string{"chain": "shardchain", "kind": "skip"}, 192},
 		{"gton_validator_consensus_standstills_total", shard, 9},
+		{"gton_validator_consensus_decoded_cache_demotions_total", shard, 7},
 		{"gton_validator_consensus_slots_finalized_total", shard, 4},
 		{"gton_validator_consensus_votes_total", map[string]string{"chain": "shardchain", "outcome": "abstained"}, 5},
 		{"gton_validator_lineage_walk_steps_total", map[string]string{"chain": "shardchain", "source": "storage"}, 1},
@@ -163,10 +168,14 @@ func TestConsensusCollectorExportsSessionState(t *testing.T) {
 	// A session retires at every rotation, and the work it did is work the
 	// process did: its counters must not fall back to zero with it.
 	source.stats.Stats.Standstills = 11
+	source.stats.Retention.DecodedDemotions = 9
 	observer.UnregisterConsensusSession(key)
 	byName = consensusTestFamilies(t, registry)
 	if got := validatorCounterValue(byName["gton_validator_consensus_standstills_total"], shard); got != 11 {
 		t.Fatalf("standstills after the session retired = %v, want its final 11", got)
+	}
+	if got := validatorCounterValue(byName["gton_validator_consensus_decoded_cache_demotions_total"], shard); got != 9 {
+		t.Fatalf("decoded demotions after the session retired = %v, want its final 9", got)
 	}
 	if _, exists = consensusGaugeValue(byName["gton_validator_consensus_slot"], shard); exists {
 		t.Fatal("a retired session still reports a consensus slot")

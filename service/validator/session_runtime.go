@@ -2320,12 +2320,15 @@ func (r *sessionRuntime) ConsensusStats() ConsensusSessionStats {
 		Chain: r.validationChain(),
 		Stats: r.runner.StatsSnapshot(),
 		Retention: ConsensusRetentionStats{
-			AnchorSlot:       anchor,
-			AnchorKnown:      anchorKnown,
-			Capped:           capped,
-			BudgetBytes:      r.candidates.retentionBudgetBytes(),
-			RetainedPayloads: cache.Candidates,
-			RetainedBytes:    cache.Bytes,
+			AnchorSlot:         anchor,
+			AnchorKnown:        anchorKnown,
+			Capped:             capped,
+			BudgetBytes:        r.candidates.retentionBudgetBytes(),
+			RetainedPayloads:   cache.Candidates,
+			RetainedBytes:      cache.Bytes,
+			DecodedBytes:       cache.DecodedBytes,
+			DecodedBudgetBytes: r.candidates.decodedBudget,
+			DecodedDemotions:   cache.DecodedDemotions,
 		},
 	}
 }
@@ -2426,6 +2429,9 @@ func (r *sessionRuntime) logResolverCaches(slot uint32, candidates candidateCach
 		Int("candidates_retained", candidates.Candidates).
 		Int("candidates_stored", candidates.Stored).
 		Int64("candidate_bytes", candidates.Bytes).
+		Int64("candidate_decoded_bytes", candidates.DecodedBytes).
+		Int64("candidate_decoded_budget_bytes", r.candidates.decodedBudget).
+		Uint64("candidate_decoded_demotions", candidates.DecodedDemotions).
 		Int("state_flights", states.States).
 		Int("states_retained", states.Resolved).
 		Int("states_finalized", states.Finalized).

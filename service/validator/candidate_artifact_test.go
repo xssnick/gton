@@ -3,6 +3,8 @@ package validator
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"strings"
@@ -195,7 +197,7 @@ func TestCandidateCodecBroadcastSplitMatchesWrappedAndOwnsInputs(t *testing.T) {
 			if !sameDelegation(split.Candidate.Delegation, wrapped.Candidate.Delegation) {
 				t.Fatal("split broadcast decode changed the delegation")
 			}
-			if lazy.wire != nil || lazy.blockRoot == nil {
+			if lazy.wire != nil || lazy.roots.Load() == nil {
 				t.Fatal("split broadcast decode eagerly materialized the canonical wire")
 			}
 
@@ -430,7 +432,7 @@ func TestCandidateCodecBroadcastEmptyAndV2CanonicalWire(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !artifact.Candidate.Empty || lazy.wire == nil || lazy.blockRoot != nil {
+		if !artifact.Candidate.Empty || lazy.wire == nil || lazy.roots.Load() != nil {
 			t.Fatal("empty broadcast did not take the eager cheap-wire path")
 		}
 		canonical, err := simplex.SerializeCandidate(candidate, nil, nil)
@@ -533,6 +535,103 @@ func candidateBroadcastBlockData(t testing.TB, payload []byte) simplex.Consensus
 	}
 
 	return block
+}
+
+func TestCandidateWireColdV2CanonicalParity(t *testing.T) {
+	t.Parallel()
+
+	config, key := runtimeTestConfig(0x79, &runtimeTestJournal{})
+	ordinary := runtimeOrdinaryArtifact(t, config, key, 0, simplex.Genesis())
+	delegated := runtimeDelegatedArtifact(t, config, key, ordinary)
+	blockRoot, err := cell.FromBOC(ordinary.BlockBOC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collatedRoots, err := cell.FromBOCMultiRoot(ordinary.CollatedData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := append([]*cell.Cell{blockRoot}, collatedRoots...)
+
+	for name, algorithm := range map[string]cell.CompressionAlgorithm{
+		"baseline":   cell.CompressionBaselineLZ4,
+		"structural": cell.CompressionImprovedStructureLZ4,
+	} {
+		t.Run(name, func(t *testing.T) {
+			compressed, err := cell.CompressBOC(roots, algorithm, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, variant := range []coldWireVariant{
+				{name: "validator", artifact: ordinary},
+				{name: "delegated", artifact: delegated},
+			} {
+				t.Run(variant.name, func(t *testing.T) {
+					artifact := variant.artifact
+					canonical, err := simplex.SerializeCandidate(
+						artifact.Candidate, artifact.BlockBOC, artifact.CollatedData,
+					)
+					if err != nil {
+						t.Fatal(err)
+					}
+					broadcast, err := simplex.SerializeCandidateForBroadcast(
+						artifact.Candidate, artifact.BlockBOC, artifact.CollatedData,
+					)
+					if err != nil {
+						t.Fatal(err)
+					}
+					data := candidateBroadcastBlockData(t, broadcast.Data)
+					data.Candidate, err = tl.Serialize(simplex.ValidatorSessionCompressedCandidateV2{
+						Source:   make([]byte, 32),
+						Round:    int32(artifact.Candidate.Block.SeqNo),
+						RootHash: artifact.Candidate.Block.RootHash,
+						Data:     compressed,
+					}, true)
+					if err != nil {
+						t.Fatal(err)
+					}
+					payload, err := tl.Serialize(data, true)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					for protocol := uint8(0); protocol <= simplex.MaxProtocolVersion; protocol++ {
+						t.Run(fmt.Sprintf("protocol_%d", protocol), func(t *testing.T) {
+							protocolConfig := config
+							protocolConfig.Protocol.ProtocolVersion = protocol
+							codec, err := newCandidateCodec(protocolConfig, CandidateLimits{
+								MaxBlockBytes: 1 << 20, MaxCollatedDataBytes: 1 << 20,
+							})
+							if err != nil {
+								t.Fatal(err)
+							}
+							decoded, lazy, err := codec.decodeBroadcastDeferred(
+								payload, artifact.Candidate.Delegation, artifact.Candidate.ID.Slot,
+							)
+							if err != nil {
+								t.Fatal(err)
+							}
+							assertCandidateArtifactEqual(t, decoded, artifact)
+							if algorithm == cell.CompressionBaselineLZ4 {
+								minimumCharge := int64(binary.BigEndian.Uint32(compressed[1:5])) * 129
+								if decoded.decodedRootBytes < minimumCharge {
+									t.Fatalf("V2 baseline charged %d bytes, want at least %d", decoded.decodedRootBytes, minimumCharge)
+								}
+							}
+							lazy.releaseRoots()
+							wire, hash, err := lazy.materialize()
+							if err != nil {
+								t.Fatal(err)
+							}
+							if !bytes.Equal(wire, canonical) || hash != sha256.Sum256(canonical) {
+								t.Fatal("cold V2 candidate changed canonical wire or hash")
+							}
+						})
+					}
+				})
+			}
+		})
+	}
 }
 
 func runtimeDelegatedArtifact(

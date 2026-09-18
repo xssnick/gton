@@ -96,6 +96,11 @@ type candidateResolver struct {
 	// payloads themselves change. cacheStats recomputes it from scratch and the
 	// two must agree.
 	cache candidateCacheStats
+	// Intrusive LRU of received decoded graphs, independent of payload/slot
+	// retention. Links carry no allocation per admission and are cleared on exit.
+	decodedHead   *candidateEntry
+	decodedTail   *candidateEntry
+	decodedBudget int64
 	// budget is what this session may hold back for the local producer beyond
 	// the fixed margin, in bytes and payloads rather than in slots. It is the
 	// bound the retention floor is derived against; see retention.go.
@@ -118,6 +123,9 @@ type retainedPayload struct {
 }
 
 type candidateEntry struct {
+	decodedPrev      *candidateEntry
+	decodedNext      *candidateEntry
+	decodedRootBytes int64
 	// durable is the entry's claim that the candidate store holds a readable
 	// copy of this candidate's canonical wire. It is set where that becomes
 	// true — the durable index restored at startup, a completed SaveCandidate,
@@ -314,6 +322,10 @@ func newCandidateResolver(options candidateResolverOptions) (*candidateResolver,
 		budget:             defaultRetentionBudget(options.Session.Shard.IsMasterchain()),
 		entries:            make(map[simplex.CandidateID]*candidateEntry, len(options.Stored.CandidateIDs)),
 		retained:           make(map[simplex.CandidateID]*candidateEntry),
+		decodedBudget:      candidateDecodedShardBudget,
+	}
+	if options.Session.Shard.IsMasterchain() {
+		r.decodedBudget = candidateDecodedMasterBudget
 	}
 	// The durable index is the whole truth a restarted session starts with: the
 	// candidates below are in the store, and nothing about this process not
@@ -567,6 +579,9 @@ func (r *candidateResolver) attachPayloadLocked(
 	r.cache.Candidates++
 	r.cache.Bytes += candidatePayloadBytes(artifact, wire)
 	r.queueReleaseLocked(id, entry)
+	if entry.validationRoots != nil {
+		r.retainDecodedRootsLocked(entry, artifact.decodedRootBytes)
+	}
 }
 
 // attachDeferredPayloadLocked is attachPayloadLocked for a candidate whose wire
@@ -610,6 +625,7 @@ func (r *candidateResolver) attachDeferredPayloadLocked(
 	r.cache.Candidates++
 	r.cache.Bytes += candidatePayloadBytes(artifact, nil)
 	r.queueReleaseLocked(id, entry)
+	r.retainDecodedRootsLocked(entry, artifact.decodedRootBytes)
 }
 
 // materializeWire builds a lazy entry's canonical wire before taking the
@@ -655,6 +671,7 @@ func (r *candidateResolver) materializeWire(id simplex.CandidateID, entry *candi
 	if entry.candidate != nil {
 		r.cache.Bytes += int64(len(wire))
 	}
+	r.syncDecodedRootsLocked(entry)
 
 	return wire, hash, nil
 }
@@ -689,6 +706,7 @@ func (r *candidateResolver) queueReleaseLocked(id simplex.CandidateID, entry *ca
 }
 
 func (r *candidateResolver) releasePayloadLocked(id simplex.CandidateID, entry *candidateEntry) {
+	r.forgetDecodedRootsLocked(entry)
 	if entry.candidate != nil {
 		r.cache.Candidates--
 		r.cache.Bytes -= candidatePayloadBytes(entry.candidate, entry.wire)
@@ -885,6 +903,9 @@ type candidateCacheStats struct {
 	Candidates int
 	Stored     int
 	Bytes      int64
+	// Estimated received arenas still cached here, excluding active borrowers.
+	DecodedBytes     int64
+	DecodedDemotions uint64
 }
 
 func (s *candidateCacheStats) add(entry *candidateEntry) {
@@ -896,6 +917,7 @@ func (s *candidateCacheStats) add(entry *candidateEntry) {
 	}
 	s.Candidates++
 	s.Bytes += candidatePayloadBytes(entry.candidate, entry.wire)
+	s.DecodedBytes += entry.decodedRootBytes
 }
 
 // cacheStats recomputes the projection by walking every entry. It is the audit
@@ -905,7 +927,7 @@ func (r *candidateResolver) cacheStats() candidateCacheStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	stats := candidateCacheStats{Entries: len(r.entries)}
+	stats := candidateCacheStats{Entries: len(r.entries), DecodedDemotions: r.cache.DecodedDemotions}
 	for _, entry := range r.entries {
 		stats.add(entry)
 	}
@@ -1200,8 +1222,10 @@ func (r *candidateResolver) candidate(
 
 	r.mu.Lock()
 	entry := r.entries[id]
+	r.touchDecodedRootsLocked(entry)
 	roots := entry.validationRoots
 	entry.validationRoots = nil
+	r.syncDecodedRootsLocked(entry)
 	r.mu.Unlock()
 	if roots != nil {
 		prepared := *artifact
@@ -1739,6 +1763,7 @@ func (r *candidateResolver) loadCandidateLoop(id simplex.CandidateID, flight *re
 	if entry.load == flight {
 		entry.load = nil
 	}
+	r.trimDecodedRootsLocked()
 	close(flight.done)
 	r.mu.Unlock()
 }
@@ -1794,6 +1819,7 @@ func (r *candidateResolver) loadDurableCandidate(id simplex.CandidateID) (*Candi
 		entry.wireHash = record.ContentHash
 		entry.hasWireHash = true
 		r.cache.Bytes += int64(len(record.Wire))
+		r.syncDecodedRootsLocked(entry)
 	}
 	r.markDurableLocked(entry)
 	r.completeResolveLocked(id, entry)
@@ -1969,6 +1995,7 @@ func (r *candidateResolver) storeAsync(id simplex.CandidateID, notify func(error
 		_, _, materializeErr := r.materializeWire(id, entry, lazy)
 		r.mu.Lock()
 		entry.storeBuilds--
+		r.trimDecodedRootsLocked()
 		if materializeErr != nil {
 			r.mu.Unlock()
 			if notify != nil {
@@ -2031,6 +2058,7 @@ func (r *candidateResolver) storeAsync(id simplex.CandidateID, notify func(error
 			if entry.store == flight {
 				entry.store = nil
 			}
+			r.trimDecodedRootsLocked()
 			notifiers := flight.notify
 			flight.notify = nil
 			close(flight.done)
@@ -2072,6 +2100,14 @@ func (r *candidateResolver) close() {
 	}
 	r.closed = true
 	r.cancel()
+	for r.decodedTail != nil {
+		entry := r.decodedTail
+		entry.validationRoots = nil
+		if entry.lazyWire != nil {
+			entry.lazyWire.releaseRoots()
+		}
+		r.forgetDecodedRootsLocked(entry)
+	}
 	r.mu.Unlock()
 
 	r.wg.Wait()

@@ -66,12 +66,15 @@ type ConsensusSessionKey = SessionStorageID
 // The lag is reported for diagnosis and is deliberately not what bounds
 // anything: see retention.go.
 type ConsensusRetentionStats struct {
-	AnchorSlot       uint32
-	AnchorKnown      bool
-	Capped           bool
-	BudgetBytes      int64
-	RetainedPayloads int
-	RetainedBytes    int64
+	AnchorSlot         uint32
+	AnchorKnown        bool
+	Capped             bool
+	BudgetBytes        int64
+	RetainedPayloads   int
+	RetainedBytes      int64
+	DecodedBytes       int64
+	DecodedBudgetBytes int64
+	DecodedDemotions   uint64
 }
 
 // ConsensusSessionStats is one live session's whole metric contribution.
@@ -99,11 +102,12 @@ const consensusValidatorGaugeMaxRoster = 64
 // are per chain: summing the live ones would make the totals fall at every
 // rotation.
 type consensusCounters struct {
-	standstills    uint64
-	slotsFinalized uint64
-	certificates   [simplex.VoteKindCount]uint64
-	signatures     [simplex.VoteKindCount]uint64
-	votes          [consensusVoteOutcomeCount]uint64
+	standstills      uint64
+	slotsFinalized   uint64
+	certificates     [simplex.VoteKindCount]uint64
+	signatures       [simplex.VoteKindCount]uint64
+	votes            [consensusVoteOutcomeCount]uint64
+	decodedDemotions uint64
 }
 
 const (
@@ -132,6 +136,7 @@ func sessionCounters(stats simplex.Stats) consensusCounters {
 func (c *consensusCounters) addDelta(previous, current consensusCounters) {
 	c.standstills += current.standstills - previous.standstills
 	c.slotsFinalized += current.slotsFinalized - previous.slotsFinalized
+	c.decodedDemotions += current.decodedDemotions - previous.decodedDemotions
 	for i := range c.certificates {
 		c.certificates[i] += current.certificates[i] - previous.certificates[i]
 		c.signatures[i] += current.signatures[i] - previous.signatures[i]
@@ -176,6 +181,9 @@ type consensusCollector struct {
 	retentionCapped       *prometheus.Desc
 	retentionBudgetBytes  *prometheus.Desc
 	retainedPayloads      *prometheus.Desc
+	decodedBytes          *prometheus.Desc
+	decodedBudgetBytes    *prometheus.Desc
+	decodedDemotions      *prometheus.Desc
 	lastFinalization      *prometheus.Desc
 	firstBlockTimeout     *prometheus.Desc
 	standstills           *prometheus.Desc
@@ -213,6 +221,12 @@ func newConsensusCollector(namespace string) *consensusCollector {
 		retainedPayloads: prometheus.NewDesc(name("consensus_retained_payloads"),
 			"Candidate payloads the session retains; the quantity the retention budget bounds.",
 			chain, nil),
+		decodedBytes: prometheus.NewDesc(name("consensus_decoded_cache_bytes"),
+			"Estimated received cell arenas cached by the newest live session; excludes active borrowers and byte payloads.", chain, nil),
+		decodedBudgetBytes: prometheus.NewDesc(name("consensus_decoded_cache_budget_bytes"),
+			"Decoded cache budget per session; one MRU candidate and in-flight claims may exceed it. Not an RSS limit.", chain, nil),
+		decodedDemotions: prometheus.NewDesc(name("consensus_decoded_cache_demotions_total"),
+			"Received candidate graphs dropped from the parsed cache while preserving canonical BOC bytes.", chain, nil),
 		lastFinalization: prometheus.NewDesc(name("consensus_last_finalization_timestamp_seconds"),
 			"Unix time of the last observed finalization. Its age is the liveness signal.", chain, nil),
 		firstBlockTimeout: prometheus.NewDesc(name("consensus_first_block_timeout_seconds"),
@@ -275,6 +289,7 @@ func (c *consensusCollector) unregister(key ConsensusSessionKey) {
 func (c *consensusCollector) accumulateLocked(key ConsensusSessionKey, stats ConsensusSessionStats) {
 	chain := boundedValidationChain(stats.Chain)
 	current := sessionCounters(stats.Stats)
+	current.decodedDemotions = stats.Retention.DecodedDemotions
 	c.totals[chain].addDelta(c.last[key], current)
 	c.last[key] = current
 }
@@ -291,6 +306,7 @@ func (c *consensusCollector) descs() []*prometheus.Desc {
 		c.retentionBudgetBytes, c.retainedPayloads, c.lastFinalization, c.firstBlockTimeout,
 		c.standstills, c.slotsFinalized, c.certificates, c.certificateSignatures, c.votes,
 		c.validatorLastSigned,
+		c.decodedBytes, c.decodedBudgetBytes, c.decodedDemotions,
 	}
 }
 
@@ -339,6 +355,8 @@ func (c *consensusCollector) Collect(ch chan<- prometheus.Metric) {
 			float64(counters.standstills), label)
 		ch <- prometheus.MustNewConstMetric(c.slotsFinalized, prometheus.CounterValue,
 			float64(counters.slotsFinalized), label)
+		ch <- prometheus.MustNewConstMetric(c.decodedDemotions, prometheus.CounterValue,
+			float64(counters.decodedDemotions), label)
 		for kind, kindLabel := range kinds {
 			ch <- prometheus.MustNewConstMetric(c.certificates, prometheus.CounterValue,
 				float64(counters.certificates[kind]), label, kindLabel)
@@ -399,6 +417,10 @@ func (c *consensusCollector) Collect(ch chan<- prometheus.Metric) {
 			float64(stats.Retention.BudgetBytes), label)
 		ch <- prometheus.MustNewConstMetric(c.retainedPayloads, prometheus.GaugeValue,
 			float64(stats.Retention.RetainedPayloads), label)
+		ch <- prometheus.MustNewConstMetric(c.decodedBytes, prometheus.GaugeValue,
+			float64(stats.Retention.DecodedBytes), label)
+		ch <- prometheus.MustNewConstMetric(c.decodedBudgetBytes, prometheus.GaugeValue,
+			float64(stats.Retention.DecodedBudgetBytes), label)
 
 		if len(stats.Stats.LastSignedSlot) > consensusValidatorGaugeMaxRoster {
 			continue

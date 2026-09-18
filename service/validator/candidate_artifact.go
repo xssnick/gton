@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -82,6 +83,10 @@ type CandidateArtifact struct {
 	// or observer state preparation and retains only canonical bytes afterwards.
 	// Observers discard the collated proof roots immediately.
 	validationRoots *candidateValidationRoots
+	// decodedRootBytes estimates the received arenas behind validationRoots.
+	// It is a cache charge, not the size of the canonical byte payload or of
+	// live state borrowed by another consumer. Computed once, without a DAG walk.
+	decodedRootBytes int64
 
 	// generationTimeMS is the exact millisecond timestamp carried by the
 	// consensus-extra root. generationTimeKnown is set only by code that already
@@ -358,8 +363,7 @@ func deferredCandidateWire(artifact *CandidateArtifact) (*lazyCandidateWire, err
 
 		return lazy, nil
 	}
-	lazy.blockRoot = artifact.validationRoots.block
-	lazy.collatedRoots = artifact.validationRoots.collated
+	lazy.setRoots(artifact.validationRoots.block, artifact.validationRoots.collated)
 	lazy.blockBOC = artifact.BlockBOC
 	lazy.collatedData = artifact.CollatedData
 
@@ -421,8 +425,10 @@ func (c *candidateCodec) decodeBlock(
 		Workchain: c.shard.Workchain,
 		Shard:     c.shard.Shard,
 		SeqNo:     payload.round,
-		RootHash:  payload.rootHash[:],
-		FileHash:  payload.fileHash[:],
+		// These small, long-lived identities must not point into payload: an
+		// interior slice would retain its parsed roots after cache demotion.
+		RootHash: bytes.Clone(payload.rootHash[:]),
+		FileHash: bytes.Clone(payload.fileHash[:]),
 	}
 	candidate := simplex.Candidate{
 		Parent:           parent,
@@ -454,6 +460,7 @@ func (c *candidateCodec) decodeBlock(
 		},
 		generationTimeMS:    payload.generationTimeMS,
 		generationTimeKnown: true,
+		decodedRootBytes:    payload.decodedRootBytes,
 	}, nil
 }
 
@@ -487,6 +494,7 @@ type decodedCandidatePayload struct {
 	blockRoot        *cell.Cell
 	collatedRoots    []*cell.Cell
 	generationTimeMS uint64
+	decodedRootBytes int64
 }
 
 // decodePayload owns data only for the duration of the call, and parses the
@@ -533,6 +541,7 @@ func (c *candidateCodec) decodePayload(data []byte) (decodedCandidatePayload, er
 	// for why a count read out of an untrusted header cannot presize an unbounded
 	// table.
 	var combinedCellsHint int
+	var combinedRootBytes int64
 	switch compressed := payload.(type) {
 	case simplex.ValidatorSessionCompressedCandidate:
 		source, round, rootHash = compressed.Source, compressed.Round, compressed.RootHash
@@ -554,17 +563,24 @@ func (c *candidateCodec) decodePayload(data []byte) (decodedCandidatePayload, er
 		roots, err = cell.FromBOCMultiRootWithOptions(decompressed, cell.BOCParseOptions{
 			NoCopyPayload: true,
 		})
+		if err == nil {
+			combinedRootBytes = candidateDecodedBOCBytes(decompressed)
+		}
 	case simplex.ValidatorSessionCompressedCandidateV2:
 		source, round, rootHash = compressed.Source, compressed.Round, compressed.RootHash
 		if uint64(len(compressed.Data)) > maxCombined {
 			return decodedCandidatePayload{}, errors.New("validator runtime: compressed candidate is too large")
 		}
-		// The structural form never materializes a combined BOC, so there is no
-		// header to read a count off and the serializers size themselves as they
-		// always did. Nothing in this project emits this form — it is decoded
-		// because a peer may send it — so the hinted path is the one production
-		// takes.
+		// The decompressor does not expose an incoming BOC header/count. The
+		// serializers size themselves; this project emits the hinted V1 form.
 		roots, err = cell.DecompressBOC(compressed.Data, int(maxCombined), nil)
+		if err == nil && cell.CompressionAlgorithm(compressed.Data[0]) == cell.CompressionBaselineLZ4 {
+			// Baseline V2 can keep unreachable cells in its parsed arena, just
+			// like V1. Its verified size header bounds the count at size/2 (two
+			// descriptor bytes per cell). Charge 256 bytes per possible cell
+			// plus payload, without a second decompression just to read a count.
+			combinedRootBytes = int64(binary.BigEndian.Uint32(compressed.Data[1:5])) * 129
+		}
 	default:
 		return decodedCandidatePayload{}, fmt.Errorf("validator runtime: unexpected compressed candidate type %T", payload)
 	}
@@ -572,7 +588,20 @@ func (c *candidateCodec) decodePayload(data []byte) (decodedCandidatePayload, er
 		return decodedCandidatePayload{}, fmt.Errorf("validator runtime: decode combined candidate boc: %w", err)
 	}
 
-	return c.finishPayload(source, round, rootHash, roots, combinedCellsHint)
+	result, err := c.finishPayload(source, round, rootHash, roots, combinedCellsHint)
+	if err != nil {
+		return decodedCandidatePayload{}, err
+	}
+	if combinedRootBytes != 0 {
+		// The incoming BOC can contain cells omitted by canonical rebuilding.
+		// Charge its incoming arena estimate, not just reachable output cells.
+		result.decodedRootBytes = combinedRootBytes
+		if result.preparedBlock != nil {
+			result.decodedRootBytes += candidateDecodedBOCBytes(result.blockBOC)
+		}
+	}
+
+	return result, nil
 }
 
 // finishPayload rebuilds the two canonical BOCs of a received candidate and the
@@ -746,6 +775,13 @@ func (c *candidateCodec) finishPayload(
 		blockRoot:        blockRoot,
 		collatedRoots:    roots[1:],
 		generationTimeMS: generationTimeMS,
+		// Structural V2 has no combined BOC header. The two canonical cell
+		// counts conservatively charge their union; Protocol 1 also owns a
+		// detached block arena. The ordinary decode refines this from its input.
+		decodedRootBytes: candidateDecodedBOCBytes(blockBOC) + candidateDecodedBOCBytes(collatedData),
+	}
+	if preparedBlock != nil {
+		result.decodedRootBytes += candidateDecodedBOCBytes(blockBOC)
 	}
 	copy(result.rootHash[:], rootHash)
 

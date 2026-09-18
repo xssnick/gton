@@ -191,6 +191,40 @@ func TestCommitteePaceRelaxSeedUsesTargetRate(t *testing.T) {
 	}
 }
 
+// After a backlog, recovered certificate cadence with microsecond jitter must
+// not keep cutting the cap because the old pipeline latency is still present.
+func TestCommitteePaceRecoveredCadenceToleratesMicrosecondJitter(t *testing.T) {
+	t.Parallel()
+	pace := newCommitteePace()
+	rate := 400 * time.Millisecond
+	start := time.Unix(1_700_000_000, 0)
+	emitPaceCandidate(pace, paceCandidate(0), start, rate, 400, 400, false)
+	pace.noteCertified(paceCandidate(0), start.Add(800*time.Millisecond))
+	for slot := uint32(1); slot <= 2; slot++ {
+		cap := pace.transactionCap(rate)
+		emitPaceCandidate(pace, paceCandidate(slot), start.Add(time.Duration(slot)*rate), rate, cap, cap, false)
+		pace.noteCertified(paceCandidate(slot), start.Add(800*time.Millisecond+time.Duration(slot)*700*time.Millisecond))
+	}
+
+	before := pace.transactionCap(rate)
+	previous := before
+	for slot := uint32(3); slot <= 15; slot++ {
+		emitPaceCandidate(pace, paceCandidate(slot), start.Add(time.Duration(slot)*rate), rate, previous, previous, false)
+		_, sampled := pace.noteCertified(paceCandidate(slot), start.Add(1400*time.Millisecond+time.Duration(slot)*(rate+time.Microsecond)))
+		if sampled {
+			t.Fatalf("recovered certificate %d with 1 us jitter became a slowdown sample", slot)
+		}
+		current := pace.transactionCap(rate)
+		if current < previous {
+			t.Fatalf("recovered certificate %d cut cap from %d to %d", slot, previous, current)
+		}
+		previous = current
+	}
+	if previous <= before {
+		t.Fatalf("recovered cadence left cap at %d, want growth above %d", previous, before)
+	}
+}
+
 // Certificates for candidates this node did not emit, for empty candidates, and
 // for blocks too small to measure the per-transaction cost leave the estimate
 // alone — though a small block's certificate still marks the committee busy.
@@ -353,13 +387,14 @@ func TestCommitteePaceStallIsSteppedAndUndoneByAFastCertificate(t *testing.T) {
 }
 
 // The service hands every slot the session's paced cap and the first slot the
-// smaller of that and firstSlotTransactions. Validator-set rotations, even on
-// the same shard, do not inherit the previous committee's estimate.
+// smaller of that and firstSlotTransactions. A different committee must not
+// inherit the previous committee's estimate even on the same shard.
 func TestServiceTransactionCapPerSessionAndFirstSlot(t *testing.T) {
 	service := &Service{}
 	rate := 400 * time.Millisecond
-	loaded := [32]byte{0x11}
-	quiet := [32]byte{0x12}
+	loaded := historySession(0x11)
+	quiet := historySession(0x12)
+	quiet.Validators[0].Weight++
 
 	if got := service.transactionCap(loaded, rate, false); got != adaptiveTransactionStart {
 		t.Fatalf("cap with nothing measured = %d, want the start value", got)
@@ -370,8 +405,8 @@ func TestServiceTransactionCapPerSessionAndFirstSlot(t *testing.T) {
 
 	// A committee slower than the start value assumes: 400-transaction blocks
 	// certified 700 ms apart, 1.5 ms per transaction, a cap of about 221.
-	start := time.Unix(1_700_000_000, 0)
-	pace := service.pace(loaded)
+	start := time.Now()
+	pace := service.pace(loaded, rate)
 	for slot := uint32(0); slot < 4; slot++ {
 		emitPaceCandidate(pace, paceCandidate(slot), start, rate, 400, 400, false)
 	}
@@ -388,14 +423,14 @@ func TestServiceTransactionCapPerSessionAndFirstSlot(t *testing.T) {
 		t.Fatalf("first-slot cap = %d, want %d while the paced cap is larger", got, firstSlotTransactions)
 	}
 	if got := service.transactionCap(quiet, rate, false); got != adaptiveTransactionStart {
-		t.Fatalf("next session's cap = %d, want the start value: sessions do not share an estimate", got)
+		t.Fatalf("different committee's cap = %d, want the start value", got)
 	}
 
 	// Through the public hook, the same sample path: a block emitted right
 	// after the others, queued behind the previous certificate, certified a
 	// second after it — far behind the emission cadence.
-	emitPaceCandidate(service.pace(loaded), paceCandidate(40), start.Add(100*time.Millisecond), rate, 400, 400, false)
-	service.ObserveConsensusNotarized(loaded, paceCandidate(40), cert.Add(time.Second))
+	emitPaceCandidate(service.pace(loaded, rate), paceCandidate(40), start.Add(100*time.Millisecond), rate, 400, 400, false)
+	service.ObserveConsensusNotarized(loaded.ID, paceCandidate(40), cert.Add(time.Second))
 	if got := service.transactionCap(loaded, rate, false); got >= paced {
 		t.Fatalf("cap after a slower certificate = %d, want below %d", got, paced)
 	}

@@ -104,12 +104,12 @@ type Service struct {
 	runCtx   context.Context
 	cancel   context.CancelFunc
 	sessions map[[32]byte]*managedCollatorSession
-	// paces is the measured cost per transaction for every consensus session
-	// this service has produced for; see committee_pace.go. A validator-set
-	// rotation starts with a fresh estimate even when it keeps the same shard.
-	pacesMu sync.Mutex
-	paces   map[[32]byte]*committeePace
-	retired map[[32]byte]struct{}
+	// Certificate bookkeeping is session-local. Only bounded numeric estimates
+	// survive rotations with an equivalent committee and production schedule.
+	pacesMu     sync.Mutex
+	paces       map[[32]byte]*sessionPace
+	paceHistory map[paceHistoryKey]paceHistoryEntry
+	retired     map[[32]byte]struct{}
 	// retiredOrder mirrors the keys of retired in insertion order so the fence
 	// can be evicted oldest-first. Both are mutated only under mu.
 	retiredOrder    [][32]byte
@@ -1856,37 +1856,22 @@ func (s *Service) ObserveConsensusFinalized(
 	return nil
 }
 
-// RetireSession cancels production, retires the pipeline, and removes durable
-// session state. Pipeline and storage operations are idempotent by contract.
-// pace is the committee-pace estimate for sessionID, created on first use.
-func (s *Service) pace(sessionID [32]byte) *committeePace {
-	s.pacesMu.Lock()
-	defer s.pacesMu.Unlock()
-
-	if s.paces == nil {
-		s.paces = make(map[[32]byte]*committeePace)
-	}
-	pace := s.paces[sessionID]
-	if pace == nil {
-		pace = newCommitteePace()
-		s.paces[sessionID] = pace
-	}
-
-	return pace
-}
-
 func (s *Service) existingPace(sessionID [32]byte) *committeePace {
 	s.pacesMu.Lock()
 	defer s.pacesMu.Unlock()
 
-	return s.paces[sessionID]
+	if active := s.paces[sessionID]; active != nil {
+		return active.pace
+	}
+
+	return nil
 }
 
 // transactionCap is the number of transactions a build for session may admit:
 // what the committee validates inside a slot at its measured pace, and for the
 // first slot of a window the smaller of that and firstSlotTransactions.
-func (s *Service) transactionCap(sessionID [32]byte, targetRate time.Duration, first bool) uint32 {
-	cap := s.pace(sessionID).transactionCap(targetRate)
+func (s *Service) transactionCap(session Session, targetRate time.Duration, first bool) uint32 {
+	cap := s.pace(session, targetRate).transactionCap(targetRate)
 	if first {
 		return firstSlotTransactionCap(cap)
 	}
@@ -1900,9 +1885,12 @@ func (s *Service) transactionCap(sessionID [32]byte, targetRate time.Duration, f
 func (s *Service) ObserveConsensusNotarized(sessionID [32]byte, id simplex.CandidateID, at time.Time) {
 	if pace := s.existingPace(sessionID); pace != nil {
 		pace.noteCertified(id, at)
+		s.rememberPace(sessionID, pace, at)
 	}
 }
 
+// RetireSession cancels production, retires the pipeline, and removes durable
+// session state. Pipeline and storage operations are idempotent by contract.
 func (s *Service) RetireSession(ctx context.Context, sessionID [32]byte) error {
 	managed, err := s.beginSessionOp(ctx, sessionID)
 	if err != nil {
@@ -1990,6 +1978,7 @@ func (s *Service) RetireSession(ctx context.Context, sessionID [32]byte) error {
 	s.mu.Unlock()
 
 	s.pacesMu.Lock()
+	s.rememberPaceLocked(sessionID, time.Now())
 	delete(s.paces, sessionID)
 	s.pacesMu.Unlock()
 
@@ -2343,7 +2332,7 @@ func (s *Service) SpeculateWindow(ctx context.Context, request SpeculativeWindow
 		Parent:  simplex.Parent(request.Base.candidate),
 		// The first slot of the window this bets on, so the cap the scheduled
 		// first slot carries applies here too; see firstSlotTransactions.
-		MaxTransactions: s.transactionCap(record.Session.ID, record.Update.TargetRate, true),
+		MaxTransactions: s.transactionCap(record.Session, record.Update.TargetRate, true),
 	}
 	build.speculative = &speculativeBase{state: request.Base, at: request.StartAt}
 	// The schedule of the window this is for, derived from the estimate rather
@@ -2457,7 +2446,7 @@ func (s *Service) SpeculateSessionStart(ctx context.Context, request Speculative
 		Slot:            0,
 		Leader:          request.Leader,
 		Parent:          simplex.Genesis(),
-		MaxTransactions: s.transactionCap(record.Session.ID, record.Update.TargetRate, true),
+		MaxTransactions: s.transactionCap(record.Session, record.Update.TargetRate, true),
 	}
 	predicted := record
 	predicted.Update.CurrentWindowStart = 0
@@ -3628,7 +3617,7 @@ func (p *windowProducer) offerNextWindow(offer SuccessorOffer) PipelineHandoffOu
 		PreviousPending: &pending,
 		crossWindowBet:  true,
 		// The first slot of the next window; see firstSlotTransactions.
-		MaxTransactions: p.service.transactionCap(p.record.Session.ID, targetRate, true),
+		MaxTransactions: p.service.transactionCap(p.record.Session, targetRate, true),
 	}
 	request.excludeExternals = offer.Exclude
 	// Never idle on the estimated window opening: this bet starts from the
@@ -4241,6 +4230,9 @@ func (p *windowProducer) runSlot(slot uint32) error {
 	// Pipeline is public and may retain the pointer it returns. Take ownership
 	// before signing so later extension-side mutation cannot change the bytes
 	// being persisted or the metadata consumed by CommitCandidate.
+	// The future may have started before the latest feedback (or in an earlier
+	// slot). Feedback must describe the budget actually used to build it.
+	request.MaxTransactions = finishedFuture.request.MaxTransactions
 	built := p.service.ownBuiltCandidate(result.candidate)
 	stageStarted := p.service.metricStageStarted()
 	artifact, err := p.service.signArtifact(
@@ -4659,19 +4651,24 @@ func (s *Service) persistAndEmit(
 			time.Since(broadcastTime(record, artifact.Candidate.ID.Slot)),
 		)
 	}
-	if commit != nil && commit.Built != nil {
+	var emittedPace *committeePace
+	if commit != nil && commit.Built != nil && !record.Session.Shard.IsMasterchain() {
 		// The certificate for this candidate, when it comes, measures the
 		// committee from this instant; see committee_pace.go.
-		s.pace(record.Session.ID).noteEmitted(artifact.Candidate.ID, paceEmission{
+		emittedPace = s.pace(record.Session, commit.Request.Update.TargetRate)
+		emittedPace.noteEmitted(artifact.Candidate.ID, paceEmission{
 			at:             time.Now(),
 			targetRate:     commit.Request.Update.TargetRate,
 			transactions:   commit.Built.Stats.Transactions,
 			transactionCap: commit.Request.MaxTransactions,
-			artificialCap:  commit.Request.Slot == commit.Request.Update.CurrentWindowStart,
+			artificialCap:  artifact.Candidate.ID.Slot == artifact.WindowID.StartSlot,
 		})
 	}
 	stageStarted = s.metricStageStarted()
 	if err := s.opts.Emit(deliveryCtx, artifact); err != nil {
+		if emittedPace != nil {
+			emittedPace.discardEmission(artifact.Candidate.ID)
+		}
 		s.observeMetricStage(chain, CollationStageDeliverCandidate, stageStarted)
 
 		return fmt.Errorf("collator runtime: emit candidate: %w", err)
@@ -5272,7 +5269,7 @@ func (p *windowProducer) underloadedNotBefore() time.Time {
 // window is further bounded by firstSlotTransactions.
 func (p *windowProducer) transactionCap(slot uint32) uint32 {
 	return p.service.transactionCap(
-		p.record.Session.ID,
+		p.record.Session,
 		p.record.Update.TargetRate,
 		slot == p.job.window.ID.StartSlot,
 	)
