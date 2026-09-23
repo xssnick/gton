@@ -497,9 +497,7 @@ func (s *SyncCoordinator) markLiveCheckpointStatesFlushed(entries []storage.Stat
 		s.liveState.MarkLiveBlockStatesFlushed(stateBlocks)
 	}
 	if s.liveState != nil {
-		for _, block := range artifactBlocks {
-			s.liveState.MarkLiveBlockFlushed(block)
-		}
+		s.liveState.MarkLiveBlocksFlushed(artifactBlocks)
 	}
 	if s.liveBlockCache != nil {
 		for _, block := range artifactBlocks {

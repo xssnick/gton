@@ -47,6 +47,45 @@ func TestStoreArtifactFlushDoesNotRememberBlocksBehindCurrentState(t *testing.T)
 	}
 }
 
+func TestStoreMarkLiveBlocksFlushedTrimsBatch(t *testing.T) {
+	const pinned, flushed, retain = 200, 20, 2
+	live := New(noopBacking{}, Options{MasterBlockCache: 1, ShardBlockCache: retain})
+	root := cell.BeginCell().EndCell()
+	blocks := make([]ton.BlockIDExt, 0, pinned+flushed)
+
+	for i := range pinned + flushed {
+		block := testLiveBlockID(0, int64(1)<<62, uint32(i+1), byte(i+1))
+		key := storage.BlockKey(block)
+		live.blocks[key] = &liveBlock{id: block, root: root, stateFlushed: true}
+		live.shardOrder.pushBack(key)
+		blocks = append(blocks, block)
+	}
+
+	live.MarkLiveBlocksFlushed(blocks[pinned:])
+
+	if got := len(live.blocks); got != pinned+retain {
+		t.Fatalf("live blocks after batch flush = %d, want %d", got, pinned+retain)
+	}
+	if live.shardEvictable != retain {
+		t.Fatalf("evictable shard blocks = %d, want %d", live.shardEvictable, retain)
+	}
+	for _, block := range blocks[:pinned] {
+		if live.blocks[storage.BlockKey(block)] == nil {
+			t.Fatalf("unflushed block %d was evicted", block.SeqNo)
+		}
+	}
+	for _, block := range blocks[pinned : len(blocks)-retain] {
+		if live.blocks[storage.BlockKey(block)] != nil {
+			t.Fatalf("oldest flushed block %d was retained", block.SeqNo)
+		}
+	}
+	for _, block := range blocks[len(blocks)-retain:] {
+		if live.blocks[storage.BlockKey(block)] == nil {
+			t.Fatalf("newest flushed block %d was evicted", block.SeqNo)
+		}
+	}
+}
+
 func TestStoreLoadsZeroStateCurrentWithoutBlockData(t *testing.T) {
 	block := testLiveBlockID(-1, masterchainShard, 0, 0x21)
 	root := cell.BeginCell().MustStoreUInt(0x22, 8).EndCell()

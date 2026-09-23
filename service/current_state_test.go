@@ -530,7 +530,7 @@ func (f *testLiveCheckpointFlusher) MarkLiveCurrentStateFlushed(current *tnstore
 	f.current = current
 }
 
-func (f *testLiveCheckpointFlusher) MarkLiveBlockFlushed(ton.BlockIDExt) {}
+func (f *testLiveCheckpointFlusher) MarkLiveBlocksFlushed([]ton.BlockIDExt) {}
 
 func (f *testLiveCheckpointFlusher) PublishLiveBlockArtifacts(artifact tnstore.LiveBlockArtifacts) error {
 	f.artifacts = append(f.artifacts, artifact)

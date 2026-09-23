@@ -266,7 +266,7 @@ type CurrentStatePublisher interface {
 	SetLiveCurrentStateSnapshot(*storage.CurrentState)
 	MarkLiveCurrentStateFlushed(*storage.CurrentState)
 	MarkLiveBlockStatesFlushed([]ton.BlockIDExt)
-	MarkLiveBlockFlushed(ton.BlockIDExt)
+	MarkLiveBlocksFlushed([]ton.BlockIDExt)
 	PublishLiveBlockArtifacts(storage.LiveBlockArtifacts) error
 	NonfinalBlockCacheEnabled() bool
 	PublishNonfinalBlockArtifacts(storage.LiveBlockArtifacts, storage.LiveBlockNonfinalKind) error

@@ -305,26 +305,61 @@ func (s *Store) publishLiveBlockArtifactsPreparedLocked(prepared livePreparedBlo
 func (s *Store) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 	s.liveBlockCache.MarkBlockFlushed(block)
 
-	key := storage.BlockKey(block)
+	s.mu.Lock()
+	if s.markLiveBlockFlushedLocked(block) {
+		s.finishLiveBlockFlushLocked(liveBlockKind(block) == liveBlockMaster, liveBlockKind(block) == liveBlockShard)
+		s.signalBlockArtifactsLocked()
+	}
+	s.mu.Unlock()
+	if s.nonFinalEnabled {
+		s.promoteNonfinalWaiting()
+	}
+}
+
+// MarkLiveBlocksFlushed releases a checkpoint's artifacts before trimming the
+// live cache. During archive catch-up, many older blocks remain pinned until
+// the same checkpoint commits, so trimming after each block repeatedly scans
+// the entire pinned history.
+func (s *Store) MarkLiveBlocksFlushed(blocks []ton.BlockIDExt) {
+	if len(blocks) == 0 {
+		return
+	}
+
+	for _, block := range blocks {
+		s.liveBlockCache.MarkBlockFlushed(block)
+	}
 
 	s.mu.Lock()
+	var master, shard bool
+	for _, block := range blocks {
+		if !s.markLiveBlockFlushedLocked(block) {
+			continue
+		}
+		if liveBlockKind(block) == liveBlockMaster {
+			master = true
+		} else {
+			shard = true
+		}
+	}
+	if master || shard {
+		s.finishLiveBlockFlushLocked(master, shard)
+		s.signalBlockArtifactsLocked()
+	}
+	s.mu.Unlock()
+	if s.nonFinalEnabled {
+		s.promoteNonfinalWaiting()
+	}
+}
+
+func (s *Store) markLiveBlockFlushedLocked(block ton.BlockIDExt) bool {
+	key := storage.BlockKey(block)
 	if cached := s.blocks[key]; cached != nil {
 		evictableBefore := s.liveBlockEvictableLocked(cached)
 		cached.artifactFlushed = true
 		s.adjustLiveEvictableStateLocked(cached, evictableBefore)
-		published := s.publishPendingCurrentLocked()
-		if s.nonFinalEnabled {
-			s.cleanupNonfinalPendingLocked()
-		}
-		s.cleanupAcceptedStatesLocked()
-		s.trimBlocksLocked(liveBlockKind(block))
-		ready := s.updateReadyMasterSeqnoLocked()
-		s.signalBlockArtifactsLocked()
-		if published || ready {
-			close(s.notify)
-			s.notify = make(chan struct{})
-		}
-	} else if !s.coveredByCurrentStateLocked(block) {
+		return true
+	}
+	if !s.coveredByCurrentStateLocked(block) {
 		// Only a later publication of the block consumes the marker, and the
 		// producers of an unflushed block publish it before the applied current
 		// state passes it, so a marker for a covered block would never be consumed.
@@ -332,9 +367,25 @@ func (s *Store) MarkLiveBlockFlushed(block ton.BlockIDExt) {
 		flushed.artifact = true
 		s.flushed[key] = flushed
 	}
-	s.mu.Unlock()
+	return false
+}
+
+func (s *Store) finishLiveBlockFlushLocked(master, shard bool) {
+	published := s.publishPendingCurrentLocked()
 	if s.nonFinalEnabled {
-		s.promoteNonfinalWaiting()
+		s.cleanupNonfinalPendingLocked()
+	}
+	s.cleanupAcceptedStatesLocked()
+	if master {
+		s.trimBlocksLocked(liveBlockMaster)
+	}
+	if shard {
+		s.trimBlocksLocked(liveBlockShard)
+	}
+	ready := s.updateReadyMasterSeqnoLocked()
+	if published || ready {
+		close(s.notify)
+		s.notify = make(chan struct{})
 	}
 }
 

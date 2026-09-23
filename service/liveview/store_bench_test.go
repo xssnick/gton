@@ -2,12 +2,57 @@ package liveview
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
+
+func BenchmarkStoreCheckpointArtifactFlush(b *testing.B) {
+	const pinned, flushed = 4_096, 128
+	root := cell.BeginCell().EndCell()
+	prepare := func() (*Store, []ton.BlockIDExt) {
+		live := New(noopBacking{}, Options{MasterBlockCache: 1, ShardBlockCache: 16})
+		blocks := make([]ton.BlockIDExt, 0, flushed)
+		for i := range pinned + flushed {
+			block := testLiveBlockID(0, int64(1)<<62, uint32(i+1), byte(i+1))
+			binary.LittleEndian.PutUint32(block.RootHash[:4], uint32(i+1))
+			binary.LittleEndian.PutUint32(block.FileHash[:4], uint32(i+1))
+			key := storage.BlockKey(block)
+			live.blocks[key] = &liveBlock{id: block, root: root, stateFlushed: true}
+			live.shardOrder.pushBack(key)
+			if i >= pinned {
+				blocks = append(blocks, block)
+			}
+		}
+		return live, blocks
+	}
+
+	for _, benchmark := range []struct {
+		name  string
+		flush func(*Store, []ton.BlockIDExt)
+	}{
+		{"per-block", func(live *Store, blocks []ton.BlockIDExt) {
+			for _, block := range blocks {
+				live.MarkLiveBlockFlushed(block)
+			}
+		}},
+		{"batch", (*Store).MarkLiveBlocksFlushed},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				live, blocks := prepare()
+				b.StartTimer()
+				benchmark.flush(live, blocks)
+			}
+		})
+	}
+}
 
 func BenchmarkStoreCachedHistoryLookup(b *testing.B) {
 	const historyBlocks = 10_000
