@@ -204,7 +204,7 @@ func (spec *overlaySpec) privatePeerRoster() bool {
 		spec.Kind == overlayKindPrivate
 }
 
-// enforcesAcceptQueries reports whether spec.AcceptQueries gates non-ping
+// enforcesAcceptQueries reports whether spec.AcceptQueries gates application
 // queries. Only a fixed roster has the concept of the local node being a
 // configured acceptor, so the flag is consulted nowhere else.
 func (spec *overlaySpec) enforcesAcceptQueries() bool {

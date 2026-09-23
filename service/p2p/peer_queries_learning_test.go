@@ -17,12 +17,12 @@ import (
 // One query used to be allowed to teach us maxPeersPerOverlay nodes, each
 // costing a signature check and a directory write. Honest peers send four.
 func TestBoundedAdvertisedNodesCapsOneExchange(t *testing.T) {
-	nodes := make([]overlay.Node, maxAdvertisedPeersPerQuery*4)
+	nodes := make([]overlay.NodeV2, maxAdvertisedPeersPerQuery*4)
 	if got := len(boundedAdvertisedNodes(nodes)); got != maxAdvertisedPeersPerQuery {
 		t.Fatalf("bounded %d nodes, want %d", got, maxAdvertisedPeersPerQuery)
 	}
 
-	short := make([]overlay.Node, maxRandomPeerReply)
+	short := make([]overlay.NodeV2, maxRandomPeerReply)
 	if got := len(boundedAdvertisedNodes(short)); got != maxRandomPeerReply {
 		t.Fatalf("bounded an honest answer to %d nodes, want %d", got, maxRandomPeerReply)
 	}
@@ -43,13 +43,13 @@ func TestLearnQuerySourceFilesSenderAddressAsVerified(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sender peer id: %v", err)
 	}
-	node, err := overlay.NewNode(spec.FullID, senderPrivate)
+	node, err := newTestOverlayNode(spec.FullID, senderPrivate)
 	if err != nil {
 		t.Fatalf("build sender node: %v", err)
 	}
 
 	// C++ puts its own record first and fills the rest with other peers.
-	sub.learnQuerySource(sender, "10.9.9.9:30303", []overlay.Node{
+	sub.learnQuerySource(sender, "10.9.9.9:30303", []overlay.NodeV2{
 		*node,
 		signedAdvertisedPeer(t, spec.FullID),
 	})
@@ -77,7 +77,7 @@ func TestLearnQuerySourceFilesSenderAddressAsVerified(t *testing.T) {
 // Only the sender's own record may claim the sender's address: everything else
 // in the list is hearsay, and a record can be forged for any id.
 func TestLearnQuerySourceRejectsRecordsItCannotAttribute(t *testing.T) {
-	forged := func(t *testing.T, overlayID []byte) overlay.Node {
+	forged := func(t *testing.T, overlayID []byte) overlay.NodeV2 {
 		node := signedAdvertisedPeer(t, overlayID)
 		node.Signature[0] ^= 0xFF
 		return node
@@ -85,13 +85,13 @@ func TestLearnQuerySourceRejectsRecordsItCannotAttribute(t *testing.T) {
 
 	tests := []struct {
 		name string
-		node func(t *testing.T, overlayID []byte) overlay.Node
+		node func(t *testing.T, overlayID []byte) overlay.NodeV2
 	}{
 		{name: "another peer's record", node: signedAdvertisedPeer},
 		{name: "broken signature", node: forged},
 		{
 			name: "stale version",
-			node: func(t *testing.T, overlayID []byte) overlay.Node {
+			node: func(t *testing.T, overlayID []byte) overlay.NodeV2 {
 				node := signedAdvertisedPeer(t, overlayID)
 				node.Version = int32(time.Now().Add(-2 * overlayPeerTTL).Unix())
 				return node
@@ -99,7 +99,7 @@ func TestLearnQuerySourceRejectsRecordsItCannotAttribute(t *testing.T) {
 		},
 		{
 			name: "another overlay",
-			node: func(t *testing.T, _ []byte) overlay.Node {
+			node: func(t *testing.T, _ []byte) overlay.NodeV2 {
 				return signedAdvertisedPeer(t, make([]byte, PeerIDSize))
 			},
 		},
@@ -108,7 +108,7 @@ func TestLearnQuerySourceRejectsRecordsItCannotAttribute(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			sub, spec := testLearningSubscription(t)
-			sub.learnQuerySource(testPeerID("sender"), "10.9.9.9:30303", []overlay.Node{
+			sub.learnQuerySource(testPeerID("sender"), "10.9.9.9:30303", []overlay.NodeV2{
 				test.node(t, spec.FullID),
 			})
 			if size := sub.directorySize(); size != 0 {
@@ -175,7 +175,7 @@ func TestHandleGetRandomPeersLimitsAdvertisedPeerLearningJobs(t *testing.T) {
 	})
 
 	sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{
-		List: overlay.NodesList{List: []overlay.Node{first}},
+		List: overlayNodesToV1([]overlay.NodeV2{first}),
 	})
 	select {
 	case <-dhtBackend.started:
@@ -188,7 +188,7 @@ func TestHandleGetRandomPeersLimitsAdvertisedPeerLearningJobs(t *testing.T) {
 	sub.endRefreshPeers()
 
 	sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{
-		List: overlay.NodesList{List: []overlay.Node{second}},
+		List: overlayNodesToV1([]overlay.NodeV2{second}),
 	})
 	if got := dhtBackend.calls.Load(); got != 1 {
 		t.Fatalf("concurrent DHT lookup count = %d, want 1", got)
@@ -202,7 +202,7 @@ func TestHandleGetRandomPeersLimitsAdvertisedPeerLearningJobs(t *testing.T) {
 	}
 
 	sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{
-		List: overlay.NodesList{List: []overlay.Node{second}},
+		List: overlayNodesToV1([]overlay.NodeV2{second}),
 	})
 	node.wg.Wait()
 	if got := dhtBackend.calls.Load(); got != 2 {
@@ -228,15 +228,15 @@ func TestHandleGetRandomPeersReleasesLearningGateForInvalidBatch(t *testing.T) {
 	invalid.Signature = invalid.Signature[:ed25519.SignatureSize-1]
 
 	sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{
-		List: overlay.NodesList{List: []overlay.Node{invalid}},
+		List: overlayNodesToV1([]overlay.NodeV2{invalid}),
 	})
 	if sub.advertisedPeerLearning.Load() {
 		t.Fatal("invalid batch left advertised-peer learning gate active")
 	}
 }
 
-func structurallyValidAdvertisedPeer() overlay.Node {
-	return overlay.Node{
+func structurallyValidAdvertisedPeer() overlay.NodeV2 {
+	return overlay.NodeV2{
 		ID:        keys.PublicKeyED25519{Key: make(ed25519.PublicKey, ed25519.PublicKeySize)},
 		Overlay:   make([]byte, PeerIDSize),
 		Version:   1,
@@ -244,14 +244,14 @@ func structurallyValidAdvertisedPeer() overlay.Node {
 	}
 }
 
-func signedAdvertisedPeer(t *testing.T, overlayID []byte) overlay.Node {
+func signedAdvertisedPeer(t *testing.T, overlayID []byte) overlay.NodeV2 {
 	t.Helper()
 
 	_, key, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		t.Fatalf("generate advertised peer key: %v", err)
 	}
-	node, err := overlay.NewNode(overlayID, key)
+	node, err := newTestOverlayNode(overlayID, key)
 	if err != nil {
 		t.Fatalf("create advertised peer: %v", err)
 	}

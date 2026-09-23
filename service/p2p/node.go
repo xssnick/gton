@@ -123,6 +123,7 @@ type Node struct {
 	zeroStateFileHash               []byte
 	zeroStateBlock                  ton.BlockIDExt
 	initBlock                       ton.BlockIDExt
+	hardforks                       []ton.BlockIDExt
 	hardforkSet                     map[blockIDFullKey]struct{}
 	externalPort                    uint16
 	dhtListenAddr                   string
@@ -149,6 +150,7 @@ type Node struct {
 	masterchainNextBroadcastWaiters keyedBroadcastWaiters
 	blockCacheObserver              BlockCacheObserver
 	rebroadcastQuiet                atomic.Bool
+	chainBroadcastsPaused           atomic.Bool
 
 	rebroadcastThrottleMu   sync.Mutex
 	rebroadcastThrottleLast map[string]time.Time

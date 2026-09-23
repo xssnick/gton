@@ -89,7 +89,7 @@ func TestReloadNeighboursReplacesWorstPeer(t *testing.T) {
 		peer := &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
-			announced:     &overlay.Node{Version: now},
+			announced:     &overlay.NodeV2{Version: now},
 			alive:         true,
 			lastReceiveAt: time.Now(),
 		}
@@ -103,7 +103,7 @@ func TestReloadNeighboursReplacesWorstPeer(t *testing.T) {
 	fresh := &overlayPeer{
 		id:            testPeerID("fresh"),
 		overlay:       &overlay.ADNLOverlayWrapper{},
-		announced:     &overlay.Node{Version: now},
+		announced:     &overlay.NodeV2{Version: now},
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}
@@ -136,7 +136,7 @@ func TestReloadNeighboursKeepsLeasedWorstPeer(t *testing.T) {
 		peer := &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
-			announced:     &overlay.Node{Version: now},
+			announced:     &overlay.NodeV2{Version: now},
 			alive:         true,
 			lastReceiveAt: time.Now(),
 		}
@@ -150,7 +150,7 @@ func TestReloadNeighboursKeepsLeasedWorstPeer(t *testing.T) {
 	fresh := &overlayPeer{
 		id:            testPeerID("fresh"),
 		overlay:       &overlay.ADNLOverlayWrapper{},
-		announced:     &overlay.Node{Version: now},
+		announced:     &overlay.NodeV2{Version: now},
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}
@@ -181,7 +181,7 @@ func TestReloadNeighboursDoesNotProtectArchiveSelection(t *testing.T) {
 		peer := &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
-			announced:     &overlay.Node{Version: now},
+			announced:     &overlay.NodeV2{Version: now},
 			alive:         true,
 			lastReceiveAt: time.Now(),
 		}
@@ -199,7 +199,7 @@ func TestReloadNeighboursDoesNotProtectArchiveSelection(t *testing.T) {
 	fresh := &overlayPeer{
 		id:            testPeerID("fresh"),
 		overlay:       &overlay.ADNLOverlayWrapper{},
-		announced:     &overlay.Node{Version: now},
+		announced:     &overlay.NodeV2{Version: now},
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}
@@ -227,7 +227,7 @@ func TestReloadNeighboursDoesNotRandomRotateLeasedNeighbours(t *testing.T) {
 		sub.peers[id] = &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
-			announced:     &overlay.Node{Version: now},
+			announced:     &overlay.NodeV2{Version: now},
 			alive:         true,
 			lastReceiveAt: time.Now(),
 		}
@@ -238,7 +238,7 @@ func TestReloadNeighboursDoesNotRandomRotateLeasedNeighbours(t *testing.T) {
 	fresh := &overlayPeer{
 		id:            testPeerID("fresh"),
 		overlay:       &overlay.ADNLOverlayWrapper{},
-		announced:     &overlay.Node{Version: now},
+		announced:     &overlay.NodeV2{Version: now},
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}
@@ -271,7 +271,7 @@ func TestReloadNeighboursPrunesDeadLeasedPeer(t *testing.T) {
 	sub.peers[deadID] = &overlayPeer{
 		id:            deadID,
 		overlay:       &overlay.ADNLOverlayWrapper{},
-		announced:     &overlay.Node{Version: now},
+		announced:     &overlay.NodeV2{Version: now},
 		alive:         false,
 		lastReceiveAt: time.Now().Add(-time.Minute),
 	}
@@ -279,7 +279,7 @@ func TestReloadNeighboursPrunesDeadLeasedPeer(t *testing.T) {
 	fresh := &overlayPeer{
 		id:            testPeerID("fresh"),
 		overlay:       &overlay.ADNLOverlayWrapper{},
-		announced:     &overlay.Node{Version: now},
+		announced:     &overlay.NodeV2{Version: now},
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}
@@ -311,7 +311,7 @@ func TestReloadNeighboursPrunesDeadSessionPinnedArchivePeer(t *testing.T) {
 	sub.peers[deadID] = &overlayPeer{
 		id:            deadID,
 		overlay:       &overlay.ADNLOverlayWrapper{},
-		announced:     &overlay.Node{Version: now},
+		announced:     &overlay.NodeV2{Version: now},
 		alive:         false,
 		lastReceiveAt: time.Now().Add(-time.Minute),
 	}
@@ -320,7 +320,7 @@ func TestReloadNeighboursPrunesDeadSessionPinnedArchivePeer(t *testing.T) {
 	fresh := &overlayPeer{
 		id:            testPeerID("fresh"),
 		overlay:       &overlay.ADNLOverlayWrapper{},
-		announced:     &overlay.Node{Version: now},
+		announced:     &overlay.NodeV2{Version: now},
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}
@@ -349,14 +349,14 @@ func TestReloadNeighboursPrefersAliveKnownPeers(t *testing.T) {
 	sub.peers[deadID] = &overlayPeer{
 		id:            testPeerID("dead"),
 		overlay:       &overlay.ADNLOverlayWrapper{},
-		announced:     &overlay.Node{Version: now},
+		announced:     &overlay.NodeV2{Version: now},
 		alive:         false,
 		lastReceiveAt: time.Now().Add(-time.Minute),
 	}
 	sub.peers[aliveID] = &overlayPeer{
 		id:            testPeerID("alive"),
 		overlay:       &overlay.ADNLOverlayWrapper{},
-		announced:     &overlay.Node{Version: now},
+		announced:     &overlay.NodeV2{Version: now},
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}
@@ -383,7 +383,7 @@ func TestAttachPeerEvictionRejectsHealthyFullPool(t *testing.T) {
 		sub.peers[id] = &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
-			announced:     &overlay.Node{Version: now},
+			announced:     &overlay.NodeV2{Version: now},
 			alive:         true,
 			lastReceiveAt: time.Now(),
 		}
@@ -409,7 +409,7 @@ func TestAttachPeerEvictionAllowsBadPeerReplacement(t *testing.T) {
 		peer := &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
-			announced:     &overlay.Node{Version: now},
+			announced:     &overlay.NodeV2{Version: now},
 			alive:         true,
 			lastReceiveAt: time.Now(),
 		}
@@ -439,7 +439,7 @@ func TestAttachPeerEvictionAllowsSlowPeerReplacement(t *testing.T) {
 		peer := &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
-			announced:     &overlay.Node{Version: now},
+			announced:     &overlay.NodeV2{Version: now},
 			alive:         true,
 			lastReceiveAt: time.Now(),
 		}
@@ -486,7 +486,7 @@ func TestAttachPooledPeerDoesNotEvictProtectedPeer(t *testing.T) {
 			protected := &overlayPeer{
 				id:            protectedID,
 				overlay:       &overlay.ADNLOverlayWrapper{},
-				announced:     &overlay.Node{Version: now},
+				announced:     &overlay.NodeV2{Version: now},
 				alive:         true,
 				lastReceiveAt: time.Now(),
 				unreliability: peerStopUnreliability + 1,
@@ -497,7 +497,7 @@ func TestAttachPooledPeerDoesNotEvictProtectedPeer(t *testing.T) {
 				sub.peers[id] = &overlayPeer{
 					id:            id,
 					overlay:       &overlay.ADNLOverlayWrapper{},
-					announced:     &overlay.Node{Version: now},
+					announced:     &overlay.NodeV2{Version: now},
 					alive:         true,
 					lastReceiveAt: time.Now(),
 				}
@@ -528,7 +528,7 @@ func TestDHTRefreshReplacementKeepsPeerUntilAttach(t *testing.T) {
 		peer := &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
-			announced:     &overlay.Node{Version: now},
+			announced:     &overlay.NodeV2{Version: now},
 			alive:         true,
 			lastReceiveAt: time.Now(),
 		}
@@ -559,7 +559,7 @@ func TestPingTargetsRotateNeighbours(t *testing.T) {
 		sub.peers[id] = &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
-			announced:     &overlay.Node{Version: now},
+			announced:     &overlay.NodeV2{Version: now},
 			alive:         true,
 			lastReceiveAt: time.Now(),
 			versionMajor:  3,
@@ -598,7 +598,7 @@ func TestEnsurePeersReturnsWhenFirstPeerArrives(t *testing.T) {
 	sub.peers[peerID] = &overlayPeer{
 		id:            peerID,
 		overlay:       &overlay.ADNLOverlayWrapper{},
-		announced:     &overlay.Node{Version: int32(time.Now().Unix())},
+		announced:     &overlay.NodeV2{Version: int32(time.Now().Unix())},
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}
@@ -667,7 +667,7 @@ func TestStartSeedFromDHTRefreshesWhenPeerPoolIsFull(t *testing.T) {
 		sub.peers[id] = &overlayPeer{
 			id:            id,
 			overlay:       &overlay.ADNLOverlayWrapper{},
-			announced:     &overlay.Node{Version: int32(time.Now().Unix())},
+			announced:     &overlay.NodeV2{Version: int32(time.Now().Unix())},
 			alive:         true,
 			lastReceiveAt: time.Now(),
 		}

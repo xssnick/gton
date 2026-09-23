@@ -34,7 +34,7 @@ type directoryEntry struct {
 	quicAddr string
 	// announced is the peer's own signed overlay node record. Advertising it is
 	// only meaningful while it is fresh, which advertisedDirectoryNode checks.
-	announced *overlay.Node
+	announced *overlay.NodeV2
 	// lastSeenAt is the last time this peer was observed alive: attached,
 	// answered a query, or arrived in a fresh gossip response.
 	lastSeenAt time.Time
@@ -50,7 +50,7 @@ type directoryEntry struct {
 
 // directoryTrust says how much a write may displace when the directory is full.
 //
-// A signed overlay.Node proves nothing about who sent it: identities are free to
+// A signed overlay.NodeV2 proves nothing about who sent it: identities are free to
 // mint and announcements free to sign, so a peer forwarding a list of 300
 // strangers must not be able to flush the rows we actually gossip with and
 // promote from. Trust is a property of the write, not of the record.
@@ -90,7 +90,7 @@ func (s *overlaySubscription) rememberDirectoryPeerLocked(
 	pub ed25519.PublicKey,
 	adnlAddr string,
 	quicAddr string,
-	announced *overlay.Node,
+	announced *overlay.NodeV2,
 	now time.Time,
 	trust directoryTrust,
 ) bool {
@@ -218,7 +218,7 @@ func (s *overlaySubscription) markDirectoryLiveLocked(id PeerID, live bool) {
 // and evicts a row that does carry one. Cheaply repeated, that pins
 // knownPeerCount at the cap, which stops learning from gossip and parks DHT
 // discovery in refresh-only mode. Rows are filed where there is proof the peer
-// is worth keeping - a signed overlay.Node, or an attachment we made ourselves.
+// is worth keeping - a signed overlay.NodeV2, or an attachment we made ourselves.
 func (s *overlaySubscription) noteDirectoryActivity(id PeerID, addr string) {
 	s.mx.Lock()
 	defer s.mx.Unlock()
@@ -282,13 +282,13 @@ func (s *overlaySubscription) directorySize() int {
 // cost ~300 deep clones to answer with three - and s.mx is taken from under the
 // plumtree engine lock on every forwarded broadcast part, so that time lands
 // directly on block propagation.
-func (s *overlaySubscription) advertisedDirectoryNodes(now time.Time, limit int) []overlay.Node {
+func (s *overlaySubscription) advertisedDirectoryNodes(now time.Time, limit int) []overlay.NodeV2 {
 	if limit <= 0 {
 		return nil
 	}
 
 	selected := s.sampleAdvertisedNodes(now, limit)
-	list := make([]overlay.Node, 0, len(selected))
+	list := make([]overlay.NodeV2, 0, len(selected))
 	for _, node := range selected {
 		list = append(list, *cloneOverlayNode(node))
 	}
@@ -299,19 +299,19 @@ func (s *overlaySubscription) advertisedDirectoryNodes(now time.Time, limit int)
 // returned pointers are never mutated in place by their owners (both
 // directoryEntry.announced and overlayPeer.announced are replaced wholesale), so
 // they stay safe to copy once the lock is gone.
-func (s *overlaySubscription) sampleAdvertisedNodes(now time.Time, limit int) []*overlay.Node {
+func (s *overlaySubscription) sampleAdvertisedNodes(now time.Time, limit int) []*overlay.NodeV2 {
 	s.mx.Lock()
 	defer s.mx.Unlock()
 
-	advertisable := func(node *overlay.Node) bool {
+	advertisable := func(node *overlay.NodeV2) bool {
 		return node != nil &&
 			announcedNodeIsFresh(node, now) &&
 			overlayNodeHasSerializableID(node)
 	}
 
-	reservoir := make([]*overlay.Node, 0, limit)
+	reservoir := make([]*overlay.NodeV2, 0, limit)
 	considered := 0
-	add := func(node *overlay.Node) {
+	add := func(node *overlay.NodeV2) {
 		if !advertisable(node) {
 			return
 		}

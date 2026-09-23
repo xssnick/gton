@@ -334,7 +334,7 @@ func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate foreign key: %v", err)
 	}
-	foreignNode, err := overlay.NewNode(spec.FullID, foreignPriv)
+	foreignNode, err := newTestOverlayNode(spec.FullID, foreignPriv)
 	if err != nil {
 		t.Fatalf("build foreign overlay node: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestHandleGetRandomPeersIncludesSelfAndKnownPeers(t *testing.T) {
 		t.Fatalf("expected self and known peer, got %d entries", len(res.List))
 	}
 
-	self, err := overlay.NewNode(spec.FullID, node.privKey)
+	self, err := newTestOverlayNode(spec.FullID, node.privKey)
 	if err != nil {
 		t.Fatalf("build self overlay node: %v", err)
 	}
@@ -389,7 +389,7 @@ func TestOverlayNodeIdentityRejectsMalformedIDWithoutPanic(t *testing.T) {
 		node: node,
 		spec: overlaySpec{ShortID: make([]byte, 32)},
 	})
-	malformed := overlay.Node{
+	malformed := overlay.NodeV2{
 		Overlay: sub.spec.ShortID,
 		Version: int32(time.Now().Unix()),
 	}
@@ -423,13 +423,13 @@ func TestHandleGetRandomPeersSkipsMalformedAnnouncement(t *testing.T) {
 	malformedPeerID := testPeerID("malformed")
 	sub.peers[malformedPeerID] = &overlayPeer{
 		id:        malformedPeerID,
-		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		announced: &overlay.NodeV2{Version: int32(time.Now().Unix())},
 		alive:     true,
 	}
 
 	res := sub.handleGetRandomPeers(context.Background(), PeerID{}, "", overlay.GetRandomPeers{})
 	for _, node := range res.List {
-		if !overlayNodeHasSerializableID(&node) {
+		if !overlayNodeHasSerializableID(new(overlayNodeFromV1(node))) {
 			t.Fatalf("getRandomPeers returned malformed node: %#v", node)
 		}
 	}
@@ -456,7 +456,7 @@ func TestOverlayNodesSnapshotConcurrentAnnouncementUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate first key: %v", err)
 	}
-	firstNode, err := overlay.NewNode(spec.FullID, firstKey)
+	firstNode, err := newTestOverlayNode(spec.FullID, firstKey)
 	if err != nil {
 		t.Fatalf("build first overlay node: %v", err)
 	}
@@ -464,7 +464,7 @@ func TestOverlayNodesSnapshotConcurrentAnnouncementUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate second key: %v", err)
 	}
-	secondNode, err := overlay.NewNode(spec.FullID, secondKey)
+	secondNode, err := newTestOverlayNode(spec.FullID, secondKey)
 	if err != nil {
 		t.Fatalf("build second overlay node: %v", err)
 	}
@@ -551,7 +551,7 @@ func TestGetRandomPeersCapsAdvertisementLikeCppOverlay(t *testing.T) {
 		if err != nil {
 			t.Fatalf("generate peer key: %v", err)
 		}
-		announced, err := overlay.NewNode(spec.FullID, priv)
+		announced, err := newTestOverlayNode(spec.FullID, priv)
 		if err != nil {
 			t.Fatalf("build overlay node: %v", err)
 		}
@@ -569,7 +569,7 @@ func TestGetRandomPeersCapsAdvertisementLikeCppOverlay(t *testing.T) {
 		t.Fatalf("getRandomPeers returned %d nodes, want %d", len(res.List), maxRandomPeerReply)
 	}
 
-	self, err := overlay.NewNode(spec.FullID, node.privKey)
+	self, err := newTestOverlayNode(spec.FullID, node.privKey)
 	if err != nil {
 		t.Fatalf("build self overlay node: %v", err)
 	}
@@ -602,12 +602,12 @@ func TestConnectOverlayNodeSkipsSelf(t *testing.T) {
 		peers: map[PeerID]*overlayPeer{},
 	})
 
-	self, err := overlay.NewNode(spec.FullID, node.privKey)
+	self, err := newTestOverlayNode(spec.FullID, node.privKey)
 	if err != nil {
 		t.Fatalf("build self overlay node: %v", err)
 	}
 
-	attached, err := sub.connectOverlayNodeV1(context.Background(), *self)
+	attached, err := sub.connectOverlayNode(context.Background(), *self)
 	if err != nil {
 		t.Fatalf("connect self overlay node: %v", err)
 	}
@@ -647,7 +647,7 @@ func TestHandleGetRandomPeersIncludesSelfForClientNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate foreign key: %v", err)
 	}
-	foreignNode, err := overlay.NewNode(spec.FullID, foreignPriv)
+	foreignNode, err := newTestOverlayNode(spec.FullID, foreignPriv)
 	if err != nil {
 		t.Fatalf("build foreign overlay node: %v", err)
 	}
@@ -664,7 +664,7 @@ func TestHandleGetRandomPeersIncludesSelfForClientNode(t *testing.T) {
 		t.Fatalf("expected self and known peer for client node, got %d entries", len(res.List))
 	}
 
-	self, err := overlay.NewNode(spec.FullID, node.privKey)
+	self, err := newTestOverlayNode(spec.FullID, node.privKey)
 	if err != nil {
 		t.Fatalf("build self overlay node: %v", err)
 	}
@@ -826,7 +826,7 @@ func TestKnownPeerCountIgnoresInboundOnlyPeers(t *testing.T) {
 		peers: map[PeerID]*overlayPeer{
 			testPeerID("inbound-only"): {},
 			testPeerID("known-v1"): {
-				announced:     &overlay.Node{Version: int32(time.Now().Unix())},
+				announced:     &overlay.NodeV2{Version: int32(time.Now().Unix())},
 				alive:         true,
 				lastReceiveAt: time.Now(),
 			},
@@ -862,7 +862,7 @@ func testRebroadcastQueuePeer(id string) *overlayPeer {
 		addr:    id,
 		route:   newTestPeerRoute(""),
 		overlay: &overlay.ADNLOverlayWrapper{},
-		announced: &overlay.Node{
+		announced: &overlay.NodeV2{
 			Version: int32(time.Now().Unix()),
 		},
 		alive:         true,

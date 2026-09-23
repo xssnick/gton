@@ -1068,7 +1068,7 @@ func TestStatusSnapshotIncludesNeighbours(t *testing.T) {
 				lastReceiveAt: time.Now(),
 				failedQueries: 3,
 				unreliability: 1.5,
-				announced:     &overlay.Node{Version: int32(time.Now().Unix())},
+				announced:     &overlay.NodeV2{Version: int32(time.Now().Unix())},
 			},
 		},
 		neighbours: []PeerID{testPeerID("peer-1")},

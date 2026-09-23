@@ -257,7 +257,7 @@ func (s *overlaySubscription) aliveKnownPeersSnapshot() []*overlayPeer {
 	return peers
 }
 
-func (s *overlaySubscription) overlayNodesSnapshot(limit int) []overlay.Node {
+func (s *overlaySubscription) overlayNodesSnapshot(limit int) []overlay.NodeV2 {
 	// Drawn from the directory, not the live set: what we gossip is how other
 	// nodes learn about our peers and, symmetrically, how wide a surface we
 	// keep in the network. Narrowing it to the peers we happen to hold
@@ -274,14 +274,14 @@ func (s *overlaySubscription) randomPeerAdvertisement() (overlay.NodesList, erro
 		return overlay.NodesList{}, err
 	}
 
-	list := make([]overlay.Node, 0, maxRandomPeerReply)
-	list = append(list, *self)
+	list := make([]overlay.NodeV2, 0, maxRandomPeerReply)
+	list = append(list, overlayNodeFromV1(*self))
 	list = append(list, s.randomOverlayNodes(maxRandomPeerReply-len(list))...)
 
-	return overlay.NodesList{List: list}, nil
+	return overlayNodesToV1(list), nil
 }
 
-func (s *overlaySubscription) randomOverlayNodes(limit int) []overlay.Node {
+func (s *overlaySubscription) randomOverlayNodes(limit int) []overlay.NodeV2 {
 	if limit <= 0 {
 		return nil
 	}

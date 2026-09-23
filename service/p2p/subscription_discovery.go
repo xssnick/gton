@@ -336,7 +336,7 @@ func (s *overlaySubscription) seedFromDHT(ctx context.Context, targetPeers int) 
 }
 
 func (s *overlaySubscription) prepareDHTRefreshNode(node overlay.Node, replacements int) (bool, bool) {
-	identity, err := s.overlayNodeIdentity(node)
+	identity, err := s.overlayNodeIdentity(overlayNodeFromV1(node))
 	if err != nil || identity.self {
 		return false, false
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"time"
@@ -121,6 +122,12 @@ type IhrMessageBroadcast struct {
 
 var errOverlayInactive = errors.New("overlay is inactive")
 var forgetPeerConstructorID uint32
+
+var (
+	overlayPingQueryID          = tl.CRC("overlay.ping = overlay.Pong")
+	overlayRandomPeersQueryID   = tl.CRC("overlay.getRandomPeers peers:overlay.nodes = overlay.Nodes")
+	overlayRandomPeersV2QueryID = tl.CRC("overlay.getRandomPeersV2 peers:overlay.nodesV2 = overlay.NodesV2")
+)
 
 // inboundQuery is one served query, independent of whether the sender is
 // attached to this overlay. A detached sender carries no wrappers, so the
@@ -315,13 +322,41 @@ func (s *overlaySubscription) dispatchPeerQueryFrom(
 	default:
 	}
 
-	switch req.(type) {
+	// Private transports leave application queries raw. Overlay control
+	// queries still belong to the overlay, before its application callback,
+	// just as in OverlayImpl::receive_query.
+	if raw, ok := req.(tl.Raw); ok && len(raw) >= 4 {
+		switch binary.LittleEndian.Uint32(raw) {
+		case overlayPingQueryID, overlayRandomPeersQueryID, overlayRandomPeersV2QueryID, repairPlumtreePartConstructorID:
+			var parsed tl.Serializable
+			rest, err := tl.Parse(&parsed, raw, true)
+			if err != nil {
+				return nil, err
+			}
+			if len(rest) != 0 {
+				return nil, errors.New("trailing overlay query data")
+			}
+			req = parsed
+		}
+	}
+
+	switch query := req.(type) {
 	case overlay.Ping:
 		return overlay.Pong{}, nil
+	case RepairPlumtreePart:
+		if s.plumtree == nil {
+			return nil, errPlumtreeDisabled
+		}
+		answer, err := s.plumtree.HandleRepairQuery(ctx, source, query)
+		if err != nil {
+			return nil, err
+		}
+		return tl.Raw(answer), nil
 	}
 
 	if s.spec.privatePeerRoster() {
-		if _, ok := req.(overlay.GetRandomPeers); ok {
+		switch req.(type) {
+		case overlay.GetRandomPeers, overlay.GetRandomPeersV2:
 			return nil, errors.New("overlay is private")
 		}
 	}
@@ -342,12 +377,12 @@ func (s *overlaySubscription) dispatchPeerQueryFrom(
 
 	switch query := req.(type) {
 	case overlay.GetRandomPeers:
+		if s.fastSync != nil {
+			return s.handleFastSyncRandomPeersV1(query)
+		}
 		return s.handleGetRandomPeers(ctx, source, peerAddr, query), nil
 	case overlay.GetRandomPeersV2:
-		if s.fastSync == nil {
-			return nil, errors.New("overlay.getRandomPeersV2 requires a FastSync overlay")
-		}
-		return s.handleFastSyncRandomPeers(query)
+		return s.handleGetRandomPeersV2(source, peerAddr, query)
 	case GetCapabilities:
 		return Capabilities{
 			VersionMajor: s.spec.ProtoVersionMajor,
@@ -748,7 +783,18 @@ func (s *overlaySubscription) handleGetRandomPeers(
 	peerAddr string,
 	query overlay.GetRandomPeers,
 ) overlay.NodesList {
-	advertised := boundedAdvertisedNodes(query.List.List)
+	s.learnRandomPeerRequest(source, peerAddr, overlayNodesFromV1(query.List.List))
+
+	reply, err := s.randomPeerAdvertisement()
+	if err != nil {
+		s.log.Debug().Err(err).Msg("failed to create getRandomPeers response")
+		return overlay.NodesList{}
+	}
+	return reply
+}
+
+func (s *overlaySubscription) learnRandomPeerRequest(source PeerID, peerAddr string, nodes []overlay.NodeV2) {
+	advertised := boundedAdvertisedNodes(nodes)
 	s.learnQuerySource(source, peerAddr, advertised)
 
 	if len(advertised) > 0 && s.advertisedPeerLearning.CompareAndSwap(false, true) {
@@ -756,7 +802,7 @@ func (s *overlaySubscription) handleGetRandomPeers(
 		// this answer is written, so the async job gets copies. Records that
 		// cannot be a node of this overlay are dropped before the copy: rejecting
 		// them costs no signature check and no goroutine.
-		peers := make([]overlay.Node, 0, len(advertised))
+		peers := make([]overlay.NodeV2, 0, len(advertised))
 		for i := range advertised {
 			if !advertisedNodeHasShape(&advertised[i], s.spec.ShortID) {
 				continue
@@ -772,13 +818,6 @@ func (s *overlaySubscription) handleGetRandomPeers(
 			})
 		}
 	}
-
-	reply, err := s.randomPeerAdvertisement()
-	if err != nil {
-		s.log.Debug().Err(err).Msg("failed to create getRandomPeers response")
-		return overlay.NodesList{}
-	}
-	return reply
 }
 
 // learnQuerySource files the sender's own announcement together with the address
@@ -792,7 +831,7 @@ func (s *overlaySubscription) handleGetRandomPeers(
 // be dialled. Without this a peer that talks to us every few minutes stays an
 // address-less, unverified row: never a gossip target, never a promotion
 // candidate, and first in line for eviction.
-func (s *overlaySubscription) learnQuerySource(source PeerID, peerAddr string, nodes []overlay.Node) {
+func (s *overlaySubscription) learnQuerySource(source PeerID, peerAddr string, nodes []overlay.NodeV2) {
 	if source.IsZero() || peerAddr == "" || !s.spec.hasDirectoryTier() {
 		return
 	}
@@ -817,9 +856,11 @@ func (s *overlaySubscription) learnQuerySource(source PeerID, peerAddr string, n
 			return
 		}
 
-		announced := cloneOverlayNode(&nodes[i])
 		s.mx.Lock()
-		s.rememberDirectoryPeerLocked(source, identity.pub, peerAddr, "", announced, time.Now(), directoryContacted)
+		if peer := s.peers[source]; peer != nil {
+			peer.mergeAnnouncement(&nodes[i])
+		}
+		s.rememberDirectoryPeerLocked(source, identity.pub, peerAddr, "", &nodes[i], time.Now(), directoryContacted)
 		s.mx.Unlock()
 		return
 	}
@@ -828,7 +869,7 @@ func (s *overlaySubscription) learnQuerySource(source PeerID, peerAddr string, n
 // boundedAdvertisedNodes caps what one exchange may teach us. Honest peers send
 // four records; the cap is what keeps a hostile peer from buying hundreds of
 // signature checks and directory writes with a single query.
-func boundedAdvertisedNodes(nodes []overlay.Node) []overlay.Node {
+func boundedAdvertisedNodes(nodes []overlay.NodeV2) []overlay.NodeV2 {
 	if len(nodes) > maxAdvertisedPeersPerQuery {
 		return nodes[:maxAdvertisedPeersPerQuery]
 	}
@@ -839,7 +880,7 @@ func boundedAdvertisedNodes(nodes []overlay.Node) []overlay.Node {
 // it can only be a node of this overlay if the fields are the right kind and
 // size. The signature check that follows costs real work, so nothing that fails
 // here should reach it.
-func advertisedNodeHasShape(node *overlay.Node, overlayID []byte) bool {
+func advertisedNodeHasShape(node *overlay.NodeV2, overlayID []byte) bool {
 	key, ok := node.ID.(keys.PublicKeyED25519)
 	return ok &&
 		len(key.Key) == ed25519.PublicKeySize &&

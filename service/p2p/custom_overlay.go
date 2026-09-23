@@ -238,6 +238,9 @@ func (s *overlaySubscription) enqueueTwoStepRebroadcast(req rebroadcastRequest) 
 }
 
 func (s *overlaySubscription) sendTwoStepRebroadcast(ctx context.Context, req rebroadcastRequest) bool {
+	if s.chainBroadcastsPaused() {
+		return false
+	}
 	payloadLen := req.payloadLen()
 	if payloadLen == 0 || payloadLen > maxOverlayPayloadSize {
 		return false

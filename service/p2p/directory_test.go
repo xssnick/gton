@@ -114,14 +114,14 @@ func TestDirectoryEvictionPrefersColdNonLiveRows(t *testing.T) {
 // freshDirectoryNode is the signed record a peer advertises for itself right
 // now. Eviction only reads its version, so one record can stand in for many
 // rows.
-func freshDirectoryNode(t *testing.T, overlayID []byte) *overlay.Node {
+func freshDirectoryNode(t *testing.T, overlayID []byte) *overlay.NodeV2 {
 	t.Helper()
 
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
-	node, err := overlay.NewNode(overlayID, priv)
+	node, err := newTestOverlayNode(overlayID, priv)
 	if err != nil {
 		t.Fatalf("build overlay node: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestAdvertisementDrawsFromDirectory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("generate key: %v", err)
 		}
-		node, err := overlay.NewNode(sub.spec.FullID, priv)
+		node, err := newTestOverlayNode(sub.spec.FullID, priv)
 		if err != nil {
 			t.Fatalf("build overlay node: %v", err)
 		}
@@ -244,7 +244,7 @@ func TestAdvertisementSkipsStaleAnnouncements(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
-	node, err := overlay.NewNode(sub.spec.FullID, priv)
+	node, err := newTestOverlayNode(sub.spec.FullID, priv)
 	if err != nil {
 		t.Fatalf("build overlay node: %v", err)
 	}
@@ -278,10 +278,10 @@ func TestLivePeerLimitIsSmallerThanDirectory(t *testing.T) {
 }
 
 // signedOverlayNode builds the record a peer advertises for itself.
-func signedOverlayNode(t *testing.T, private ed25519.PrivateKey, overlayID []byte, version time.Time) overlay.Node {
+func signedOverlayNode(t *testing.T, private ed25519.PrivateKey, overlayID []byte, version time.Time) overlay.NodeV2 {
 	t.Helper()
 
-	node := overlay.Node{
+	node := overlay.NodeV2{
 		ID:      keys.PublicKeyED25519{Key: private.Public().(ed25519.PublicKey)},
 		Overlay: overlayID,
 		Version: int32(version.Unix()),
@@ -355,7 +355,7 @@ func TestAdvertisementSamplesOnlyUpToLimit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("generate key: %v", err)
 		}
-		node, err := overlay.NewNode(sub.spec.FullID, priv)
+		node, err := newTestOverlayNode(sub.spec.FullID, priv)
 		if err != nil {
 			t.Fatalf("build overlay node: %v", err)
 		}
@@ -397,7 +397,7 @@ func TestAdvertisementReturnsDeepCopies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
-	node, err := overlay.NewNode(sub.spec.FullID, priv)
+	node, err := newTestOverlayNode(sub.spec.FullID, priv)
 	if err != nil {
 		t.Fatalf("build overlay node: %v", err)
 	}
@@ -449,7 +449,7 @@ func TestDirectoryActivityFloodDoesNotEvictAnnouncedRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
-	node, err := overlay.NewNode(sub.spec.FullID, priv)
+	node, err := newTestOverlayNode(sub.spec.FullID, priv)
 	if err != nil {
 		t.Fatalf("build overlay node: %v", err)
 	}

@@ -54,11 +54,6 @@ func (r *archiveCatchUpRun) downloadAndImportShardArchives(ctx context.Context, 
 		err       error
 	}
 
-	type archivePreloadJob struct {
-		idx  int
-		done <-chan archiveImportQueueResult
-	}
-
 	limit := archiveShardArchiveImportInFlight
 	if limit < 1 {
 		limit = 1
@@ -70,28 +65,28 @@ func (r *archiveCatchUpRun) downloadAndImportShardArchives(ctx context.Context, 
 	results := make(chan archivePreloadResult, limit)
 	var wg sync.WaitGroup
 	inFlight := 0
-	submit := func(idx int) error {
-		shard := plans[idx].shard
-		done, err := queue.submitArchive(preloadCtx, masterchainSeqno, shard, splitDepth, priority)
-		if err != nil {
-			return fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, shard.String(), err)
-		}
-
-		job := archivePreloadJob{idx: idx, done: done}
+	submit := func(idx int) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			var res archivePreloadResult
-			select {
-			case result := <-job.done:
-				res = archivePreloadResult{idx: job.idx, imported: result.imported, peer: result.peer, archiveID: result.archiveID, err: result.err}
-			case <-preloadCtx.Done():
-				res = archivePreloadResult{idx: job.idx, err: preloadCtx.Err()}
+			// Keep completed shard imports across pipeline retries, just like
+			// master imports. Otherwise an unavailable shard discards all of
+			// its successful siblings and every window starts downloading again.
+			loaded, err := r.loadArchiveImport(preloadCtx, queue, masterchainSeqno, plans[idx].shard, splitDepth, priority, nil)
+			res := archivePreloadResult{idx: idx, imported: loaded.imported, err: err}
+			if err == nil {
+				res.peer = loaded.imported.stats.Peer
+				res.archiveID = loaded.imported.stats.ArchiveID
+			} else {
+				var peerErr *archiveImportPeerError
+				if errors.As(err, &peerErr) {
+					res.peer = peerErr.peer
+					res.archiveID = peerErr.archiveID
+				}
 			}
 			results <- res
 		}()
 		inFlight++
-		return nil
 	}
 
 	imports := make([]*archiveImportResult, len(plans))
@@ -101,11 +96,7 @@ func (r *archiveCatchUpRun) downloadAndImportShardArchives(ctx context.Context, 
 	completed := 0
 	submitMore := func() {
 		for firstErr == nil && next < len(plans) && inFlight < limit {
-			if err := submit(next); err != nil {
-				cancel()
-				firstErr = err
-				return
-			}
+			submit(next)
 			next++
 		}
 	}
@@ -125,43 +116,35 @@ func (r *archiveCatchUpRun) downloadAndImportShardArchives(ctx context.Context, 
 			if r.rejectArchiveImportPeer(plan.shard, res.peer, res.archiveID, p2p.ArchivePeerRejectImportFailed, res.err) {
 				retries[res.idx]++
 				if retries[res.idx] <= archiveImportPeerRetries {
-					if err := submit(res.idx); err != nil {
-						cancel()
-						firstErr = err
-					}
+					submit(res.idx)
 					continue
 				}
 			} else if ctx.Err() == nil && retries[res.idx] < archiveImportPeerRetries {
 				retries[res.idx]++
-				if err := submit(res.idx); err != nil {
-					cancel()
-					firstErr = err
-				}
+				submit(res.idx)
 				continue
 			}
-			cancel()
-			if firstErr == nil {
-				firstErr = fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, plan.shard.String(), res.err)
+			// A transient failure must not repeatedly cancel slower successful
+			// siblings before they reach the cache. Stop submitting new work,
+			// but join the already bounded in-flight imports before restarting.
+			if !isArchiveCatchUpRetryError(res.err) {
+				cancel()
 			}
+			firstErr = fmt.Errorf("preload shard archive #%d %s: %w", masterchainSeqno, plan.shard.String(), res.err)
 			break
 		}
 
 		if err := validateArchiveImportCoversPlan(res.imported, plan); err != nil {
+			r.importCache.drop(res.imported.cacheKey)
 			if r.rejectArchiveImportPeer(plan.shard, res.peer, res.archiveID, p2p.ArchivePeerRejectImportIncomplete, err) {
 				retries[res.idx]++
 				if retries[res.idx] <= archiveImportPeerRetries {
-					if err := submit(res.idx); err != nil {
-						cancel()
-						firstErr = err
-					}
+					submit(res.idx)
 					continue
 				}
 			} else if ctx.Err() == nil && retries[res.idx] < archiveImportPeerRetries {
 				retries[res.idx]++
-				if err := submit(res.idx); err != nil {
-					cancel()
-					firstErr = err
-				}
+				submit(res.idx)
 				continue
 			}
 			cancel()

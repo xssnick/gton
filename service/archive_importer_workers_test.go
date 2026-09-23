@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/p2p"
+	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/tonutils-go/ton"
 )
 
 func newTestArchiveSession(t *testing.T) *p2p.ArchiveSession {
@@ -278,7 +282,7 @@ func TestDownloadAndImportShardArchivesLimitsSubmittedImports(t *testing.T) {
 		downloadHot:      make(chan archiveDownloadJob, len(plans)),
 		downloadPrefetch: make(chan archiveDownloadJob, len(plans)),
 	}
-	runner := &archiveCatchUpRun{}
+	runner := &archiveCatchUpRun{archive: &ArchiveRunner{}, importCache: newArchiveImportCache()}
 	done := make(chan error, 1)
 	go func() {
 		imports, err := runner.downloadAndImportShardArchives(context.Background(), queue, 100, plans, 0, archiveImportPriorityPrefetch)
@@ -299,15 +303,15 @@ func TestDownloadAndImportShardArchivesLimitsSubmittedImports(t *testing.T) {
 	default:
 	}
 
-	jobs[0].done <- archiveImportQueueResult{imported: &archiveImportResult{}}
+	jobs[0].done <- archiveImportQueueResult{imported: &archiveImportResult{stats: &archive.ImportStats{}}}
 	jobs = append(jobs, receiveArchiveDownloadJob(t, queue.downloadPrefetch))
 
 	for _, job := range jobs[1:] {
-		job.done <- archiveImportQueueResult{imported: &archiveImportResult{}}
+		job.done <- archiveImportQueueResult{imported: &archiveImportResult{stats: &archive.ImportStats{}}}
 	}
 	for len(jobs) < len(plans) {
 		job := receiveArchiveDownloadJob(t, queue.downloadPrefetch)
-		job.done <- archiveImportQueueResult{imported: &archiveImportResult{}}
+		job.done <- archiveImportQueueResult{imported: &archiveImportResult{stats: &archive.ImportStats{}}}
 		jobs = append(jobs, job)
 	}
 
@@ -331,7 +335,7 @@ func TestDownloadAndImportShardArchivesRetriesFailedShardWithoutCancelingWindow(
 		downloadPrefetch: make(chan archiveDownloadJob, len(plans)+1),
 	}
 
-	runner := &archiveCatchUpRun{}
+	runner := &archiveCatchUpRun{archive: &ArchiveRunner{}, importCache: newArchiveImportCache()}
 	done := make(chan error, 1)
 	go func() {
 		_, err := runner.downloadAndImportShardArchives(context.Background(), queue, 100, plans, 0, archiveImportPriorityPrefetch)
@@ -347,8 +351,8 @@ func TestDownloadAndImportShardArchivesRetriesFailedShardWithoutCancelingWindow(
 		t.Fatalf("retried shard = %s, want %s", retry.shard.String(), first.shard.String())
 	}
 
-	second.done <- archiveImportQueueResult{imported: &archiveImportResult{}}
-	retry.done <- archiveImportQueueResult{imported: &archiveImportResult{}}
+	second.done <- archiveImportQueueResult{imported: &archiveImportResult{stats: &archive.ImportStats{}}}
+	retry.done <- archiveImportQueueResult{imported: &archiveImportResult{stats: &archive.ImportStats{}}}
 
 	select {
 	case err := <-done:
@@ -357,6 +361,160 @@ func TestDownloadAndImportShardArchivesRetriesFailedShardWithoutCancelingWindow(
 		}
 	case <-time.After(time.Second):
 		t.Fatal("downloadAndImportShardArchives did not finish")
+	}
+}
+
+func TestShardArchiveImportsSurviveWindowRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var workers sync.WaitGroup
+	defer func() {
+		cancel()
+		workers.Wait()
+	}()
+	plans := make([]archiveShardImportPlan, archiveShardArchiveImportInFlight+1)
+	for i := range plans {
+		plans[i].shard = archive.ShardID{Workchain: 0, Shard: int64(i*2+1) << 56}
+	}
+	queue := &archiveImportQueue{downloadHot: make(chan archiveDownloadJob, len(plans))}
+	runner := &archiveCatchUpRun{archive: &ArchiveRunner{}, importCache: newArchiveImportCache()}
+	done := make(chan error, 1)
+	start := func() {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			_, err := runner.downloadAndImportShardArchives(ctx, queue, 7301281, plans, 4, archiveImportPriorityHot)
+			done <- err
+		}()
+	}
+	start()
+	jobs := make([]archiveDownloadJob, 0, archiveShardArchiveImportInFlight)
+	for range archiveShardArchiveImportInFlight {
+		jobs = append(jobs, receiveArchiveDownloadJob(t, queue.downloadHot))
+	}
+	for _, job := range jobs {
+		job.done <- archiveImportQueueResult{imported: &archiveImportResult{stats: &archive.ImportStats{}}}
+	}
+	missing := plans[len(plans)-1].shard
+	for range archiveImportPeerRetries + 1 {
+		job := receiveArchiveDownloadJob(t, queue.downloadHot)
+		if job.shard != missing {
+			t.Fatalf("retry shard = %s, want %s", job.shard.String(), missing.String())
+		}
+		job.done <- archiveImportQueueResult{err: p2p.ErrNoArchivePeers}
+	}
+	if err := <-done; !errors.Is(err, p2p.ErrNoArchivePeers) {
+		t.Fatalf("first window error = %v, want no archive peers", err)
+	}
+
+	start()
+	job := receiveArchiveDownloadJob(t, queue.downloadHot)
+	if job.shard != missing {
+		t.Fatalf("window restart downloads completed shard %s again, want only missing %s", job.shard.String(), missing.String())
+	}
+	job.done <- archiveImportQueueResult{imported: &archiveImportResult{stats: &archive.ImportStats{}}}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("window did not complete after the missing shard arrived")
+	}
+	if entries, _ := runner.importCache.stats(); entries != len(plans) {
+		t.Fatalf("retained imports = %d, want %d", entries, len(plans))
+	}
+}
+
+func TestShardArchiveRetryLetsSlowSiblingFinish(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		plans := []archiveShardImportPlan{
+			{shard: archive.ShardID{Workchain: 0, Shard: 1 << 60}},
+			{shard: archive.ShardID{Workchain: 0, Shard: 3 << 60}},
+		}
+		queue := &archiveImportQueue{downloadHot: make(chan archiveDownloadJob, len(plans))}
+		runner := &archiveCatchUpRun{archive: &ArchiveRunner{}, importCache: newArchiveImportCache()}
+		done := make(chan error, 1)
+		go func() {
+			_, err := runner.downloadAndImportShardArchives(ctx, queue, 100, plans, 0, archiveImportPriorityHot)
+			done <- err
+		}()
+		failed := receiveArchiveDownloadJob(t, queue.downloadHot)
+		slow := receiveArchiveDownloadJob(t, queue.downloadHot)
+		for attempt := 0; attempt <= archiveImportPeerRetries; attempt++ {
+			failed.done <- archiveImportQueueResult{err: p2p.ErrNoArchivePeers}
+			if attempt < archiveImportPeerRetries {
+				failed = receiveArchiveDownloadJob(t, queue.downloadHot)
+			}
+		}
+		synctest.Wait()
+		if err := slow.ctx.Err(); err != nil {
+			t.Fatalf("unavailable shard canceled a slow sibling before import: %v", err)
+		}
+		slow.done <- archiveImportQueueResult{imported: &archiveImportResult{stats: &archive.ImportStats{}}}
+		if err := <-done; !errors.Is(err, p2p.ErrNoArchivePeers) {
+			t.Fatalf("window error = %v, want no archive peers", err)
+		}
+		if entries, _ := runner.importCache.stats(); entries != 1 {
+			t.Fatalf("retained slow imports = %d, want 1", entries)
+		}
+	})
+}
+
+func TestShardArchiveImportCancellationJoinsWorkers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		plans := []archiveShardImportPlan{{shard: archive.ShardID{Workchain: 0, Shard: topShard}}}
+		queue := &archiveImportQueue{downloadHot: make(chan archiveDownloadJob, 1)}
+		runner := &archiveCatchUpRun{archive: &ArchiveRunner{}, importCache: newArchiveImportCache()}
+		done := make(chan error, 1)
+		go func() {
+			_, err := runner.downloadAndImportShardArchives(ctx, queue, 100, plans, 0, archiveImportPriorityHot)
+			done <- err
+		}()
+		receiveArchiveDownloadJob(t, queue.downloadHot)
+		cancel()
+		synctest.Wait()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled import error = %v", err)
+		}
+		if len(runner.importCache.waiters) != 0 {
+			t.Fatal("canceled import retained active cache loaders")
+		}
+	})
+}
+
+func TestShardArchiveImportRetriesIncompleteCachedResult(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	block := testArchiveImportCacheBlock(42, 0x41, 0x42)
+	block.Workchain = 0
+	shard := archive.ShardID{Workchain: block.Workchain, Shard: block.Shard}
+	plan := archiveShardImportPlan{shard: shard, needed: []ton.BlockIDExt{block}}
+	cache := newArchiveImportCache()
+	key := archiveImportCacheKey{masterchainSeqno: 100, shard: shard}
+	cache.entries[key] = &archiveImportResult{stats: &archive.ImportStats{Peer: "gone-peer"}}
+	runner := &archiveCatchUpRun{archive: &ArchiveRunner{}, importCache: cache, archiveSession: newTestArchiveSession(t)}
+	queue := &archiveImportQueue{downloadHot: make(chan archiveDownloadJob, 1)}
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.downloadAndImportShardArchives(ctx, queue, 100, []archiveShardImportPlan{plan}, 0, archiveImportPriorityHot)
+		done <- err
+	}()
+	job := receiveArchiveDownloadJob(t, queue.downloadHot)
+	job.done <- archiveImportQueueResult{imported: &archiveImportResult{
+		stats: &archive.ImportStats{},
+		blocks: map[storage.BlockRootHash]PreparedBlock{
+			storage.BlockKey(block): {ID: block, Meta: &storage.BlockMeta{ID: block}},
+		},
+	}}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cache.entries[key].blocks[storage.BlockKey(block)]; !ok {
+		t.Fatal("incomplete cached import was not replaced with the complete archive")
 	}
 }
 

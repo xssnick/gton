@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -478,6 +479,10 @@ func TestCustomQuerySelectionReadinessCooldownAndScope(t *testing.T) {
 	if historical != first {
 		t.Fatalf("historical overlay = %q, want custom %q", historical.spec.Name, first.spec.Name)
 	}
+	archiveSub, err := node.querySubscriptionForArchive(archive.ShardID{Workchain: 0, Shard: 0x2800000000000000})
+	if err != nil || archiveSub != first {
+		t.Fatalf("archive overlay = %p, error = %v, want custom %p", archiveSub, err, first)
+	}
 
 	candidates := first.queryCandidates(0, 0)
 	if len(candidates) != 1 || candidates[0] != firstPeer {
@@ -501,6 +506,10 @@ func TestCustomQuerySelectionReadinessCooldownAndScope(t *testing.T) {
 	}
 	if selected != second || selected.queryCandidates(0, 0)[0] != secondPeer {
 		t.Fatalf("selected overlay after cooldown = %q, want %q", selected.spec.Name, second.spec.Name)
+	}
+	archiveSub, err = node.querySubscriptionForArchive(archive.ShardID{Workchain: 0, Shard: 0x2800000000000000})
+	if err != nil || archiveSub != second {
+		t.Fatalf("archive overlay after cooldown = %p, error = %v, want custom %p", archiveSub, err, second)
 	}
 }
 
@@ -552,24 +561,28 @@ func TestHistoricalQuerySelectionSkipsFastSync(t *testing.T) {
 			selected.spec.Name,
 		)
 	}
+	archiveSub, err := node.querySubscriptionForArchive(archive.ShardID{Workchain: 0, Shard: shard})
+	if err != nil || archiveSub == fastSync || archiveSub.spec.Shard != topShard {
+		t.Fatalf("archive overlay = %p, error = %v, want public root", archiveSub, err)
+	}
 }
 
 func TestPublicQueryCandidatesUseOneHourAliveRandomFallback(t *testing.T) {
 	now := time.Now()
 	retained := testReadyQueryPeer("retained-public-fallback")
-	retained.announced = &overlay.Node{Version: int32(now.Add(-30 * time.Minute).Unix())}
+	retained.announced = &overlay.NodeV2{Version: int32(now.Add(-30 * time.Minute).Unix())}
 	retained.lastReceiveAt = now
 
 	expired := testReadyQueryPeer("expired-public-fallback")
-	expired.announced = &overlay.Node{Version: int32(now.Add(-publicRandomQueryFallbackTTL - time.Minute).Unix())}
+	expired.announced = &overlay.NodeV2{Version: int32(now.Add(-publicRandomQueryFallbackTTL - time.Minute).Unix())}
 	expired.lastReceiveAt = now
 
 	dead := testReadyQueryPeer("dead-public-fallback")
-	dead.announced = &overlay.Node{Version: int32(now.Add(-30 * time.Minute).Unix())}
+	dead.announced = &overlay.NodeV2{Version: int32(now.Add(-30 * time.Minute).Unix())}
 	dead.alive = false
 
 	pending := testReadyQueryPeer("pending-public-fallback")
-	pending.announced = &overlay.Node{Version: int32(now.Add(-30 * time.Minute).Unix())}
+	pending.announced = &overlay.NodeV2{Version: int32(now.Add(-30 * time.Minute).Unix())}
 	pending.pending = true
 
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -594,7 +607,7 @@ func TestPublicQueryCandidatesUseOneHourAliveRandomFallback(t *testing.T) {
 	}
 
 	fresh := testReadyQueryPeer("fresh-public-query")
-	fresh.announced = &overlay.Node{Version: int32(now.Unix())}
+	fresh.announced = &overlay.NodeV2{Version: int32(now.Unix())}
 	fresh.lastReceiveAt = now
 	sub.peers[fresh.id] = fresh
 
@@ -604,7 +617,7 @@ func TestPublicQueryCandidatesUseOneHourAliveRandomFallback(t *testing.T) {
 	}
 
 	otherRetained := testReadyQueryPeer("other-retained-public-fallback")
-	otherRetained.announced = &overlay.Node{Version: int32(now.Add(-45 * time.Minute).Unix())}
+	otherRetained.announced = &overlay.NodeV2{Version: int32(now.Add(-45 * time.Minute).Unix())}
 	otherRetained.lastReceiveAt = now
 	sub.peers[otherRetained.id] = otherRetained
 	delete(sub.peers, fresh.id)

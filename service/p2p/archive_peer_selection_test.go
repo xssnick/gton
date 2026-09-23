@@ -24,7 +24,7 @@ func testArchiveCandidate(label string) *overlayPeer {
 		id:        id,
 		addr:      label,
 		overlay:   adnlOverlay,
-		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		announced: &overlay.NodeV2{Version: int32(time.Now().Unix())},
 		alive:     true,
 		release:   func() {},
 	}
@@ -151,7 +151,7 @@ func newTestLeasedPooledPeer(label string) (*peerPool, *pooledPeer, *testOverlay
 	return pool, pooled, base
 }
 
-func mustNewTestOverlayPeer(tb testing.TB, sub *overlaySubscription, pooled *pooledPeer, announced *overlay.Node, fixedMember bool) *overlayPeer {
+func mustNewTestOverlayPeer(tb testing.TB, sub *overlaySubscription, pooled *pooledPeer, announced *overlay.NodeV2, fixedMember bool) *overlayPeer {
 	tb.Helper()
 	ensureTestBroadcastReceiver(tb, sub)
 
@@ -219,7 +219,7 @@ func TestArchiveScoutAddressLookupUsesArchiveTimeout(t *testing.T) {
 	if timeoutTooShort || timeoutTooLong {
 		t.Fatalf("archive address lookup timeout = %s, want about %s", got, archiveDHTAddressTimeout)
 	}
-	identity, err := sub.overlayNodeIdentity(*peerNode)
+	identity, err := sub.overlayNodeIdentity(overlayNodeFromV1(*peerNode))
 	if err != nil {
 		t.Fatalf("resolve peer identity: %v", err)
 	}
@@ -377,7 +377,7 @@ func TestArchivePoolKeepsOwnedPeerSeparateFromSameLivePeer(t *testing.T) {
 		spec:  overlaySpec{ShortID: []byte{0x01}, Kind: overlayKindPublicShard},
 		peers: map[PeerID]*overlayPeer{},
 	})
-	announced := &overlay.Node{Version: int32(time.Now().Unix())}
+	announced := &overlay.NodeV2{Version: int32(time.Now().Unix())}
 	archivePeer := mustNewTestOverlayPeer(t, sub, pooledPeer, announced, false)
 	livePeer := mustNewTestOverlayPeer(t, sub, pooledPeer, announced, false)
 	sub.peers[livePeer.id] = livePeer
@@ -408,7 +408,7 @@ func TestArchivePoolLeaseDoesNotEnterLivePeerAccounting(t *testing.T) {
 		spec:  overlaySpec{ShortID: []byte{0x01}, Kind: overlayKindPublicShard},
 		peers: map[PeerID]*overlayPeer{},
 	})
-	announced := &overlay.Node{Version: int32(time.Now().Unix())}
+	announced := &overlay.NodeV2{Version: int32(time.Now().Unix())}
 	archivePeer := mustNewTestOverlayPeer(t, sub, pooledPeer, announced, false)
 	pool := testArchivePool(t, sub)
 
@@ -440,7 +440,7 @@ func TestEnsureArchivePeersBoundsDHTDiscoveryWait(t *testing.T) {
 	livePeer := &overlayPeer{
 		id:        testPeerID("overlay-peer"),
 		addr:      "overlay-peer",
-		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		announced: &overlay.NodeV2{Version: int32(time.Now().Unix())},
 		alive:     true,
 	}
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -1216,7 +1216,7 @@ func TestArchivePoolKeepsValuablePeersUsableAfterAnnouncementExpires(t *testing.
 	for i := 0; i < valuablePeers; i++ {
 		peer := testArchiveOnlyPoolPeer(t, pool, fmt.Sprintf("stale-proven-%d", i))
 		pool.markSuccess(shard, peer)
-		peer.announced = &overlay.Node{Version: int32(time.Now().Add(-overlayPeerTTL - time.Second).Unix())}
+		peer.announced = &overlay.NodeV2{Version: int32(time.Now().Add(-overlayPeerTTL - time.Second).Unix())}
 		peer.alive = false
 	}
 
@@ -1571,9 +1571,9 @@ func TestArchiveQueryCandidatesUseAllAliveKnownPeers(t *testing.T) {
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
 		peers: map[PeerID]*overlayPeer{
-			testPeerID("peer-1"): {id: testPeerID("peer-1"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
-			testPeerID("peer-2"): {id: testPeerID("peer-2"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
-			testPeerID("peer-3"): {id: testPeerID("peer-3"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+			testPeerID("peer-1"): {id: testPeerID("peer-1"), overlay: overlayWrapper, announced: &overlay.NodeV2{Version: now}, alive: true},
+			testPeerID("peer-2"): {id: testPeerID("peer-2"), overlay: overlayWrapper, announced: &overlay.NodeV2{Version: now}, alive: true},
+			testPeerID("peer-3"): {id: testPeerID("peer-3"), overlay: overlayWrapper, announced: &overlay.NodeV2{Version: now}, alive: true},
 		},
 		neighbours: []PeerID{testPeerID("peer-1"), testPeerID("peer-2")},
 	})
@@ -1694,7 +1694,7 @@ func TestArchiveDownloadCandidatesDropMissingSelectedPeer(t *testing.T) {
 func TestArchiveQueryCandidatesKeepProvenArchivePeerAfterAnnouncementExpires(t *testing.T) {
 	now := int32(time.Now().Add(-overlayPeerTTL - time.Second).Unix())
 	peer := testArchiveCandidate("archive-retained")
-	peer.announced = &overlay.Node{Version: now}
+	peer.announced = &overlay.NodeV2{Version: now}
 	peer.alive = false
 	sub := testOverlaySubscription(&overlaySubscription{
 		log: discardLogger(),
@@ -1796,7 +1796,7 @@ func TestArchiveDownloadCandidatesKeepSelectedProvenPeerAfterAnnouncementExpires
 	shard := archive.ShardID{Workchain: -1, Shard: topShard}
 	now := int32(time.Now().Add(-overlayPeerTTL - time.Second).Unix())
 	selected := testArchiveCandidate("selected")
-	selected.announced = &overlay.Node{Version: now}
+	selected.announced = &overlay.NodeV2{Version: now}
 	selected.alive = false
 	fast := testArchiveCandidate("fast")
 	node := &Node{peerUse: map[PeerID]peerUse{}}
@@ -1835,8 +1835,8 @@ func TestArchiveQueryCandidatesUseKnownPeersWithoutNeighbours(t *testing.T) {
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
 		peers: map[PeerID]*overlayPeer{
-			testPeerID("peer-1"): {id: testPeerID("peer-1"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
-			testPeerID("peer-2"): {id: testPeerID("peer-2"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+			testPeerID("peer-1"): {id: testPeerID("peer-1"), overlay: overlayWrapper, announced: &overlay.NodeV2{Version: now}, alive: true},
+			testPeerID("peer-2"): {id: testPeerID("peer-2"), overlay: overlayWrapper, announced: &overlay.NodeV2{Version: now}, alive: true},
 		},
 	})
 	pool := testArchivePool(t, sub)
@@ -1860,8 +1860,8 @@ func TestArchiveQueryCandidatesSkipDeadKnownPeers(t *testing.T) {
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
 		peers: map[PeerID]*overlayPeer{
-			testPeerID("alive"): {id: testPeerID("alive"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
-			testPeerID("dead"):  {id: testPeerID("dead"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: false},
+			testPeerID("alive"): {id: testPeerID("alive"), overlay: overlayWrapper, announced: &overlay.NodeV2{Version: now}, alive: true},
+			testPeerID("dead"):  {id: testPeerID("dead"), overlay: overlayWrapper, announced: &overlay.NodeV2{Version: now}, alive: false},
 		},
 		neighbours: []PeerID{testPeerID("dead"), testPeerID("alive")},
 	})
@@ -2026,7 +2026,7 @@ func TestArchiveInfoDoesNotKeepDeadPeerActive(t *testing.T) {
 	peer := testArchiveOnlyPoolPeer(t, pool, "info-only-dead")
 
 	peer.statsMx.Lock()
-	peer.announced = &overlay.Node{Version: int32(time.Now().Add(-overlayPeerTTL - time.Second).Unix())}
+	peer.announced = &overlay.NodeV2{Version: int32(time.Now().Add(-overlayPeerTTL - time.Second).Unix())}
 	peer.alive = false
 	peer.statsMx.Unlock()
 
@@ -2155,7 +2155,7 @@ func TestArchivePeerZeroStateProbeRecordsAvailabilityOnly(t *testing.T) {
 		id:          testPeerID("zero-serving"),
 		addr:        "zero-serving",
 		overlay:     &overlay.ADNLOverlayWrapper{},
-		announced:   &overlay.Node{Version: int32(time.Now().Unix())},
+		announced:   &overlay.NodeV2{Version: int32(time.Now().Unix())},
 		alive:       true,
 		rldpOverlay: servingRLDP,
 		queryTransport: rldpPeerQueryTransport{
@@ -2179,7 +2179,7 @@ func TestArchivePeerZeroStateProbeRecordsAvailabilityOnly(t *testing.T) {
 		id:          testPeerID("zero-missing"),
 		addr:        "zero-missing",
 		overlay:     &overlay.ADNLOverlayWrapper{},
-		announced:   &overlay.Node{Version: int32(time.Now().Unix())},
+		announced:   &overlay.NodeV2{Version: int32(time.Now().Unix())},
 		alive:       true,
 		rldpOverlay: missingRLDP,
 		queryTransport: rldpPeerQueryTransport{

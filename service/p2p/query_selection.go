@@ -8,6 +8,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/xssnick/gton/service/archive"
 	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -34,7 +35,7 @@ func (n *Node) querySubscriptionForBlock(block ton.BlockIDExt) (*overlaySubscrip
 }
 
 // querySubscriptionForHistoricalBlock picks the overlay for bulk historical
-// downloads: archive packages, zero state and persistent state.
+// downloads of zero state and persistent state.
 //
 // FastSync is deliberately not a candidate here. Its pool holds exactly one
 // validator at a time, which disables everything the archive pool exists for -
@@ -55,6 +56,20 @@ func (n *Node) querySubscriptionForHistoricalBlock(block ton.BlockIDExt) (*overl
 		return nil, err
 	}
 	return n.subscriptionForOverlayBlock(historical)
+}
+
+func (n *Node) querySubscriptionForArchive(shard archive.ShardID) (*overlaySubscription, error) {
+	if err := sharddomain.Validate(shard.Shard); err != nil {
+		return nil, err
+	}
+	if selected := n.readyCustomQuerySubscription(time.Now()); selected != nil {
+		return selected, nil
+	}
+
+	// C++ serves getShardArchiveInfo by the shard prefix in the query, not
+	// the receiving overlay. Keep one public root pool per workchain so old
+	// splits do not move archive downloads into deserted historical overlays.
+	return n.subscriptionForOverlayBlock(ton.BlockIDExt{Workchain: shard.Workchain, Shard: topShard})
 }
 
 func (n *Node) readyCustomQuerySubscription(now time.Time) *overlaySubscription {

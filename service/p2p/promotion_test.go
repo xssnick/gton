@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/tonutils-go/adnl/overlay"
 )
 
 func testPromotionSubscription(t *testing.T, liveRows, directoryRows int) *overlaySubscription {
@@ -32,7 +31,7 @@ func testPromotionSubscription(t *testing.T, liveRows, directoryRows int) *overl
 		if err != nil {
 			t.Fatalf("generate key: %v", err)
 		}
-		node, err := overlay.NewNode(sub.spec.FullID, priv)
+		node, err := newTestOverlayNode(sub.spec.FullID, priv)
 		if err != nil {
 			t.Fatalf("build overlay node: %v", err)
 		}
@@ -73,7 +72,7 @@ func TestPromotionCandidatesFilterUnusableRows(t *testing.T) {
 	sub.rememberDirectoryPeerLocked(noAddr, testDirectoryPub(t), "", "", nil, time.Now(), directoryHearsay)
 	staleID := testPeerID("stale-node")
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
-	staleNode, _ := overlay.NewNode(sub.spec.FullID, priv)
+	staleNode, _ := newTestOverlayNode(sub.spec.FullID, priv)
 	staleNode.Version = int32(time.Now().Add(-2 * overlayPeerTTL).Unix())
 	sub.rememberDirectoryPeerLocked(staleID, testDirectoryPub(t), "10.3.0.1:30303", "", staleNode, time.Now(), directoryProven)
 	sub.mx.Unlock()

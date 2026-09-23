@@ -208,7 +208,7 @@ func (r *plumtreeRuntime) prepareOutboundBatch(
 }
 
 func (r *plumtreeRuntime) enqueueOutbounds(batch plumtreeWireBatch) {
-	if len(batch.sends) == 0 {
+	if len(batch.sends) == 0 || r.sub.chainBroadcastsPaused() {
 		return
 	}
 
@@ -226,6 +226,9 @@ func (r *plumtreeRuntime) sendOutboundBatch(
 	peerID PeerID,
 	wires [][]byte,
 ) {
+	if r.sub.chainBroadcastsPaused() {
+		return
+	}
 	path, err := r.sub.quicPeerPath(peerID)
 	if err != nil {
 		return
@@ -237,6 +240,9 @@ func (r *plumtreeRuntime) sendOutboundBatch(
 	peer, err := path.dialGated(ctx)
 	if err == nil {
 		for _, wire := range wires {
+			if r.sub.chainBroadcastsPaused() {
+				return
+			}
 			err = peer.SendOutboundMessage(ctx, wire)
 			if err != nil {
 				break

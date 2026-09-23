@@ -122,6 +122,7 @@ func (n *Node) newOverlaySubscriptionWithPrivate(
 	if spec.relaysSimpleBroadcasts() {
 		receiver.EnableBroadcastSimpleRelay(n.localID.Bytes(), overlaySimpleRelayPeerSet{sub: sub})
 	}
+	receiver.SetActive(!sub.chainBroadcastsPaused())
 	return sub, nil
 }
 

@@ -104,6 +104,7 @@ func (n *Node) start(ctx context.Context) (bool, error) {
 	n.zeroStateFileHash = append([]byte(nil), zeroBlock.FileHash...)
 	n.zeroStateBlock = zeroBlock
 	n.initBlock = initBlock
+	n.hardforks = hardforks
 	n.hardforkSet = hardforkSet
 	if len(hardforks) > 0 {
 		n.log.Info().

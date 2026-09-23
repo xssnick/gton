@@ -372,11 +372,11 @@ func TestArchiveDHTOfferDoesNotRefreshLiveAnnouncement(t *testing.T) {
 		},
 		peers: map[PeerID]*overlayPeer{},
 	})
-	identity, err := sub.overlayNodeIdentity(*advertised)
+	identity, err := sub.overlayNodeIdentity(overlayNodeFromV1(*advertised))
 	if err != nil {
 		t.Fatalf("resolve advertised identity: %v", err)
 	}
-	original := cloneOverlayNode(advertised)
+	original := cloneOverlayNode(new(overlayNodeFromV1(*advertised)))
 	original.Version--
 	live := &overlayPeer{
 		id:        identity.peerID,

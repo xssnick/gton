@@ -72,7 +72,7 @@ func (p *overlayPeer) isAliveKnownOverlayPeer(now time.Time) bool {
 	return !p.pending && p.announced != nil && announcedNodeIsFresh(p.announced, now) && p.alive
 }
 
-func (p *overlayPeer) advertisedNodeSnapshot(now time.Time) *overlay.Node {
+func (p *overlayPeer) advertisedNodeSnapshot(now time.Time) *overlay.NodeV2 {
 	return cloneOverlayNode(p.advertisedNodeRef(now))
 }
 
@@ -81,7 +81,7 @@ func (p *overlayPeer) advertisedNodeSnapshot(now time.Time) *overlay.Node {
 // returned node is safe to read after the lock is dropped - but it must not be
 // handed to a caller that mutates or retains it, hence the clone above for
 // everyone who does not clone the selection itself.
-func (p *overlayPeer) advertisedNodeRef(now time.Time) *overlay.Node {
+func (p *overlayPeer) advertisedNodeRef(now time.Time) *overlay.NodeV2 {
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
@@ -91,13 +91,20 @@ func (p *overlayPeer) advertisedNodeRef(now time.Time) *overlay.Node {
 	return p.announced
 }
 
-func (p *overlayPeer) mergeAnnouncement(v1 *overlay.Node) {
+func (p *overlayPeer) mergeAnnouncement(node *overlay.NodeV2) {
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
-	if v1 != nil && (p.announced == nil || v1.Version >= p.announced.Version) {
-		p.announced = cloneOverlayNode(v1)
+	if node != nil && (p.announced == nil || node.Version >= p.announced.Version) {
+		p.announced = cloneOverlayNode(node)
 	}
+}
+
+func (p *overlayPeer) receivesBroadcasts() bool {
+	p.statsMx.Lock()
+	defer p.statsMx.Unlock()
+
+	return p.announced == nil || p.announced.Flags&overlayMemberDoNotReceiveBroadcasts == 0
 }
 
 func (p *overlayPeer) statsSnapshot() peerStats {
@@ -317,7 +324,7 @@ func (p *overlayPeer) shouldStopQuerying() bool {
 	return p.unreliability > peerStopUnreliability
 }
 
-func announcedNodeIsFresh(node *overlay.Node, now time.Time) bool {
+func announcedNodeIsFresh(node *overlay.NodeV2, now time.Time) bool {
 	if node == nil {
 		return false
 	}
@@ -625,6 +632,8 @@ const weightedPeerDrawLimit = 32
 
 const broadcastTargetsTTL = 200 * time.Millisecond
 
+var noBroadcastTargets broadcastTargetsSnapshot
+
 type broadcastTargetsSnapshot struct {
 	generation uint64
 	builtAt    time.Time
@@ -646,6 +655,9 @@ type broadcastTargetsSnapshot struct {
 // known peers: alive ones when any exist, everything known otherwise. The
 // slices are cached and shared between callers and must not be modified.
 func (s *overlaySubscription) broadcastTargetsSnapshot() *broadcastTargetsSnapshot {
+	if s.chainBroadcastsPaused() {
+		return &noBroadcastTargets
+	}
 	generation := s.broadcastTargetsGen.Load()
 	if snap := s.broadcastTargets.Load(); snap != nil && snap.generation == generation && time.Since(snap.builtAt) < broadcastTargetsTTL {
 		return snap
@@ -711,6 +723,9 @@ func (s *overlaySubscription) buildBroadcastTargetsSnapshot() *broadcastTargetsS
 	// Kept in sync with the neighbour prefix as the fastSync filter drops peers.
 	neighbourTargets := 0
 	for i, peer := range peers {
+		if s.fastSync == nil && !peer.receivesBroadcasts() {
+			continue
+		}
 		if s.fastSync != nil &&
 			!s.fastSync.peerReceivesBroadcasts(peer.id) {
 			continue

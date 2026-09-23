@@ -215,7 +215,7 @@ func TestPersistentStateProbeAcquiresDownloadLease(t *testing.T) {
 			overlay:   rldpOverlay,
 			overlayID: []byte{0x01},
 		},
-		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		announced: &overlay.NodeV2{Version: int32(time.Now().Unix())},
 		alive:     true,
 	}
 	node := &Node{

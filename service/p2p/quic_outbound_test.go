@@ -294,11 +294,11 @@ func TestDHTAddressLookupSuppliesBothPeerRoutes(t *testing.T) {
 				return spec
 			},
 			connect: func(sub *overlaySubscription) (bool, error) {
-				node, nodeErr := overlay.NewNode(sub.spec.FullID, remoteKey)
+				node, nodeErr := newTestOverlayNode(sub.spec.FullID, remoteKey)
 				if nodeErr != nil {
 					return false, nodeErr
 				}
-				return sub.connectOverlayNodeV1(context.Background(), *node)
+				return sub.connectOverlayNode(context.Background(), *node)
 			},
 		},
 		{
@@ -692,11 +692,11 @@ func TestMalformedQUICRouteOnlyRejectsCustomQUICOverlay(t *testing.T) {
 				return spec
 			},
 			connect: func(sub *overlaySubscription) (bool, error) {
-				node, nodeErr := overlay.NewNode(sub.spec.FullID, remoteKey)
+				node, nodeErr := newTestOverlayNode(sub.spec.FullID, remoteKey)
 				if nodeErr != nil {
 					return false, nodeErr
 				}
-				return sub.connectOverlayNodeV1(context.Background(), *node)
+				return sub.connectOverlayNode(context.Background(), *node)
 			},
 		},
 		{

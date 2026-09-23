@@ -84,6 +84,7 @@ func (s *SyncCoordinator) catchUpCurrentState(ctx context.Context) error {
 				Msg("starting archive catch-up from zero state")
 
 			var err error
+			s.node.SetChainBroadcastsEnabled(false)
 			current, err = s.archive.CatchUp(ctx, current, archiveTarget)
 			if err != nil {
 				return err
@@ -102,7 +103,7 @@ func (s *SyncCoordinator) catchUpCurrentState(ctx context.Context) error {
 		masterUTime := blockStateUtime(ctx, s.storage, &current.Masterchain)
 		hasMasterLag := masterUTime != 0
 		lagSeconds := nowUnix - masterUTime
-		knownTarget, err := s.knownMasterchainTarget(current.Masterchain.Block.SeqNo)
+		knownTarget, err := s.masterchainCatchUpTarget(current.Masterchain.Block)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return err
 		}
@@ -123,6 +124,7 @@ func (s *SyncCoordinator) catchUpCurrentState(ctx context.Context) error {
 			}
 			event.Msg("switching from next-block pipeline to archive catch-up")
 
+			s.node.SetChainBroadcastsEnabled(false)
 			current, err = s.archive.CatchUp(ctx, current, archiveTarget)
 			if err != nil {
 				return err
@@ -190,10 +192,22 @@ func (s *SyncCoordinator) catchUpCurrentState(ctx context.Context) error {
 }
 
 func shouldPreferNextBlockTarget(currentSeqno, targetSeqno uint32) bool {
-	// A nearby verified head is stronger recovery evidence than wall-clock lag:
-	// a deliberately halted private network has old block times but no newer
-	// archive to download. Distant heads still take the archive path.
+	// A nearby verified head or configured immediate hardfork takes precedence
+	// over wall-clock lag: a halted chain has old block times but may have no
+	// newer archive to download. Distant heads still take the archive path.
 	return targetSeqno > currentSeqno && targetSeqno-currentSeqno <= nextMasterchainPrefetchBlocks
+}
+
+func (s *SyncCoordinator) masterchainCatchUpTarget(current ton.BlockIDExt) (ton.BlockIDExt, error) {
+	// A halted chain can have an old head but no newer archive. Fetch its
+	// configured immediate hardfork before selecting archive catch-up; this
+	// is a download target, not an observed or consensus-checked chain head.
+	hardfork, err := s.node.HardforkAfter(current)
+	if !errors.Is(err, storage.ErrNotFound) {
+		return hardfork, err
+	}
+
+	return s.knownMasterchainTarget(current.SeqNo)
 }
 
 func (s *SyncCoordinator) knownMasterchainTarget(currentSeqno uint32) (ton.BlockIDExt, error) {

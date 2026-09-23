@@ -190,12 +190,12 @@ func (s *overlaySubscription) exchangeRandomPeers(ctx context.Context, peer *ove
 	}
 
 	s.noteDirectoryActivity(peer.id, peer.addr)
-	s.learnAdvertisedNodes(ctx, res.List)
+	s.learnAdvertisedNodes(ctx, overlayNodesFromV1(res.List))
 }
 
 // learnAdvertisedNodes files the peers one exchange told us about, bounded the
 // way an honest answer is bounded.
-func (s *overlaySubscription) learnAdvertisedNodes(ctx context.Context, nodes []overlay.Node) {
+func (s *overlaySubscription) learnAdvertisedNodes(ctx context.Context, nodes []overlay.NodeV2) {
 	bounded := boundedAdvertisedNodes(nodes)
 	for i := range bounded {
 		if ctx.Err() != nil {
@@ -214,7 +214,7 @@ func (s *overlaySubscription) learnAdvertisedNodes(ctx context.Context, nodes []
 // A node we only heard about is filed as hearsay: if the directory is full of
 // rows that proved themselves, the write is refused rather than allowed to
 // displace one, and we do not spend a DHT lookup dialling it either.
-func (s *overlaySubscription) learnAdvertisedPeer(ctx context.Context, node overlay.Node) {
+func (s *overlaySubscription) learnAdvertisedPeer(ctx context.Context, node overlay.NodeV2) {
 	identity, err := s.overlayNodeIdentity(node)
 	if err != nil || identity.self {
 		return
@@ -242,7 +242,7 @@ func (s *overlaySubscription) learnAdvertisedPeer(ctx context.Context, node over
 	if !filed || !shortOfLive {
 		return
 	}
-	if _, err := s.connectOverlayNodeV1(ctx, node); err != nil {
+	if _, err := s.connectOverlayNode(ctx, node); err != nil {
 		s.log.Debug().Err(err).Msg("failed to connect peer learned from overlay")
 	}
 }

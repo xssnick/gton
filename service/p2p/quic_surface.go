@@ -327,13 +327,6 @@ func (n *Node) handleQUICQuery(
 		return nil, queryCtx.Err()
 	}
 
-	if repair, ok := req.(RepairPlumtreePart); ok {
-		if sub.plumtree == nil {
-			return nil, errPlumtreeDisabled
-		}
-		return sub.plumtree.HandleRepairQuery(queryCtx, peer.id, repair)
-	}
-
 	resp, err := sub.handlePeerQueryFrom(queryCtx, peer.id, peer.addr, req)
 	if err != nil {
 		if errors.Is(err, errOverlayInactive) {
@@ -387,6 +380,10 @@ func (n *Node) handleQUICMessage(
 			return nil
 		}
 		return sub.handlePrivateOverlayMessage(ctx, peer.id, tl.Raw(body))
+	}
+	// forgetPeer is overlay membership control, not a broadcast.
+	if sub.chainBroadcastsPaused() && !(len(body) == 4 && binary.LittleEndian.Uint32(body) == forgetPeerConstructorID) {
+		return nil
 	}
 	if constructor, isPlumtree := plumtreeBroadcastConstructor(body); isPlumtree {
 		if sub.plumtree == nil {

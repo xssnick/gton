@@ -23,7 +23,7 @@ func TestTwoStepSendOutcomeChargesOnlyGenuinePeerFaults(t *testing.T) {
 		peer := &overlayPeer{
 			id:        id,
 			overlay:   peerOverlay,
-			announced: &overlay.Node{Version: now},
+			announced: &overlay.NodeV2{Version: now},
 			alive:     true,
 		}
 

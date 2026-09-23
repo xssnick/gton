@@ -26,10 +26,10 @@ type overlayNodeIdentity struct {
 func (s *overlaySubscription) connectDHTOverlayNode(ctx context.Context, node overlay.Node) (bool, error) {
 	connectCtx, cancel := context.WithTimeout(ctx, dhtSeedPeerTimeout)
 	defer cancel()
-	return s.connectOverlayNodeV1(connectCtx, node)
+	return s.connectOverlayNode(connectCtx, overlayNodeFromV1(node))
 }
 
-func (s *overlaySubscription) connectOverlayNodeV1(ctx context.Context, node overlay.Node) (bool, error) {
+func (s *overlaySubscription) connectOverlayNode(ctx context.Context, node overlay.NodeV2) (bool, error) {
 	if !s.isActive() {
 		return false, errors.New("shard is inactive")
 	}
@@ -225,7 +225,7 @@ func peerQUICRouteFromAddresses(addresses []adnladdr.Address) (string, error) {
 	return endpoint.String(), nil
 }
 
-func (s *overlaySubscription) overlayNodeIdentity(node overlay.Node) (overlayNodeIdentity, error) {
+func (s *overlaySubscription) overlayNodeIdentity(node overlay.NodeV2) (overlayNodeIdentity, error) {
 	pub, ok := node.ID.(keys.PublicKeyED25519)
 	if !ok {
 		return overlayNodeIdentity{}, fmt.Errorf("unsupported overlay node key type %T", node.ID)
@@ -265,7 +265,7 @@ func (s *overlaySubscription) overlayNodeIdentity(node overlay.Node) (overlayNod
 	}, nil
 }
 
-func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *overlay.Node) bool {
+func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *overlay.NodeV2) bool {
 	if !s.acceptsPeerID(pooled.id) {
 		return false
 	}
@@ -344,7 +344,7 @@ func (s *overlaySubscription) attachPooledPeer(pooled *pooledPeer, announced *ov
 	return true
 }
 
-func (s *overlaySubscription) newOverlayPeer(pooled *pooledPeer, announced *overlay.Node, fixedMember bool) (*overlayPeer, error) {
+func (s *overlaySubscription) newOverlayPeer(pooled *pooledPeer, announced *overlay.NodeV2, fixedMember bool) (*overlayPeer, error) {
 	adnlOverlay, rldpOverlay, release, err := s.node.pool.acquireOverlay(pooled, s.broadcastReceiver, fixedMember)
 	if err != nil {
 		return nil, err

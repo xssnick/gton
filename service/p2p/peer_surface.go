@@ -296,7 +296,7 @@ func isTransientDHTStoreError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "no alive nodes found to store this key")
 }
 
-func cloneOverlayNode(node *overlay.Node) *overlay.Node {
+func cloneOverlayNode(node *overlay.NodeV2) *overlay.NodeV2 {
 	if node == nil {
 		return nil
 	}
@@ -305,6 +305,11 @@ func cloneOverlayNode(node *overlay.Node) *overlay.Node {
 	cloned.ID = cloneOverlayNodeID(node.ID)
 	cloned.Overlay = append([]byte(nil), node.Overlay...)
 	cloned.Signature = append([]byte(nil), node.Signature...)
+	if cert, ok := node.Certificate.(overlay.MemberCertificate); ok {
+		cert.IssuedBy = cloneOverlayNodeID(cert.IssuedBy)
+		cert.Signature = append([]byte(nil), cert.Signature...)
+		cloned.Certificate = cert
+	}
 	return &cloned
 }
 
@@ -319,7 +324,7 @@ func cloneOverlayNodeID(id any) any {
 	}
 }
 
-func overlayNodeHasSerializableID(node *overlay.Node) bool {
+func overlayNodeHasSerializableID(node *overlay.NodeV2) bool {
 	if node == nil {
 		return false
 	}

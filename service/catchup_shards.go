@@ -19,6 +19,20 @@ func (s *SyncCoordinator) downloadShardStateBlocks(ctx context.Context, start to
 	go func() {
 		defer close(downloads)
 
+		// A configured immediate hardfork pins the exact successor. Neither a
+		// local height index nor a peer's next-block answer may substitute a
+		// different branch. The regular prepare/apply stages still check the
+		// proof, previous block and state update before committing it.
+		immediateTarget := target.SeqNo > start.SeqNo && target.SeqNo-start.SeqNo == 1
+		if immediateTarget && s.node.IsHardfork(target) {
+			s.log.Info().
+				Str("current", storage.FormatBlockRef(start)).
+				Str("hardfork", storage.FormatBlockRef(target)).
+				Msg("downloading configured hardfork after current masterchain block")
+			s.downloadKnownChainBlocks(ctx, downloads, start, []ton.BlockIDExt{target}, SyncBlockSourcePeerCatchUp)
+			return
+		}
+
 		prev := start
 
 		for !prev.Equals(&target) {

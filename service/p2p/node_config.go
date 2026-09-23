@@ -65,6 +65,34 @@ func (n *Node) IsHardfork(block ton.BlockIDExt) bool {
 	return ok
 }
 
+// HardforkAfter returns the configured hardfork immediately after prev, not a
+// verified chain head. The returned block ID shares immutable config hashes.
+func (n *Node) HardforkAfter(prev ton.BlockIDExt) (ton.BlockIDExt, error) {
+	if prev.Workchain != -1 || prev.Shard != topShard {
+		return ton.BlockIDExt{}, storage2.ErrNotFound
+	}
+	if len(n.hardforks) == 0 {
+		return ton.BlockIDExt{}, storage2.ErrNotFound
+	}
+	// Active forks are ordered by seqno. This also prevents prev.SeqNo + 1
+	// from overflowing when prev is already at the maximum sequence number.
+	if n.hardforks[len(n.hardforks)-1].SeqNo <= prev.SeqNo {
+		return ton.BlockIDExt{}, storage2.ErrNotFound
+	}
+
+	nextSeqno := prev.SeqNo + 1
+	for _, hardfork := range n.hardforks {
+		if hardfork.SeqNo < nextSeqno {
+			continue
+		}
+		if hardfork.SeqNo == nextSeqno {
+			return hardfork, nil
+		}
+		break
+	}
+	return ton.BlockIDExt{}, storage2.ErrNotFound
+}
+
 func blockIDFromConfig(block liteclient.ConfigBlock) ton.BlockIDExt {
 	return ton.BlockIDExt{
 		Workchain: block.Workchain,

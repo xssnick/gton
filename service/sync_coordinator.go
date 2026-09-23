@@ -396,6 +396,9 @@ func blockUtimeFromMeta(ctx context.Context, store blockMetaStore, block *ton.Bl
 }
 
 func (s *SyncCoordinator) runInitialStateSync(ctx context.Context) {
+	if s.archiveFromZero {
+		s.node.SetChainBroadcastsEnabled(false)
+	}
 	s.node.SetRebroadcastQuiet(true)
 	quiet := true
 	defer func() {

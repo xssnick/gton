@@ -18,8 +18,6 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-const fastSyncDoNotReceiveBroadcasts = uint32(1)
-
 const fastSyncRandomPeersTimeout = 5 * time.Second
 
 // FastSyncState is the config and current shard set needed to reconcile
@@ -127,7 +125,7 @@ func fastSyncLocalMemberFlags(receiveBroadcasts bool) uint32 {
 	if receiveBroadcasts {
 		return 0
 	}
-	return fastSyncDoNotReceiveBroadcasts
+	return overlayMemberDoNotReceiveBroadcasts
 }
 
 func (r *fastSyncOverlayRuntime) matches(spec fastSyncOverlaySpec) bool {
@@ -183,7 +181,7 @@ func (r *fastSyncOverlayRuntime) declinesBroadcasts() bool {
 
 func (r *fastSyncOverlayRuntime) peerReceivesBroadcasts(id PeerID) bool {
 	flags, err := r.membership.PeerFlags(fastsync.ID(id))
-	return err == nil && flags&fastSyncDoNotReceiveBroadcasts == 0
+	return err == nil && flags&overlayMemberDoNotReceiveBroadcasts == 0
 }
 
 func (r *fastSyncOverlayRuntime) setValidatorAlive(
@@ -534,7 +532,7 @@ func (n *Node) buildFastSyncOverlaySpec(
 	}
 	permanentFlags := uint32(0)
 	if plumtreeEnabled || shard.Workchain != -1 {
-		permanentFlags = fastSyncDoNotReceiveBroadcasts
+		permanentFlags = overlayMemberDoNotReceiveBroadcasts
 	}
 
 	fastSyncSpec := fastSyncOverlaySpec{
@@ -848,31 +846,16 @@ func (s *overlaySubscription) exchangeFastSyncRandomPeers(
 			Msg("FastSync random peer exchange failed")
 		return
 	}
-	if len(response.Nodes) > fastsync.RandomPeerResultLimit {
-		s.log.Debug().
-			Int("nodes", len(response.Nodes)).
-			Int("maximum", fastsync.RandomPeerResultLimit).
-			Str("peer", peer.addr).
-			Msg("rejected oversized FastSync random peer response")
-		return
-	}
-
-	s.learnFastSyncNodes(response.Nodes, time.Now())
+	// A peer may configure nodes_to_send above our own reply size in cppnode.
+	s.learnFastSyncNodes(boundedAdvertisedNodes(response.Nodes), time.Now())
 }
 
 func (s *overlaySubscription) handleFastSyncRandomPeers(
 	query overlay.GetRandomPeersV2,
 ) (overlay.NodesV2, error) {
-	if len(query.Peers.Nodes) > fastsync.RandomPeerResultLimit {
-		return overlay.NodesV2{}, fmt.Errorf(
-			"FastSync random peer request contains %d nodes, maximum is %d",
-			len(query.Peers.Nodes),
-			fastsync.RandomPeerResultLimit,
-		)
-	}
-
 	now := time.Now()
-	s.learnFastSyncNodes(query.Peers.Nodes, now)
+	// nodes_to_send limits our answer, not the incoming request in cppnode.
+	s.learnFastSyncNodes(boundedAdvertisedNodes(query.Peers.Nodes), now)
 	return s.fastSync.peers.RandomPeers(now, rand.Uint64())
 }
 

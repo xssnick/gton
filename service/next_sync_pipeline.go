@@ -293,6 +293,7 @@ func (s *SyncCoordinator) runNextSync(ctx context.Context, current *storage.Curr
 		return current, 0, nil
 	}
 	s.rememberMasterState(ctx, master, nil)
+	s.node.SetChainBroadcastsEnabled(true)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

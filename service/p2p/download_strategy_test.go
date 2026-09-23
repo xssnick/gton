@@ -449,8 +449,8 @@ func TestLiveNextPeerScoreKeepsSlowPeerBehindHealthy(t *testing.T) {
 
 func TestLiveNextPeerScoreBeatsGenericStickyPeer(t *testing.T) {
 	now := int32(time.Now().Unix())
-	sticky := &overlayPeer{id: testPeerID("sticky"), addr: "sticky", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
-	fast := &overlayPeer{id: testPeerID("fast"), addr: "fast", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
+	sticky := &overlayPeer{id: testPeerID("sticky"), addr: "sticky", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.NodeV2{Version: now}}
+	fast := &overlayPeer{id: testPeerID("fast"), addr: "fast", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.NodeV2{Version: now}}
 	sub := testOverlaySubscription(&overlaySubscription{
 		log: discardLogger(),
 		peers: map[PeerID]*overlayPeer{
@@ -479,8 +479,8 @@ func TestLiveNextPeerScoreBeatsGenericStickyPeer(t *testing.T) {
 
 func TestLiveNextPreferredSourceBeatsStickyPeer(t *testing.T) {
 	now := int32(time.Now().Unix())
-	sticky := &overlayPeer{id: testPeerID("sticky"), addr: "sticky", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
-	preferred := &overlayPeer{id: testPeerID("preferred"), addr: "preferred", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.Node{Version: now}}
+	sticky := &overlayPeer{id: testPeerID("sticky"), addr: "sticky", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.NodeV2{Version: now}}
+	preferred := &overlayPeer{id: testPeerID("preferred"), addr: "preferred", alive: true, overlay: &overlay.ADNLOverlayWrapper{}, announced: &overlay.NodeV2{Version: now}}
 	sub := testOverlaySubscription(&overlaySubscription{
 		log: discardLogger(),
 		peers: map[PeerID]*overlayPeer{
@@ -702,9 +702,9 @@ func TestQueryCandidatesKeepNeighboursFirstButFallBackToOtherPeers(t *testing.T)
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
 		peers: map[PeerID]*overlayPeer{
-			testPeerID("peer-1"): {id: testPeerID("peer-1"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
-			testPeerID("peer-2"): {id: testPeerID("peer-2"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
-			testPeerID("peer-3"): {id: testPeerID("peer-3"), overlay: overlayWrapper, announced: &overlay.Node{Version: now}, alive: true},
+			testPeerID("peer-1"): {id: testPeerID("peer-1"), overlay: overlayWrapper, announced: &overlay.NodeV2{Version: now}, alive: true},
+			testPeerID("peer-2"): {id: testPeerID("peer-2"), overlay: overlayWrapper, announced: &overlay.NodeV2{Version: now}, alive: true},
+			testPeerID("peer-3"): {id: testPeerID("peer-3"), overlay: overlayWrapper, announced: &overlay.NodeV2{Version: now}, alive: true},
 		},
 		neighbours: []PeerID{testPeerID("peer-1"), testPeerID("peer-2")},
 	})
@@ -739,7 +739,7 @@ func TestHedgedQueryCandidatesReserveSlotsForFastPeers(t *testing.T) {
 		peers[id] = &overlayPeer{
 			id:           id,
 			overlay:      overlayWrapper,
-			announced:    &overlay.Node{Version: now},
+			announced:    &overlay.NodeV2{Version: now},
 			alive:        true,
 			roundtrip:    500 * time.Millisecond,
 			versionMajor: shardchainProtoVersionMajor,
@@ -750,7 +750,7 @@ func TestHedgedQueryCandidatesReserveSlotsForFastPeers(t *testing.T) {
 	peers[testPeerID("fast")] = &overlayPeer{
 		id:           testPeerID("fast"),
 		overlay:      overlayWrapper,
-		announced:    &overlay.Node{Version: now},
+		announced:    &overlay.NodeV2{Version: now},
 		alive:        true,
 		roundtrip:    10 * time.Millisecond,
 		versionMajor: shardchainProtoVersionMajor,
@@ -834,7 +834,7 @@ func TestAliveNeighbourPeersUseOnlyAliveNeighbours(t *testing.T) {
 			testPeerID("alive-neighbour"): {
 				id:            testPeerID("alive-neighbour"),
 				overlay:       overlayWrapper,
-				announced:     &overlay.Node{Version: now},
+				announced:     &overlay.NodeV2{Version: now},
 				alive:         true,
 				versionMajor:  masterchainProtoVersionMajor,
 				versionMinor:  masterchainProtoVersionMinor,
@@ -843,7 +843,7 @@ func TestAliveNeighbourPeersUseOnlyAliveNeighbours(t *testing.T) {
 			testPeerID("dead-neighbour"): {
 				id:            testPeerID("dead-neighbour"),
 				overlay:       overlayWrapper,
-				announced:     &overlay.Node{Version: now},
+				announced:     &overlay.NodeV2{Version: now},
 				alive:         false,
 				versionMajor:  masterchainProtoVersionMajor,
 				versionMinor:  masterchainProtoVersionMinor,
@@ -852,7 +852,7 @@ func TestAliveNeighbourPeersUseOnlyAliveNeighbours(t *testing.T) {
 			testPeerID("alive-non-neighbour"): {
 				id:            testPeerID("alive-non-neighbour"),
 				overlay:       overlayWrapper,
-				announced:     &overlay.Node{Version: now},
+				announced:     &overlay.NodeV2{Version: now},
 				alive:         true,
 				versionMajor:  masterchainProtoVersionMajor,
 				versionMinor:  masterchainProtoVersionMinor,

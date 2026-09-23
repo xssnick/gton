@@ -38,7 +38,7 @@ type archivePeerProbeResult struct {
 }
 
 type archivePeerOffer struct {
-	node     overlay.Node
+	node     overlay.NodeV2
 	hasNode  bool
 	identity overlayNodeIdentity
 	endpoint string
@@ -327,7 +327,8 @@ func (p *archivePeerPool) runScoutWorker() {
 	}
 }
 
-func (p *archivePeerPool) offerArchiveNode(node overlay.Node) archivePeerOfferStatus {
+func (p *archivePeerPool) offerArchiveNode(wire overlay.Node) archivePeerOfferStatus {
+	node := overlayNodeFromV1(wire)
 	if p.ctx.Err() != nil || !p.sub.isActive() {
 		return archivePeerOfferInvalid
 	}
@@ -357,7 +358,7 @@ func (p *archivePeerPool) offerArchiveLivePeer(peer *overlayPeer) archivePeerOff
 	}, peer.addr)
 }
 
-func (p *archivePeerPool) offerArchiveIdentity(node *overlay.Node, identity overlayNodeIdentity, endpoint string) archivePeerOfferStatus {
+func (p *archivePeerPool) offerArchiveIdentity(node *overlay.NodeV2, identity overlayNodeIdentity, endpoint string) archivePeerOfferStatus {
 	now := time.Now()
 	if p.scout.retry.peerBlocked(identity.peerID, now) {
 		return archivePeerOfferBackoff
@@ -586,7 +587,7 @@ func (p *archivePeerPool) scoutTransientArchivePeer(offer archivePeerOffer) {
 		return
 	}
 	endpoint = pooled.addr
-	var announced *overlay.Node
+	var announced *overlay.NodeV2
 	if offer.hasNode && !offer.valuable {
 		announced = &offer.node
 	}

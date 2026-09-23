@@ -209,9 +209,9 @@ func TestQueryCandidatesSkipClosedPeers(t *testing.T) {
 			ProtoVersionMinor: shardchainProtoVersionMinor,
 		},
 		peers: map[PeerID]*overlayPeer{
-			testPeerID("peer-1"): {id: testPeerID("peer-1"), overlay: openOverlay, announced: &overlay.Node{Version: now}, alive: true},
-			testPeerID("peer-2"): {id: testPeerID("peer-2"), overlay: closedOverlay, announced: &overlay.Node{Version: now}, alive: true},
-			testPeerID("peer-3"): {id: testPeerID("peer-3"), overlay: fallbackOverlay, announced: &overlay.Node{Version: now}, alive: true},
+			testPeerID("peer-1"): {id: testPeerID("peer-1"), overlay: openOverlay, announced: &overlay.NodeV2{Version: now}, alive: true},
+			testPeerID("peer-2"): {id: testPeerID("peer-2"), overlay: closedOverlay, announced: &overlay.NodeV2{Version: now}, alive: true},
+			testPeerID("peer-3"): {id: testPeerID("peer-3"), overlay: fallbackOverlay, announced: &overlay.NodeV2{Version: now}, alive: true},
 		},
 		neighbours: []PeerID{testPeerID("peer-1"), testPeerID("peer-2")},
 	})
@@ -235,7 +235,7 @@ func TestHandlePeerQueryFailureRemovesClosedPeer(t *testing.T) {
 	peer := &overlayPeer{
 		id:        testPeerID("peer-1"),
 		overlay:   peerOverlay,
-		announced: &overlay.Node{Version: now},
+		announced: &overlay.NodeV2{Version: now},
 		alive:     true,
 	}
 
@@ -506,7 +506,7 @@ func TestAttachPublicAdvertisedPeerWaitsForPromotion(t *testing.T) {
 		peers: map[PeerID]*overlayPeer{},
 	})
 	announcedPub := testPeerID("pending-public-key")
-	announced := &overlay.Node{
+	announced := &overlay.NodeV2{
 		ID:      keys.PublicKeyED25519{Key: ed25519.PublicKey(announcedPub[:])},
 		Overlay: shortID,
 		Version: int32(time.Now().Unix()),
@@ -576,7 +576,7 @@ func TestExistingPendingPublicPeerRediscoveryRetriesWarmup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build overlay short id: %v", err)
 	}
-	announced, err := overlay.NewNode(fullID, peerKey)
+	announced, err := newTestOverlayNode(fullID, peerKey)
 	if err != nil {
 		t.Fatalf("build announced overlay node: %v", err)
 	}
@@ -662,7 +662,7 @@ func TestExistingPendingPublicPeerRediscoveryRetriesWarmup(t *testing.T) {
 		t.Fatalf("failed warmup public peer counted as alive known: %d", got)
 	}
 
-	attached, err := sub.connectOverlayNodeV1(context.Background(), *announced)
+	attached, err := sub.connectOverlayNode(context.Background(), *announced)
 	if err != nil {
 		t.Fatalf("rediscover existing pending peer: %v", err)
 	}
@@ -675,7 +675,7 @@ func TestExistingPendingPublicPeerRediscoveryRetriesWarmup(t *testing.T) {
 		t.Fatal("rediscovered pending peer did not retry warmup")
 	}
 
-	attached, err = sub.connectOverlayNodeV1(context.Background(), *announced)
+	attached, err = sub.connectOverlayNode(context.Background(), *announced)
 	if err != nil {
 		t.Fatalf("rediscover pending peer while warmup runs: %v", err)
 	}
@@ -752,7 +752,7 @@ func TestDHTCandidateReplacesBadPeerAtFullLiveLimit(t *testing.T) {
 			pub:           remotePub,
 			route:         newTestPeerRoute(""),
 			overlay:       &overlay.ADNLOverlayWrapper{},
-			announced:     &overlay.Node{Version: int32(now.Unix())},
+			announced:     &overlay.NodeV2{Version: int32(now.Unix())},
 			alive:         true,
 			lastReceiveAt: now,
 			release:       func() {},
@@ -777,12 +777,12 @@ func TestDHTCandidateReplacesBadPeerAtFullLiveLimit(t *testing.T) {
 		sub.markDirectoryLiveLocked(id, true)
 	}
 
-	announced, err := overlay.NewNode(spec.FullID, remoteKey)
+	announced, err := newTestOverlayNode(spec.FullID, remoteKey)
 	if err != nil {
 		t.Fatalf("build candidate overlay node: %v", err)
 	}
 
-	attached, err := sub.connectDHTOverlayNode(context.Background(), *announced)
+	attached, err := sub.connectDHTOverlayNode(context.Background(), overlayNodesToV1([]overlay.NodeV2{*announced}).List[0])
 	if err != nil {
 		t.Fatalf("connect candidate without replacement: %v", err)
 	}
@@ -806,11 +806,11 @@ func TestDHTCandidateReplacesBadPeerAtFullLiveLimit(t *testing.T) {
 	victim.downloadSlowUntil = now.Add(time.Minute)
 	victim.statsMx.Unlock()
 
-	if send, replacement := sub.prepareDHTRefreshNode(*announced, 0); !send || !replacement {
+	if send, replacement := sub.prepareDHTRefreshNode(overlayNodesToV1([]overlay.NodeV2{*announced}).List[0], 0); !send || !replacement {
 		t.Fatalf("DHT candidate admission = send %v replacement %v, want true/true", send, replacement)
 	}
 
-	attached, err = sub.connectDHTOverlayNode(context.Background(), *announced)
+	attached, err = sub.connectDHTOverlayNode(context.Background(), overlayNodesToV1([]overlay.NodeV2{*announced}).List[0])
 	if err != nil {
 		t.Fatalf("connect DHT replacement: %v", err)
 	}
@@ -892,7 +892,7 @@ func TestPingPeersRunsPeerQueriesConcurrently(t *testing.T) {
 		sub.peers[id] = &overlayPeer{
 			id:            id,
 			overlay:       wrapper,
-			announced:     &overlay.Node{Version: now},
+			announced:     &overlay.NodeV2{Version: now},
 			alive:         true,
 			lastReceiveAt: time.Now(),
 		}
@@ -930,7 +930,7 @@ func TestStartPingPeersDoesNotBlockCaller(t *testing.T) {
 	sub.peers[id] = &overlayPeer{
 		id:            id,
 		overlay:       wrapper,
-		announced:     &overlay.Node{Version: int32(time.Now().Unix())},
+		announced:     &overlay.NodeV2{Version: int32(time.Now().Unix())},
 		alive:         true,
 		lastReceiveAt: time.Now(),
 	}

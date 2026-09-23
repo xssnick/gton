@@ -99,7 +99,7 @@ func (s *overlaySubscription) setActiveLocked(active bool, deleteAt time.Time) b
 		s.inactiveDeleteAt = time.Time{}
 		s.pendingInactive = false
 		s.pendingDeleteAt = time.Time{}
-		s.broadcastReceiver.SetActive(true)
+		s.broadcastReceiver.SetActive(!s.chainBroadcastsPaused())
 		return changed
 	}
 
@@ -148,7 +148,7 @@ func (s *overlaySubscription) beginArchiveUse() (func(), error) {
 		s.pendingDeleteAt = s.inactiveDeleteAt
 		s.inactive = false
 		s.inactiveDeleteAt = time.Time{}
-		s.broadcastReceiver.SetActive(true)
+		s.broadcastReceiver.SetActive(!s.chainBroadcastsPaused())
 	}
 	s.activityLeases++
 	s.mx.Unlock()
@@ -280,7 +280,7 @@ type overlayPeer struct {
 	route          *peerroute.Route
 	pub            ed25519.PublicKey
 	overlayID      []byte
-	announced      *overlay.Node
+	announced      *overlay.NodeV2
 	fixedMember    bool
 	overlay        *overlay.ADNLOverlayWrapper
 	rldp           *overlay.RLDPWrapper

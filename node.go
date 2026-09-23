@@ -655,6 +655,8 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 		}
 	}
 
+	// Archive bootstrap has no current validator set for live broadcasts yet.
+	node.SetChainBroadcastsEnabled(!archiveFromZero)
 	if err = node.Start(networkCtx); err != nil {
 		logger.Error().Err(err).Msg("failed to start p2p node")
 		return fmt.Errorf("start p2p node: %w", err)

@@ -670,6 +670,9 @@ func selectRebroadcastQueueTargets(candidates []*overlayPeer, tried map[PeerID]s
 }
 
 func (s *overlaySubscription) rebroadcastToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest) bool {
+	if s.chainBroadcastsPaused() {
+		return false
+	}
 	payloadLen := req.payloadLen()
 	if payloadLen == 0 || payloadLen > maxOverlayPayloadSize {
 		return false

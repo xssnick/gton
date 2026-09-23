@@ -101,5 +101,5 @@ func (s *overlaySubscription) exchangeRandomPeersEphemeral(ctx context.Context, 
 	}
 
 	s.noteDirectoryActivity(entry.id, entry.adnlAddr)
-	s.learnAdvertisedNodes(ctx, res.List)
+	s.learnAdvertisedNodes(ctx, overlayNodesFromV1(res.List))
 }

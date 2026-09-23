@@ -297,54 +297,54 @@ func TestFastSyncWarmupPromotesLearnedPeerBeforeExchange(t *testing.T) {
 	}
 }
 
-func TestFastSyncRandomPeersRejectsOversizedResponseBeforeLearning(t *testing.T) {
-	membership, peers, remoteID := newFastSyncLearnedPeerRuntime(t)
-	runtime := &fastSyncOverlayRuntime{
-		membership:     membership,
-		peers:          peers,
-		aliveRootIndex: make(map[PeerID]int),
-	}
-	before := peers.Counts()
+func TestFastSyncRandomPeersLearnsBoundedLargeResponse(t *testing.T) {
+	for _, size := range []int{5, maxAdvertisedPeersPerQuery + 1} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			now := time.Now()
+			overlayID := peerRuntimeTestOverlayID(0xe1)
+			membership, peers, issuerKey := peerRuntimeTestRootRuntime(t, overlayID, now)
+			remoteKey := peerRuntimeTestKey(0xe2)
+			remoteID := peerRuntimeTestPeerID(remoteKey.Public().(ed25519.PublicKey))
+			certificate := peerRuntimeTestCertificate(t, issuerKey, remoteID, 0, 0, int32(now.Add(time.Hour).Unix()))
+			remote := peerRuntimeTestNode(t, remoteKey, overlayID, 0, int32(now.Unix()), certificate)
 
-	peer := testReadyQueryPeer("fast-sync-oversized-random-peers")
-	peer.id = remoteID
-	adnlOverlay, adnlPeer := newTestOverlayWrapper()
-	t.Cleanup(adnlOverlay.Close)
-	peer.overlay = adnlOverlay
-	adnlPeer.queryResponder = func(
-		req tl.Serializable,
-		result tl.Serializable,
-	) error {
-		if _, ok := testFastSyncADNLQueryPayload(t, req).(overlay.GetRandomPeersV2); !ok {
-			return fmt.Errorf("unexpected ADNL overlay query %T", req)
-		}
+			peer := testReadyQueryPeer("fast-sync-large-random-peers")
+			peer.id = remoteID
+			adnlOverlay, adnlPeer := newTestOverlayWrapper()
+			t.Cleanup(adnlOverlay.Close)
+			peer.overlay = adnlOverlay
+			adnlPeer.queryResponder = func(req tl.Serializable, result tl.Serializable) error {
+				if _, ok := testFastSyncADNLQueryPayload(t, req).(overlay.GetRandomPeersV2); !ok {
+					return fmt.Errorf("unexpected ADNL overlay query %T", req)
+				}
+				nodes, ok := result.(*overlay.NodesV2)
+				if !ok {
+					return fmt.Errorf("random peers destination is %T", result)
+				}
+				nodes.Nodes = make([]overlay.NodeV2, size)
+				nodes.Nodes[size-1] = remote
+				return nil
+			}
+			sub := &overlaySubscription{
+				node:         &Node{},
+				spec:         overlaySpec{Kind: overlayKindFastSync},
+				log:          discardLogger(),
+				peers:        map[PeerID]*overlayPeer{remoteID: peer},
+				fastSync:     &fastSyncOverlayRuntime{membership: membership, peers: peers},
+				quicEnvelope: testFastSyncQueryEnvelope(t),
+			}
+			// Inspect synchronous enrollment without starting a DHT dial.
+			sub.advertisedPeerLearning.Store(true)
+			sub.exchangeFastSyncRandomPeers(t.Context(), peer)
 
-		nodes, ok := result.(*overlay.NodesV2)
-		if !ok {
-			return fmt.Errorf("random peers destination is %T", result)
-		}
-		nodes.Nodes = make(
-			[]overlay.NodeV2,
-			fastsync.RandomPeerResultLimit+1,
-		)
-		return nil
-	}
-	sub := &overlaySubscription{
-		node:         &Node{},
-		spec:         overlaySpec{Kind: overlayKindFastSync},
-		log:          discardLogger(),
-		peers:        map[PeerID]*overlayPeer{remoteID: peer},
-		fastSync:     runtime,
-		quicEnvelope: testFastSyncQueryEnvelope(t),
-	}
-
-	sub.exchangeFastSyncRandomPeers(context.Background(), peer)
-
-	if after := peers.Counts(); after != before {
-		t.Fatalf("oversized response changed peer runtime: before=%+v after=%+v", before, after)
-	}
-	if sub.advertisedPeerLearning.Load() {
-		t.Fatal("oversized response entered peer learning")
+			wantKnown := 1
+			if size > maxAdvertisedPeersPerQuery {
+				wantKnown = 0
+			}
+			if got := peers.Counts().Known; got != wantKnown {
+				t.Fatalf("learned %d peers, want %d", got, wantKnown)
+			}
+		})
 	}
 }
 

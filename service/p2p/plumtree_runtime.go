@@ -152,6 +152,9 @@ func (r *plumtreeRuntime) HandleMessage(
 	if !r.sub.isActive() {
 		return errOverlayInactive
 	}
+	if r.sub.chainBroadcastsPaused() {
+		return nil
+	}
 
 	result, err := r.processMessage(ctx, from, wire, body)
 	r.notifyAlarmChanged()
@@ -379,6 +382,9 @@ func (r *plumtreeRuntime) HandleRepairQuery(
 	if !r.sub.isActive() {
 		return nil, errOverlayInactive
 	}
+	if r.sub.chainBroadcastsPaused() {
+		return tl.Serialize(BroadcastNotFound{}, true)
+	}
 	r.stats.telemetry.noteMessageReceived(plumtreeMessageRepairQuery)
 	return r.engine.HandleRepairQuery(time.Now(), from, request)
 }
@@ -386,6 +392,9 @@ func (r *plumtreeRuntime) HandleRepairQuery(
 func (r *plumtreeRuntime) applyActions(
 	actions plumtreeActions,
 ) error {
+	if r.sub.chainBroadcastsPaused() {
+		return nil
+	}
 	r.enqueueOutbounds(r.prepareOutboundBatch(actions.Outbounds))
 	r.startVerifiedRepairs(actions.Candidates)
 	for _, delivery := range actions.Deliveries {
@@ -587,6 +596,9 @@ func (r *plumtreeRuntime) runRepair(
 	defer func() {
 		_ = r.engine.FinishRepair(action.ID)
 	}()
+	if r.sub.chainBroadcastsPaused() {
+		return nil
+	}
 
 	path, err := r.sub.quicPeerPath(action.To)
 	if err != nil {
@@ -615,6 +627,9 @@ func (r *plumtreeRuntime) runRepair(
 		return fmt.Errorf("query Plumtree repair: %w", err)
 	}
 
+	if r.sub.chainBroadcastsPaused() {
+		return nil
+	}
 	actions, err := r.processRepairAnswer(ctx, action, answer)
 	r.notifyAlarmChanged()
 	deliveryErr := r.applyActions(actions)
@@ -907,8 +922,11 @@ func (s *overlaySubscription) plumtreePinnedPeers() []PeerID {
 
 func (s *overlaySubscription) PlumtreePeerReceivesBroadcasts(peer PeerID) bool {
 	s.mx.Lock()
-	_, rosterPeer := s.peers[peer]
-	receives := !s.removed && !s.inactive && rosterPeer
+	row := s.peers[peer]
+	receives := !s.removed && !s.inactive && row != nil
+	if receives && s.fastSync == nil {
+		receives = row.receivesBroadcasts()
+	}
 	s.mx.Unlock()
 	if receives && s.fastSync != nil {
 		return s.fastSync.peerReceivesBroadcasts(peer)
@@ -923,8 +941,11 @@ func (s *overlaySubscription) PlumtreePeersReceiveBroadcasts(
 	s.mx.Lock()
 	alive := !s.removed && !s.inactive
 	for i, peer := range peers {
-		_, rosterPeer := s.peers[peer]
-		out[i] = alive && rosterPeer
+		row := s.peers[peer]
+		out[i] = alive && row != nil
+		if out[i] && s.fastSync == nil {
+			out[i] = row.receivesBroadcasts()
+		}
 	}
 	s.mx.Unlock()
 

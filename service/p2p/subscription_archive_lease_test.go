@@ -173,7 +173,7 @@ func TestArchiveUseLeaseKeepsEnsurePeersActive(t *testing.T) {
 	peerID := testPeerID("archive-lease-peer")
 	sub.peers[peerID] = &overlayPeer{
 		id:        peerID,
-		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		announced: &overlay.NodeV2{Version: int32(time.Now().Unix())},
 		overlay:   &overlay.ADNLOverlayWrapper{},
 		release:   func() {},
 		alive:     true,
