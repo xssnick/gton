@@ -107,7 +107,8 @@ func (s *SyncCoordinator) catchUpCurrentState(ctx context.Context) error {
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return err
 		}
-		preferNext := err == nil && shouldPreferNextBlockTarget(current.Masterchain.Block.SeqNo, knownTarget.SeqNo)
+		preferNext := err == nil && shouldPreferNextBlockTarget(current.Masterchain.Block.SeqNo, knownTarget.SeqNo) &&
+			(s.node.IsHardfork(knownTarget) || hasMasterLag && !shouldSwitchNextToArchiveByLag(lagSeconds))
 		if hasMasterLag && shouldSwitchNextToArchiveByLag(lagSeconds) && !preferNext && current.Masterchain.Block.SeqNo != ^uint32(0) {
 			archiveTarget := current.Masterchain.Block
 			archiveTarget.SeqNo = ^uint32(0)
@@ -192,9 +193,9 @@ func (s *SyncCoordinator) catchUpCurrentState(ctx context.Context) error {
 }
 
 func shouldPreferNextBlockTarget(currentSeqno, targetSeqno uint32) bool {
-	// A nearby verified head or configured immediate hardfork takes precedence
-	// over wall-clock lag: a halted chain has old block times but may have no
-	// newer archive to download. Distant heads still take the archive path.
+	// This only checks height. Callers must also check block time before
+	// preferring next-block sync: archive lookahead can observe a nearby
+	// historical block whose shard data is only available in the archive.
 	return targetSeqno > currentSeqno && targetSeqno-currentSeqno <= nextMasterchainPrefetchBlocks
 }
 

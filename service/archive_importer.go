@@ -329,7 +329,15 @@ func (r *archiveCatchUpRun) commitAcceptedArchiveWindow(window *shardClientArchi
 
 func (r *archiveCatchUpRun) shouldHandoffToNextBlock() bool {
 	latest, err := r.archive.network.ObservedMasterchainBlock()
-	return err == nil && shouldPreferNextBlockTarget(r.current.Masterchain.Block.SeqNo, latest.SeqNo)
+	if err != nil || !shouldPreferNextBlockTarget(r.current.Masterchain.Block.SeqNo, latest.SeqNo) {
+		return false
+	}
+	if r.archive.network.IsHardfork(latest) {
+		return true
+	}
+
+	blockUTime := blockStateUtime(r.ctx, r.archive.storage, &r.current.Masterchain)
+	return blockUTime != 0 && shouldSwitchArchiveToNextByLag(time.Now().Unix()-blockUTime)
 }
 
 func (r *archiveCatchUpRun) shutdown() error {

@@ -41,6 +41,7 @@ type ArchiveRunnerOptions struct {
 type ArchiveNetwork interface {
 	BeginArchiveSession() *p2p.ArchiveSession
 	ObservedMasterchainBlock() (ton.BlockIDExt, error)
+	IsHardfork(ton.BlockIDExt) bool
 }
 
 // ArchiveStore is the persisted read surface used by archive catch-up. Writes

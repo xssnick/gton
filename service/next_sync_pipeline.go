@@ -1482,7 +1482,7 @@ func (r *nextSyncRunner) shouldReturnAfterCommit() bool {
 	if err != nil {
 		latest = r.current.Masterchain.Block
 	}
-	if shouldPreferNextBlockTarget(r.current.Masterchain.Block.SeqNo, latest.SeqNo) {
+	if r.mode == nextSyncToTarget && r.service.node.IsHardfork(r.target) {
 		return false
 	}
 
