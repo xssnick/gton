@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -123,40 +121,4 @@ func closeStorage(logger zerolog.Logger, store io.Closer) {
 		return
 	}
 	logger.Info().Dur("elapsed", time.Since(started)).Msg("storage closed")
-}
-
-func startMetricsServer(ctx context.Context, logger zerolog.Logger, addr string, handler http.Handler) error {
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", handler)
-
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
-
-	server := &http.Server{
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Warn().Err(err).Str("metrics_addr", addr).Msg("failed to stop metrics server")
-		}
-	}()
-
-	go func() {
-		logger.Info().
-			Str("metrics_addr", addr).
-			Str("metrics_url", "http://"+addr+"/metrics").
-			Msg("started prometheus metrics server")
-		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
-			logger.Error().Err(err).Str("metrics_addr", addr).Msg("metrics server stopped")
-		}
-	}()
-
-	return nil
 }

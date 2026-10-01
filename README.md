@@ -63,7 +63,7 @@ After startup node will sync with the latest blockchain state. First it will dow
 The main binary is `./cmd/node`.
 
 ```bash
-./gton-node [flags]
+./gton-node [flags] [status [full|db]]
 ```
 
 Supported flags:
@@ -208,7 +208,18 @@ Non-final data is kept in memory only. It is not applied to persistent state or 
 
 ## Console Commands
 
-After startup, the process reads commands from stdin. This is useful for manual diagnostics and maintenance without a separate RPC control interface.
+After startup, the process reads commands from stdin for diagnostics and maintenance.
+
+To read the same status from another process, run the binary in the directory containing `config.json`:
+
+```bash
+./gton-node status
+./gton-node status full
+./gton-node status db
+./gton-node --config /path/to/config.json status full
+```
+
+Place flags before `status`. These commands read the existing config, request `/status` from the local metrics HTTP server, print its text, and exit. They do not open node storage or start another node. A disabled server, connection failure, timeout, or HTTP error produces a non-zero exit code and a message on stderr.
 
 | Command | Description                                                                                                                                   |
 | --- |-----------------------------------------------------------------------------------------------------------------------------------------------|
@@ -544,9 +555,9 @@ Each `nodes` entry has:
 
 When `true`, automatic persistent state serialization is disabled. Manual serialization through the `serialize` console command is still a separate service operation.
 
-## Metrics
+## Metrics and status
 
-To enable the Prometheus endpoint, add:
+New configs enable the metrics and status HTTP server on `127.0.0.1:9090` by default:
 
 ```json
 {
@@ -558,11 +569,16 @@ To enable the Prometheus endpoint, add:
 }
 ```
 
-Metrics are exposed at:
+The server exposes:
 
 ```text
 http://127.0.0.1:9090/metrics
+http://127.0.0.1:9090/status
+http://127.0.0.1:9090/status?mode=full
+http://127.0.0.1:9090/status?mode=db
 ```
+
+The status endpoints return the same plain text as the stdin commands `status`, `status full`, and `status db`, including while the node is syncing. Set `metrics.enabled` to `false` to disable both endpoints. Existing configs that explicitly disable metrics retain that setting; enable it to use the CLI status commands. An omitted `metrics` section now uses the enabled loopback default. The CLI uses loopback addresses, translating wildcard listeners to `127.0.0.1` or `::1`; bind a loopback or wildcard address to use it. If the HTTP listener is exposed beyond localhost, `/status` is accessible along with `/metrics`.
 
 The exported metrics cover liteserver latency, sync lag, block download/apply, checkpoint persistence, p2p queues, rebroadcasting, blocksync, and Pebble/cell DB status. The full metric list and PromQL examples are documented in [METRICS.md](METRICS.md). A Grafana dashboard is available in `metrics.json`.
 

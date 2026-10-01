@@ -531,29 +531,16 @@ func benchmarkJSONResponse() successEnvelope {
 	}
 }
 
-func BenchmarkJSONEncoders(b *testing.B) {
+func BenchmarkWriteJSON(b *testing.B) {
 	value := benchmarkJSONResponse()
+	server := &Server{}
+	w := &benchmarkResponseWriter{header: http.Header{}}
 
-	b.Run("encoding_json", func(b *testing.B) {
-		w := &benchmarkResponseWriter{header: http.Header{}}
-		b.ReportAllocs()
-		for b.Loop() {
-			w.Reset()
-			if err := json.NewEncoder(w).Encode(value); err != nil {
-				b.Fatal(err)
-			}
-		}
-	})
-
-	b.Run("go_json", func(b *testing.B) {
-		server := &Server{}
-		w := &benchmarkResponseWriter{header: http.Header{}}
-		b.ReportAllocs()
-		for b.Loop() {
-			w.Reset()
-			server.writeJSON(w, http.StatusOK, value)
-		}
-	})
+	b.ReportAllocs()
+	for b.Loop() {
+		w.Reset()
+		server.writeJSON(w, http.StatusOK, value)
+	}
 }
 
 func TestWriteJSONMatchesStandardLibrary(t *testing.T) {

@@ -3,15 +3,14 @@ module github.com/xssnick/gton
 go 1.26.0
 
 require (
-	github.com/cockroachdb/pebble/v2 v2.1.6
-	github.com/goccy/go-json v0.10.6
+	github.com/cockroachdb/pebble/v2 v2.1.7
 	github.com/natefinch/lumberjack v2.0.0+incompatible
 	github.com/pierrec/lz4/v4 v4.1.28
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2
 	github.com/rs/zerolog v1.35.1
-	github.com/xssnick/raptorq v1.5.2
-	github.com/xssnick/tonutils-go v1.18.1-0.20260923140344-8bceea19f691
+	github.com/xssnick/raptorq v1.6.0
+	github.com/xssnick/tonutils-go v1.18.1-0.20261001115605-60dbbadb3b59
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sys v0.48.0
 )
@@ -30,7 +29,7 @@ require (
 	github.com/cockroachdb/errors v1.13.0 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
 	github.com/cockroachdb/redact v1.1.8 // indirect
-	github.com/cockroachdb/swiss v0.0.0-20251224182025-b0f6560f979b // indirect
+	github.com/cockroachdb/swiss v0.0.0-20260820225851-333444432258 // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20250429170803-42689b6311bb // indirect
 	github.com/getsentry/sentry-go v0.46.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
@@ -48,7 +47,7 @@ require (
 	github.com/rogpeppe/go-internal v1.12.0 // indirect
 	github.com/xssnick/quic-go-ton v0.0.0-20260707110703-14f3237f97b9 // indirect
 	golang.org/x/exp v0.0.0-20260508232706-74f9aab9d74a // indirect
-	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect

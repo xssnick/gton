@@ -53,6 +53,7 @@ type cliCommands struct {
 	validatorControlPubkey bool
 	dhtDescriptor          bool
 	skipConfigCheck        bool
+	statusMode             string
 }
 
 type startupOptions struct {
@@ -89,7 +90,8 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	cfg, created, err := loadNodeConfig(
 		context.Background(),
 		startOpts.ConfigFile,
-		commands.lsPubkey || commands.adnlID || commands.consensusADNLID || commands.validatorControlPubkey || commands.dhtDescriptor,
+		commands.lsPubkey || commands.adnlID || commands.consensusADNLID || commands.validatorControlPubkey ||
+			commands.dhtDescriptor || commands.statusMode != "",
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -104,6 +106,13 @@ func Run(extensions ...hooks.ExtensionFactory) {
 		}
 	}
 
+	if commands.statusMode != "" {
+		if err = writeRemoteStatus(context.Background(), os.Stdout, cfg.Metrics, commands.statusMode); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if commands.lsPubkey {
 		if err = writeLiteServerPublicKey(os.Stdout, cfg, startOpts.ConfigFile); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -506,6 +515,10 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 
 	flags := flag.NewFlagSet("gton-node", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: gton-node [flags] [status [full|db]]")
+		flags.PrintDefaults()
+	}
 	configPath := flags.String("config", nodeconfig.DefaultPath, "path to node config JSON")
 	dataDirFlag := flags.String("data-dir", "", "override storage.dir from node config")
 	globalConfigFileFlag := flags.String("global-config-file", "", "override ton.global_config_path from node config")
@@ -551,7 +564,30 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 		dhtDescriptor:          *dhtDescriptorFlag,
 		skipConfigCheck:        *skipConfigCheckFlag,
 	}
-	if commands.version || commands.lsPubkey || commands.adnlID || commands.consensusADNLID || commands.validatorControlPubkey || commands.dhtDescriptor {
+	infoCommand := commands.version || commands.lsPubkey || commands.adnlID || commands.consensusADNLID ||
+		commands.validatorControlPubkey || commands.dhtDescriptor
+	if positional := flags.Args(); len(positional) != 0 {
+		if positional[0] != "status" {
+			return startupOptions{}, cliCommands{}, fmt.Errorf("unknown command %q", positional[0])
+		}
+		if infoCommand {
+			return startupOptions{}, cliCommands{}, errors.New("status cannot be combined with another command")
+		}
+		if len(positional) > 2 {
+			return startupOptions{}, cliCommands{}, errors.New("usage: gton-node [flags] status [full|db]")
+		}
+
+		commands.statusMode = "short"
+		if len(positional) == 2 {
+			switch positional[1] {
+			case "full", "db":
+				commands.statusMode = positional[1]
+			default:
+				return startupOptions{}, cliCommands{}, fmt.Errorf("unknown status mode %q; expected full or db", positional[1])
+			}
+		}
+	}
+	if infoCommand || commands.statusMode != "" {
 		return startOpts, commands, nil
 	}
 	if *archivePrefetchWindowsFlag < 0 {
@@ -592,9 +628,9 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 	return startOpts, commands, nil
 }
 
-func loadNodeConfig(ctx context.Context, path string, keyOnly bool) (nodeconfig.Config, bool, error) {
+func loadNodeConfig(ctx context.Context, path string, readOnly bool) (nodeconfig.Config, bool, error) {
 	path = resolveConfigPath(path)
-	if keyOnly {
+	if readOnly {
 		cfg, err := nodeconfig.Load(path)
 		if err != nil {
 			return nodeconfig.Config{}, false, fmt.Errorf("load config %s: %w", path, err)

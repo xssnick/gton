@@ -12,8 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	gojson "github.com/goccy/go-json"
 )
 
 const apiPrefix = "/api/v2/"
@@ -546,7 +544,7 @@ func (s *Server) writeAPIError(w http.ResponseWriter, err *apiError, started tim
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
 	w.WriteHeader(status)
-	if err := gojson.NewEncoder(w).Encode(value); err != nil {
+	if err := json.NewEncoder(w).Encode(value); err != nil {
 		s.log.Warn().Err(err).Msg("failed to write http api response")
 	}
 }

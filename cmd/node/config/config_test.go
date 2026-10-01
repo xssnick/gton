@@ -17,6 +17,20 @@ import (
 	"github.com/xssnick/gton/service"
 )
 
+func TestLoadPreservesExplicitMetricsDisable(t *testing.T) {
+	path := writeTestConfig(t, `{"metrics":{"enabled":false}}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Metrics.Enabled {
+		t.Fatal("explicit metrics disable was overridden")
+	}
+	if cfg.Metrics.ListenAddr != DefaultMetricsListen {
+		t.Fatalf("metrics listen address = %q", cfg.Metrics.ListenAddr)
+	}
+}
+
 func TestLoadDefaults(t *testing.T) {
 	path := writeTestConfig(t, `{}`)
 
@@ -75,10 +89,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Collator.Enabled {
 		t.Fatal("standalone collator should be disabled by default")
 	}
-	if cfg.Metrics.Enabled {
-		t.Fatal("metrics should be disabled by default")
+	if !cfg.Metrics.Enabled {
+		t.Fatal("metrics should be enabled by default")
 	}
-	if cfg.Metrics.ListenAddr != "" {
+	if cfg.Metrics.ListenAddr != DefaultMetricsListen {
 		t.Fatalf("unexpected metrics listen addr %q", cfg.Metrics.ListenAddr)
 	}
 	if cfg.Metrics.Namespace != DefaultMetricsNamespace {
@@ -1232,8 +1246,8 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.TON.SyncBackpressureWindows != DefaultSyncBackpressureWindows {
 		t.Fatalf("unexpected sync backpressure windows %d", cfg.TON.SyncBackpressureWindows)
 	}
-	if cfg.Metrics.Enabled {
-		t.Fatal("expected generated metrics to be disabled")
+	if !cfg.Metrics.Enabled || cfg.Metrics.ListenAddr != DefaultMetricsListen {
+		t.Fatalf("generated metrics = %+v, want enabled on %s", cfg.Metrics, DefaultMetricsListen)
 	}
 	if cfg.Metrics.Namespace != DefaultMetricsNamespace {
 		t.Fatalf("unexpected generated metrics namespace %q", cfg.Metrics.Namespace)

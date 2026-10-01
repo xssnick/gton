@@ -207,10 +207,6 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 	var syncObserver service.SyncObserver
 	if metricsOpts.Enabled {
 		runtimeMetrics = metrics.New(metricsOpts.Namespace)
-		if err = startMetricsServer(ctx, logger, metricsOpts.ListenAddr, runtimeMetrics.Handler()); err != nil {
-			logger.Error().Err(err).Str("metrics_addr", metricsOpts.ListenAddr).Msg("failed to start metrics server")
-			return fmt.Errorf("start metrics server %s: %w", metricsOpts.ListenAddr, err)
-		}
 		syncObserver = runtimeMetrics
 	}
 	syncBefore := runOpts.SyncBefore
@@ -573,6 +569,39 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 		store.SetArtifactMetricsObserver(runtimeMetrics)
 	}
 
+	var diagnosticsServer *metricsServer
+	closeMetricsServer := func(closeCtx context.Context) error {
+		if diagnosticsServer == nil {
+			return nil
+		}
+		if err := diagnosticsServer.Close(closeCtx); err != nil {
+			return fmt.Errorf("stop metrics and status server: %w", err)
+		}
+		diagnosticsServer = nil
+
+		return nil
+	}
+	defer func() {
+		if shutdownAbandoned {
+			return
+		}
+		cancelRun()
+		closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if closeErr := closeMetricsServer(closeCtx); closeErr != nil {
+			shutdownAbandoned = true
+			returnErr = errors.Join(returnErr, ErrShutdownIncomplete, closeErr)
+			logger.Error().Err(closeErr).Msg("metrics and status server cleanup is incomplete")
+		}
+	}()
+	if runtimeMetrics != nil {
+		handler := metricsHTTPHandler(logger, runtimeMetrics.Handler(), commandRegistry)
+		diagnosticsServer, err = startMetricsServer(ctx, logger, metricsOpts.ListenAddr, handler)
+		if err != nil {
+			return fmt.Errorf("start metrics server %s: %w", metricsOpts.ListenAddr, err)
+		}
+	}
+
 	var httpAPIServer *httpapi.Server
 	var liteserverServer *liteserver.Server
 	var consoleDone <-chan struct{}
@@ -670,6 +699,9 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 		cancelRun()
 		if consoleDone != nil {
 			<-consoleDone
+		}
+		if err := closeMetricsServer(shutdownCtx); err != nil {
+			return err
 		}
 		closeAPIServers()
 		coordinator.Wait()

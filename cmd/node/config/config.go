@@ -51,6 +51,7 @@ const (
 	DefaultHTTPAPIRequestTimeout            = 10 * time.Second
 	DefaultValidatorControlListen           = "127.0.0.1:3030"
 	DefaultMetricsNamespace                 = "gton"
+	DefaultMetricsListen                    = "127.0.0.1:9090"
 	defaultStorageDir                       = "data"
 	defaultADNLPort                         = 30303
 	defaultADNLListen                       = "0.0.0.0:30303"
@@ -361,7 +362,9 @@ func defaultConfig() Config {
 			ArtifactFileMaxOpen:              DefaultArtifactFileMaxOpen,
 		},
 		Metrics: Metrics{
-			Namespace: DefaultMetricsNamespace,
+			Enabled:    true,
+			ListenAddr: DefaultMetricsListen,
+			Namespace:  DefaultMetricsNamespace,
 		},
 		Validator: Validator{
 			Control: ValidatorControl{
