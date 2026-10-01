@@ -311,7 +311,8 @@ func BlockStateRootProof(root *cell.Cell) (*cell.Cell, error) {
 
 func OldMasterBlockStateProof(stateRoot *cell.Cell, id ton.BlockIDExt) (*cell.Cell, error) {
 	return CreateUsageProof(stateRoot, func(root *cell.Cell) error {
-		prefix, err := LoadMcStateExtraPrefix(root, false)
+		// C++ get_prev_blocks_dict unpacks the state header, including stats.
+		prefix, err := LoadMcStateExtraPrefix(root, true)
 		if err != nil {
 			return err
 		}

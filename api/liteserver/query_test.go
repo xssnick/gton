@@ -2935,6 +2935,80 @@ func TestLookupBlockWithProofBuildsShardLinks(t *testing.T) {
 	assertRefType(t, linkBody, 3, cell.OrdinaryCellType)
 }
 
+func TestLookupBlockWithProofIncludesMasterStateHeader(t *testing.T) {
+	target, targetRoot := testBlockForState(t, masterchainID, masterchainShard, 3, cell.BeginCell().EndCell())
+	clientState := testMasterStateWithOldBlocks(t, ton.BlockIDExt{
+		Workchain: masterchainID,
+		Shard:     masterchainShard,
+		SeqNo:     100,
+	}, []testOldMasterBlock{{id: target}})
+	libraries := cell.NewDict(256)
+	if err := libraries.SetIntKey(big.NewInt(1), cell.BeginCell().MustStoreRef(cell.BeginCell().EndCell()).EndCell()); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := tlb.ToCell(&tlb.ShardStateStats{
+		TotalBalance:       tlb.CurrencyCollection{Coins: tlb.ZeroCoins},
+		TotalValidatorFees: tlb.CurrencyCollection{Coins: tlb.ZeroCoins},
+		Libraries:          libraries,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientState, err = clientState.RebuildWithRefs([]*cell.Cell{
+		clientState.MustPeekRef(0), clientState.MustPeekRef(1), stats, clientState.MustPeekRef(3),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client, clientRoot := testBlockForState(t, masterchainID, masterchainShard, 100, clientState)
+	store := &fakeStore{
+		blocks: map[storage.BlockRootHash][]byte{
+			storage.BlockKey(target): testBlockBOC(targetRoot),
+			storage.BlockKey(client): testBlockBOC(clientRoot),
+		},
+		stateRoots: map[string]*cell.Cell{string(clientState.Hash(0)): clientState},
+		seqLookupByKey: map[fakeSeqLookupKey]ton.BlockIDExt{
+			fakeSeqKey(storage.BlockHistoryKey{Workchain: masterchainID, Shard: masterchainShard}, target.SeqNo): target,
+		},
+	}
+	srv := testServer(store)
+
+	resp := srv.handleQuery(context.Background(), ton.LookupBlockWithProof{
+		Mode:      1,
+		ID:        &ton.BlockInfoShort{Workchain: masterchainID, Shard: masterchainShard, Seqno: int32(target.SeqNo)},
+		MCBlockID: blockproof.CloneBlockID(client),
+	})
+	result, ok := resp.(ton.LookupBlockResult)
+	if !ok {
+		t.Fatalf("response type = %T, want ton.LookupBlockResult: %+v", resp, resp)
+	}
+
+	blockBody := mustUnwrapProof(t, result.ClientMCStateProof, client.RootHash)
+	update, err := blockBody.PeekRef(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provedState, err := update.PeekRef(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateBody := mustUnwrapProof(t, result.MCBlockProof, provedState.Hash(0))
+
+	// C++ get_prev_blocks_dict unpacks the shard-state header, including stats,
+	// before reading mc_state_extra. Direct history lookup misses this requirement.
+	if _, err = blockproof.LoadMcStateExtraPrefix(stateBody, true); err != nil {
+		t.Fatalf("unpack masterchain state header from lookup proof: %v", err)
+	}
+	old, err := blockproof.OldMasterBlockIDFromState(stateBody, target.SeqNo)
+	if err != nil {
+		t.Fatalf("read old masterchain block from lookup proof: %v", err)
+	}
+	if !blockproof.BlockIDEqual(old, target) {
+		t.Fatalf("proved block = %s, want %s", storage.FormatBlockRef(old), storage.FormatBlockRef(target))
+	}
+}
+
 func TestLookupBlockWithProofIncludesPrevHeaderForLTLookup(t *testing.T) {
 	prevState := cell.BeginCell().MustStoreUInt(0x65, 8).EndCell()
 	prev, prevRoot := testBlockForState(t, 0, masterchainShard, 20, prevState)
