@@ -30,6 +30,165 @@ func TestStoreCheckpointFlushDoesNotRememberMissingBlocks(t *testing.T) {
 	}
 }
 
+func TestStoreArtifactFlushDoesNotRememberBlocksBehindCurrentState(t *testing.T) {
+	live, _ := acceptedStateStore(t)
+	behind := testLiveBlockID(0, acceptedStateShardID(), acceptedStateAppliedSeqno-1, 0x37)
+	ahead := testLiveBlockID(0, acceptedStateShardID(), acceptedStateAppliedSeqno+1, 0x38)
+
+	live.MarkLiveBlockFlushed(behind)
+	if len(live.flushed) != 0 {
+		t.Fatalf("flush markers for a block behind the current state = %d, want 0", len(live.flushed))
+	}
+	// A block the current state has not reached keeps its marker: its publication
+	// can still arrive.
+	live.MarkLiveBlockFlushed(ahead)
+	if !live.flushed[storage.BlockKey(ahead)].artifact {
+		t.Fatal("the flush marker for a block ahead of the current state was not remembered")
+	}
+}
+
+func TestStoreMarkLiveBlocksFlushedTrimsBatch(t *testing.T) {
+	const pinned, flushed, retain = 200, 20, 2
+	live := New(noopBacking{}, Options{MasterBlockCache: 1, ShardBlockCache: retain})
+	root := cell.BeginCell().EndCell()
+	blocks := make([]ton.BlockIDExt, 0, pinned+flushed)
+
+	for i := range pinned + flushed {
+		block := testLiveBlockID(0, int64(1)<<62, uint32(i+1), byte(i+1))
+		key := storage.BlockKey(block)
+		live.blocks[key] = &liveBlock{id: block, root: root, stateFlushed: true}
+		live.shardOrder.pushBack(key)
+		blocks = append(blocks, block)
+	}
+
+	live.MarkLiveBlocksFlushed(blocks[pinned:])
+
+	if got := len(live.blocks); got != pinned+retain {
+		t.Fatalf("live blocks after batch flush = %d, want %d", got, pinned+retain)
+	}
+	if live.shardEvictable != retain {
+		t.Fatalf("evictable shard blocks = %d, want %d", live.shardEvictable, retain)
+	}
+	for _, block := range blocks[:pinned] {
+		if live.blocks[storage.BlockKey(block)] == nil {
+			t.Fatalf("unflushed block %d was evicted", block.SeqNo)
+		}
+	}
+	for _, block := range blocks[pinned : len(blocks)-retain] {
+		if live.blocks[storage.BlockKey(block)] != nil {
+			t.Fatalf("oldest flushed block %d was retained", block.SeqNo)
+		}
+	}
+	for _, block := range blocks[len(blocks)-retain:] {
+		if live.blocks[storage.BlockKey(block)] == nil {
+			t.Fatalf("newest flushed block %d was evicted", block.SeqNo)
+		}
+	}
+}
+
+func TestStoreLoadsZeroStateCurrentWithoutBlockData(t *testing.T) {
+	block := testLiveBlockID(-1, masterchainShard, 0, 0x21)
+	root := cell.BeginCell().MustStoreUInt(0x22, 8).EndCell()
+	state := storage.BlockState{
+		Block:         block,
+		StateRootHash: root.Hash(),
+		Cell:          root,
+	}
+	backing := zeroStateCurrentBacking{
+		current: &storage.CurrentState{Masterchain: state},
+		state:   state,
+	}
+
+	live := New(backing)
+
+	current, err := live.CurrentState(t.Context())
+	if err != nil {
+		t.Fatalf("load current state: %v", err)
+	}
+	if !current.Masterchain.Block.Equals(&block) {
+		t.Fatalf("current masterchain = %s, want %s", storage.FormatBlockRef(current.Masterchain.Block), storage.FormatBlockRef(block))
+	}
+	if _, err = live.BlockState(t.Context(), block); err != nil {
+		t.Fatalf("load zero-state block state: %v", err)
+	}
+	if _, err = live.BlockMeta(t.Context(), block); err != nil {
+		t.Fatalf("load zero-state block metadata: %v", err)
+	}
+	if _, err = live.BlockData(t.Context(), block); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("load zero-state block data error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestStorePublishesDownloadedZeroStatesWithoutBlockData(t *testing.T) {
+	masterBlock := testLiveBlockID(-1, masterchainShard, 0, 0x31)
+	masterRoot := cell.BeginCell().MustStoreUInt(0x32, 8).EndCell()
+	master := storage.BlockState{
+		Block:         masterBlock,
+		StateRootHash: masterRoot.Hash(),
+		Cell:          masterRoot,
+	}
+	shardBlock := testLiveBlockID(0, masterchainShard, 0, 0x33)
+	shardRoot := cell.BeginCell().MustStoreUInt(0x34, 8).EndCell()
+	shard := storage.BlockState{
+		Block:         shardBlock,
+		StateRootHash: shardRoot.Hash(),
+		Cell:          shardRoot,
+	}
+	backing := syncedZeroStateBacking{
+		states: map[storage.BlockRootHash]storage.BlockState{
+			storage.BlockKey(masterBlock): master,
+			storage.BlockKey(shardBlock):  shard,
+		},
+	}
+	live := New(backing)
+
+	currentSnapshot := &storage.CurrentState{
+		Masterchain: storage.BlockStateWithoutCells(&master),
+		Shards: map[storage.ShardKey]storage.BlockState{
+			storage.ShardKeyFromBlock(shardBlock): storage.BlockStateWithoutCells(&shard),
+		},
+	}
+	live.SetLiveCurrentStateSnapshot(currentSnapshot)
+	if _, err := live.CurrentState(t.Context()); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("unflushed current state error = %v, want ErrNotFound", err)
+	}
+	live.MarkLiveCurrentStateFlushed(currentSnapshot)
+
+	current, err := live.CurrentState(t.Context())
+	if err != nil {
+		t.Fatalf("published current state: %v", err)
+	}
+	if !current.Masterchain.Block.Equals(&masterBlock) || len(current.Shards) != 1 {
+		t.Fatalf("published current state = %+v", current)
+	}
+	for _, block := range []ton.BlockIDExt{masterBlock, shardBlock} {
+		state, err := live.BlockState(t.Context(), block)
+		if err != nil {
+			t.Fatalf("load published state %s: %v", storage.FormatBlockRef(block), err)
+		}
+		if state.Cell == nil {
+			t.Fatalf("published state %s did not load its durable cell tree", storage.FormatBlockRef(block))
+		}
+		if _, err = live.BlockData(t.Context(), block); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("load zerostate block data %s error = %v, want ErrNotFound", storage.FormatBlockRef(block), err)
+		}
+	}
+}
+
+type syncedZeroStateBacking struct {
+	noopBacking
+	states map[storage.BlockRootHash]storage.BlockState
+}
+
+func (b syncedZeroStateBacking) BlockState(_ context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
+	state, ok := b.states[storage.BlockKey(block)]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+
+	return storage.CloneBlockState(&state), nil
+}
+
 func TestStorePublishBlockWithStateMaintainsFinalIndexesAndEvictability(t *testing.T) {
 	block := testLiveBlockID(0, int64(1)<<62, 36, 0x36)
 	state := storage.BlockState{
@@ -354,6 +513,24 @@ func testLiveBlockID(workchain int32, shard int64, seqno uint32, fill byte) ton.
 }
 
 type noopBacking struct{}
+
+type zeroStateCurrentBacking struct {
+	noopBacking
+	current *storage.CurrentState
+	state   storage.BlockState
+}
+
+func (b zeroStateCurrentBacking) CurrentState(context.Context) (*storage.CurrentState, error) {
+	return storage.CloneCurrentState(b.current), nil
+}
+
+func (b zeroStateCurrentBacking) BlockState(_ context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
+	if !block.Equals(&b.state.Block) {
+		return nil, storage.ErrNotFound
+	}
+
+	return storage.CloneBlockState(&b.state), nil
+}
 
 func (noopBacking) BlockData(context.Context, ton.BlockIDExt) ([]byte, error) {
 	return nil, storage.ErrNotFound

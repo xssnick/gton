@@ -8,14 +8,13 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/xssnick/gton/service/hooks"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
 
 func TestShardBlockProofMasterchainShape(t *testing.T) {
-	master := proofTestBlock(masterchainWorkchain, masterchainShard, 11, 0x11)
+	master := proofTestBlock(masterchainWorkchain, 11, 0x11)
 	store := proofTestStore{
 		current: master,
 		seqLookup: map[storage.BlockSeqRef]ton.BlockIDExt{
@@ -58,9 +57,9 @@ func TestShardBlockProofMasterchainShape(t *testing.T) {
 }
 
 func TestShardBlockProofRejectsOldFromMasterchain(t *testing.T) {
-	from := proofTestBlock(masterchainWorkchain, masterchainShard, 9, 0x09)
-	master := proofTestBlock(masterchainWorkchain, masterchainShard, 10, 0x10)
-	shard := proofTestBlock(0, masterchainShard, 20, 0x20)
+	from := proofTestBlock(masterchainWorkchain, 9, 0x09)
+	master := proofTestBlock(masterchainWorkchain, 10, 0x10)
+	shard := proofTestBlock(0, 20, 0x20)
 	store := proofTestStore{
 		current: from,
 		seqLookup: map[storage.BlockSeqRef]ton.BlockIDExt{
@@ -92,7 +91,7 @@ func TestShardBlockProofRejectsOldFromMasterchain(t *testing.T) {
 }
 
 type proofTestStore struct {
-	hooks.Store
+	Store
 	current   ton.BlockIDExt
 	seqLookup map[storage.BlockSeqRef]ton.BlockIDExt
 	metas     map[storage.BlockRootHash]*storage.BlockMeta
@@ -118,10 +117,10 @@ func (s proofTestStore) BlockMeta(_ context.Context, block ton.BlockIDExt) (*sto
 	return meta, nil
 }
 
-func proofTestBlock(workchain int32, shard int64, seqno uint32, fill byte) ton.BlockIDExt {
+func proofTestBlock(workchain int32, seqno uint32, fill byte) ton.BlockIDExt {
 	return ton.BlockIDExt{
 		Workchain: workchain,
-		Shard:     shard,
+		Shard:     masterchainShard,
 		SeqNo:     seqno,
 		RootHash:  bytes.Repeat([]byte{fill}, 32),
 		FileHash:  bytes.Repeat([]byte{fill + 1}, 32),

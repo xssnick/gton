@@ -21,16 +21,17 @@ func BenchmarkStateSerializerLargeBOCCellCountHint(b *testing.B) {
 	b.Cleanup(func() { _ = store.Close() })
 
 	root, records := benchmarkStateSerializerTree(b, leaves)
-	if err = store.SaveCells(records); err != nil {
+	if err = saveActiveTestCells(store, records); err != nil {
 		b.Fatalf("save cells: %v", err)
 	}
 	rootHash := root.HashKey()
+	activeCells := activeTestCellGeneration(b, store)
 
 	for _, hint := range []uint64{0, uint64(len(records))} {
 		b.Run(fmt.Sprintf("hint=%d", hint), func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				loader := newLargeBOCStateLoader(context.Background(), store, 0)
+				loader := newLargeBOCStateLoader(context.Background(), activeCells)
 				if err := cell.ToLargeBOC(
 					io.Discard,
 					[]cell.Hash{rootHash},

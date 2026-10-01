@@ -39,7 +39,7 @@ func prepareStateCheckpoint(current *storage.CurrentState, entries []storage.Sta
 	}
 }
 
-func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells storage.StateCellRecords, cellPrewriteTarget uint64, artifactPrewriteTarget uint64) (*storage.CurrentState, []SyncPersistStageObservation, error) {
+func (s *StateLifecycle) saveStateCheckpoint(ctx context.Context, current *storage.CurrentState, entries []storage.StateCheckpointBlock, cells storage.StateCellRecords, cellPrewriteTarget uint64, artifactPrewriteTarget uint64) (*storage.CurrentState, []SyncPersistStageObservation, error) {
 	var stages []SyncPersistStageObservation
 
 	if cellPrewriteTarget > 0 {
@@ -51,7 +51,7 @@ func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.Curr
 		stages = appendSyncPersistStage(stages, "wait_cell_prewrite", time.Since(stageStarted))
 
 		stageStarted = time.Now()
-		if err := s.storage.FlushStateCells(ctx); err != nil {
+		if err := s.checkpointStore.FlushStateCells(ctx); err != nil {
 			stages = appendSyncPersistStage(stages, "flush_prewrite_cells", time.Since(stageStarted))
 			return nil, stages, err
 		}
@@ -69,7 +69,7 @@ func (s *Service) saveStateCheckpoint(ctx context.Context, current *storage.Curr
 		stages = appendSyncPersistStage(stages, "wait_artifact_prewrite", time.Since(stageStarted))
 	}
 
-	timing, err := s.storage.SaveStateCheckpointEntries(ctx, entries, cells, current)
+	timing, err := s.checkpointStore.SaveStateCheckpointEntries(ctx, entries, cells, current)
 	stages = appendStateCheckpointTimingStages(stages, timing)
 	if err != nil {
 		return nil, stages, err

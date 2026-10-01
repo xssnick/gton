@@ -19,7 +19,3 @@ func (c *lazyCellLoadCounters) snapshot() []storage.LazyCellLoadMetric {
 		{Layer: storage.LazyCellLoadLayerStateWindow, Count: c.stateWindow.Load()},
 	}
 }
-
-func (s *Service) LazyCellLoadMetrics() []storage.LazyCellLoadMetric {
-	return s.lazyCellLoads.snapshot()
-}

@@ -33,9 +33,8 @@ const (
 	DefaultCellTotalCache                   = int64(8 << 30)
 	DefaultDecodedCellCacheEnabled          = true
 	DefaultDecodedCellCacheShards           = int64(64)
-	DefaultDecodedCellCacheBytesPerEntry    = int64(16 << 10)
-	DefaultDecodedCellCacheMinEntries       = int64(64 << 10)
-	DefaultDecodedCellCacheMaxEntries       = int64(1 << 20)
+	DefaultDecodedCellCacheEntries          = int64(128 << 10)
+	DefaultCellRecordCacheBytes             = int64(4 << 30)
 	DefaultCellShardMemTable                = int64(256 << 20)
 	DefaultCellMemTableStopWritesThreshold  = int64(4)
 	DefaultLargeBOCShardReadWorkers         = int64(2)
@@ -50,29 +49,87 @@ const (
 	MaxLiteSendMessageBroadcastFanout       = 20
 	DefaultHTTPAPIListen                    = "0.0.0.0:8081"
 	DefaultHTTPAPIRequestTimeout            = 10 * time.Second
+	DefaultValidatorControlListen           = "127.0.0.1:3030"
 	DefaultMetricsNamespace                 = "gton"
+	DefaultMetricsListen                    = "127.0.0.1:9090"
 	defaultStorageDir                       = "data"
 	defaultADNLPort                         = 30303
 	defaultADNLListen                       = "0.0.0.0:30303"
 	defaultDHTListen                        = "0.0.0.0:30304"
+	defaultConsensusADNLPort                = 30305
+	defaultConsensusADNLListen              = "0.0.0.0:30305"
 	privateKeySeedSize                      = 32
 	externalIPHTTPClient                    = 5 * time.Second
 	globalConfigHTTPClient                  = 30 * time.Second
 	ipAPILookupURL                          = "http://ip-api.com/json/?fields=status,message,query"
 )
 
+// MaxDecodedCellCacheEntries is the ceiling on the decoded cell cache.
+//
+// This knob is an entry count precisely because its cost is GC mark work, which
+// tracks the live object COUNT and is paid on every collection: an entry is
+// roughly 10 live objects. The derivation that used to size the cache was
+// clamped here, and when the derivation was removed the clamp went with it,
+// leaving the knob unbounded above — so a config could put back exactly the
+// object count the resize removed, one heap at a time. 1 Mi entries is the same
+// ceiling the clamp had: about 10 M live objects and ~820 MiB.
+const MaxDecodedCellCacheEntries = int64(1 << 20)
+
+// MaxCellRecordCacheBytes is a typo guard, not a tuning ceiling: the record
+// cache's arenas live outside the GC (malloc under cgo), so nothing in the Go
+// runtime pushes back on an absurd value — a config asking for more than 1 TiB
+// of record arena is a mistake and is rejected at load.
+const MaxCellRecordCacheBytes = int64(1 << 40)
+
 var ErrConfigMissingWithExistingStorage = errors.New("config file is missing while storage metadata exists")
 
 type Config struct {
 	TON                       TON             `json:"ton"`
 	ADNL                      ADNL            `json:"adnl"`
+	ConsensusADNL             *ConsensusADNL  `json:"consensus_adnl,omitempty"`
 	DHT                       DHT             `json:"dht"`
 	Lite                      Lite            `json:"liteserver"`
 	HTTPAPI                   HTTPAPI         `json:"http_api"`
 	Storage                   Storage         `json:"storage"`
 	Metrics                   Metrics         `json:"metrics"`
+	Validator                 Validator       `json:"validator"`
+	Collator                  Collator        `json:"collator"`
 	CustomOverlays            []CustomOverlay `json:"custom_overlays"`
 	DisableStateSerialization bool            `json:"disable_state_serialization"`
+}
+
+// Validator contains only operator-owned validator identity and lifecycle
+// policy. Protocol timing and mempool limits follow network and implementation
+// defaults instead of becoming local consensus knobs.
+type Validator struct {
+	Enabled bool             `json:"enabled"`
+	Control ValidatorControl `json:"control"`
+}
+
+// ValidatorControl configures the authenticated validator-engine-compatible
+// TCP endpoint. Validator signing keys are deliberately absent: they live in
+// the validator database and are created through this endpoint.
+type ValidatorControl struct {
+	ListenAddr string                   `json:"listen_addr"`
+	Key        []byte                   `json:"key"`
+	Clients    []ValidatorControlClient `json:"clients"`
+}
+
+type ValidatorControlClient struct {
+	ID          []byte `json:"id"`
+	Permissions uint32 `json:"permissions"`
+}
+
+// Collator configures the independent standalone delegated collator. It uses
+// consensus_adnl when enabled and does not serve the local validator mode.
+type Collator struct {
+	Enabled            bool                       `json:"enabled"`
+	ValidatorAllowlist CollatorValidatorAllowlist `json:"validator_allowlist"`
+}
+
+type CollatorValidatorAllowlist struct {
+	Enabled bool     `json:"enabled"`
+	ADNLIDs [][]byte `json:"adnl_ids"`
 }
 
 type TON struct {
@@ -92,6 +149,11 @@ type ADNL struct {
 	Key          []byte `json:"key"`
 	ListenAddr   string `json:"listen_addr"`
 	ExternalAddr string `json:"external_addr"`
+}
+
+type ConsensusADNL struct {
+	Enabled bool `json:"enabled"`
+	ADNL
 }
 
 type DHT struct {
@@ -130,20 +192,87 @@ type HTTPAPI struct {
 }
 
 type Storage struct {
-	Dir                              string `json:"dir"`
-	CellTotalCacheSize               int64  `json:"cell_total_cache_size"`
-	DecodedCellCacheEnabled          bool   `json:"decoded_cell_cache_enabled"`
-	DecodedCellCacheShards           int64  `json:"decoded_cell_cache_shards"`
-	DecodedCellCacheBytesPerEntry    int64  `json:"decoded_cell_cache_bytes_per_entry"`
-	DecodedCellCacheMinEntries       int64  `json:"decoded_cell_cache_min_entries"`
-	DecodedCellCacheMaxEntries       int64  `json:"decoded_cell_cache_max_entries"`
-	CellShardMemTableSize            int64  `json:"cell_shard_memtable_size"`
-	CellMemTableStopWritesThreshold  int64  `json:"cell_memtable_stop_writes_threshold"`
-	LargeBOCShardReadWorkers         int64  `json:"large_boc_shard_read_workers"`
-	PersistentStateLargeBOCBatchSize int64  `json:"persistent_state_large_boc_batch_size"`
-	PersistentStateKeepRecent        int64  `json:"persistent_state_keep_recent"`
-	StateSerializeOnePass            bool   `json:"state_serialize_one_pass"`
-	ArtifactFileMaxOpen              int64  `json:"artifact_file_max_open"`
+	Dir string `json:"dir"`
+
+	// CellTotalCacheSize is the PEBBLE block cache budget for celldb, in bytes.
+	// It sizes an opaque allocation inside pebble: compressed blocks, cheap for
+	// the Go GC because it is one big arena rather than millions of objects.
+	// It has no influence on the decoded cell cache below — different tier,
+	// different cost model. This is where bulk capacity belongs.
+	CellTotalCacheSize int64 `json:"cell_total_cache_size"`
+
+	// The decoded cell cache holds fully decoded *cell.Cell trees. Unlike the
+	// pebble cache above, every entry is a live Go object graph that each GC mark
+	// cycle has to walk, so its cost is measured in LIVE OBJECTS and the knob
+	// that bounds it is an entry count, not a byte budget. That is why the
+	// default is small: capacity here is paid for on every collection.
+	//
+	// There is ONE cache, shared by every consumer — lightserver, archive import,
+	// sync, state download, collation and validation. It is not splittable per
+	// consumer as a sizing decision: the collator and the validator must receive
+	// the same *cell.Cell for a given parent (the validator compares tip states
+	// by pointer), and two caches cannot both supply one object.
+	//
+	// Previously ONE knob drove both this Go cache and the pebble byte budget
+	// above: entries were derived as cell_total_cache_size / bytes_per_entry.
+	// Raising the pebble cache — the ordinary thing to do on a big machine —
+	// therefore silently multiplied live Go objects, and the 16 KiB divisor
+	// corresponded to nothing about a cell (a decoded cell is ~104 B of Cell
+	// plus ~48 B of meta plus a body slice and its ref placeholders).
+	DecodedCellCacheEnabled bool  `json:"decoded_cell_cache_enabled"`
+	DecodedCellCacheShards  int64 `json:"decoded_cell_cache_shards"`
+	DecodedCellCacheEntries int64 `json:"decoded_cell_cache_entries"`
+
+	// CellRecordCacheBytes budgets the encoded cell RECORD cache, in BYTES —
+	// the tier between the decoded cell cache above and the pebble block cache:
+	// raw celldb records, pre-decode, in a ring of regions allocated OUTSIDE
+	// the GC under cgo (Go-heap noscan bytes under cgo=0, where the budget then
+	// counts as live heap for GOGC/GOMEMLIMIT). Bytes, not entries, because
+	// this tier's memory has no per-object GC cost — its ring-of-regions design
+	// is byte-denominated — and the derived lookup index adds ~22-25% on top of
+	// this budget.
+	//
+	// 0 DISABLES the tier. The default applies when the field is ABSENT:
+	// defaultConfig prefills it, so a config written before the knob existed
+	// gets the default and an operator's explicit zero is honoured as off.
+	CellRecordCacheBytes int64 `json:"cell_record_cache_bytes"`
+
+	// ServiceDecodedCellCacheEntries is the FORMER name of the knob directly
+	// above, from the period when there were two caches and this one sized the
+	// non-collation half. It is still honoured — an operator who deliberately
+	// tuned it should not silently lose the value on upgrade — and warned about,
+	// so the name gets corrected once rather than carried forever. If both are
+	// set, decoded_cell_cache_entries wins and this one is reported as ignored.
+	ServiceDecodedCellCacheEntries int64 `json:"service_decoded_cell_cache_entries,omitempty"`
+
+	// Deprecated and ignored. Every one of these sized something that no longer
+	// exists, and none can be reinterpreted:
+	//
+	//   - operation_decoded_cell_cache_entries sized the second decoded cache.
+	//     There is no second cache. Folding it into the single one would either
+	//     halve or double an operator's stated intent depending on which knob
+	//     they had tuned, so it is dropped rather than guessed at.
+	//   - bytes_per_entry has the wrong unit for an entry count.
+	//   - min/max_entries clamped a derivation that no longer happens; a stock
+	//     config carries min_entries = 65536, so honouring it would override any
+	//     smaller value an operator sets today.
+	//
+	// They remain explicit fields for range checks and startup deprecation
+	// warnings when loading older configs.
+	// omitempty keeps them out of newly written configs, so they fade out on
+	// their own instead of being re-emitted forever.
+	OperationDecodedCellCacheEntries int64 `json:"operation_decoded_cell_cache_entries,omitempty"`
+	DecodedCellCacheBytesPerEntry    int64 `json:"decoded_cell_cache_bytes_per_entry,omitempty"`
+	DecodedCellCacheMinEntries       int64 `json:"decoded_cell_cache_min_entries,omitempty"`
+	DecodedCellCacheMaxEntries       int64 `json:"decoded_cell_cache_max_entries,omitempty"`
+
+	CellShardMemTableSize            int64 `json:"cell_shard_memtable_size"`
+	CellMemTableStopWritesThreshold  int64 `json:"cell_memtable_stop_writes_threshold"`
+	LargeBOCShardReadWorkers         int64 `json:"large_boc_shard_read_workers"`
+	PersistentStateLargeBOCBatchSize int64 `json:"persistent_state_large_boc_batch_size"`
+	PersistentStateKeepRecent        int64 `json:"persistent_state_keep_recent"`
+	StateSerializeOnePass            bool  `json:"state_serialize_one_pass"`
+	ArtifactFileMaxOpen              int64 `json:"artifact_file_max_open"`
 }
 
 type LiteSendMessageBroadcastCapacity struct {
@@ -206,12 +335,24 @@ func defaultConfig() Config {
 			RequestTimeoutSeconds: int64(DefaultHTTPAPIRequestTimeout / time.Second),
 		},
 		Storage: Storage{
-			CellTotalCacheSize:               DefaultCellTotalCache,
-			DecodedCellCacheEnabled:          DefaultDecodedCellCacheEnabled,
-			DecodedCellCacheShards:           DefaultDecodedCellCacheShards,
-			DecodedCellCacheBytesPerEntry:    DefaultDecodedCellCacheBytesPerEntry,
-			DecodedCellCacheMinEntries:       DefaultDecodedCellCacheMinEntries,
-			DecodedCellCacheMaxEntries:       DefaultDecodedCellCacheMaxEntries,
+			CellTotalCacheSize:      DefaultCellTotalCache,
+			DecodedCellCacheEnabled: DefaultDecodedCellCacheEnabled,
+			DecodedCellCacheShards:  DefaultDecodedCellCacheShards,
+			// DecodedCellCacheEntries is deliberately left at zero here, unlike
+			// every knob around it. defaultConfig is the base Load decodes ON
+			// TOP of, so a prefilled value is indistinguishable from one the
+			// operator wrote — and this knob has a former name whose value must
+			// only be honoured when the current name is ABSENT. Zero means
+			// absent, decodedCellCacheOptionsFromConfig turns it into
+			// DefaultDecodedCellCacheEntries, and generate() writes the real
+			// value into a freshly created config so the knob is still visible
+			// to an operator reading config.json.
+			//
+			// CellRecordCacheBytes is the opposite case, prefilled ON PURPOSE:
+			// it has no former name to disambiguate, and prefilling is what
+			// makes "absent = default 4 GiB" and "explicit 0 = off" two
+			// different statements a JSON int64 can carry.
+			CellRecordCacheBytes:             DefaultCellRecordCacheBytes,
 			CellShardMemTableSize:            DefaultCellShardMemTable,
 			CellMemTableStopWritesThreshold:  DefaultCellMemTableStopWritesThreshold,
 			LargeBOCShardReadWorkers:         DefaultLargeBOCShardReadWorkers,
@@ -221,7 +362,15 @@ func defaultConfig() Config {
 			ArtifactFileMaxOpen:              DefaultArtifactFileMaxOpen,
 		},
 		Metrics: Metrics{
-			Namespace: DefaultMetricsNamespace,
+			Enabled:    true,
+			ListenAddr: DefaultMetricsListen,
+			Namespace:  DefaultMetricsNamespace,
+		},
+		Validator: Validator{
+			Control: ValidatorControl{
+				ListenAddr: DefaultValidatorControlListen,
+				Clients:    []ValidatorControlClient{},
+			},
 		},
 		CustomOverlays: []CustomOverlay{},
 	}
@@ -233,6 +382,11 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		return Config{}, fmt.Errorf("generate ADNL key: %w", err)
 	}
 
+	consensusADNLSeed, err := generateSeed()
+	if err != nil {
+		return Config{}, fmt.Errorf("generate consensus ADNL key: %w", err)
+	}
+
 	dhtSeed, err := generateSeed()
 	if err != nil {
 		return Config{}, fmt.Errorf("generate DHT key: %w", err)
@@ -241,6 +395,10 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 	liteSeed, err := generateSeed()
 	if err != nil {
 		return Config{}, fmt.Errorf("generate liteserver key: %w", err)
+	}
+	validatorControlSeed, err := generateSeed()
+	if err != nil {
+		return Config{}, fmt.Errorf("generate validator control key: %w", err)
 	}
 
 	externalIP, err := externalIPLookup(ctx)
@@ -258,14 +416,26 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 		return Config{}, fmt.Errorf("resolve storage dir: %w", err)
 	}
 
-	// Everything except the generated keys, listen/external addresses, and the
-	// resolved paths matches defaultConfig() exactly.
+	// Generated keys, network addresses, the disabled consensus network,
+	// resolved paths and decoded cell cache entry count differ from defaultConfig.
 	cfg := defaultConfig()
+	// defaultConfig leaves this zero so that Load can tell "absent" from
+	// "written by the operator"; see the note there. A config file we create
+	// ourselves has no such ambiguity, and spelling the value out keeps the knob
+	// discoverable to whoever opens config.json.
+	cfg.Storage.DecodedCellCacheEntries = DefaultDecodedCellCacheEntries
 	cfg.TON.GlobalConfigPath = globalConfigPath
 	cfg.ADNL = ADNL{
 		Key:          adnlSeed,
 		ListenAddr:   defaultADNLListen,
 		ExternalAddr: net.JoinHostPort(externalIP, strconv.Itoa(defaultADNLPort)),
+	}
+	cfg.ConsensusADNL = &ConsensusADNL{
+		ADNL: ADNL{
+			Key:          consensusADNLSeed,
+			ListenAddr:   defaultConsensusADNLListen,
+			ExternalAddr: net.JoinHostPort(externalIP, strconv.Itoa(defaultConsensusADNLPort)),
+		},
 	}
 	cfg.DHT = DHT{
 		Key:        dhtSeed,
@@ -274,6 +444,7 @@ func generate(ctx context.Context, externalIPLookup func(context.Context) (strin
 	cfg.Lite.Key = liteSeed
 	cfg.Lite.ListenAddr = DefaultLiteListen
 	cfg.Storage.Dir = storageDir
+	cfg.Validator.Control.Key = validatorControlSeed
 
 	return cfg, nil
 }
@@ -336,7 +507,6 @@ func Load(path string) (Config, error) {
 
 	cfg := defaultConfig()
 	dec := json.NewDecoder(file)
-	dec.DisallowUnknownFields()
 	if err = dec.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
@@ -411,9 +581,38 @@ func write(path string, cfg Config) error {
 	}
 	data = append(data, '\n')
 
-	if err = os.WriteFile(path, data, 0o600); err != nil {
-		return fmt.Errorf("write config %s: %w", path, err)
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".node-config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp config in %s: %w", dir, err)
 	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+
+	if err = tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+
+		return fmt.Errorf("chmod temp config %s: %w", tmpPath, err)
+	}
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+
+		return fmt.Errorf("write temp config %s: %w", tmpPath, err)
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+
+		return fmt.Errorf("sync temp config %s: %w", tmpPath, err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("close temp config %s: %w", tmpPath, err)
+	}
+	if err = os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace config %s: %w", path, err)
+	}
+
 	return nil
 }
 

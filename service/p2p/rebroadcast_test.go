@@ -393,7 +393,7 @@ func TestSendCustomTwoStepRebroadcastUsesRLDP2(t *testing.T) {
 		addr:          "peer-a",
 		overlay:       overlayA,
 		rldpOverlay:   overlay.CreateExtendedRLDP(rldpA).CreateOverlay(overlayID[:]),
-		announced:     &overlay.Node{Version: now},
+		announced:     &overlay.NodeV2{Version: now},
 		fixedMember:   true,
 		alive:         true,
 		lastReceiveAt: time.Now(),
@@ -403,7 +403,7 @@ func TestSendCustomTwoStepRebroadcastUsesRLDP2(t *testing.T) {
 		addr:        "peer-b",
 		overlay:     overlayB,
 		rldpOverlay: overlay.CreateExtendedRLDP(rldpB).CreateOverlay(overlayID[:]),
-		announced:   &overlay.Node{Version: now},
+		announced:   &overlay.NodeV2{Version: now},
 		fixedMember: true,
 	}
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -553,9 +553,9 @@ func TestCustomIHRRebroadcastUnsupported(t *testing.T) {
 func TestBuildSimpleBroadcastSupportsAnySender(t *testing.T) {
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -583,14 +583,6 @@ func TestBuildSimpleBroadcastSupportsAnySender(t *testing.T) {
 	if !ed25519.Verify(pub, toSign, msg.Signature) {
 		t.Fatalf("signature should verify with zero source hash when any-sender is enabled")
 	}
-}
-
-func sentOverlayPayload(msg tl.Serializable) tl.Serializable {
-	wrapped, ok := msg.([]tl.Serializable)
-	if ok && len(wrapped) == 2 {
-		return wrapped[1]
-	}
-	return msg
 }
 
 func TestSendFastFECToPeerSendsReserveParts(t *testing.T) {

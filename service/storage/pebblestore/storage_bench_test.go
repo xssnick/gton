@@ -16,19 +16,19 @@ import (
 )
 
 func BenchmarkCellRecordCodec(b *testing.B) {
-	root, _ := benchmarkCellGraph(b, 256, 4)
+	root, _ := benchmarkCellGraph(b, 256)
 	record, err := storage.CellRecordFromCell(root)
 	if err != nil {
 		b.Fatalf("cell record from cell: %v", err)
 	}
-	encoded := encodeCellRecord(record)
+	encoded := storage.EncodeCellRecord(record)
 	hash := bytes.Clone(record.Hash)
 
 	b.Run("encode", func(b *testing.B) {
 		b.ReportAllocs()
 		b.SetBytes(int64(len(encoded)))
 		for i := 0; i < b.N; i++ {
-			got := encodeCellRecord(record)
+			got := storage.EncodeCellRecord(record)
 			if len(got) != len(encoded) {
 				b.Fatalf("encoded length mismatch: got=%d want=%d", len(got), len(encoded))
 			}
@@ -39,7 +39,7 @@ func BenchmarkCellRecordCodec(b *testing.B) {
 		b.ReportAllocs()
 		b.SetBytes(int64(len(encoded)))
 		for i := 0; i < b.N; i++ {
-			if _, err := decodeCellRecord(hash, encoded); err != nil {
+			if _, err := storage.DecodeCellRecord(hash, encoded); err != nil {
 				b.Fatalf("decode cell record: %v", err)
 			}
 		}
@@ -79,7 +79,7 @@ func BenchmarkCellRecordCodec(b *testing.B) {
 }
 
 func BenchmarkStateCellEncoder(b *testing.B) {
-	root, _ := benchmarkCellGraph(b, 256, 4)
+	root, _ := benchmarkCellGraph(b, 256)
 	refs := root.GetMetadata().Refs
 
 	b.Run("cell-record", func(b *testing.B) {
@@ -89,7 +89,7 @@ func BenchmarkStateCellEncoder(b *testing.B) {
 			if err != nil {
 				b.Fatalf("cell record from cell: %v", err)
 			}
-			encoded := encodeCellRecord(record)
+			encoded := storage.EncodeCellRecord(record)
 			if len(encoded) == 0 {
 				b.Fatalf("empty encoded cell")
 			}
@@ -97,36 +97,40 @@ func BenchmarkStateCellEncoder(b *testing.B) {
 	})
 
 	b.Run("direct-state", func(b *testing.B) {
-		valueLen, layout, err := stateCellEncodedLen(root, refs)
+		encoder, err := storage.PrepareCellRecordEncoder(root, refs)
 		if err != nil {
-			b.Fatalf("state cell encoded len: %v", err)
+			b.Fatalf("prepare direct state encoder: %v", err)
 		}
-		buf := make([]byte, valueLen)
+		buf := make([]byte, encoder.EncodedLen())
 
 		b.ReportAllocs()
-		b.SetBytes(int64(valueLen))
+		b.SetBytes(int64(len(buf)))
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			encodeStateCellRecordTo(buf, root, refs, layout)
+			encoder.EncodeCellTo(buf, root, refs)
 		}
 	})
 }
 
 func BenchmarkPebbleSaveCells(b *testing.B) {
-	root, cells := benchmarkCellGraph(b, 1024, 4)
+	root, cells := benchmarkCellGraph(b, 1024)
 	records, err := collectCellRecordsForBenchmark(root)
 	if err != nil {
 		b.Fatalf("collect cell records: %v", err)
 	}
 	store := openBenchmarkStore(b, Options{})
+	activeCells, err := store.ActiveCells()
+	if err != nil {
+		b.Fatalf("select active cells: %v", err)
+	}
 
 	b.ReportAllocs()
 	b.ReportMetric(float64(cells), "cells/op")
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if err := store.SaveCells(records); err != nil {
+		if err := activeCells.Save(context.Background(), records); err != nil {
 			b.Fatalf("save cells: %v", err)
 		}
 	}
@@ -134,7 +138,7 @@ func BenchmarkPebbleSaveCells(b *testing.B) {
 
 func BenchmarkPebbleImportStateCellTree(b *testing.B) {
 	b.Run("boc-view", func(b *testing.B) {
-		root, cells := benchmarkCellGraph(b, 1024, 4)
+		root, cells := benchmarkCellGraph(b, 1024)
 		boc := root.ToBOCWithOptions(cell.BOCSerializeOptions{
 			WithCRC32C:    true,
 			WithIndex:     true,
@@ -164,7 +168,7 @@ func BenchmarkPebbleImportStateCellTree(b *testing.B) {
 	})
 
 	b.Run("eager-root", func(b *testing.B) {
-		root, cells := benchmarkCellGraph(b, 1024, 4)
+		root, cells := benchmarkCellGraph(b, 1024)
 		store := openBenchmarkStore(b, Options{})
 		block := benchmarkBlockID(1)
 
@@ -181,7 +185,7 @@ func BenchmarkPebbleImportStateCellTree(b *testing.B) {
 }
 
 func BenchmarkPebbleSaveStateBOCViewParallel(b *testing.B) {
-	root, cells := benchmarkCellGraph(b, 32768, 4)
+	root, cells := benchmarkCellGraph(b, 32768)
 	boc := root.ToBOCWithOptions(cell.BOCSerializeOptions{
 		WithIndex:     true,
 		WithTopHash:   true,
@@ -298,9 +302,13 @@ func BenchmarkSaveCellRecordSetSharded(b *testing.B) {
 
 func BenchmarkPebbleSaveStateCellTree(b *testing.B) {
 	b.Run("dfs", func(b *testing.B) {
-		root, cells := benchmarkCellGraph(b, 1024, 4)
+		root, cells := benchmarkCellGraph(b, 1024)
 		store := openBenchmarkStore(b, Options{})
 		block := benchmarkBlockID(1)
+		generation, err := store.activeCellGenerationID()
+		if err != nil {
+			b.Fatalf("select active generation: %v", err)
+		}
 
 		b.ReportAllocs()
 		b.ReportMetric(float64(cells), "cells/op")
@@ -308,9 +316,10 @@ func BenchmarkPebbleSaveStateCellTree(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			if _, err := store.saveStateCellTree(context.Background(), stateCellTreeSave{
-				block:      block,
-				root:       root,
-				totalCells: uint64(cells),
+				block:          block,
+				root:           root,
+				totalCells:     uint64(cells),
+				cellGeneration: generation,
 			}); err != nil {
 				b.Fatalf("save dfs state cell tree: %v", err)
 			}
@@ -319,15 +328,16 @@ func BenchmarkPebbleSaveStateCellTree(b *testing.B) {
 }
 
 func BenchmarkPebbleSaveStateCellTree1M(b *testing.B) {
-	const (
-		leaves = 750_000
-		fanout = 4
-	)
+	const leaves = 750_000
 
 	b.Run("dfs-batch", func(b *testing.B) {
-		root, cells := benchmarkCellGraph(b, leaves, fanout)
+		root, cells := benchmarkCellGraph(b, leaves)
 		store := openBenchmarkStore(b, Options{})
 		block := benchmarkBlockID(1)
+		generation, err := store.activeCellGenerationID()
+		if err != nil {
+			b.Fatalf("select active generation: %v", err)
+		}
 
 		b.ReportAllocs()
 		b.ReportMetric(float64(cells), "cells/op")
@@ -335,9 +345,10 @@ func BenchmarkPebbleSaveStateCellTree1M(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			if _, err := store.saveStateCellTree(context.Background(), stateCellTreeSave{
-				block:      block,
-				root:       root,
-				totalCells: uint64(cells),
+				block:          block,
+				root:           root,
+				totalCells:     uint64(cells),
+				cellGeneration: generation,
 			}); err != nil {
 				b.Fatalf("save dfs state cell tree: %v", err)
 			}
@@ -346,7 +357,7 @@ func BenchmarkPebbleSaveStateCellTree1M(b *testing.B) {
 }
 
 func BenchmarkPebbleLoadCell(b *testing.B) {
-	root, _ := benchmarkCellGraph(b, 4096, 4)
+	root, _ := benchmarkCellGraph(b, 4096)
 	records, err := collectCellRecordsForBenchmark(root)
 	if err != nil {
 		b.Fatalf("collect cell records: %v", err)
@@ -355,7 +366,7 @@ func BenchmarkPebbleLoadCell(b *testing.B) {
 
 	b.Run("lazy-root", func(b *testing.B) {
 		store := openBenchmarkStore(b, Options{})
-		if err := store.SaveCells(records); err != nil {
+		if err := saveActiveTestCells(store, records); err != nil {
 			b.Fatalf("save cells: %v", err)
 		}
 
@@ -376,7 +387,7 @@ func BenchmarkPebbleLoadCell(b *testing.B) {
 
 	b.Run("lazy-first-ref-chain", func(b *testing.B) {
 		store := openBenchmarkStore(b, Options{})
-		if err := store.SaveCells(records); err != nil {
+		if err := saveActiveTestCells(store, records); err != nil {
 			b.Fatalf("save cells: %v", err)
 		}
 		b.ReportAllocs()
@@ -403,7 +414,7 @@ func BenchmarkLazyCellLoader(b *testing.B) {
 
 	b.Run("decoded-cache-hit", func(b *testing.B) {
 		store := openBenchmarkStore(b, Options{})
-		if err := store.SaveCells([]*storage.CellRecord{record}); err != nil {
+		if err := saveActiveTestCells(store, []*storage.CellRecord{record}); err != nil {
 			b.Fatalf("save cell: %v", err)
 		}
 
@@ -429,7 +440,7 @@ func BenchmarkLazyCellLoader(b *testing.B) {
 
 	b.Run("pebble-hit-cache-disabled", func(b *testing.B) {
 		store := openBenchmarkStore(b, Options{DisableDecodedCellCache: true})
-		if err := store.SaveCells([]*storage.CellRecord{record}); err != nil {
+		if err := saveActiveTestCells(store, []*storage.CellRecord{record}); err != nil {
 			b.Fatalf("save cell: %v", err)
 		}
 
@@ -449,7 +460,7 @@ func BenchmarkLazyCellLoader(b *testing.B) {
 	})
 
 	b.Run("pebble-hit-cache-disabled-fanout4", func(b *testing.B) {
-		root, _ := benchmarkCellGraph(b, 256, 4)
+		root, _ := benchmarkCellGraph(b, 256)
 		records, err := collectCellRecordsForBenchmark(root)
 		if err != nil {
 			b.Fatalf("collect cell records: %v", err)
@@ -457,7 +468,7 @@ func BenchmarkLazyCellLoader(b *testing.B) {
 		rootHash := root.HashKey()
 
 		store := openBenchmarkStore(b, Options{DisableDecodedCellCache: true})
-		if err := store.SaveCells(records); err != nil {
+		if err := saveActiveTestCells(store, records); err != nil {
 			b.Fatalf("save cells: %v", err)
 		}
 
@@ -496,14 +507,12 @@ func openBenchmarkStore(b *testing.B, opts Options) *Store {
 	return store
 }
 
-func benchmarkCellGraph(tb testing.TB, leaves int, fanout int) (*cell.Cell, int) {
+func benchmarkCellGraph(tb testing.TB, leaves int) (*cell.Cell, int) {
 	tb.Helper()
 	if leaves <= 0 {
 		tb.Fatalf("leaves must be positive")
 	}
-	if fanout < 2 || fanout > 4 {
-		tb.Fatalf("fanout must be between 2 and 4")
-	}
+	const fanout = 4
 
 	level := make([]*cell.Cell, leaves)
 	total := 0

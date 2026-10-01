@@ -888,10 +888,14 @@ func TestPlumtreeExactBoxedParsers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize repair request: %v", err)
 	}
-	if _, err = parseRepairPlumtreePart(requestBytes); err != nil {
+	var request RepairPlumtreePart
+	if err = parsePlumtreeMessage(&request, requestBytes); err != nil {
 		t.Fatalf("parse repair request: %v", err)
 	}
-	if _, err = parseRepairPlumtreePart(append(append([]byte{}, requestBytes...), 0)); err == nil {
+	if err = parsePlumtreeMessage(
+		&request,
+		append(append([]byte{}, requestBytes...), 0),
+	); err == nil {
 		t.Fatal("repair request parser accepted trailing data")
 	}
 }

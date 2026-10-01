@@ -35,7 +35,7 @@ func (n *Node) runQUICIdleSweepLoop(ctx context.Context) {
 			n.sweepIdleQUICPaths(now)
 			// Rides the same ticker: it reclaims per-peer bookkeeping nothing
 			// else frees, and is too cheap to deserve a goroutine of its own.
-			n.sweepPeerRoutes(now)
+			n.sweepPeerRoutes()
 		}
 	}
 }
@@ -154,13 +154,13 @@ const maxPeerRoutes = 20000
 // reference-counted: routes are handed out in two places and released in a
 // dozen, and a single missed release would pin a route forever while a double
 // release would drop one out from under a live peer.
-func (n *Node) sweepPeerRoutes(now time.Time) int {
-	if n.peerRoutes.size() <= maxPeerRoutes {
+func (n *Node) sweepPeerRoutes() int {
+	if n.peerRoutes.Size() <= maxPeerRoutes {
 		return 0
 	}
 
 	held := n.routesHeldByTransports()
-	return n.peerRoutes.sweep(held, maxPeerRoutes, now)
+	return n.peerRoutes.Sweep(held, maxPeerRoutes)
 }
 
 // routesHeldByTransports takes the two locks one after the other, never nested,

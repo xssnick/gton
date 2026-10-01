@@ -240,7 +240,7 @@ func (req rebroadcastRequest) queueName() string {
 	payloadLen := req.payloadLen()
 	if payloadLen > 0 {
 		plan := req.subscription.rebroadcastPlan(req.kind, payloadLen)
-		if req.subscription.usesTwoStepRebroadcast(plan) {
+		if req.subscription.usesTwoStepForRequest(req, plan) {
 			return twoStepRebroadcastQueueName
 		}
 	}
@@ -308,7 +308,7 @@ func (s *overlaySubscription) runPeerRebroadcastLoop(ctx context.Context, peer *
 			return
 		}
 		if req.expiredInQueue(time.Now()) {
-			s.node.noteRebroadcastDropped(req)
+			s.node.chainNode().noteRebroadcastDropped(req)
 			s.log.Debug().
 				Str("kind", req.kind).
 				Str("queue", req.queueName()).
@@ -320,16 +320,16 @@ func (s *overlaySubscription) runPeerRebroadcastLoop(ctx context.Context, peer *
 		}
 
 		if s.rebroadcastToPeer(ctx, peer, req) {
-			s.node.noteRebroadcastSent(req)
+			s.node.chainNode().noteRebroadcastSent(req)
 		} else {
-			s.node.noteRebroadcastDropped(req)
+			s.node.chainNode().noteRebroadcastDropped(req)
 		}
 	}
 }
 
 func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	if s.customRebroadcastUnsupported(req.kind) {
-		s.node.noteRebroadcastDropped(req)
+		s.node.chainNode().noteRebroadcastDropped(req)
 		s.log.Debug().
 			Str("kind", req.kind).
 			Str("queue", req.queueName()).
@@ -337,31 +337,31 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 		return false
 	}
 	if s.customBlockRebroadcastBlocked(req.kind) {
-		s.node.noteRebroadcastDropped(req)
+		s.node.chainNode().noteRebroadcastDropped(req)
 		s.log.Debug().
 			Str("kind", req.kind).
 			Str("queue", req.queueName()).
 			Msg("dropping custom block rebroadcast because local node is not a block sender")
 		return false
 	}
-	if !s.node.canAcceptBroadcast(req.kind, req.local) {
-		s.node.noteRebroadcastDropped(req)
+	if !s.node.chainNode().canAcceptBroadcast(req.kind, req.local) {
+		s.node.chainNode().noteRebroadcastDropped(req)
 		s.log.Debug().
 			Str("kind", req.kind).
 			Str("queue", req.queueName()).
 			Msg("dropping rebroadcast request because broadcast admission is closed")
 		return false
 	}
-	if !s.node.allowRebroadcast(&req) {
+	if !s.node.chainNode().allowRebroadcast(&req) {
 		return false
 	}
 	candidates := s.rebroadcastCandidatesForRequest(req)
 	if len(candidates) == 0 {
-		s.node.noteRebroadcastDropped(req)
+		s.node.chainNode().noteRebroadcastDropped(req)
 		return false
 	}
 	if err := req.materializePayload(); err != nil {
-		s.node.noteRebroadcastDropped(req)
+		s.node.chainNode().noteRebroadcastDropped(req)
 		s.log.Debug().
 			Err(err).
 			Str("kind", req.kind).
@@ -372,7 +372,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 
 	payloadLen := req.payloadLen()
 	if payloadLen == 0 || payloadLen > maxOverlayPayloadSize {
-		s.node.noteRebroadcastDropped(req)
+		s.node.chainNode().noteRebroadcastDropped(req)
 		s.log.Debug().
 			Str("kind", req.kind).
 			Str("queue", req.queueName()).
@@ -382,13 +382,13 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	}
 
 	plan := s.rebroadcastPlan(req.kind, payloadLen)
-	if s.usesTwoStepRebroadcast(plan) {
+	if s.usesTwoStepForRequest(req, plan) {
 		return s.enqueueTwoStepRebroadcast(req)
 	}
 	if plan.mode == rebroadcastModeSimple && req.simple == nil {
 		msg, err := s.node.buildSimpleBroadcast(req.payload, plan.flags)
 		if err != nil {
-			s.node.noteRebroadcastDropped(req)
+			s.node.chainNode().noteRebroadcastDropped(req)
 			s.log.Debug().
 				Err(err).
 				Str("kind", req.kind).
@@ -402,13 +402,13 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 	if plan.mode == rebroadcastModeFEC && req.fec == nil {
 		fec, err := overlay.NewBroadcastFECSender(
 			s.node.privKey,
-			overlay.CertificateEmpty{},
+			req.certificate,
 			req.payload,
 			plan.flags,
 			overlay.WithBroadcastFECSymbolSize(rebroadcastFECSymbolSize),
 		)
 		if err != nil {
-			s.node.noteRebroadcastDropped(req)
+			s.node.chainNode().noteRebroadcastDropped(req)
 			s.log.Debug().
 				Err(err).
 				Str("kind", req.kind).
@@ -450,7 +450,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 		return true
 	}
 
-	s.node.noteRebroadcastDropped(req)
+	s.node.chainNode().noteRebroadcastDropped(req)
 	s.log.Debug().
 		Str("kind", req.kind).
 		Str("queue", req.queueName()).
@@ -473,11 +473,18 @@ func (s *overlaySubscription) usesTwoStepRebroadcast(
 		plan.flags&overlay.BroadcastFlagNoTwoStep == 0
 }
 
+func (s *overlaySubscription) usesTwoStepForRequest(
+	req rebroadcastRequest,
+	plan rebroadcastPlan,
+) bool {
+	return !req.forceLegacyFEC && s.usesTwoStepRebroadcast(plan)
+}
+
 func (s *overlaySubscription) rebroadcastDelivery(
 	req rebroadcastRequest,
 ) Delivery {
 	plan := s.rebroadcastPlan(req.kind, req.payloadLen())
-	if s.usesTwoStepRebroadcast(plan) {
+	if s.usesTwoStepForRequest(req, plan) {
 		return DeliveryTwoStep
 	}
 	if plan.mode == rebroadcastModeSimple {
@@ -545,19 +552,19 @@ func (s *overlaySubscription) rebroadcastPreferredCandidateIDs(req rebroadcastRe
 func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest) int {
 	if req.kind == "tonNode.externalMessageBroadcast" || req.kind == "tonNode.ihrMessageBroadcast" {
 		if s.spec.floodsWholeRoster() {
-			if s.node.rebroadcastLagged() {
+			if s.node.chainNode().rebroadcastLagged() {
 				return laggedExternalFanout
 			}
 			return s.peerLimit()
 		}
 		if req.local {
-			fanout := s.node.effectiveLocalExternalFanout()
-			if s.node.rebroadcastLagged() {
+			fanout := s.node.chainNode().effectiveLocalExternalFanout()
+			if s.node.chainNode().rebroadcastLagged() {
 				return laggedLocalExternalFanout(fanout)
 			}
 			return fanout
 		}
-		if s.node.rebroadcastLagged() {
+		if s.node.chainNode().rebroadcastLagged() {
 			return laggedExternalFanout
 		}
 		return externalRebroadcastFanout
@@ -565,7 +572,7 @@ func (s *overlaySubscription) rebroadcastFanoutForRequest(req rebroadcastRequest
 	if s.spec.floodsWholeRoster() {
 		return s.peerLimit()
 	}
-	if s.node.rebroadcastQuiet.Load() {
+	if s.node.chainNode().rebroadcastQuiet.Load() {
 		return quietRebroadcastFanout
 	}
 	return rebroadcastFanout
@@ -663,6 +670,9 @@ func selectRebroadcastQueueTargets(candidates []*overlayPeer, tried map[PeerID]s
 }
 
 func (s *overlaySubscription) rebroadcastToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest) bool {
+	if s.chainBroadcastsPaused() {
+		return false
+	}
 	payloadLen := req.payloadLen()
 	if payloadLen == 0 || payloadLen > maxOverlayPayloadSize {
 		return false
@@ -709,7 +719,7 @@ func (s *overlaySubscription) rebroadcastSimpleToPeer(ctx context.Context, peer 
 }
 
 func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest, plan rebroadcastPlan) bool {
-	releaseBackpressure, ok := s.node.waitRebroadcastFECBackpressure(ctx, peer, req)
+	releaseBackpressure, ok := s.node.chainNode().waitRebroadcastFECBackpressure(ctx, peer, req)
 	if !ok {
 		return false
 	}
@@ -723,7 +733,7 @@ func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *ov
 		var err error
 		sender, err = overlay.NewBroadcastFECSender(
 			s.node.privKey,
-			overlay.CertificateEmpty{},
+			req.certificate,
 			req.payload,
 			plan.flags,
 			overlay.WithBroadcastFECSymbolSize(rebroadcastFECSymbolSize),
@@ -736,7 +746,7 @@ func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *ov
 
 	pace := time.Duration(0)
 	if s.spec.pacesFECBursts() {
-		pace = s.node.fastSyncBroadcastFECPace
+		pace = s.node.chainNode().fastSyncBroadcastFECPace
 	}
 	err := sendFastFECToPeer(
 		ctx,
@@ -899,7 +909,11 @@ func sendFastFECToPeer(
 		if err != nil {
 			return fmt.Errorf("build FEC part %d: %w", seqno, err)
 		}
-		if err = peer.SendCustomMessage(sendCtx, part.Full); err != nil {
+		// One sender feeds every peer worker of the fanout; the part's
+		// prepared message carries the ADNL frame built on the first send,
+		// so the other peers copy bytes instead of serializing again. QUIC
+		// peers take the body with their own prefix, legacy peers the object.
+		if err = overlay.SendPreparedBroadcast(sendCtx, peer, part.Full, part.FullMessage); err != nil {
 			return fmt.Errorf("send FEC part %d to peer %x: %w", seqno, peer.ID(), err)
 		}
 	}

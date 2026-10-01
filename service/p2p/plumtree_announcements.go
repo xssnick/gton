@@ -158,10 +158,15 @@ func (e *plumtreeEngine) dropAnnouncementLocked(announcement *plumtreeAnnounceme
 		if missing.announcers[i] != announcement {
 			continue
 		}
+		// Shift instead of moving the last one in: the asked announcers stay a
+		// prefix.
 		last := int(missing.announcerCount) - 1
-		missing.announcers[i] = missing.announcers[last]
+		copy(missing.announcers[i:last], missing.announcers[i+1:])
 		missing.announcers[last] = nil
 		missing.announcerCount--
+		if i < int(missing.askedCount) {
+			missing.askedCount--
+		}
 		break
 	}
 	if missing.announcerCount == 0 {
@@ -187,8 +192,9 @@ func (e *plumtreeEngine) hasAnnouncementLocked(key plumtreePartKey, from PeerID)
 	return queue != nil && queue.byKey[key] != nil
 }
 
-// Hands out every announcer of a part whose deadline has passed. The caller
-// erases the part right after, which releases the announcements.
+// Hands out the announcers of a part not asked yet: right away when no eager peer
+// can push the part, otherwise once its deadline has passed, after which the
+// caller erases the part and releases the announcements.
 func (e *plumtreeEngine) takeCandidatesLocked(
 	missing *plumtreeMissingPart,
 	into []plumtreeRepairCandidate,
@@ -198,7 +204,7 @@ func (e *plumtreeEngine) takeCandidatesLocked(
 		return into
 	}
 
-	for i := range int(missing.announcerCount) {
+	for i := int(missing.askedCount); i < int(missing.announcerCount); i++ {
 		announcement := missing.announcers[i]
 		into = append(into, plumtreeRepairCandidate{
 			Key:              announcement.key,
@@ -211,6 +217,7 @@ func (e *plumtreeEngine) takeCandidatesLocked(
 			DataSize:         announcement.dataSize,
 		})
 	}
+	missing.askedCount = missing.announcerCount
 	return into
 }
 

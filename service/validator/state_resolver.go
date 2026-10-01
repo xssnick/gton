@@ -1,0 +1,1747 @@
+package validator
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xssnick/tonutils-go/tvm/cell"
+
+	"github.com/xssnick/gton/service/validator/collator"
+	"github.com/xssnick/gton/service/validator/groups"
+	"github.com/xssnick/gton/service/validator/simplex"
+)
+
+var errFinalizedLineageAhead = errors.New("validator runtime: finalized lineage anchor is not an ancestor")
+
+// errStateBelowFinalization ends an uncertified observer flight finalization
+// has left behind. It is a not-ready error on purpose: a window base joined to
+// that flight retries, and the retry resolves the candidate again from what the
+// finalization walk has established by then instead of failing the session.
+var errStateBelowFinalization = fmt.Errorf("%w: uncertified candidate is below finalization", ErrBlockNotReady)
+
+const consensusExtraDataTag = uint64(0x638eb292)
+
+// ResolvedState is one cached candidate-parent state. GenUtime is zero for
+// consensus genesis and exact to the millisecond for ordinary candidates.
+type ResolvedState struct {
+	State    *ChainState
+	GenUtime time.Time
+}
+
+// lineageWalkStats is one walk's depth and the residency of each step.
+type lineageWalkStats struct {
+	Visited int
+	Steps   [lineageStepSourceCount]int
+}
+
+type stateResolver struct {
+	shard      groups.ShardID
+	storageID  SessionStorageID
+	storage    ValidatorStorage
+	backend    SessionBackend
+	candidates *candidateResolver
+	recovery   []simplex.VerifiedCertificate
+	// slotsPerLeaderWindow is a critical session parameter and never changes for
+	// the life of this resolver. targetRate is noncritical and does, through
+	// updateParams; both retention margins here are derived from them rather
+	// than written as slot literals.
+	slotsPerLeaderWindow uint32
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	mu sync.Mutex
+	// targetRate is the noncritical slot rate the wall-clock retention margins
+	// are converted against. It is read under mu because updateParams writes it.
+	targetRate            time.Duration
+	resolveTimeoutCap     time.Duration
+	maxLeaderWindowDesync uint32
+	genesis               *ChainState
+	startAt               *SessionStart
+	states                map[simplex.ParentID]*stateFlight
+	finalized             map[simplex.CandidateID]*finalizedState
+	// applied holds exactly the finalization markers still carrying a loaded
+	// state. finalized itself is never pruned — its markers are what keep an
+	// already-final block from being re-applied through a Merkle update — so the
+	// release sweep is driven from here instead, and costs what it retains.
+	applied   map[simplex.CandidateID]*finalizedState
+	persisted map[simplex.CandidateID]struct{}
+	// lineageFloor is the oldest candidate slot an ancestry guard has had to
+	// reach, and lineageFloorKnown says whether any guarded walk has happened.
+	// Candidate retention keeps parent links from there upward; state retention
+	// is independent because ancestry never materializes historical states.
+	lineageFloor      uint32
+	lineageFloorKnown bool
+	isClosed          bool
+	// describeFailed reports a shard-top description that gave up with an error
+	// other than not-ready. It runs on the detached description goroutine, so
+	// the session runtime installs a logger here rather than passing one in.
+	describeFailed func(simplex.CandidateID, error)
+}
+
+type stateFlight struct {
+	done      chan struct{}
+	cancel    context.CancelFunc
+	result    ResolvedState
+	err       error
+	waiters   int
+	finished  bool
+	cancelErr error
+	expires   time.Time
+	timer     *time.Timer
+
+	// prepared is allocated only when an observer warm-up asks to speculate.
+	// Ordinary readers wait on done, which remains gated by notarization.
+	prepared       chan struct{}
+	preparedResult ResolvedState
+	// awaitingNotarization marks an observer flight whose successor is already
+	// computed and which now waits only for its candidate's certificate.
+	awaitingNotarization bool
+}
+
+type finalizedState struct {
+	isDone     bool
+	reconciled bool
+	// appliedState is the exact immutable state loaded while accepting this
+	// finalization. Parent resolution can reuse it until the retention sweep
+	// releases the tree; the finalization marker itself never goes away.
+	appliedState *ChainState
+	inFlight     *resolverFlight
+}
+
+func newStateResolver(
+	shard groups.ShardID,
+	storageID SessionStorageID,
+	storage ValidatorStorage,
+	backend SessionBackend,
+	candidates *candidateResolver,
+	stored StoredSessionState,
+	recovery []simplex.VerifiedCertificate,
+	params simplex.Params,
+	slotsPerLeaderWindow uint32,
+) *stateResolver {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &stateResolver{
+		shard:                 shard,
+		storageID:             storageID,
+		storage:               storage,
+		backend:               backend,
+		candidates:            candidates,
+		recovery:              recovery,
+		slotsPerLeaderWindow:  slotsPerLeaderWindow,
+		targetRate:            params.TargetRate,
+		resolveTimeoutCap:     params.CandidateResolveTimeoutCap,
+		maxLeaderWindowDesync: params.MaxLeaderWindowDesync,
+		ctx:                   ctx,
+		cancel:                cancel,
+		states:                make(map[simplex.ParentID]*stateFlight),
+		finalized:             make(map[simplex.CandidateID]*finalizedState, len(stored.Finalized)),
+		applied:               make(map[simplex.CandidateID]*finalizedState),
+		persisted:             make(map[simplex.CandidateID]struct{}, len(stored.Finalized)),
+	}
+	for _, id := range stored.Finalized {
+		r.finalized[id] = &finalizedState{isDone: true}
+		r.persisted[id] = struct{}{}
+	}
+	// A final certificate is authenticated consensus evidence. Include it in
+	// the replay set even if the process crashed before MarkFinalized completed.
+	for _, certificate := range recovery {
+		id := certificate.Vote().ID
+		if r.finalized[id] == nil {
+			r.finalized[id] = &finalizedState{isDone: true}
+		}
+	}
+
+	return r
+}
+
+// updateParams installs a new noncritical parameter set. Only the slot rate
+// matters here, and only because the retention margins are wall-clock budgets
+// converted against it.
+func (r *stateResolver) updateParams(params simplex.Params) {
+	r.mu.Lock()
+	r.targetRate = params.TargetRate
+	r.resolveTimeoutCap = params.CandidateResolveTimeoutCap
+	r.maxLeaderWindowDesync = params.MaxLeaderWindowDesync
+	r.mu.Unlock()
+}
+
+func (r *stateResolver) start(ctx context.Context, start SessionStart) error {
+	if len(start.Genesis) == 0 {
+		return errors.New("validator runtime: session genesis is unavailable")
+	}
+
+	r.mu.Lock()
+	if r.isClosed {
+		r.mu.Unlock()
+
+		return ErrResolverClosed
+	}
+	if r.startAt != nil {
+		matches := sessionStartEqual(*r.startAt, start)
+		r.mu.Unlock()
+		if !matches {
+			return errors.New("validator runtime: state resolver start differs from recovery")
+		}
+
+		return nil
+	}
+	r.mu.Unlock()
+
+	request := ChainStateRequest{
+		Shard:          r.shard,
+		Blocks:         start.Genesis,
+		MinMasterchain: start.MinMasterchain,
+	}
+	data, err := r.backend.LoadChainState(ctx, request)
+	if err != nil {
+		return fmt.Errorf("validator runtime: load genesis chain state: %w", err)
+	}
+	genesis, err := newChainState(request, data)
+	if err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	if r.isClosed {
+		r.mu.Unlock()
+
+		return ErrResolverClosed
+	}
+	if r.startAt != nil {
+		matches := sessionStartEqual(*r.startAt, start)
+		r.mu.Unlock()
+		if !matches {
+			return errors.New("validator runtime: state resolver start differs from recovery")
+		}
+
+		return nil
+	}
+	r.genesis = genesis
+	storedStart := cloneSessionStart(start)
+	r.startAt = &storedStart
+	r.mu.Unlock()
+
+	if err = r.reconcileAppliedRecovery(ctx); err != nil {
+		return fmt.Errorf("validator runtime: reconcile applied finalizations: %w", err)
+	}
+
+	// The C++ validator awaits FinalizeBlock before its state resolver records
+	// a candidate as done. Our node ingress is deliberately asynchronous, so a
+	// crash can leave the consensus journal ahead of the node database. Replay
+	// masterchain finalizations in slot order before Simplex starts: its normal
+	// unordered certificate bootstrap may prune older slots after seeing the
+	// newest certificate and therefore cannot repair the missing prefix itself.
+	for _, certificate := range r.recovery {
+		if err = r.finalizeWith(ctx, certificate.Vote().ID, certificate, nil); err != nil {
+			return fmt.Errorf("validator runtime: replay masterchain finalization: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// reconcileAppliedRecovery finds the newest finalization which is durable in
+// both the validator journal and the node's block store. A readable
+// masterchain state implies that its whole predecessor chain was applied, so
+// replay only needs to cover the crash-gap after that point. This keeps restart
+// proportional to the missing tail instead of the lifetime of the session.
+func (r *stateResolver) reconcileAppliedRecovery(ctx context.Context) error {
+	if len(r.recovery) == 0 || len(r.persisted) == 0 {
+		return nil
+	}
+
+	appliedThrough := -1
+	var appliedState *ChainState
+	var appliedStateID simplex.CandidateID
+	var lastChecked *ton.BlockIDExt
+	for i := len(r.recovery) - 1; i >= 0; i-- {
+		id := r.recovery[i].Vote().ID
+		if _, persisted := r.persisted[id]; !persisted {
+			continue
+		}
+
+		resolution, err := r.candidates.resolveFinalization(ctx, id)
+		if err != nil {
+			return err
+		}
+		block := resolution.Candidate.Candidate.Block
+		if lastChecked != nil && sameBlockID(block, *lastChecked) {
+			continue
+		}
+		checked := *block.Copy()
+		lastChecked = &checked
+
+		request := ChainStateRequest{
+			Shard:          r.shard,
+			Blocks:         []ton.BlockIDExt{block},
+			MinMasterchain: r.genesis.minMasterchain,
+		}
+		data, loadErr := r.backend.LoadChainState(ctx, request)
+		if loadErr == nil {
+			loaded, stateErr := newChainState(request, data)
+			if stateErr != nil {
+				return stateErr
+			}
+			if !resolution.Candidate.Candidate.Empty {
+				appliedState = loaded
+				appliedStateID = id
+			}
+			appliedThrough = i
+			break
+		}
+		if !errors.Is(loadErr, ErrBlockNotReady) && !errors.Is(loadErr, context.DeadlineExceeded) {
+			return loadErr
+		}
+	}
+	if appliedThrough < 0 {
+		return nil
+	}
+
+	r.mu.Lock()
+	for i := 0; i <= appliedThrough; i++ {
+		id := r.recovery[i].Vote().ID
+		if _, persisted := r.persisted[id]; !persisted {
+			continue
+		}
+		state := r.finalized[id]
+		if state != nil {
+			state.isDone = true
+			state.reconciled = true
+			if appliedState != nil && id == appliedStateID {
+				r.rememberAppliedStateLocked(id, state, appliedState)
+			}
+		}
+	}
+	r.mu.Unlock()
+
+	return nil
+}
+
+func cloneSessionStart(start SessionStart) SessionStart {
+	result := SessionStart{
+		Genesis:        make([]ton.BlockIDExt, len(start.Genesis)),
+		MinMasterchain: *start.MinMasterchain.Copy(),
+	}
+	for i := range start.Genesis {
+		result.Genesis[i] = *start.Genesis[i].Copy()
+	}
+
+	return result
+}
+
+func (r *stateResolver) resolve(ctx context.Context, id simplex.ParentID) (ResolvedState, error) {
+	return r.resolveWithPreparation(ctx, id, nil)
+}
+
+// resolveWithPreparation lets an observer warm-up use the prepared successor
+// before its certificate arrives. The callback runs in this waiter, which
+// keeps the shared flight alive until certification, expiry, or cancellation.
+// Completed cache hits do not replay the speculative offer.
+func (r *stateResolver) resolveWithPreparation(
+	ctx context.Context,
+	id simplex.ParentID,
+	onPrepared func(ResolvedState),
+) (ResolvedState, error) {
+	for {
+		r.mu.Lock()
+		if r.isClosed {
+			r.mu.Unlock()
+
+			return ResolvedState{}, ErrResolverClosed
+		}
+		flight := r.states[id]
+		if flight != nil {
+			select {
+			case <-flight.done:
+				result, err := flight.result, flight.err
+				flight.finished = true
+				if flight.timer != nil {
+					flight.timer.Stop()
+					flight.timer = nil
+				}
+				r.mu.Unlock()
+
+				return result, err
+			default:
+			}
+			if flight.cancelErr != nil {
+				done := flight.done
+				r.mu.Unlock()
+				select {
+				case <-ctx.Done():
+					return ResolvedState{}, ctx.Err()
+				case <-done:
+					continue
+				}
+			}
+		}
+		if flight == nil {
+			flightCtx, cancel := context.WithCancel(r.ctx)
+			flight = &stateFlight{done: make(chan struct{}), cancel: cancel}
+			r.states[id] = flight
+			r.armStateExpiryLocked(id, flight)
+			r.wg.Add(1)
+			go r.resolveLoop(flightCtx, id, flight)
+		}
+		flight.waiters++
+		var prepared <-chan struct{}
+		if onPrepared != nil {
+			if flight.prepared == nil {
+				flight.prepared = make(chan struct{})
+				if flight.preparedResult.State != nil {
+					close(flight.prepared)
+				}
+			}
+			prepared = flight.prepared
+		}
+		r.mu.Unlock()
+
+		for {
+			select {
+			case <-ctx.Done():
+				r.releaseStateWaiter(id, flight)
+
+				return ResolvedState{}, ctx.Err()
+			case <-prepared:
+				r.mu.Lock()
+				usable := !r.isClosed && flight.cancelErr == nil && (!flight.finished || flight.err == nil)
+				r.mu.Unlock()
+				if usable && ctx.Err() == nil {
+					onPrepared(flight.preparedResult)
+				}
+				onPrepared = nil
+				prepared = nil
+			case <-flight.done:
+				if onPrepared != nil && flight.err == nil && ctx.Err() == nil {
+					onPrepared(flight.result)
+				}
+				r.releaseStateWaiter(id, flight)
+
+				return flight.result, flight.err
+			}
+		}
+	}
+}
+
+func (r *stateResolver) armStateExpiryLocked(id simplex.ParentID, flight *stateFlight) {
+	if flight.expires.IsZero() {
+		params := simplex.Params{
+			TargetRate:                 r.targetRate,
+			CandidateResolveTimeoutCap: r.resolveTimeoutCap,
+			MaxLeaderWindowDesync:      r.maxLeaderWindowDesync,
+		}
+		flight.expires = time.Now().Add(resolverFlightTTL(params, r.slotsPerLeaderWindow))
+	}
+	delay := time.Until(flight.expires)
+	if delay <= 0 {
+		delay = time.Nanosecond
+	}
+	flight.timer = time.AfterFunc(delay, func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		flight.timer = nil
+		if r.states[id] != flight || flight.finished {
+			return
+		}
+		flight.cancelErr = context.DeadlineExceeded
+		flight.cancel()
+	})
+}
+
+func (r *stateResolver) releaseStateWaiter(id simplex.ParentID, flight *stateFlight) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if flight.waiters > 0 {
+		flight.waiters--
+	}
+	if flight.waiters != 0 || r.states[id] != flight || flight.finished {
+		return
+	}
+	if flight.timer != nil {
+		flight.timer.Stop()
+		flight.timer = nil
+	}
+	flight.cancelErr = context.Canceled
+	flight.cancel()
+}
+
+func (r *stateResolver) finishStateFlightLocked(
+	id simplex.ParentID,
+	flight *stateFlight,
+	result ResolvedState,
+	err error,
+	cache bool,
+) {
+	if flight.finished {
+		return
+	}
+
+	flight.finished = true
+	flight.result = result
+	flight.err = err
+	if flight.timer != nil {
+		flight.timer.Stop()
+		flight.timer = nil
+	}
+	if !cache && r.states[id] == flight {
+		delete(r.states, id)
+	}
+	close(flight.done)
+	if flight.cancel != nil {
+		flight.cancel()
+	}
+}
+
+// rememberValidatedState makes an exact post-validation state available to
+// descendants before notarization, finalization, or the ordinary node apply
+// pipeline. If a finalized-state store lookup won the race and is already
+// polling, this result completes the same flight and cancels the redundant
+// lookup without replacing the identity seen by its waiters.
+func (r *stateResolver) rememberValidatedState(id simplex.CandidateID, resolved ResolvedState) {
+	parent := simplex.Parent(id)
+
+	r.mu.Lock()
+	if r.isClosed {
+		r.mu.Unlock()
+
+		return
+	}
+	flight := r.states[parent]
+	if flight == nil {
+		done := make(chan struct{})
+		close(done)
+		r.states[parent] = &stateFlight{done: done, result: resolved, finished: true}
+		r.mu.Unlock()
+
+		return
+	}
+	select {
+	case <-flight.done:
+		r.mu.Unlock()
+
+		return
+	default:
+	}
+	r.finishStateFlightLocked(parent, flight, resolved, nil, true)
+	r.mu.Unlock()
+}
+
+// stateRetainedSlots is the margin of already-finalized parents kept resolved.
+// Simplex prunes its own slot map at slot+1, so nothing below the finalized
+// slot can become the parent of a new candidate; the margin only absorbs a
+// leader window that opened just before the finalization it now trails, because
+// re-resolving a released parent reloads a whole state from the node.
+//
+// A leader window is SlotsPerLeaderWindow slots, which is configured per
+// session, so the margin is derived from that value rather than from the four
+// slots this network happens to use.
+func (r *stateResolver) stateRetainedSlots() uint32 {
+	return stateRetainedSlots(r.slotsPerLeaderWindow)
+}
+
+// finalizedStateRetainedSlots is the margin of applied finalized states kept in
+// memory. It matches the candidate payload margin so resolving a recent parent
+// can reuse the state accepted by finalization instead of loading it again.
+func (r *stateResolver) finalizedStateRetainedSlots() uint32 {
+	return candidateRetainedSlots(r.targetRate)
+}
+
+// retentionFloorNone is the floor of a session no consumer constrains: nothing
+// has walked a lineage here yet, so the fixed margins are the whole policy.
+const retentionFloorNone = ^uint32(0)
+
+// retentionFloor is the oldest slot the finalization sweeps must not release
+// below, together with the producer's own request and whether the retention
+// budget is what overrode it.
+//
+// Capped is not a statement about how far behind this node is. It says the
+// retained payloads between the producer's anchor and the tip no longer fit the
+// session's memory budget, which is the only reason to stop honouring a request
+// that costs memory.
+type retentionFloor struct {
+	Slot   uint32
+	Capped bool
+	// Anchor is where the last completed lineage walk stopped, and AnchorKnown
+	// whether any walk has completed at all. It is reported so the distance
+	// between it and the finalized slot stays visible without being what the
+	// sweeps are bounded by.
+	Anchor      uint32
+	AnchorKnown bool
+}
+
+// notifyFinalized releases resolved parent states consensus can no longer
+// build on, and the applied states of finalizations it has left behind.
+// Nothing else drops either before the session object itself is released, so a
+// long catchain otherwise keeps every intermediate state version of the session
+// reachable. An applied successor shares the unchanged subtrees of its parent,
+// so an ordinary flight uniquely pins the superseded part of that state plus
+// its block BOC; a finalized parent pins a whole separately loaded state tree,
+// which is where the bulk of the bytes are.
+//
+// A flight with an active waiter is never removed by this sweep. The last
+// waiter cancels its flight; the loop removes it only after the current
+// ApplyMerkleUpdate returns, and a later caller waits for that cleanup before
+// restarting. That keeps the non-context-aware cell apply single-flight.
+//
+// It returns the ancestry floor for the candidate-payload sweep. State trees
+// are bounded only by their fixed parent-resolution margins.
+//
+// budgetFloor is the oldest slot the session's retention budget still allows,
+// computed from the retained payloads themselves by candidateResolver.
+// retentionCapFloor. It is passed in rather than read here so neither resolver
+// takes the other's lock.
+func (r *stateResolver) notifyFinalized(slot uint32, budgetFloor uint32) retentionFloor {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	floor := r.retentionFloorLocked(slot, budgetFloor)
+	if margin := r.stateRetainedSlots(); slot >= margin {
+		watermark := slot - margin
+		for id, flight := range r.states {
+			if !id.Exists || id.ID.Slot >= watermark {
+				continue
+			}
+			select {
+			case <-flight.done:
+				delete(r.states, id)
+			default:
+				// An observer flight still waiting for a certificate this far below
+				// the finalized slot waits for a candidate the committee left behind,
+				// and until the TTL it pinned the successor state it prepared. It is
+				// cancelled rather than removed, so the loop still owns the cleanup.
+				// A candidate the finalization walk has reached is kept: that walk
+				// fetches the certificate which completes this flight.
+				if !flight.awaitingNotarization || flight.cancelErr != nil || r.finalized[id.ID] != nil {
+					continue
+				}
+				if flight.timer != nil {
+					flight.timer.Stop()
+					flight.timer = nil
+				}
+				flight.cancelErr = errStateBelowFinalization
+				flight.cancel()
+			}
+		}
+	}
+	stateMargin := r.finalizedStateRetainedSlots()
+	if slot < stateMargin {
+		return floor
+	}
+
+	// The finalization marker stays; only the state tree behind it goes. A
+	// finalization still being applied keeps its own and is reconsidered at the
+	// next finalization. The exact selected base is handed to the producer
+	// directly, so ancestry retention no longer pins historical state trees.
+	watermark := slot - stateMargin
+	for id, state := range r.applied {
+		if id.Slot >= watermark || state.inFlight != nil {
+			continue
+		}
+		state.appliedState = nil
+		delete(r.applied, id)
+	}
+
+	return floor
+}
+
+// retentionFloorLocked reports what the local producer still needs, bounded by
+// the session's retention budget.
+//
+// The requirement is stated by the consumer rather than guessed at: a lineage
+// walk reports where it stopped, which is the masterchain-visible finalized
+// anchor and therefore the oldest slot the next one can be asked to reach. A
+// session that has never walked one constrains nothing, which is what keeps an
+// observer — or any session with no local producer — on the fixed margins.
+//
+// What bounds that requirement is budgetFloor, and it is a measurement of the
+// retained payloads rather than a slot distance. The distinction is the whole
+// point: this bound used to be slot - 64, so a session that skipped 64 slots
+// gave up on its producer's lineage while holding nothing at all — skips are
+// slots that never had a block and never will, and charging them as production
+// lag turned a stalled session into one that also had to read its lineage back
+// from storage. Slots the session never produced in are now free, because they
+// cost nothing.
+func (r *stateResolver) retentionFloorLocked(slot uint32, budgetFloor uint32) retentionFloor {
+	if !r.lineageFloorKnown {
+		return retentionFloor{Slot: retentionFloorNone}
+	}
+
+	floor := retentionFloor{Slot: r.lineageFloor, Anchor: r.lineageFloor, AnchorKnown: true}
+	if budgetFloor > r.lineageFloor && budgetFloor <= slot {
+		floor.Slot = budgetFloor
+		floor.Capped = true
+	}
+
+	return floor
+}
+
+// noteLineageFloorLocked records how far back a completed lineage walk reached.
+// It only ever moves forward: the anchor advances as the node applies, and the
+// slots it has moved past are the ones the sweeps are free to release again.
+func (r *stateResolver) noteLineageFloorLocked(slot uint32) {
+	if !r.lineageFloorKnown || slot > r.lineageFloor {
+		r.lineageFloor = slot
+		r.lineageFloorKnown = true
+	}
+}
+
+// lineageAnchor is where the last completed leader-window walk stopped, as of
+// right now. Lineage walks run per leader window and keep running through a
+// standstill — they are what a stalled session spends its time on — so this
+// advances between finalizations, and reading it from the last finalization
+// instead would freeze it for exactly as long as the session is stuck.
+func (r *stateResolver) lineageAnchor() (uint32, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.lineageFloor, r.lineageFloorKnown
+}
+
+// stateCacheStats is a debug projection of the session-scoped state cache.
+//
+// BlockBOCBytes is the one figure here that is bytes, and it is a floor rather
+// than a measurement: it counts the block payloads of the retained tips and
+// nothing else. Two much larger things sit beside every one of those payloads
+// and cannot be sized without walking them — the applied state root, and the
+// parsed block DAG each tip pins through ChainTip.Block, which is typically
+// several times the payload it was decoded from. Both are shared immutable cell
+// trees, so Resolved — one distinct retained tip set each — is the growth
+// figure that matters, and the byte count is only useful for spotting a retained
+// count that stops matching the payload sizes.
+//
+// AppliedStates counts the same kind of root held beside a finalization
+// marker. It is the figure that turns from a margin into a leak if a path that
+// stores one ever escapes the release sweep, which is why it is reported
+// separately from the finalization markers themselves.
+type stateCacheStats struct {
+	States        int
+	Resolved      int
+	Finalized     int
+	AppliedStates int
+	BlockBOCBytes int64
+}
+
+func (r *stateResolver) cacheStats() stateCacheStats {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	stats := stateCacheStats{
+		States:        len(r.states),
+		Finalized:     len(r.finalized),
+		AppliedStates: len(r.applied),
+	}
+	for _, flight := range r.states {
+		select {
+		case <-flight.done:
+		default:
+			continue
+		}
+		stats.Resolved++
+		if flight.result.State == nil {
+			continue
+		}
+		for i := range flight.result.State.tips {
+			stats.BlockBOCBytes += int64(len(flight.result.State.tips[i].BlockBOC))
+		}
+	}
+
+	return stats
+}
+
+// ancestry verifies that the locally applied finalized block is an ancestor of
+// the selected consensus base. The producer receives the exact already-resolved
+// base state directly, so this guard only follows candidate parent links and
+// never loads or applies historical states.
+//
+// With no local finalized block there is no constraint to prove and therefore
+// no reason to walk back to genesis.
+func (r *stateResolver) ancestry(
+	ctx context.Context,
+	base simplex.ParentID,
+	finalizedBlock *ton.BlockIDExt,
+) (lineageWalkStats, error) {
+	var walk lineageWalkStats
+	if finalizedBlock == nil {
+		return walk, nil
+	}
+
+	var oldestVisitedSlot uint32
+	visitedCandidate := false
+	for base.Exists {
+		walk.Visited++
+		walk.Steps[r.candidates.lineageResidency(base.ID)]++
+		lineage, err := r.candidates.lineage(ctx, base.ID)
+		if err != nil {
+			return walk, err
+		}
+		oldestVisitedSlot = base.ID.Slot
+		visitedCandidate = true
+		if lineage.matches(*finalizedBlock) {
+			r.mu.Lock()
+			r.noteLineageFloorLocked(oldestVisitedSlot)
+			r.mu.Unlock()
+
+			return walk, nil
+		}
+		base = lineage.parent
+	}
+
+	r.mu.Lock()
+	genesis := r.genesis
+	r.mu.Unlock()
+	if genesis == nil {
+		return walk, errors.New("validator runtime: state resolver is not started")
+	}
+	for i := range genesis.tips {
+		if !sameBlockID(genesis.tips[i].ID, *finalizedBlock) {
+			continue
+		}
+		if visitedCandidate {
+			r.mu.Lock()
+			r.noteLineageFloorLocked(oldestVisitedSlot)
+			r.mu.Unlock()
+		}
+
+		return walk, nil
+	}
+
+	return walk, errFinalizedLineageAhead
+}
+
+func (r *stateResolver) resolveLoop(
+	ctx context.Context,
+	id simplex.ParentID,
+	flight *stateFlight,
+) {
+	defer r.wg.Done()
+
+	result, err := r.resolveInner(ctx, id, flight)
+	r.mu.Lock()
+	if flight.finished {
+		r.mu.Unlock()
+
+		return
+	}
+	if flight.cancelErr != nil {
+		err = flight.cancelErr
+	}
+	r.finishStateFlightLocked(id, flight, result, err, err == nil)
+	r.mu.Unlock()
+}
+
+func (r *stateResolver) resolveInner(
+	ctx context.Context,
+	id simplex.ParentID,
+	flight *stateFlight,
+) (ResolvedState, error) {
+	if !id.Exists {
+		r.mu.Lock()
+		genesis := r.genesis
+		r.mu.Unlock()
+		if genesis == nil {
+			return ResolvedState{}, errors.New("validator runtime: state resolver is not started")
+		}
+
+		return ResolvedState{State: genesis}, nil
+	}
+
+	var artifact *CandidateArtifact
+	if !r.candidates.validateCandidates {
+		var err error
+		artifact, err = r.candidates.candidate(ctx, id.ID)
+		if err != nil && !errors.Is(err, ErrCandidateUnavailable) {
+			return ResolvedState{}, err
+		}
+	}
+	if artifact == nil {
+		resolution, err := r.candidates.resolve(ctx, id.ID)
+		if err != nil {
+			return ResolvedState{}, err
+		}
+
+		return r.resolveCandidateState(ctx, id.ID, resolution.Candidate)
+	}
+
+	// Only observers speculate on an unvalidated payload. The warm-up may
+	// offer this successor to the producer, while ordinary window and
+	// finalization readers remain behind this flight's certificate gate.
+	result, err := r.resolveCandidateState(ctx, id.ID, artifact)
+	if err != nil {
+		return ResolvedState{}, err
+	}
+	r.mu.Lock()
+	if !flight.finished && flight.cancelErr == nil {
+		flight.preparedResult = result
+		if flight.prepared != nil {
+			close(flight.prepared)
+		}
+	}
+	flight.awaitingNotarization = true
+	r.mu.Unlock()
+
+	// The shared flight's ordinary lifetime bounds both computation and this
+	// wait. A shorter speculative timer could cancel a certified resolution
+	// that a newly opened window has already joined.
+	if err = r.candidates.awaitNotarization(ctx, id.ID); err != nil {
+		return ResolvedState{}, err
+	}
+
+	return result, nil
+}
+
+func (r *stateResolver) resolveCandidateState(
+	ctx context.Context,
+	id simplex.CandidateID,
+	artifact *CandidateArtifact,
+) (ResolvedState, error) {
+	if artifact.Candidate.Empty {
+		return r.resolve(ctx, artifact.Candidate.Parent)
+	}
+	genUtime, err := artifact.generationTime()
+	if err != nil {
+		return ResolvedState{}, err
+	}
+
+	r.mu.Lock()
+	isFinalized := r.finalized[id] != nil && r.finalized[id].isDone
+	genesis := r.genesis
+	r.mu.Unlock()
+	if isFinalized {
+		if genesis == nil {
+			return ResolvedState{}, errors.New("validator runtime: state resolver is not started")
+		}
+		// The state this session may already hold for this exact block, before any
+		// store read. Two things were wrong with going straight to the load:
+		//
+		//   - it re-read a state that was already in memory, and when the store
+		//     could not answer it waited for one it was holding;
+		//   - it returned the freshly built state rather than the one already
+		//     cached under this marker, so one parent could end up with two
+		//     materializations. chain_state.go compares tip states BY POINTER for
+		//     the live-successor carry-back, so the second one silently costs a
+		//     full re-apply per candidate — with no error and no metric.
+		//
+		// Both are fixed by asking first and by returning the canonical object.
+		if state := r.residentAppliedState(id, artifact.Candidate.Block); state != nil {
+			return ResolvedState{State: state, GenUtime: genUtime}, nil
+		}
+		// Then from what the session holds for an ancestor, before the store.
+		// The store answers only once the node's apply pipeline has reached this
+		// block, and the pipeline is fed by the very acceptances that wait here:
+		// on the stand a lagging pipeline held every validation of a session in
+		// this read for 75 s, and the standstill that followed fed the lag.
+		if state, ok := r.reconstructFinalizedState(ctx, id, artifact); ok {
+			return ResolvedState{State: state, GenUtime: genUtime}, nil
+		}
+		request := ChainStateRequest{
+			Shard:          r.shard,
+			Blocks:         []ton.BlockIDExt{artifact.Candidate.Block},
+			MinMasterchain: genesis.minMasterchain,
+		}
+		data, loadErr := r.loadFinalizedChainState(ctx, request)
+		if loadErr != nil {
+			return ResolvedState{}, loadErr
+		}
+		state, loadErr := newChainState(request, data)
+		if loadErr != nil {
+			return ResolvedState{}, loadErr
+		}
+
+		return ResolvedState{State: r.rememberAppliedCandidateState(id, state), GenUtime: genUtime}, nil
+	}
+
+	previous, err := r.resolve(ctx, artifact.Candidate.Parent)
+	if err != nil {
+		return ResolvedState{}, err
+	}
+	state, err := previous.State.apply(artifact)
+	if err != nil {
+		return ResolvedState{}, err
+	}
+
+	return ResolvedState{State: state, GenUtime: genUtime}, nil
+}
+
+// finalizedStateReconstructionWindows bounds reconstructFinalizedState: how many
+// leader windows of blocks it may walk back and apply forward before giving the
+// question to the store. Two windows is where the retention margins stop keeping
+// candidate payloads resident anyway, so a longer walk would be reading them back
+// from storage one by one and applying them one by one — at which point the
+// store's own applied state is the cheaper answer.
+const finalizedStateReconstructionWindows = 2
+
+// reconstructFinalizedState rebuilds the state of a finalized candidate from a
+// state this session still holds — a resolved parent, an applied finalization or
+// the session genesis — by applying each intervening block's update forward, the
+// same apply the non-finalized branch of resolveInner performs. It never asks the
+// node for a state.
+//
+// This is what the reference gets for free: it applies a block right after
+// validating it, so the state of anything it finalized is in its own database.
+// Ours is applied by a separate pipeline, and when that pipeline lags, the store
+// read this replaces waits for it — with every validation of the session queued
+// behind the wait, because the parent of the next candidate is the block being
+// waited for. The states rebuilt here are remembered exactly where a load would
+// have put them, so the sweeps release them on the same margins.
+//
+// It reports false when the walk finds no resident ancestor inside its bound,
+// when a payload cannot be resolved, or when an update does not apply; the
+// caller then falls back to the store.
+func (r *stateResolver) reconstructFinalizedState(
+	ctx context.Context,
+	id simplex.CandidateID,
+	artifact *CandidateArtifact,
+) (*ChainState, bool) {
+	if artifact == nil || artifact.Candidate.Empty || artifact.Candidate.ID != id {
+		return nil, false
+	}
+	bound := int(r.slotsPerLeaderWindow) * finalizedStateReconstructionWindows
+	if bound <= 0 {
+		return nil, false
+	}
+
+	// Newest first: the candidate itself, then every non-empty ancestor down to
+	// the one whose state is resident.
+	chain := []*CandidateArtifact{artifact}
+	parent := artifact.Candidate.Parent
+	var base *ChainState
+	for base == nil {
+		if !parent.Exists {
+			r.mu.Lock()
+			base = r.genesis
+			r.mu.Unlock()
+			if base == nil {
+				return nil, false
+			}
+			break
+		}
+		if state := r.residentParentState(parent); state != nil {
+			base = state
+			break
+		}
+		if len(chain) >= bound {
+			return nil, false
+		}
+		resolution, err := r.candidates.resolve(ctx, parent.ID)
+		if err != nil || resolution.Candidate == nil {
+			return nil, false
+		}
+		ancestor := resolution.Candidate
+		if !ancestor.Candidate.Empty {
+			chain = append(chain, ancestor)
+		}
+		parent = ancestor.Candidate.Parent
+	}
+
+	state := base
+	for i := len(chain) - 1; i >= 0; i-- {
+		next, err := state.apply(chain[i])
+		if err != nil {
+			return nil, false
+		}
+		genUtime, err := chain[i].generationTime()
+		if err != nil {
+			return nil, false
+		}
+		state = r.rememberReconstructedState(chain[i].Candidate.ID, next, genUtime)
+	}
+
+	return state, true
+}
+
+// residentParentState is the state this session holds for the parent relation
+// "my parent is parent", or nil. A finished resolve flight is the common case; a
+// finalization that still carries its applied state is the other. Nothing is
+// read or computed.
+func (r *stateResolver) residentParentState(parent simplex.ParentID) *ChainState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if flight := r.states[parent]; flight != nil {
+		select {
+		case <-flight.done:
+			if flight.err == nil && flight.result.State != nil {
+				return flight.result.State
+			}
+		default:
+		}
+	}
+	if !parent.Exists {
+		return nil
+	}
+	if state := r.finalized[parent.ID]; state != nil && state.isDone && state.appliedState != nil {
+		r.applied[parent.ID] = state
+
+		return state.appliedState
+	}
+
+	return nil
+}
+
+// rememberReconstructedState files one rebuilt state where a load or a
+// validation would have filed it — under the finalization marker when the block
+// is already final, and as the resolved parent relation otherwise — and returns
+// the canonical object for that slot, so a concurrent resolve that won the race
+// is not answered with a second materialization.
+func (r *stateResolver) rememberReconstructedState(
+	id simplex.CandidateID,
+	state *ChainState,
+	genUtime time.Time,
+) *ChainState {
+	r.mu.Lock()
+	if final := r.finalized[id]; final != nil && final.isDone {
+		r.rememberAppliedStateLocked(id, final, state)
+		state = final.appliedState
+	}
+	r.mu.Unlock()
+	r.rememberValidatedState(id, ResolvedState{State: state, GenUtime: genUtime})
+
+	return state
+}
+
+// residentAppliedState returns the applied state this session already holds for
+// one finalized candidate, or nil. It never reads anything: it is the question
+// "do we already have this" asked before the read that would answer it again.
+//
+// The tip is checked against the block the caller is resolving. The marker is
+// keyed by candidate id and only ever carries that candidate's own state, so the
+// check cannot fail today; it is here because a mismatch would hand out a state
+// for another block, which is not a failure worth discovering later.
+func (r *stateResolver) residentAppliedState(
+	id simplex.CandidateID,
+	block ton.BlockIDExt,
+) *ChainState {
+	r.mu.Lock()
+	var resolved *ChainState
+	if state := r.finalized[id]; state != nil && state.isDone && state.appliedState != nil {
+		resolved = state.appliedState
+		r.applied[id] = state
+	}
+	r.mu.Unlock()
+	if resolved == nil {
+		return nil
+	}
+	if tip, err := resolved.NormalBlock(); err != nil || !sameBlockID(tip, block) {
+		return nil
+	}
+
+	return resolved
+}
+
+// rememberAppliedCandidateState caches one loaded state under its finalization
+// marker and returns the CANONICAL state for that marker — the one already
+// cached when a concurrent resolve won the race, and the argument otherwise.
+// Callers must use the returned value: handing out a state the marker did not
+// adopt is how one block ends up with two materializations, which
+// chain_state.go's pointer comparison turns into a silent full re-apply.
+func (r *stateResolver) rememberAppliedCandidateState(
+	id simplex.CandidateID,
+	resolved *ChainState,
+) *ChainState {
+	r.mu.Lock()
+	if state := r.finalized[id]; state != nil && state.isDone {
+		r.rememberAppliedStateLocked(id, state, resolved)
+		resolved = state.appliedState
+	}
+	r.mu.Unlock()
+
+	return resolved
+}
+
+// rememberAppliedStateLocked keeps one loaded state with its finalization
+// marker and queues it for release. Every assignment to appliedState goes
+// through here: the queue is what keeps the release sweep proportional to what
+// is retained rather than to every candidate this session has finalized.
+func (r *stateResolver) rememberAppliedStateLocked(
+	id simplex.CandidateID,
+	state *finalizedState,
+	resolved *ChainState,
+) {
+	if state.appliedState == nil {
+		state.appliedState = resolved
+	}
+	r.applied[id] = state
+}
+
+// loadFinalizedChainState reads an already-finalized block's state, tolerating
+// the gap between the final certificate and the block becoming readable.
+// SubmitBlockLocally deliberately only queues acceptance, so that gap exists by
+// design and treating it as a fatal session error stops every validator in an
+// otherwise healthy network.
+//
+// THE WAIT IS NOT HERE ANY MORE, and this loop is no longer a poll. A local
+// backend blocks inside its own read until a publication edge tells it to look
+// again — see LocalSessionBackend.loadChainTip — and it returns not-ready only
+// after its backstop has fired and complained. The interval below is therefore
+// what paces a backend that does not wait at all, which is the only case left
+// where returning instantly in a tight loop would spin. On the real path it is
+// reached at most once per backstop, so the 1 Hz that used to be the whole
+// mechanism is now the fallback of a fallback.
+//
+// Two callers, two different bounds, and both are deliberate: resolveInner
+// runs under the shared resolve flight, bounded by its waiters and the session
+// horizon TTL, while waitReplayApplied runs under r.ctx during crash replay,
+// which is exact parity with the reference's masterchain finalize ordering.
+func (r *stateResolver) loadFinalizedChainState(
+	ctx context.Context,
+	request ChainStateRequest,
+) (ChainStateData, error) {
+	// This is the caller that exists in order to wait, so it asks the backend to
+	// wait rather than asking it again every second.
+	request.Wait = true
+	for {
+		data, err := r.backend.LoadChainState(ctx, request)
+		if err == nil {
+			return data, nil
+		}
+		if !errors.Is(err, ErrBlockNotReady) && !errors.Is(err, context.DeadlineExceeded) {
+			return ChainStateData{}, fmt.Errorf("validator runtime: load finalized chain state: %w", err)
+		}
+		if err = waitDuration(ctx, time.Second); err != nil {
+			return ChainStateData{}, ErrResolverClosed
+		}
+	}
+}
+
+func candidateGenUtime(collatedData []byte) (time.Time, error) {
+	roots, err := cell.FromBOCMultiRootWithOptions(
+		collatedData,
+		cell.BOCParseOptions{NoCopyPayload: true},
+	)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("validator runtime: decode collated data time: %w", err)
+	}
+	milliseconds, err := candidateGenUtimeMSFromRoots(roots)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	return time.UnixMilli(int64(milliseconds)), nil
+}
+
+func candidateGenUtimeMSFromRoots(roots []*cell.Cell) (uint64, error) {
+	for _, root := range roots {
+		var loader cell.Slice
+		loadErr := root.BeginParseInto(&loader)
+		if loadErr != nil || loader.BitsLeft() < 128 {
+			continue
+		}
+		tag, tagErr := loader.LoadUInt(32)
+		if tagErr != nil || tag != consensusExtraDataTag {
+			continue
+		}
+		if _, loadErr = loader.LoadUInt(32); loadErr != nil {
+			continue
+		}
+		milliseconds, timeErr := loader.LoadUInt(64)
+		if timeErr != nil || loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
+			continue
+		}
+		if milliseconds > uint64(^uint64(0)>>1) {
+			return 0, errors.New("validator runtime: candidate generation time overflows int64")
+		}
+
+		return milliseconds, nil
+	}
+
+	return 0, errors.New("validator runtime: candidate has no consensus extra data")
+}
+
+// generationTime returns the exact timestamp attached by a trusted producer.
+// The byte fallback preserves compatibility for artifacts assembled inside
+// this package without an optimization capsule.
+func (a *CandidateArtifact) generationTime() (time.Time, error) {
+	if !a.generationTimeKnown {
+		return candidateGenUtime(a.CollatedData)
+	}
+	if a.generationTimeMS > uint64(^uint64(0)>>1) {
+		return time.Time{}, errors.New("validator runtime: candidate generation time overflows int64")
+	}
+
+	return time.UnixMilli(int64(a.generationTimeMS)), nil
+}
+
+// withGenerationTime establishes private timestamp provenance at an admission
+// boundary. Trusted local and decoded candidates return unchanged; a custom
+// artifact pays one collated BOC decode and the resolver retains the derived
+// scalar from then on.
+func (a *CandidateArtifact) withGenerationTime() (*CandidateArtifact, error) {
+	if a.Candidate.Empty || a.generationTimeKnown {
+		return a, nil
+	}
+	milliseconds, err := candidateGenUtime(a.CollatedData)
+	if err != nil {
+		return nil, err
+	}
+	withTime := *a
+	withTime.generationTimeMS = uint64(milliseconds.UnixMilli())
+	withTime.generationTimeKnown = true
+
+	return &withTime, nil
+}
+
+func (r *stateResolver) finalize(
+	ctx context.Context,
+	id simplex.CandidateID,
+	certificate simplex.VerifiedCertificate,
+) error {
+	return r.finalizeWith(ctx, id, certificate, nil)
+}
+
+func (r *stateResolver) finalizeWith(
+	ctx context.Context,
+	id simplex.CandidateID,
+	certificate simplex.VerifiedCertificate,
+	certifiedCandidate *CandidateArtifact,
+) error {
+	r.mu.Lock()
+	if r.isClosed {
+		r.mu.Unlock()
+
+		return ErrResolverClosed
+	}
+	state := r.finalized[id]
+	if state == nil {
+		state = &finalizedState{}
+		r.finalized[id] = state
+	}
+	if state.isDone && state.reconciled {
+		r.mu.Unlock()
+
+		return nil
+	}
+	flight := state.inFlight
+	if flight == nil {
+		replay := state.isDone
+		flight = &resolverFlight{done: make(chan struct{})}
+		state.inFlight = flight
+		r.wg.Add(1)
+		go r.finalizeLoop(id, certificate, certifiedCandidate, replay, flight)
+	}
+	r.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-flight.done:
+		return flight.err
+	}
+}
+
+func (r *stateResolver) finalizeLoop(
+	id simplex.CandidateID,
+	certificate simplex.VerifiedCertificate,
+	certifiedCandidate *CandidateArtifact,
+	replay bool,
+	flight *resolverFlight,
+) {
+	defer r.wg.Done()
+
+	err := r.finalizeInner(id, certificate, certifiedCandidate, replay)
+	r.mu.Lock()
+	flight.err = err
+	state := r.finalized[id]
+	if state != nil && state.inFlight == flight {
+		if err == nil {
+			state.isDone = true
+			state.reconciled = true
+			state.inFlight = nil
+		} else if replay {
+			// The durable finalization remains authoritative. Keep it so state
+			// resolution never falls back to applying a Merkle update over an
+			// already-final block; a repeated notification can retry ingress.
+			state.inFlight = nil
+		} else {
+			delete(r.finalized, id)
+			delete(r.applied, id)
+		}
+	}
+	close(flight.done)
+	r.mu.Unlock()
+}
+
+func (r *stateResolver) finalizeInner(
+	id simplex.CandidateID,
+	finalCertificate simplex.VerifiedCertificate,
+	certifiedCandidate *CandidateArtifact,
+	replay bool,
+) error {
+	if finalCertificate.IsZero() && r.shard.IsMasterchain() {
+		return nil
+	}
+
+	resolution, err := r.candidates.resolveFinalization(r.ctx, id)
+	if err != nil {
+		return err
+	}
+	artifact := resolution.Candidate
+	if !finalCertificate.IsZero() && certifiedCandidate == nil {
+		if finalCertificate.Vote() != simplex.FinalizeVote(id) {
+			return errors.New("validator runtime: finalization vote mismatch")
+		}
+		certifiedCandidate = artifact
+	}
+	// A persisted shard marker is written once its acceptance has been queued,
+	// so it is replayed only if the node never applied the block. A block the
+	// node can read proves every finalized block at or below its slot applied
+	// too, which keeps a restart to the crash gap instead of walking the session
+	// back to its genesis; the reference loads its markers as done and stops.
+	// The state read here is kept for the acceptance of the child that asked.
+	if replay && !r.shard.IsMasterchain() {
+		request := ChainStateRequest{
+			Shard:          r.shard,
+			Blocks:         []ton.BlockIDExt{artifact.Candidate.Block},
+			MinMasterchain: r.genesis.minMasterchain,
+		}
+		data, loadErr := r.backend.LoadChainState(r.ctx, request)
+		if loadErr == nil {
+			loaded, stateErr := newChainState(request, data)
+			if stateErr != nil {
+				return stateErr
+			}
+
+			r.mu.Lock()
+			for persisted := range r.persisted {
+				if state := r.finalized[persisted]; persisted.Slot <= id.Slot && state.inFlight == nil {
+					state.reconciled = true
+				}
+			}
+			if !artifact.Candidate.Empty {
+				r.rememberAppliedStateLocked(id, r.finalized[id], loaded)
+			}
+			r.mu.Unlock()
+
+			return nil
+		}
+		if !errors.Is(loadErr, ErrBlockNotReady) && !errors.Is(loadErr, context.DeadlineExceeded) {
+			return loadErr
+		}
+	}
+	if err = r.candidates.store(r.ctx, id); err != nil {
+		return fmt.Errorf("validator runtime: store finalized candidate: %w", err)
+	}
+
+	if artifact.Candidate.Empty {
+		if artifact.Candidate.Parent.Exists {
+			if err = r.finalizeWith(
+				r.ctx,
+				artifact.Candidate.Parent.ID,
+				finalCertificate,
+				certifiedCandidate,
+			); err != nil {
+				return err
+			}
+		}
+	} else {
+		if artifact.Candidate.Parent.Exists {
+			if err = r.finalizeWith(
+				r.ctx,
+				artifact.Candidate.Parent.ID,
+				simplex.VerifiedCertificate{},
+				nil,
+			); err != nil {
+				return err
+			}
+		}
+
+		certificate := resolution.Notarization
+		certified := artifact
+		if !finalCertificate.IsZero() {
+			certificate = finalCertificate
+			certified = certifiedCandidate
+		}
+		// The state acceptance publishes into the live view is what every later
+		// reader — the next validations, the collator — takes instead of waiting
+		// for the node to apply this block. When this node did not validate the
+		// block there is nothing resident to publish, so the state is rebuilt from
+		// a resident ancestor first, on a budget: the handoff must not wait on a
+		// payload fetch, and a block that cannot be rebuilt is accepted without a
+		// state exactly as before.
+		state := r.acceptedCandidateState(id, artifact.Candidate.Block)
+		if state == nil && !replay {
+			rebuildCtx, cancelRebuild := context.WithTimeout(r.ctx, r.reconstructionBudget())
+			if rebuilt, ok := r.reconstructFinalizedState(rebuildCtx, id, artifact); ok {
+				state = rebuilt
+			}
+			cancelRebuild()
+		}
+		if err = r.acceptBlock(BlockAcceptance{
+			Candidate:          artifact,
+			Certificate:        certificate,
+			CertifiedCandidate: certified,
+			Replay:             replay,
+			state:              state,
+		}); err != nil {
+			return err
+		}
+		if replay && r.shard.IsMasterchain() {
+			if err = r.waitReplayApplied(artifact.Candidate.Block); err != nil {
+				return err
+			}
+		}
+	}
+
+	// The wait follows r.ctx so close() stays bounded by its own cancellation
+	// instead of by storage always firing this callback. A cancelled wait
+	// leaves the marker possibly committed, which is exactly what recovery
+	// expects: finalization is replayed from the durable record.
+	if err = awaitStorageWrite(r.ctx, func(done func(error)) {
+		r.storage.MarkFinalized(r.storageID, id, done)
+	}); err != nil {
+		return fmt.Errorf("validator runtime: mark candidate finalized: %w", err)
+	}
+
+	return nil
+}
+
+// waitReplayApplied preserves the ordering guaranteed by the C++
+// StateResolver, where FinalizeBlock completes before the candidate is marked
+// done. Normal Go acceptance remains asynchronous; only crash recovery waits,
+// because submitting a later masterchain block before its predecessor reaches
+// the live store can leave an unrecoverable hole when every validator restarts
+// from the same consensus journal.
+func (r *stateResolver) waitReplayApplied(block ton.BlockIDExt) error {
+	r.mu.Lock()
+	genesis := r.genesis
+	r.mu.Unlock()
+	if genesis == nil {
+		return errors.New("validator runtime: state resolver is not started")
+	}
+
+	request := ChainStateRequest{
+		Shard:          r.shard,
+		Blocks:         []ton.BlockIDExt{block},
+		MinMasterchain: genesis.minMasterchain,
+	}
+	data, err := r.loadFinalizedChainState(r.ctx, request)
+	if err != nil {
+		return err
+	}
+	if _, err = newChainState(request, data); err != nil {
+		return fmt.Errorf("validator runtime: load replayed chain state: %w", err)
+	}
+
+	return nil
+}
+
+// acceptedCandidateState returns the state this session already holds for the
+// block being accepted, so acceptance can publish it into the live view.
+//
+// It reads what is already there and computes nothing. The state of candidate id
+// is the resolved state of the parent relation "my parent is id", which is where
+// rememberValidatedState installs it after a successful validation, and where the
+// applied-state cache keeps it after a load. Both are the same immutable object
+// every other reader of this slot got, so publishing it cannot introduce a second
+// materialization of one block.
+//
+// Nil is the ordinary answer in three cases, none of them an error: a replayed
+// finalization after a restart (nothing was validated in this process), a
+// finalization whose flight is still resolving, and a state the retention margins
+// have already released. In all three the reader falls back to the wait, which is
+// what happens today for every block.
+func (r *stateResolver) acceptedCandidateState(
+	id simplex.CandidateID,
+	block ton.BlockIDExt,
+) *ChainState {
+	r.mu.Lock()
+	var resolved *ChainState
+	if state := r.finalized[id]; state != nil && state.appliedState != nil {
+		resolved = state.appliedState
+	} else if flight := r.states[simplex.Parent(id)]; flight != nil {
+		select {
+		case <-flight.done:
+			if flight.err == nil {
+				resolved = flight.result.State
+			}
+		default:
+		}
+	}
+	r.mu.Unlock()
+	if resolved == nil {
+		return nil
+	}
+	// The tip has to be this exact block. An empty-candidate chain resolves the
+	// same parent relation for several slots, so the state under this key is not
+	// necessarily the successor of THIS block.
+	if tip, err := resolved.NormalBlock(); err != nil || !sameBlockID(tip, block) {
+		return nil
+	}
+
+	return resolved
+}
+
+// speculativeAncestorBlocks borrows only resident, certified ancestor block
+// roots. Candidate and state locks are never nested, and no missing candidate
+// or state is resolved here. Empty candidates reuse their ordinary block; the
+// candidate-hop bound also limits a run of empty aliases while taking this
+// best-effort snapshot. The selected-base constructor checks every block edge.
+func (r *stateResolver) speculativeAncestorBlocks(id simplex.CandidateID, selected *ChainState) []*cell.Cell {
+	if selected == nil || len(selected.tips) != 1 {
+		return nil
+	}
+	lastBlock := selected.tips[0].ID
+	r.candidates.mu.Lock()
+	entry := r.candidates.entries[id]
+	if r.candidates.closed || entry == nil || entry.lineage == nil || !entry.lineage.matches(lastBlock) {
+		r.candidates.mu.Unlock()
+
+		return nil
+	}
+	parent := entry.lineage.parent
+	r.candidates.mu.Unlock()
+
+	var roots []*cell.Cell
+	for hops := 0; parent.Exists && len(roots) < collator.MaxSpeculativeLineageBlocks-1 && hops < collator.MaxSpeculativeLineageBlocks; hops++ {
+		if parent.ID.Slot >= id.Slot {
+			break
+		}
+		r.candidates.mu.Lock()
+		entry = r.candidates.entries[parent.ID]
+		if r.candidates.closed || entry == nil || entry.lineage == nil ||
+			entry.notarization.IsZero() || entry.notarization.Vote() != simplex.NotarizeVote(parent.ID) {
+			r.candidates.mu.Unlock()
+
+			break
+		}
+		lineage := entry.lineage
+		r.candidates.mu.Unlock()
+		if !lineage.matches(lastBlock) {
+			if lineage.workchain != lastBlock.Workchain || lineage.shard != lastBlock.Shard ||
+				lastBlock.SeqNo == 0 || lineage.seqno != lastBlock.SeqNo-1 {
+				break
+			}
+			block := ton.BlockIDExt{
+				Workchain: lineage.workchain, Shard: lineage.shard, SeqNo: lineage.seqno,
+				RootHash: lineage.rootHash[:], FileHash: lineage.fileHash[:],
+			}
+			state := r.acceptedCandidateState(parent.ID, block)
+			if state == nil || len(state.tips) != 1 || state.tips[0].Block == nil {
+				break
+			}
+			if roots == nil {
+				roots = make([]*cell.Cell, 0, collator.MaxSpeculativeLineageBlocks-1)
+			}
+			roots = append(roots, state.tips[0].Block)
+			lastBlock = block
+		}
+		id, parent = parent.ID, lineage.parent
+	}
+	if !parent.Exists && len(roots) < collator.MaxSpeculativeLineageBlocks-1 {
+		r.mu.Lock()
+		genesis := r.genesis
+		closed := r.isClosed
+		r.mu.Unlock()
+		if !closed && genesis != nil && len(genesis.tips) == 1 && genesis.tips[0].Block != nil {
+			tip := genesis.tips[0]
+			if tip.ID.Workchain == lastBlock.Workchain && tip.ID.Shard == lastBlock.Shard &&
+				lastBlock.SeqNo != 0 && tip.ID.SeqNo == lastBlock.SeqNo-1 {
+				roots = append(roots, tip.Block)
+			}
+		}
+	}
+
+	return roots
+}
+
+// acceptBlock prepares one acceptance and submits it on the finalization chain,
+// so a child never reaches the node before its parent. The shard-top description
+// may wait on the node's apply pipeline and runs detached from that chain.
+func (r *stateResolver) acceptBlock(acceptance BlockAcceptance) error {
+	prepared, err := r.backend.PrepareBlockAcceptance(r.ctx, acceptance)
+	if err != nil {
+		return fmt.Errorf("validator runtime: prepare finalized block: %w", err)
+	}
+
+	for {
+		err = prepared.Submit(r.ctx)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrBlockNotReady) && !errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("validator runtime: accept finalized block: %w", err)
+		}
+		// Match cppnode/ton/validator/consensus/bridge.cpp: retry transient node
+		// acceptance failures at 1 Hz. The apply pipeline has no readiness edge.
+		if err = waitDuration(r.ctx, time.Second); err != nil {
+			return ErrResolverClosed
+		}
+	}
+	if r.shard.IsMasterchain() || acceptance.Certificate.IsZero() ||
+		acceptance.Certificate.Vote().Kind != simplex.VoteFinalize {
+		return nil
+	}
+
+	r.mu.Lock()
+	closed := r.isClosed
+	if !closed {
+		r.wg.Add(1)
+	}
+	r.mu.Unlock()
+	if closed {
+		return ErrResolverClosed
+	}
+	go r.describeAcceptedBlock(acceptance.Candidate.Candidate.ID, prepared)
+
+	return nil
+}
+
+// describeAcceptedBlock retries the description at the reference's 1 Hz pace
+// for the session lifetime. Permanent failures are reported and dropped; the
+// block itself has already been accepted.
+func (r *stateResolver) describeAcceptedBlock(id simplex.CandidateID, prepared PreparedBlockAcceptance) {
+	defer r.wg.Done()
+
+	for {
+		err := prepared.Describe(r.ctx)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, ErrBlockNotReady) && !errors.Is(err, context.DeadlineExceeded) {
+			if r.describeFailed != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrResolverClosed) {
+				r.describeFailed(id, err)
+			}
+			return
+		}
+		if waitDuration(r.ctx, time.Second) != nil {
+			return
+		}
+	}
+}
+
+// reconstructionBudget bounds the state rebuild acceptance attempts before the
+// handoff: a leader window of wall clock, which covers the applies a resident
+// ancestor two windows back needs and stops a payload fetch from holding the
+// chain.
+func (r *stateResolver) reconstructionBudget() time.Duration {
+	r.mu.Lock()
+	rate := r.targetRate
+	r.mu.Unlock()
+	if rate <= 0 {
+		return time.Second
+	}
+
+	return time.Duration(r.slotsPerLeaderWindow) * rate
+}
+
+func (r *stateResolver) close() {
+	r.mu.Lock()
+	if r.isClosed {
+		r.mu.Unlock()
+		r.wg.Wait()
+
+		return
+	}
+	r.isClosed = true
+	r.cancel()
+	r.mu.Unlock()
+
+	r.wg.Wait()
+}

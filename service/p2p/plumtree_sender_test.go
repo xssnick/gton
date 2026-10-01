@@ -202,6 +202,20 @@ func TestPlumtreeOutboundWorkerReusesAndStops(t *testing.T) {
 	}
 }
 
+func TestPlumtreeOutboundSendWindowExposesDeadline(t *testing.T) {
+	ctx, cancel := newPlumtreeOutboundSendWindow(t.Context())
+	defer cancel()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("outbound send window has no deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > plumtreeOutboundTimeout {
+		t.Fatalf("outbound send window remaining time = %s, want (0, %s]", remaining, plumtreeOutboundTimeout)
+	}
+}
+
 func BenchmarkPlumtreeOutboundQueueRoundTrip(b *testing.B) {
 	peer := plumtreeEngineTestPeer(1)
 	batch := plumtreeWireBatch{
@@ -234,7 +248,7 @@ func TestPlumtreeOutboundSendDefersFailedRosterRoute(t *testing.T) {
 	remoteKey := quicOutboundTestKey(t)
 	remotePublicKey := remoteKey.Public().(ed25519.PublicKey)
 	peerID := peerIDForQUICOutboundTest(t, remotePublicKey)
-	route := newPeerRoute("")
+	route := newTestPeerRouteWithRetry("", time.Millisecond, time.Millisecond)
 	firstPeer := &overlayPeer{
 		node:  node,
 		id:    peerID,
@@ -265,136 +279,20 @@ func TestPlumtreeOutboundSendDefersFailedRosterRoute(t *testing.T) {
 	if got := dht.calls.Load(); got != 1 {
 		t.Fatalf("DHT lookups during retry delay = %d, want 1", got)
 	}
-	if route.quicReady(time.Now()) {
+	if route.QUICReady(time.Now()) {
 		t.Fatal("failed QUIC route remained eligible for Plumtree fanout")
 	}
 
-	route.quicRetryState.Store(time.Now().Add(-time.Second).UnixNano())
+	deadline := time.Now().Add(time.Second)
+	for !route.QUICDialPermitted(time.Now()) {
+		if time.Now().After(deadline) {
+			t.Fatal("QUIC retry delay did not expire")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	secondRuntime.sendOutboundBatch(context.Background(), peerID, wires)
 	if got := dht.calls.Load(); got != 1 {
 		t.Fatalf("DHT lookups after retry delay = %d, want cached failure", got)
-	}
-}
-
-func TestPeerRoutePlumtreeQUICRetryDeadlineOnlyExtends(t *testing.T) {
-	route := newPeerRoute("")
-	now := time.Unix(1_000_000, 0)
-
-	route.deferQUICDial(now)
-	want := now.Add(quicDialRetryDelay(1)).UnixNano()
-	route.deferQUICDial(now.Add(-time.Second))
-
-	if got := route.quicRetryState.Load(); got != want {
-		t.Fatalf("retry deadline = %d, want %d", got, want)
-	}
-}
-
-func TestPeerRoutePlumtreeQUICRetryBacksOffAndResets(t *testing.T) {
-	route := newPeerRoute("")
-	now := time.Unix(1_000_000, 0)
-
-	for failure, wantDelay := range []time.Duration{
-		quicDialRetryMinDelay,
-		2 * quicDialRetryMinDelay,
-		quicDialRetryMaxDelay,
-		quicDialRetryMaxDelay,
-		quicDialRetryMaxDelay,
-	} {
-		if !route.beginQUICDial(now) {
-			t.Fatalf("failure %d: route rejected dial", failure+1)
-		}
-		route.failQUICDial(now)
-		want := now.Add(wantDelay).UnixNano()
-		if got := route.quicRetryState.Load(); got != want {
-			t.Fatalf(
-				"failure %d: retry deadline = %d, want %d",
-				failure+1,
-				got,
-				want,
-			)
-		}
-		now = time.Unix(0, want)
-	}
-
-	if !route.beginQUICDial(now) {
-		t.Fatal("route rejected successful retry")
-	}
-	route.finishQUICDial()
-	if route.quicDialFailures != 0 {
-		t.Fatalf("failures after successful dial = %d, want 0", route.quicDialFailures)
-	}
-
-	if !route.beginQUICDial(now) {
-		t.Fatal("route rejected dial after success")
-	}
-	route.failQUICDial(now)
-	want := now.Add(quicDialRetryMinDelay).UnixNano()
-	if got := route.quicRetryState.Load(); got != want {
-		t.Fatalf("retry deadline after reset = %d, want %d", got, want)
-	}
-}
-
-func TestPeerRouteExistingQUICPathClearsCooldown(t *testing.T) {
-	route := newPeerRoute("127.0.0.1:30303")
-	route.quicRetryState.Store(time.Now().Add(time.Minute).UnixNano())
-	route.quicRetryMx.Lock()
-	route.quicDialFailures = 3
-	route.quicRetryMx.Unlock()
-	route.markQUICAddrStale()
-
-	route.succeedQUICDial(false)
-
-	if got := route.quicRetryState.Load(); got != 0 {
-		t.Fatalf("retry state after existing path success = %d, want 0", got)
-	}
-	route.quicRetryMx.Lock()
-	failures := route.quicDialFailures
-	route.quicRetryMx.Unlock()
-	if failures != 0 {
-		t.Fatalf("failures after existing path success = %d, want 0", failures)
-	}
-	if route.quicAddrStale() {
-		t.Fatal("existing successful path left QUIC route stale")
-	}
-}
-
-func TestPeerRouteSerializesPlumtreeQUICDialAttempts(t *testing.T) {
-	route := newPeerRoute("")
-	now := time.Unix(1_000_000, 0)
-
-	if !route.beginQUICDial(now) {
-		t.Fatal("idle route rejected the first QUIC dial")
-	}
-	if route.beginQUICDial(now) {
-		t.Fatal("route admitted a second concurrent QUIC dial")
-	}
-	if !route.quicReady(now) {
-		t.Fatal("in-flight dial hid a peer from Plumtree fanout")
-	}
-
-	route.finishQUICDial()
-	if !route.beginQUICDial(now) {
-		t.Fatal("successful QUIC dial did not release the route")
-	}
-	route.failQUICDial(now)
-	route.finishQUICDial()
-	if route.quicReady(now) {
-		t.Fatal("successful cleanup erased a concurrent failure deadline")
-	}
-}
-
-func TestPeerRouteNonOwnerFailureDoesNotOverrideDial(t *testing.T) {
-	route := newPeerRoute("")
-	now := time.Unix(1_000_000, 0)
-
-	if !route.beginQUICDial(now) {
-		t.Fatal("route rejected replacement QUIC dial")
-	}
-	route.deferQUICDial(now)
-	route.finishQUICDial()
-
-	if !route.quicReady(now) {
-		t.Fatal("non-owner failure suppressed a successful QUIC dial")
 	}
 }
 
@@ -406,7 +304,7 @@ func TestPlumtreeFailedAuthenticatedPathSharesCooldown(t *testing.T) {
 	remoteKey := quicOutboundTestKey(t)
 	remotePublicKey := remoteKey.Public().(ed25519.PublicKey)
 	peerID := peerIDForQUICOutboundTest(t, remotePublicKey)
-	route := newPeerRoute("")
+	route := newTestPeerRoute("")
 	node.quicPeers[peerID] = &authenticatedQUICPeer{
 		node:      node,
 		route:     route,
@@ -457,8 +355,8 @@ func TestPlumtreeRepairSkipsCooledQUICPath(t *testing.T) {
 	node.dht = dht
 
 	peerID := testPeerID("cooled-plumtree-repair-peer")
-	route := newPeerRoute("")
-	route.deferQUICDial(time.Now())
+	route := newTestPeerRoute("")
+	route.DeferQUICDial(time.Now())
 	sub := &overlaySubscription{
 		node: node,
 		peers: map[PeerID]*overlayPeer{
@@ -480,7 +378,7 @@ func TestPlumtreeRepairSkipsCooledQUICPath(t *testing.T) {
 		engine: engine,
 	}
 
-	if err := runtime.runRepair(plumtreeRepairAction{
+	if err := runtime.runRepair(context.Background(), plumtreeRepairAction{
 		ID: repairID,
 		To: peerID,
 	}); err != nil {

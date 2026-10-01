@@ -6,13 +6,14 @@ import (
 	"sort"
 
 	"github.com/xssnick/gton/service/archive"
+	sharddomain "github.com/xssnick/gton/service/shard"
 	state2 "github.com/xssnick/gton/service/state"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-func (s *Service) importArchiveBlocks(ctx context.Context, importer *archive.Importer, downloaded *archive.Downloaded, splitDepth uint32) (*archiveImportResult, error) {
+func (a *ArchiveRunner) importArchiveBlocks(ctx context.Context, importer *archive.Importer, downloaded *archive.Downloaded, splitDepth uint32) (*archiveImportResult, error) {
 	if len(downloaded.Data) == 0 {
 		return nil, fmt.Errorf("import archive: empty downloaded archive data")
 	}
@@ -21,16 +22,16 @@ func (s *Service) importArchiveBlocks(ctx context.Context, importer *archive.Imp
 	if err != nil {
 		return nil, err
 	}
-	result, err := s.prepareImportedArchiveBlocks(imported, splitDepth)
+	result, err := a.prepareImportedArchiveBlocks(imported, splitDepth)
 	if err != nil {
 		return nil, err
 	}
-	s.observeImportedArchiveBlocksReceived(ctx, imported, result)
+	a.observeImportedArchiveBlocksReceived(ctx, imported, result)
 	return result, nil
 }
 
-func (s *Service) observeImportedArchiveBlocksReceived(ctx context.Context, imported *archive.Imported, result *archiveImportResult) {
-	if s.blockReceivedHooks == nil {
+func (a *ArchiveRunner) observeImportedArchiveBlocksReceived(ctx context.Context, imported *archive.Imported, result *archiveImportResult) {
+	if a.blockReceivedObserver == nil {
 		return
 	}
 
@@ -44,12 +45,18 @@ func (s *Service) observeImportedArchiveBlocksReceived(ctx context.Context, impo
 
 		block, ok := result.blocks[key]
 		if ok {
-			s.observePreparedBlockReceived(ctx, block, true)
+			a.blockReceivedObserver.run(ctx, BlockReceivedEvent{
+				IsSigned:  true,
+				BlockBOC:  block.BlockBOC,
+				ProofBOC:  block.ProofBOC,
+				BlockRoot: block.BlockRoot,
+				Meta:      blockReceivedPreparedMeta(block),
+			})
 		}
 	}
 }
 
-func (s *Service) prepareImportedArchiveBlocks(imported *archive.Imported, splitDepth uint32) (*archiveImportResult, error) {
+func (a *ArchiveRunner) prepareImportedArchiveBlocks(imported *archive.Imported, splitDepth uint32) (*archiveImportResult, error) {
 	if imported.Stats == nil {
 		return nil, fmt.Errorf("import archive: empty stats")
 	}
@@ -106,15 +113,16 @@ type archiveShardImportPlan struct {
 	needed     []ton.BlockIDExt
 }
 
-func (s *Service) missingArchiveShardImportPlansForWindow(start *storage.BlockState, states map[uint32]*storage.BlockState, blocks map[storage.BlockRootHash]PreparedBlock) ([]archiveShardImportPlan, archiveShardPrefixInputs, error) {
-	inputs, err := s.archiveShardPrefixInputsForWindow(start, states)
+func (a *ArchiveRunner) missingArchiveShardImportPlansForWindow(start *storage.BlockState, states map[uint32]*storage.BlockState, blocks map[storage.BlockRootHash]PreparedBlock) ([]archiveShardImportPlan, archiveShardPrefixInputs, error) {
+	inputs, err := a.archiveShardPrefixInputsForWindow(start, states)
 	if err != nil {
 		return nil, archiveShardPrefixInputs{}, err
 	}
-	return archiveShardImportPlansMissingFromBlockStates(inputs.splitDepth, inputs.startBlocks, inputs.stateBlocks, blocks), inputs, nil
+	plans, err := archiveShardImportPlansMissingFromBlockStates(inputs.splitDepth, inputs.startBlocks, inputs.stateBlocks, blocks)
+	return plans, inputs, err
 }
 
-func (s *Service) archiveShardPrefixInputsForWindow(start *storage.BlockState, states map[uint32]*storage.BlockState) (archiveShardPrefixInputs, error) {
+func (a *ArchiveRunner) archiveShardPrefixInputsForWindow(start *storage.BlockState, states map[uint32]*storage.BlockState) (archiveShardPrefixInputs, error) {
 	splitDepth, err := monitorMinSplitDepth(start, 0)
 	if err != nil {
 		return archiveShardPrefixInputs{}, fmt.Errorf("load monitor split depth for %s: %w", storage.FormatBlockRef(start.Block), err)
@@ -154,14 +162,14 @@ func (s *Service) archiveShardPrefixInputsForWindow(start *storage.BlockState, s
 	}, nil
 }
 
-func archiveShardImportPlansMissingFromBlockStates(splitDepth uint32, startBlocks []ton.BlockIDExt, stateBlocks [][]ton.BlockIDExt, blocks map[storage.BlockRootHash]PreparedBlock) []archiveShardImportPlan {
+func archiveShardImportPlansMissingFromBlockStates(splitDepth uint32, startBlocks []ton.BlockIDExt, stateBlocks [][]ton.BlockIDExt, blocks map[storage.BlockRootHash]PreparedBlock) ([]archiveShardImportPlan, error) {
 	return archiveShardImportPlansForBlockStatesMatching(splitDepth, startBlocks, stateBlocks, func(block ton.BlockIDExt) bool {
 		downloaded, ok := blocks[storage.BlockKey(block)]
 		return !ok || !downloaded.ID.Equals(&block)
 	})
 }
 
-func archiveShardImportPlansForBlockStatesMatching(splitDepth uint32, startBlocks []ton.BlockIDExt, stateBlocks [][]ton.BlockIDExt, needBlock func(ton.BlockIDExt) bool) []archiveShardImportPlan {
+func archiveShardImportPlansForBlockStatesMatching(splitDepth uint32, startBlocks []ton.BlockIDExt, stateBlocks [][]ton.BlockIDExt, needBlock func(ton.BlockIDExt) bool) ([]archiveShardImportPlan, error) {
 	startByShard := make(map[storage.ShardKey]ton.BlockIDExt, len(startBlocks))
 	for _, block := range startBlocks {
 		startByShard[storage.ShardKeyFromBlock(block)] = block
@@ -189,7 +197,10 @@ func archiveShardImportPlansForBlockStatesMatching(splitDepth uint32, startBlock
 			}
 
 			key := storage.BlockKey(next)
-			start, end := archiveShardPrefixIndexRange(splitDepth, next.Shard)
+			start, end, err := archiveShardPrefixIndexRange(splitDepth, next.Shard)
+			if err != nil {
+				return nil, fmt.Errorf("archive shard prefix for %s: %w", storage.FormatBlockRef(next), err)
+			}
 			for idx := start; idx < end; idx++ {
 				seen := seenByPrefix[idx]
 				if seen == nil {
@@ -215,7 +226,7 @@ func archiveShardImportPlansForBlockStatesMatching(splitDepth uint32, startBlock
 			plans = append(plans, plan)
 		}
 	}
-	return plans
+	return plans, nil
 }
 
 func archiveShardIDForPrefixIndex(splitDepth uint32, idx int) archive.ShardID {
@@ -226,19 +237,22 @@ func archiveShardIDForPrefixIndex(splitDepth uint32, idx int) archive.ShardID {
 	}
 }
 
-func archiveShardPrefixIndexRange(splitDepth uint32, shard int64) (int, int) {
+func archiveShardPrefixIndexRange(splitDepth uint32, shard int64) (int, int, error) {
 	count := 1 << splitDepth
-	depth := storage.ShardPrefixLength(shard)
-	if depth <= 0 {
-		return 0, count
+	depth, err := sharddomain.PrefixLength(shard)
+	if err != nil {
+		return 0, 0, err
 	}
-	if uint32(depth) >= splitDepth {
+	if depth == 0 {
+		return 0, count, nil
+	}
+	if depth >= splitDepth {
 		idx := int(uint64(shard) >> (64 - splitDepth))
-		return idx, idx + 1
+		return idx, idx + 1, nil
 	}
 
-	prefix := uint64(shard) >> (64 - uint(depth))
-	span := 1 << (splitDepth - uint32(depth))
+	prefix := uint64(shard) >> (64 - depth)
+	span := 1 << (splitDepth - depth)
 	start := int(prefix) * span
-	return start, start + span
+	return start, start + span, nil
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,8 +24,15 @@ import (
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
 	"github.com/xssnick/gton/internal/logutil"
 	"github.com/xssnick/gton/service/hooks"
+	"github.com/xssnick/gton/service/validator"
+	"github.com/xssnick/gton/service/validator/groups"
+	"github.com/xssnick/gton/service/validator/keyring"
+	"github.com/xssnick/gton/service/validator/msgpool"
+	validatorpebble "github.com/xssnick/gton/service/validator/pebblestore"
 
 	"github.com/rs/zerolog"
+	adnladdress "github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
@@ -36,15 +46,21 @@ var GitCommit = "unknown"
 const liteserverSendQueueSize = 2048
 
 type cliCommands struct {
-	version         bool
-	lsPubkey        bool
-	adnlID          bool
-	skipConfigCheck bool
+	version                bool
+	lsPubkey               bool
+	adnlID                 bool
+	consensusADNLID        bool
+	validatorControlPubkey bool
+	dhtDescriptor          bool
+	skipConfigCheck        bool
+	statusMode             string
 }
 
 type startupOptions struct {
-	Node       gton.NodeOptions
-	ConfigFile string
+	Node             gton.NodeOptions
+	ConfigFile       string
+	DataDir          string
+	GlobalConfigFile string
 
 	LogConfig   logutil.Config
 	LogFilePath string
@@ -71,7 +87,12 @@ func Run(extensions ...hooks.ExtensionFactory) {
 		return
 	}
 
-	cfg, created, err := loadNodeConfig(context.Background(), startOpts.ConfigFile, commands.lsPubkey || commands.adnlID)
+	cfg, created, err := loadNodeConfig(
+		context.Background(),
+		startOpts.ConfigFile,
+		commands.lsPubkey || commands.adnlID || commands.consensusADNLID || commands.validatorControlPubkey ||
+			commands.dhtDescriptor || commands.statusMode != "",
+	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
@@ -85,6 +106,13 @@ func Run(extensions ...hooks.ExtensionFactory) {
 		}
 	}
 
+	if commands.statusMode != "" {
+		if err = writeRemoteStatus(context.Background(), os.Stdout, cfg.Metrics, commands.statusMode); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if commands.lsPubkey {
 		if err = writeLiteServerPublicKey(os.Stdout, cfg, startOpts.ConfigFile); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -93,7 +121,28 @@ func Run(extensions ...hooks.ExtensionFactory) {
 		return
 	}
 	if commands.adnlID {
-		if err = writeADNLID(os.Stdout, cfg, startOpts.ConfigFile); err != nil {
+		if err = writeADNLID(os.Stdout, cfg.ADNL, startOpts.ConfigFile); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if commands.consensusADNLID {
+		if err = writeADNLID(os.Stdout, consensusADNL(cfg), startOpts.ConfigFile); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if commands.validatorControlPubkey {
+		if err = writeValidatorControlPublicKey(os.Stdout, cfg, startOpts.ConfigFile); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if commands.dhtDescriptor {
+		if err = writeDHTDescriptor(os.Stdout, cfg, startOpts.ConfigFile, time.Now()); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
@@ -143,9 +192,6 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 	if liteQueryConcurrency == 0 {
 		liteQueryConcurrency = runtime.GOMAXPROCS(0) * 4
 	}
-	// Query answers are produced concurrently now: give pipelined backend
-	// clients enough per-connection send buffer to absorb response bursts.
-	liteclient.ServerClientSendQueueSize = liteserverSendQueueSize
 
 	pprofCtx, stopPprof := context.WithCancel(context.Background())
 	defer stopPprof()
@@ -159,6 +205,31 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return 1
 	}
+	// An operator who tuned one of these deserves to be told it stopped doing
+	// anything, rather than to discover it from a graph months later. The list
+	// excludes the values the node's own earlier releases wrote, so this fires
+	// for a choice somebody made and not for every config.json on upgrade.
+	for _, field := range nodeconfig.DeprecatedDecodedCellCacheFields(cfg.Storage) {
+		logger.Warn().
+			Str("field", field).
+			Int("decoded_cell_cache_entries_requested", runtimeOpts.Node.Storage.DecodedCellCache.Entries).
+			Msg("config field is deprecated and ignored: the decoded cell cache is sized in entries by storage.decoded_cell_cache_entries")
+	}
+	// A renamed knob is a different message: the value IS in force, only the
+	// name is stale. Warning that it does nothing would be a lie.
+	for field, replacement := range nodeconfig.RenamedDecodedCellCacheFields(cfg.Storage) {
+		logger.Warn().
+			Str("field", field).
+			Str("renamed_to", replacement).
+			Int("decoded_cell_cache_entries_requested", runtimeOpts.Node.Storage.DecodedCellCache.Entries).
+			Msg("config field was renamed; its value is still honoured, rename it in config.json")
+	}
+	if startOpts.DataDir != "" {
+		runtimeOpts.Node.Storage.Dir = startOpts.DataDir
+	}
+	if startOpts.GlobalConfigFile != "" {
+		runtimeOpts.GlobalConfigPath = startOpts.GlobalConfigFile
+	}
 
 	globalConfig, err := prepareGlobalConfig(context.Background(), logger, runtimeOpts.GlobalConfigPath, startOpts.GlobalConfigURL, startOpts.ReplaceGlobalConfig)
 	if err != nil {
@@ -171,10 +242,22 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 	runOpts.Logger = logs.Base()
 	runOpts.ConsoleInput = os.Stdin
 	runOpts.ConsoleOutput = os.Stdout
-	liteOpts, liteExtension, err := configureLiteserver(&runOpts, cfg, runtimeOpts, globalConfig, liteQueryConcurrency)
+	liteOpts, err := configureLiteserver(
+		&runOpts,
+		cfg,
+		runtimeOpts,
+		globalConfig,
+		liteQueryConcurrency,
+		cfg.Validator.Enabled || cfg.Collator.Enabled,
+	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return 1
+	}
+	if liteOpts.Enabled {
+		// Query answers are produced concurrently now: give pipelined backend
+		// clients enough per-connection send buffer to absorb response bursts.
+		liteclient.ServerClientSendQueueSize = liteserverSendQueueSize
 	}
 	logger.Info().
 		Bool("liteserver", liteOpts.Enabled).
@@ -190,7 +273,7 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 		Int("liteserver_max_waits_per_ip", liteOpts.Limits.MaxWaitsPerIP).
 		Msg("configured liteserver")
 
-	httpOpts, httpExtension, err := configureHTTPAPI(cfg, runtimeOpts, globalConfig)
+	httpOpts, err := configureHTTPAPI(&runOpts, cfg, runtimeOpts, globalConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return 1
@@ -201,20 +284,218 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 		Dur("http_api_request_timeout", httpOpts.RequestTimeout).
 		Msg("configured http api")
 
-	// Single extension composition site: user-provided extensions first, kept
-	// as-is (nil entries still fail fast inside RunNode), then any factory
-	// already present on the node options, then the internal liteserver and
-	// HTTP API extensions.
-	factories := make(hooks.ExtensionComposer, 0, len(extensions)+3)
+	maximalVerticalSeqno := uint32(len(globalConfig.Validator.Hardforks))
+	validatorOpts, err := configureValidator(cfg.Validator, maximalVerticalSeqno)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		return 1
+	}
+	extensionFactories := append([]hooks.ExtensionFactory(nil), extensions...)
+	skipPersistentCleanup := false
+	var collationIdentity collatorIdentity
+	var localValidator *localValidatorComposition
+	var standaloneCollator *standaloneCollatorComposition
+	if validatorOpts.Enabled || cfg.Collator.Enabled {
+		if runOpts.Storage.Dir == "" {
+			fmt.Fprintln(os.Stderr, "storage.dir is required for validator and collator storage")
+			return 1
+		}
+
+		collationIdentity, err = configureCollatorIdentity(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			return 1
+		}
+	}
+	if validatorOpts.Enabled {
+		validatorDir := filepath.Join(runOpts.Storage.Dir, "validator")
+		openStarted := time.Now()
+		logger.Info().Str("dir", validatorDir).Msg("opening validator storage")
+		validatorStore, openErr := validatorpebble.Open(validatorpebble.Options{Dir: validatorDir})
+		if openErr != nil {
+			logger.Error().Err(openErr).Str("dir", validatorDir).Msg("failed to open validator storage")
+			fmt.Fprintf(os.Stderr, "open validator storage %s: %v\n", validatorDir, openErr)
+
+			return 1
+		}
+		defer func() {
+			if skipPersistentCleanup {
+				logger.Warn().Str("dir", validatorDir).
+					Msg("leaving validator storage to process exit after incomplete node shutdown")
+
+				return
+			}
+			closeStarted := time.Now()
+			logger.Info().Str("dir", validatorDir).Msg("closing validator storage")
+			if closeErr := validatorStore.Close(); closeErr != nil {
+				logger.Error().Err(closeErr).Str("dir", validatorDir).Msg("failed to close validator storage")
+
+				return
+			}
+			logger.Info().Str("dir", validatorDir).Dur("elapsed", time.Since(closeStarted)).Msg("validator storage closed")
+		}()
+		validatorOpts.Extension.Storage = validatorStore.Validator()
+		validatorKeys, keyErr := keyring.Open(context.Background(), validatorStore.Validator())
+		if keyErr != nil {
+			logger.Error().Err(keyErr).Msg("failed to load validator signing keys")
+			fmt.Fprintf(os.Stderr, "load validator signing keys: %v\n", keyErr)
+
+			return 1
+		}
+		validatorOpts.Extension.Keys = validatorKeys
+		if cfg.ConsensusADNL != nil && cfg.ConsensusADNL.Enabled {
+			if err = validateValidatorADNL(validatorKeys.Entries(), collationIdentity.keyID, time.Now()); err != nil {
+				logger.Error().Err(err).Msg("validator ADNL configuration conflicts with active signing keys")
+				return 1
+			}
+		}
+
+		poolLog := logger.With().Str("component", "validator").Str("subcomponent", "msgpool").Logger()
+		validatorOpts.Runtime.Messages.Logger = &poolLog
+		validatorRuntime, runtimeErr := validator.NewRuntime(validatorOpts.Runtime)
+		if runtimeErr != nil {
+			logger.Error().Err(runtimeErr).Msg("failed to initialize validator runtime")
+			fmt.Fprintf(os.Stderr, "initialize validator runtime: %v\n", runtimeErr)
+
+			return 1
+		}
+		defer func() {
+			if !skipPersistentCleanup {
+				validatorRuntime.Close()
+			}
+		}()
+		validatorOpts.Extension.Runtime = validatorRuntime
+		validatorOpts.Extension.CandidateCaptureDir = filepath.Join(validatorDir, "failed-candidates")
+
+		activeKeyIDs := validatorKeys.KeyIDs()
+		validatorKeyIDs := make([]string, len(activeKeyIDs))
+		for i := range activeKeyIDs {
+			validatorKeyIDs[i] = fmt.Sprintf("%x", activeKeyIDs[i])
+		}
+		logger.Info().
+			Bool("validator", true).
+			Strs("validator_signing_key_ids", validatorKeyIDs).
+			Str("validator_storage", validatorDir).
+			Dur("validator_storage_open_elapsed", time.Since(openStarted)).
+			Msg("configured validator")
+
+		localValidator = &localValidatorComposition{
+			options:         validatorOpts.Extension,
+			runtime:         validatorRuntime,
+			keys:            validatorKeys,
+			control:         validatorOpts.Control,
+			delegations:     validatorStore.Validator(),
+			collatorStorage: validatorStore.Collator(),
+			collatorKeys:    collationIdentity.keys,
+			collatorKeyID:   collationIdentity.keyID,
+		}
+	}
+
+	if cfg.Collator.Enabled {
+		policy, policyErr := configureStandaloneValidatorPolicy(cfg.Collator.ValidatorAllowlist)
+		if policyErr != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", policyErr)
+			return 1
+		}
+
+		collatorDir := filepath.Join(runOpts.Storage.Dir, "collator")
+		openStarted := time.Now()
+		logger.Info().Str("dir", collatorDir).Msg("opening standalone collator storage")
+		collatorStore, openErr := validatorpebble.Open(validatorpebble.Options{Dir: collatorDir})
+		if openErr != nil {
+			logger.Error().Err(openErr).Str("dir", collatorDir).Msg("failed to open standalone collator storage")
+			fmt.Fprintf(os.Stderr, "open standalone collator storage %s: %v\n", collatorDir, openErr)
+
+			return 1
+		}
+		defer func() {
+			if skipPersistentCleanup {
+				logger.Warn().Str("dir", collatorDir).
+					Msg("leaving standalone collator storage to process exit after incomplete node shutdown")
+
+				return
+			}
+			closeStarted := time.Now()
+			logger.Info().Str("dir", collatorDir).Msg("closing standalone collator storage")
+			if closeErr := collatorStore.Close(); closeErr != nil {
+				logger.Error().Err(closeErr).Str("dir", collatorDir).
+					Msg("failed to close standalone collator storage")
+
+				return
+			}
+			logger.Info().Str("dir", collatorDir).Dur("elapsed", time.Since(closeStarted)).
+				Msg("standalone collator storage closed")
+		}()
+
+		poolLog := logger.With().Str("component", "collator").Str("subcomponent", "msgpool").Logger()
+		collatorRuntime, runtimeErr := validator.NewRuntime(validator.SharedRuntimeOptions{
+			Messages: msgpool.Config{Logger: &poolLog},
+			Groups: groups.TrackerOptions{
+				MaximalVerticalSeqno: maximalVerticalSeqno,
+			},
+		})
+		if runtimeErr != nil {
+			logger.Error().Err(runtimeErr).Msg("failed to initialize standalone collator runtime")
+			fmt.Fprintf(os.Stderr, "initialize standalone collator runtime: %v\n", runtimeErr)
+
+			return 1
+		}
+		defer func() {
+			if !skipPersistentCleanup {
+				collatorRuntime.Close()
+			}
+		}()
+
+		logger.Info().
+			Bool("collator", true).
+			Hex("collator_key_id", collationIdentity.keyID[:]).
+			Bool("validator_allowlist", cfg.Collator.ValidatorAllowlist.Enabled).
+			Int("validator_allowlist_entries", len(policy.allowed)).
+			Str("collator_storage", collatorDir).
+			Dur("collator_storage_open_elapsed", time.Since(openStarted)).
+			Msg("configured standalone collator")
+
+		standaloneCollator = &standaloneCollatorComposition{
+			runtime:             collatorRuntime,
+			validatorStorage:    collatorStore.Validator(),
+			collatorStorage:     collatorStore.Collator(),
+			keys:                collationIdentity.keys,
+			keyID:               collationIdentity.keyID,
+			allowedValidators:   policy.allowed,
+			allowAllValidators:  policy.allowAll,
+			candidateCaptureDir: filepath.Join(collatorDir, "failed-candidates"),
+		}
+	}
+
+	if localValidator != nil || standaloneCollator != nil {
+		extensionFactories = append(extensionFactories, newValidatorStackFactory(validatorStackComposition{
+			localValidator:     localValidator,
+			standaloneCollator: standaloneCollator,
+			localADNLID:        collationIdentity.keyID,
+		}))
+	}
+
+	composeExtensions(&runOpts, extensionFactories)
+
+	err = gton.RunNode(context.Background(), runOpts)
+	if errors.Is(err, gton.ErrShutdownIncomplete) {
+		skipPersistentCleanup = true
+	}
+	if err == nil {
+		return 0
+	}
+	fmt.Fprintf(os.Stderr, "%v\n", err)
+	return 1
+}
+
+// composeExtensions combines configured extension factories. Built-in APIs
+// are configured directly on NodeOptions, while the built-in validator uses
+// the extension lifecycle and arrives through this list.
+func composeExtensions(runOpts *gton.NodeOptions, extensions []hooks.ExtensionFactory) {
+	factories := make(hooks.ExtensionComposer, 0, len(extensions)+1)
 	factories = append(factories, extensions...)
 	if runOpts.Extension != nil {
 		factories = append(factories, runOpts.Extension)
-	}
-	if liteExtension != nil {
-		factories = append(factories, liteExtension)
-	}
-	if httpExtension != nil {
-		factories = append(factories, httpExtension)
 	}
 	switch {
 	case len(factories) == 1 && factories[0] != nil:
@@ -222,13 +503,6 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 	case len(factories) > 0:
 		runOpts.Extension = factories.New
 	}
-
-	err = gton.RunNode(context.Background(), runOpts)
-	if err == nil {
-		return 0
-	}
-	fmt.Fprintf(os.Stderr, "%v\n", err)
-	return 1
 }
 
 func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommands, error) {
@@ -241,9 +515,22 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 
 	flags := flag.NewFlagSet("gton-node", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: gton-node [flags] [status [full|db]]")
+		flags.PrintDefaults()
+	}
 	configPath := flags.String("config", nodeconfig.DefaultPath, "path to node config JSON")
+	dataDirFlag := flags.String("data-dir", "", "override storage.dir from node config")
+	globalConfigFileFlag := flags.String("global-config-file", "", "override ton.global_config_path from node config")
 	lsPubkeyFlag := flags.Bool("ls-pubkey", false, "print liteserver public key in base64 and exit")
 	adnlIDFlag := flags.Bool("adnl-id", false, "print ADNL id derived from adnl.key in base64 and exit")
+	consensusADNLIDFlag := flags.Bool("consensus-adnl-id", false, "print the validator/collator ADNL id in base64 and exit")
+	validatorControlPubkeyFlag := flags.Bool(
+		"validator-control-pubkey",
+		false,
+		"print the boxed validator control server public key in base64 and exit",
+	)
+	dhtDescriptorFlag := flags.Bool("dht-descriptor", false, "print the signed public DHT descriptor as JSON and exit")
 	versionFlag := flags.Bool("version", false, "print build version and exit")
 	skipConfigCheckFlag := flags.Bool("skip-cfg-check", false, "continue startup after creating a missing config file")
 	verbosityFlag := flags.String("verbosity", "info", "log verbosity: trace, debug, info, warn, error")
@@ -265,14 +552,42 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 	}
 
 	startOpts.ConfigFile = resolveConfigPath(*configPath)
+	startOpts.DataDir = strings.TrimSpace(*dataDirFlag)
+	startOpts.GlobalConfigFile = strings.TrimSpace(*globalConfigFileFlag)
 	startOpts.Node = runOpts
 	commands := cliCommands{
-		version:         *versionFlag,
-		lsPubkey:        *lsPubkeyFlag,
-		adnlID:          *adnlIDFlag,
-		skipConfigCheck: *skipConfigCheckFlag,
+		version:                *versionFlag,
+		lsPubkey:               *lsPubkeyFlag,
+		adnlID:                 *adnlIDFlag,
+		consensusADNLID:        *consensusADNLIDFlag,
+		validatorControlPubkey: *validatorControlPubkeyFlag,
+		dhtDescriptor:          *dhtDescriptorFlag,
+		skipConfigCheck:        *skipConfigCheckFlag,
 	}
-	if commands.version || commands.lsPubkey || commands.adnlID {
+	infoCommand := commands.version || commands.lsPubkey || commands.adnlID || commands.consensusADNLID ||
+		commands.validatorControlPubkey || commands.dhtDescriptor
+	if positional := flags.Args(); len(positional) != 0 {
+		if positional[0] != "status" {
+			return startupOptions{}, cliCommands{}, fmt.Errorf("unknown command %q", positional[0])
+		}
+		if infoCommand {
+			return startupOptions{}, cliCommands{}, errors.New("status cannot be combined with another command")
+		}
+		if len(positional) > 2 {
+			return startupOptions{}, cliCommands{}, errors.New("usage: gton-node [flags] status [full|db]")
+		}
+
+		commands.statusMode = "short"
+		if len(positional) == 2 {
+			switch positional[1] {
+			case "full", "db":
+				commands.statusMode = positional[1]
+			default:
+				return startupOptions{}, cliCommands{}, fmt.Errorf("unknown status mode %q; expected full or db", positional[1])
+			}
+		}
+	}
+	if infoCommand || commands.statusMode != "" {
 		return startOpts, commands, nil
 	}
 	if *archivePrefetchWindowsFlag < 0 {
@@ -313,9 +628,9 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 	return startOpts, commands, nil
 }
 
-func loadNodeConfig(ctx context.Context, path string, keyOnly bool) (nodeconfig.Config, bool, error) {
+func loadNodeConfig(ctx context.Context, path string, readOnly bool) (nodeconfig.Config, bool, error) {
 	path = resolveConfigPath(path)
-	if keyOnly {
+	if readOnly {
 		cfg, err := nodeconfig.Load(path)
 		if err != nil {
 			return nodeconfig.Config{}, false, fmt.Errorf("load config %s: %w", path, err)
@@ -437,8 +752,8 @@ func writeLiteServerPublicKey(out io.Writer, cfg nodeconfig.Config, path string)
 	return nil
 }
 
-func writeADNLID(out io.Writer, cfg nodeconfig.Config, path string) error {
-	adnlSeed := cfg.ADNL.Key
+func writeADNLID(out io.Writer, cfg nodeconfig.ADNL, path string) error {
+	adnlSeed := cfg.Key
 	if len(adnlSeed) == 0 {
 		return fmt.Errorf("ADNL key is missing in %s", path)
 	}
@@ -454,6 +769,107 @@ func writeADNLID(out io.Writer, cfg nodeconfig.Config, path string) error {
 	if _, err = fmt.Fprintln(out, base64.StdEncoding.EncodeToString(adnlID)); err != nil {
 		return fmt.Errorf("write ADNL id: %w", err)
 	}
+	return nil
+}
+
+func writeDHTDescriptor(out io.Writer, cfg nodeconfig.Config, path string, now time.Time) error {
+	seed := cfg.DHT.Key
+	if len(seed) == 0 {
+		return fmt.Errorf("DHT key is missing in %s", path)
+	}
+	if len(seed) != ed25519.SeedSize {
+		return fmt.Errorf("invalid DHT key size: expected %d bytes, got %d", ed25519.SeedSize, len(seed))
+	}
+
+	externalHost, _, err := net.SplitHostPort(strings.TrimSpace(cfg.ADNL.ExternalAddr))
+	if err != nil {
+		return fmt.Errorf("parse adnl.external_addr: %w", err)
+	}
+	externalIP := net.ParseIP(externalHost).To4()
+	if externalIP == nil || externalIP.IsUnspecified() {
+		return fmt.Errorf("adnl.external_addr must contain a public IPv4 address")
+	}
+	_, dhtPortText, err := net.SplitHostPort(strings.TrimSpace(cfg.DHT.ListenAddr))
+	if err != nil {
+		return fmt.Errorf("parse dht.listen_addr: %w", err)
+	}
+	dhtPort, err := strconv.ParseUint(dhtPortText, 10, 16)
+	if err != nil || dhtPort == 0 {
+		return fmt.Errorf("dht.listen_addr must contain a non-zero port")
+	}
+	version := now.Unix()
+	if version <= 0 || version > int64(^uint32(0)>>1) {
+		return fmt.Errorf("current unix time %d does not fit a DHT descriptor version", version)
+	}
+
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	addressList := &adnladdress.List{
+		Addresses: []adnladdress.Address{&adnladdress.UDP{IP: externalIP, Port: int32(dhtPort)}},
+		Version:   int32(version),
+	}
+	node, err := dht.BuildSignedNode(
+		keys.PublicKeyED25519{Key: publicKey},
+		addressList,
+		int32(version),
+		-1,
+		privateKey,
+	)
+	if err != nil {
+		return fmt.Errorf("sign DHT descriptor: %w", err)
+	}
+
+	descriptor := liteclient.DHTNode{
+		Type: "dht.node",
+		ID: liteclient.ServerID{
+			Type: "pub.ed25519",
+			Key:  base64.StdEncoding.EncodeToString(publicKey),
+		},
+		AddrList: liteclient.DHTAddressList{
+			Type: "adnl.addressList",
+			Addrs: []liteclient.DHTAddress{{
+				Type: "adnl.address.udp",
+				IP:   int(int32(binary.BigEndian.Uint32(externalIP))),
+				Port: int(dhtPort),
+			}},
+			Version: int(version),
+		},
+		Version:   int(version),
+		Signature: base64.StdEncoding.EncodeToString(node.Signature),
+	}
+	encoder := json.NewEncoder(out)
+	encoder.SetIndent("", "  ")
+	if err = encoder.Encode(descriptor); err != nil {
+		return fmt.Errorf("write DHT descriptor: %w", err)
+	}
+	return nil
+}
+
+func writeValidatorControlPublicKey(out io.Writer, cfg nodeconfig.Config, path string) error {
+	seed := cfg.Validator.Control.Key
+	if len(seed) == 0 {
+		return fmt.Errorf("validator control key is missing in %s", path)
+	}
+	if len(seed) != ed25519.SeedSize {
+		return fmt.Errorf(
+			"invalid validator control key size: expected %d bytes, got %d",
+			ed25519.SeedSize,
+			len(seed),
+		)
+	}
+
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	serialized, err := tl.Serialize(keys.PublicKeyED25519{
+		Key: privateKey.Public().(ed25519.PublicKey),
+	}, true)
+	clear(privateKey)
+	if err != nil {
+		return fmt.Errorf("serialize validator control public key: %w", err)
+	}
+	if _, err = fmt.Fprintln(out, base64.StdEncoding.EncodeToString(serialized)); err != nil {
+		return fmt.Errorf("write validator control public key: %w", err)
+	}
+
 	return nil
 }
 

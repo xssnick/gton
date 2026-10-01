@@ -21,10 +21,10 @@ func TestIntegrationReceivesBroadcasts(t *testing.T) {
 	logger := stdoutLogger(zerolog.InfoLevel)
 	globalConfig := loadIntegrationGlobalConfig(t, ctx)
 	node, err := New(Options{
-		GlobalConfig:       globalConfig,
-		Logger:             &logger,
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		GlobalConfig:  globalConfig,
+		Logger:        &logger,
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -65,10 +65,10 @@ func TestIntegrationDownloadsBlockFull(t *testing.T) {
 	logger := stdoutLogger(zerolog.InfoLevel)
 	globalConfig := loadIntegrationGlobalConfig(t, ctx)
 	node, err := New(Options{
-		GlobalConfig:       globalConfig,
-		Logger:             &logger,
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		GlobalConfig:  globalConfig,
+		Logger:        &logger,
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -115,10 +115,10 @@ func TestIntegrationDownloadsNextBlockFull(t *testing.T) {
 	logger := stdoutLogger(zerolog.InfoLevel)
 	globalConfig := loadIntegrationGlobalConfig(t, ctx)
 	node, err := New(Options{
-		GlobalConfig:       globalConfig,
-		Logger:             &logger,
-		PeerServingStorage: newTestPeerStore(),
-		StateFilesDir:      t.TempDir(),
+		GlobalConfig:  globalConfig,
+		Logger:        &logger,
+		PeerStorage:   newTestPeerStore(),
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)

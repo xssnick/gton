@@ -17,7 +17,7 @@ import (
 func newShardApplyAheadTestRunner(ctx context.Context, env *fakeShardStateResolverEnv, current map[tnstore.ShardKey]tnstore.BlockState) *nextSyncRunner {
 	runCtx, cancel := context.WithCancel(ctx)
 	r := &nextSyncRunner{
-		service: &Service{log: zerolog.Nop()},
+		service: &SyncCoordinator{log: zerolog.Nop()},
 		ctx:     runCtx,
 		cancel:  cancel,
 	}
@@ -254,7 +254,7 @@ func TestShardApplyAheadRecorderIsHandedToCommit(t *testing.T) {
 	master := testMasterBlockID(51)
 	other := testMasterBlockID(52)
 
-	r := &nextSyncRunner{service: &Service{log: zerolog.Nop()}, ctx: ctx}
+	r := &nextSyncRunner{service: &SyncCoordinator{log: zerolog.Nop()}, ctx: ctx}
 	recorder := r.shardAheadRecorder(master)
 	if recorder == nil {
 		t.Fatal("apply-ahead recorder was not created")
@@ -326,10 +326,10 @@ func TestShardCheckpointStagingWaitsForInclusionMasterCommit(t *testing.T) {
 	env.addBlock(commitTarget, aheadTarget)
 
 	prewriteStore := &artifactPrewriterTestStore{}
-	svc := &Service{
+	svc := &SyncCoordinator{
 		log:               zerolog.Nop(),
 		monitorSplitDepth: make(map[monitorSplitDepthKey]uint32),
-		artifactPrewrite:  newTestArtifactPrewriter(prewriteStore, 0),
+		state:             &StateLifecycle{artifactPrewrite: newTestArtifactPrewriter(prewriteStore, 0)},
 	}
 	runCtx, cancelRun := context.WithCancel(ctx)
 	r := &nextSyncRunner{
@@ -390,12 +390,12 @@ func TestShardCheckpointStagingWaitsForInclusionMasterCommit(t *testing.T) {
 
 	// The artifact prewrite order is the staging order: shards strictly before
 	// their inclusion master.
-	svc.artifactPrewrite.mu.Lock()
+	svc.state.artifactPrewrite.queue.mu.Lock()
 	var prewriteOrder []ton.BlockIDExt
-	for _, job := range svc.artifactPrewrite.jobs {
-		prewriteOrder = append(prewriteOrder, job.entry.State.Block)
+	for _, job := range svc.state.artifactPrewrite.queue.jobs {
+		prewriteOrder = append(prewriteOrder, job.value.State.Block)
 	}
-	svc.artifactPrewrite.mu.Unlock()
+	svc.state.artifactPrewrite.queue.mu.Unlock()
 	assertBlockSeq(t, "artifact prewrite", prewriteOrder, []ton.BlockIDExt{aheadTarget, commitTarget, master.Block})
 
 	r.shardStageMu.Lock()
@@ -409,7 +409,7 @@ func TestShardCheckpointStagingWaitsForInclusionMasterCommit(t *testing.T) {
 func TestShardApplyCallbacksRequireInclusionMaster(t *testing.T) {
 	ctx := context.Background()
 	target := testBlockID(0, topShard, 101)
-	r := &nextSyncRunner{service: &Service{log: zerolog.Nop()}, ctx: ctx}
+	r := &nextSyncRunner{service: &SyncCoordinator{log: zerolog.Nop()}, ctx: ctx}
 
 	if _, err := r.applyResolvedShardBlock(ctx, target, nil, PreparedBlock{ID: target}); err == nil {
 		t.Fatal("shard apply without an inclusion master was accepted")
@@ -468,7 +468,7 @@ func TestShardApplyAheadKeepsLowestPendingMasters(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	r := &nextSyncRunner{service: &Service{log: zerolog.Nop()}, ctx: ctx, cancel: cancel}
+	r := &nextSyncRunner{service: &SyncCoordinator{log: zerolog.Nop()}, ctx: ctx, cancel: cancel}
 	r.shardAheadPending = map[uint32]shardApplyAheadJob{}
 	r.shardAheadWake = make(chan struct{}, 1)
 	r.committedMasterSeqno.Store(50)
@@ -520,7 +520,7 @@ func TestShardApplyAheadDropsCommittedMasters(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	r := &nextSyncRunner{service: &Service{log: zerolog.Nop()}, ctx: ctx, cancel: cancel}
+	r := &nextSyncRunner{service: &SyncCoordinator{log: zerolog.Nop()}, ctx: ctx, cancel: cancel}
 	r.shardAheadPending = map[uint32]shardApplyAheadJob{}
 	r.shardAheadWake = make(chan struct{}, 1)
 	r.committedMasterSeqno.Store(60)

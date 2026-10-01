@@ -149,7 +149,7 @@ func TestPlumtreeSignatureVerifierCanonicalizesDefaultV2Certificate(t *testing.T
 	now := time.Now()
 	expireAt := int32(now.Unix() + 3600)
 	maxSize := uint32(4096)
-	flags := int32(plumtreeCertificateAllowFEC | plumtreeCertificateTrusted)
+	flags := int32(overlayCertificateAllowFEC | overlayCertificateTrusted)
 
 	node := &Node{}
 	node.SetPlumtreePolicy(NewPlumtreePolicy([]PeerID{issuerID}))
@@ -201,8 +201,8 @@ func TestPlumtreeSignatureVerifierRejectsNegativeCertificateExpiry(t *testing.T)
 				ExpireAt: math.MaxUint32,
 				MaxSize:  4096,
 				Flags: int32(
-					plumtreeCertificateAllowFEC |
-						plumtreeCertificateTrusted,
+					overlayCertificateAllowFEC |
+						overlayCertificateTrusted,
 				),
 			},
 		},

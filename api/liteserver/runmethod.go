@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/big"
 
 	"github.com/xssnick/gton/service/blockproof"
 	"github.com/xssnick/gton/service/liveview"
@@ -302,37 +301,6 @@ func shardStateMasterRef(stateRoot *cell.Cell) (ton.BlockIDExt, error) {
 		return ton.BlockIDExt{}, fmt.Errorf("load shard stats master ref info: %w", err)
 	}
 	return blockIDFromExtRef(masterchainID, masterchainShard, masterRef), nil
-}
-
-func runMethodOldMasterBlockID(prevBlocks *tlb.OldMcBlocksInfoAugDict, seqno uint32) (ton.BlockIDExt, error) {
-	if prevBlocks == nil || prevBlocks.IsEmpty() {
-		return ton.BlockIDExt{}, fmt.Errorf("cannot fetch old mc block")
-	}
-
-	value, err := prevBlocks.LoadValueByIntKey(new(big.Int).SetUint64(uint64(seqno)))
-	if err != nil {
-		return ton.BlockIDExt{}, fmt.Errorf("cannot fetch old mc block: %w", err)
-	}
-
-	var ref tlb.KeyExtBlkRef
-	if err = tlb.LoadFromCell(&ref, value); err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if ref.BlkRef.SeqNo != seqno {
-		return ton.BlockIDExt{}, fmt.Errorf("old mc block seqno mismatch: got %d want %d", ref.BlkRef.SeqNo, seqno)
-	}
-
-	return runMethodExtBlkRef(ref.BlkRef), nil
-}
-
-func runMethodExtBlkRef(ref tlb.ExtBlkRef) ton.BlockIDExt {
-	return ton.BlockIDExt{
-		Workchain: masterchainID,
-		Shard:     masterchainShard,
-		SeqNo:     ref.SeqNo,
-		RootHash:  append([]byte(nil), ref.RootHash...),
-		FileHash:  append([]byte(nil), ref.FileHash...),
-	}
 }
 
 func vmStackToCell(stack *vmcore.Stack) (*cell.Cell, error) {

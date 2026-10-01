@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/archive"
-	"github.com/xssnick/tonutils-go/ton"
 )
 
 const (
@@ -107,10 +106,7 @@ func (a *ArchiveSession) DownloadArchive(ctx context.Context, masterchainSeqno u
 		return nil, ErrOffline
 	}
 
-	sub, err := a.node.querySubscriptionForHistoricalBlock(ton.BlockIDExt{
-		Workchain: shard.Workchain,
-		Shard:     shard.Shard,
-	})
+	sub, err := a.node.querySubscriptionForArchive(shard)
 	if err != nil {
 		return nil, err
 	}

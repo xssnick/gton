@@ -5,4 +5,8 @@ data/
 build/
 .idea
 *.sh
+!build-release-in-docker.sh
 .DS_Store
+
+# compiled go test binaries
+*.test

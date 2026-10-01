@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/bits"
 	"sync"
+	"time"
 
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
@@ -18,7 +19,11 @@ func (s *Store) ImportStateCellTree(ctx context.Context, block ton.BlockIDExt, r
 	if err != nil {
 		return nil, err
 	}
-	return s.importStateCellTreeInGeneration(ctx, generation, block, root, totalCells)
+	rootHash, err := s.persistStateCellTreeInGeneration(ctx, generation, block, root, totalCells)
+	if err != nil {
+		return nil, err
+	}
+	return s.loadActiveLazyCell(ctx, rootHash[:])
 }
 
 func (s *Store) ImportStateBOCView(ctx context.Context, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error) {
@@ -26,21 +31,11 @@ func (s *Store) ImportStateBOCView(ctx context.Context, block ton.BlockIDExt, vi
 	if err != nil {
 		return nil, err
 	}
-	return s.importStateBOCViewInGeneration(ctx, generation, block, view)
-}
-
-func (s *Store) ImportStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (*cell.Cell, error) {
-	if generation == 0 {
-		return nil, fmt.Errorf("cell generation is zero")
+	rootHash, err := s.persistStateBOCViewInGeneration(ctx, generation, block, view)
+	if err != nil {
+		return nil, err
 	}
-	return s.importStateCellTreeInGeneration(ctx, generation, block, root, totalCells)
-}
-
-func (s *Store) ImportStateBOCViewInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error) {
-	if generation == 0 {
-		return nil, fmt.Errorf("cell generation is zero")
-	}
-	return s.importStateBOCViewInGeneration(ctx, generation, block, view)
+	return s.loadActiveLazyCell(ctx, rootHash[:])
 }
 
 func (s *Store) TrustImportedStateCellHashes() bool {
@@ -74,68 +69,71 @@ func (s *Store) FlushStateCells(ctx context.Context) error {
 	return s.flushCellDBs(generation)
 }
 
-func (s *Store) importStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (*cell.Cell, error) {
-	rootCellHash := root.HashKey()
+func (s *Store) persistStateCellTreeInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, root *cell.Cell, totalCells uint64) (cell.Hash, error) {
+	rootHash := root.HashKey()
 	if _, err := s.saveStateCellTree(ctx, stateCellTreeSave{
 		block:          block,
 		root:           root,
 		totalCells:     totalCells,
 		cellGeneration: generation,
 	}); err != nil {
-		return nil, err
+		return cell.Hash{}, err
 	}
 	if err := s.flushCellDBs(generation); err != nil {
-		return nil, fmt.Errorf("flush generation %d state cells before returning lazy root: %w", generation, err)
-	}
-
-	lazyRoot, err := s.loadLazyCellFromGeneration(ctx, generation, rootCellHash[:])
-	if err != nil {
-		return nil, fmt.Errorf("load persisted lazy state root: %w", err)
+		return cell.Hash{}, fmt.Errorf("flush generation %d state cells before returning lazy root: %w", generation, err)
 	}
 
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(block)).
 		Uint64("cell_generation", generation).
 		Uint64("cells", totalCells).
-		Msg("state cell tree imported and switched to lazy celldb root")
-	return lazyRoot, nil
+		Msg("state cell tree imported")
+	return rootHash, nil
 }
 
-func (s *Store) importStateBOCViewInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) (*cell.Cell, error) {
+func (s *Store) persistStateBOCViewInGeneration(ctx context.Context, generation uint64, block ton.BlockIDExt, view *cell.BOCView) (cell.Hash, error) {
 	roots := view.Roots()
 	if len(roots) != 1 {
-		return nil, fmt.Errorf("state boc should contain exactly one root, got %d", len(roots))
+		return cell.Hash{}, fmt.Errorf("state boc should contain exactly one root, got %d", len(roots))
 	}
 
 	rootCell, _, err := view.ReadCell(roots[0], nil)
 	if err != nil {
-		return nil, fmt.Errorf("load state boc root cell: %w", err)
+		return cell.Hash{}, fmt.Errorf("load state boc root cell: %w", err)
 	}
 	if rootCell.D1&0b1000 != 0 && len(rootCell.Body) > 0 && cell.Type(rootCell.Body[0]) == cell.PrunedCellType {
-		return nil, fmt.Errorf("state cell tree root is pruned")
+		return cell.Hash{}, fmt.Errorf("state cell tree root is pruned")
 	}
 
-	rootCellHash := rootCell.Meta.Hash
+	rootHash := rootCell.Meta.Hash
 	if err = s.saveStateBOCView(ctx, generation, block, view); err != nil {
-		return nil, err
+		return cell.Hash{}, err
 	}
 	if err = s.flushCellDBs(generation); err != nil {
-		return nil, fmt.Errorf("flush generation %d boc state cells before returning lazy root: %w", generation, err)
-	}
-
-	lazyRoot, err := s.loadLazyCellFromGeneration(ctx, generation, rootCellHash[:])
-	if err != nil {
-		return nil, fmt.Errorf("load persisted lazy state root: %w", err)
+		return cell.Hash{}, fmt.Errorf("flush generation %d boc state cells before returning lazy root: %w", generation, err)
 	}
 
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(block)).
 		Uint64("cell_generation", generation).
 		Uint64("cells", uint64(view.Cells())).
-		Msg("boc state cells imported and switched to lazy celldb root")
-	return lazyRoot, nil
+		Msg("boc state cells imported")
+	return rootHash, nil
 }
 
+// LoadStateCellTree is the ONE state entry point. The lightserver, proof
+// building, the archive importer, sync, the operator tools, collation and
+// validation all read state through here and share one decoded cell cache.
+//
+// There was briefly a second, "operation" entry point that answered the same
+// question out of a second cache. It is gone, and reintroducing it needs more
+// than a second cache: the collator and the validator must receive the SAME
+// *cell.Cell for a given parent, because ChainState.validatedCandidateState
+// compares tip states by POINTER and silently degrades every candidate to a full
+// re-apply otherwise. Two caches cannot both supply one object. Separately, a
+// resident tree's lazy tips carry the loader they were decoded with, so a second
+// entry point would not reroute the tree the node actually collates on without
+// rebuilding it — the exact work residency exists to avoid.
 func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, rootHash []byte) (*cell.Cell, error) {
 	state, err := s.blockStateMeta(ctx, block)
 	if err != nil {
@@ -146,26 +144,18 @@ func (s *Store) LoadStateCellTree(ctx context.Context, block ton.BlockIDExt, roo
 		return nil, storage.ErrNotFound
 	}
 
-	root, err := s.loadLazyCellFromGeneration(ctx, 0, state.StateRootHash)
+	root, err := s.loadActiveLazyCell(ctx, state.StateRootHash)
 	if err != nil {
 		return nil, err
 	}
-	hash := root.HashKey(0)
+	hash := root.HashKeyAt(0)
 	if !bytes.Equal(hash[:], state.StateRootHash) {
 		return nil, storage.ErrNotFound
 	}
 	return root, nil
 }
 
-func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved storage.BlockState, parsed *storage.BlockState, root *cell.Cell) error {
-	var err error
-	if root == nil {
-		root, err = s.loadLazyCellFromGeneration(context.Background(), saved.CellGeneration, saved.StateRootHash)
-		if err != nil {
-			return fmt.Errorf("load persisted lazy state root: %w", err)
-		}
-	}
-
+func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved storage.BlockState, parsed *storage.BlockState, root *cell.Cell) {
 	state.Block = saved.Block
 	state.StateRootHash = bytes.Clone(saved.StateRootHash)
 	state.StateFileHash = bytes.Clone(saved.StateFileHash)
@@ -175,9 +165,8 @@ func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved s
 		ref := *saved.MasterchainRef
 		state.MasterchainRef = &ref
 	}
-	state.CellGeneration = saved.CellGeneration
 	state.Cell = root
-	state.Parsed = saved.Parsed
+	state.Parsed = nil
 	if parsed != nil {
 		state.Parsed = parsed.Parsed
 	}
@@ -185,14 +174,9 @@ func (s *Store) replaceBlockStateWithLazyRoot(state *storage.BlockState, saved s
 	s.log.Debug().
 		Str("block", storage.FormatBlockRef(saved.Block)).
 		Msg("block state switched to lazy celldb root")
-	return nil
 }
 
-func (s *Store) SaveCells(records []*storage.CellRecord) error {
-	return s.SaveCellsInGeneration(context.Background(), 0, records)
-}
-
-func (s *Store) SaveCellsInGeneration(ctx context.Context, generation uint64, records []*storage.CellRecord) error {
+func (s *Store) saveCellsInGeneration(ctx context.Context, generation uint64, records []*storage.CellRecord) error {
 	encoded := make([]storage.EncodedCellRecord, 0, len(records))
 	for _, record := range records {
 		if len(record.Hash) != 32 {
@@ -203,7 +187,7 @@ func (s *Store) SaveCellsInGeneration(ctx context.Context, generation uint64, re
 		copy(hash[:], record.Hash)
 		encoded = append(encoded, storage.EncodedCellRecord{
 			Hash: hash,
-			Data: encodeCellRecord(record),
+			Data: storage.EncodeCellRecord(record),
 		})
 	}
 
@@ -211,7 +195,7 @@ func (s *Store) SaveCellsInGeneration(ctx context.Context, generation uint64, re
 	return err
 }
 
-func (s *Store) SaveEncodedCellsInGeneration(ctx context.Context, generation uint64, records []storage.EncodedCellRecord, sync bool) error {
+func (s *Store) saveEncodedCellsInGeneration(ctx context.Context, generation uint64, records []storage.EncodedCellRecord, sync bool) error {
 	_, err := s.saveCellRecordBatch(ctx, records, sync, generation, true)
 	return err
 }
@@ -533,98 +517,521 @@ func saveCellRecords(ctx context.Context, cells *cellStore, records storage.Stat
 }
 
 func (s *Store) CellRecord(ctx context.Context, hash []byte) (*storage.CellRecord, error) {
-	return s.CellRecordInGeneration(ctx, 0, hash)
-}
-
-func (s *Store) CellRecordInGeneration(ctx context.Context, generation uint64, hash []byte) (*storage.CellRecord, error) {
-	raw, err := s.getCellCopyFromGeneration(ctx, generation, hash)
+	cells, err := s.acquireActiveCellStore(ctx)
 	if err != nil {
 		return nil, err
 	}
-	record, err := decodeCellRecord(hash, raw)
-	if err != nil {
-		return nil, err
-	}
-	return record, nil
+	defer cells.release()
+
+	return cellRecordFromStore(cells, hash)
 }
 
-func (s *Store) LoadCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
-	return s.loadLazyCellFromGeneration(ctx, 0, hash)
-}
-
-func (s *Store) LazyCellLoader() cell.LazyCellLoader {
-	return s.lazyCellLoaderForGeneration(0)
-}
-
-func (s *Store) LazyCellLoaderInGeneration(generation uint64) cell.LazyCellLoader {
-	return s.lazyCellLoaderForGeneration(generation)
-}
-
-func (s *Store) lazyCellLoaderForGeneration(generation uint64) cell.LazyCellLoader {
-	if generation == 0 && s.lazyCellLoaderZero != nil {
-		return s.lazyCellLoaderZero
-	}
-	return s.newLazyCellLoaderForGeneration(generation)
-}
-
-func (s *Store) newLazyCellLoaderForGeneration(generation uint64) cell.LazyCellLoader {
-	loadMiss := func(hash cell.Hash) (*cell.Cell, error) {
-		loaded, err := s.loadLazyCellMissFromGeneration(context.Background(), generation, hash[:])
-		if err != nil {
-			return nil, fmt.Errorf("load lazy cell %x: %w", hash[:], err)
-		}
-		return loaded, nil
-	}
-	// Resolve the cache branch once rather than per lookup.
-	if s.cellCache == nil {
-		return loadMiss
-	}
-
-	return func(hash cell.Hash) (*cell.Cell, error) {
-		// getHash reports storage.ErrNotFound and nothing else, so any error here
-		// is a plain miss.
-		if loaded, err := s.cellCache.getHash(generation, hash); err == nil {
-			s.lazyCellLoads.observeDecodedCache()
-			return loaded, nil
-		}
-		return loadMiss(hash)
-	}
-}
-
-func (s *Store) loadLazyCellFromGeneration(ctx context.Context, generation uint64, hash []byte) (*cell.Cell, error) {
-	// Generation 0 means "the active generation": the decoded-cell cache keys
-	// it as 0 and acquireCellStore resolves it to the active generation under
-	// its own lock, so cache hits never touch the store-wide mutex.
-	loaded, err := s.cellCache.get(generation, hash)
-	if err == nil {
-		s.lazyCellLoads.observeDecodedCache()
-		return loaded, nil
-	}
-	if !errors.Is(err, storage.ErrNotFound) {
-		return nil, err
-	}
-
-	return s.loadLazyCellMissFromGeneration(ctx, generation, hash)
-}
-
-func (s *Store) loadLazyCellMissFromGeneration(ctx context.Context, generation uint64, hash []byte) (*cell.Cell, error) {
+func (s *Store) cellRecordInGeneration(ctx context.Context, generation uint64, hash []byte) (*storage.CellRecord, error) {
 	cells, err := s.acquireCellStore(ctx, generation)
 	if err != nil {
 		return nil, err
 	}
 	defer cells.release()
 
+	return cellRecordFromStore(cells, hash)
+}
+
+func cellRecordFromStore(cells *cellStore, hash []byte) (*storage.CellRecord, error) {
+	raw, err := cells.getCopy(hash)
+	if err != nil {
+		return nil, err
+	}
+
+	record, err := storage.DecodeCellRecord(hash, raw)
+	if err != nil {
+		return nil, err
+	}
+
+	return record, nil
+}
+
+func (s *Store) LoadCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
+	return s.loadActiveLazyCell(ctx, hash)
+}
+
+func (s *Store) LazyCellLoader() cell.LazyCellLoader {
+	return s.activeCellLoader
+}
+
+const cellRecordWarmScratchInitialCells = 1024
+
+type cellRecordWarmScratch struct {
+	stack []cell.Hash
+	seen  map[cell.Hash]struct{}
+	raw   []byte
+	refs  [4]cell.Hash
+}
+
+var cellRecordWarmScratchPool = sync.Pool{
+	New: func() any {
+		return &cellRecordWarmScratch{
+			stack: make([]cell.Hash, 0, cellRecordWarmScratchInitialCells),
+			seen:  make(map[cell.Hash]struct{}, cellRecordWarmScratchInitialCells),
+			raw:   make([]byte, 0, 512),
+		}
+	},
+}
+
+// WarmCellRecords recursively brings the encoded records reachable from root
+// into the record, Pebble block and OS caches without decoding or inserting a
+// cell into decodedCells. A decoded-cache hit still walks its reference hashes:
+// the hit refreshes the entry's CLOCK bit, but a resident parent does not imply
+// that its independently cached children are resident too.
+func (s *Store) WarmCellRecords(ctx context.Context, root cell.Hash) error {
+	cells, err := s.acquireActiveCellStore(ctx)
+	if err != nil {
+		return err
+	}
+	defer cells.release()
+
+	scratch := cellRecordWarmScratchPool.Get().(*cellRecordWarmScratch)
+	defer func() {
+		scratch.stack = scratch.stack[:0]
+		clear(scratch.seen)
+		scratch.raw = scratch.raw[:0]
+		cellRecordWarmScratchPool.Put(scratch)
+	}()
+
+	scratch.stack = append(scratch.stack, root)
+	iterations := 0
+	for len(scratch.stack) > 0 {
+		if iterations&0xff == 0 {
+			if err = ctx.Err(); err != nil {
+				return err
+			}
+		}
+		iterations++
+
+		last := len(scratch.stack) - 1
+		hash := scratch.stack[last]
+		scratch.stack = scratch.stack[:last]
+		if _, ok := scratch.seen[hash]; ok {
+			continue
+		}
+		scratch.seen[hash] = struct{}{}
+
+		loaded, cacheErr := s.decodedCells.getHash(activeCellCacheNamespace, hash)
+		if cacheErr == nil {
+			for i := int(loaded.RefsNum()) - 1; i >= 0; i-- {
+				scratch.stack = append(scratch.stack, loaded.MustRefHashAt(i))
+			}
+			continue
+		}
+		if !errors.Is(cacheErr, storage.ErrNotFound) {
+			return cacheErr
+		}
+
+		raw := s.recordCache.get(hash[:], scratch.raw)
+		if raw == nil {
+			storeRaw, closer, readErr := cells.get(hash[:])
+			if readErr != nil {
+				return fmt.Errorf("warm cell record %x: %w", hash, readErr)
+			}
+
+			refsCount, decodeErr := storage.DecodeCellRecordRefHashes(storeRaw, &scratch.refs)
+			if decodeErr != nil {
+				_ = closer.Close()
+				return fmt.Errorf("decode warm cell record %x refs: %w", hash, decodeErr)
+			}
+			s.recordCache.put(hash[:], storeRaw)
+			_ = closer.Close()
+			for i := refsCount - 1; i >= 0; i-- {
+				scratch.stack = append(scratch.stack, scratch.refs[i])
+			}
+			continue
+		}
+
+		scratch.raw = raw
+		refsCount, err := storage.DecodeCellRecordRefHashes(raw, &scratch.refs)
+		if err != nil {
+			return fmt.Errorf("decode cached warm cell record %x refs: %w", hash, err)
+		}
+		for i := refsCount - 1; i >= 0; i-- {
+			scratch.stack = append(scratch.stack, scratch.refs[i])
+		}
+	}
+	return nil
+}
+
+// newLazyCellLoaderForGeneration builds a loader for a NON-ACTIVE generation.
+// Its single caller is generation_cells.go, the retired- and
+// migrating-generation read surface used by cleanup, migration and the operator
+// tools. It reads through the same cache as everything else, under the
+// generation's own namespace rather than activeCellCacheNamespace, so a retired
+// generation's cells can never be answered as if they were the active one.
+func (s *Store) newLazyCellLoaderForGeneration(generation uint64) cell.LazyCellLoader {
+	var loader cell.LazyCellLoader
+	loadMiss := func(hash cell.Hash) (*cell.Cell, error) {
+		loaded, err := s.loadLazyCellMissFromGeneration(context.Background(), generation, hash[:], loader)
+		if err != nil {
+			return nil, fmt.Errorf("load lazy cell %x: %w", hash[:], err)
+		}
+		return loaded, nil
+	}
+	loader = s.cachedCellLoader(s.decodedCells, generation, loadMiss)
+	return loader
+}
+
+const activeCellCacheNamespace uint64 = 0
+
+// newActiveCellLoader builds the loader for the active generation. It reads
+// through the decoded cell cache and threads ITSELF into every cell it decodes:
+// DecodeLazyCellRecordTrusted hands the loader to CreateWithLazyRefsUnsafe,
+// which stores it in the meta of every child placeholder it creates, so
+// resolving a child re-enters here and its own children inherit it in turn.
+//
+// That self-threading is why a tree's cache membership is decided ONCE, at the
+// first cold decode of its root, and never re-decided afterwards: an
+// already-decoded tree handed to a new caller keeps the loader it was built
+// with. Any future attempt to route consumers to different caches has to start
+// from that fact rather than from the entry points.
+func (s *Store) newActiveCellLoader() cell.LazyCellLoader {
+	loadMiss := func(hash cell.Hash) (*cell.Cell, error) {
+		loaded, err := s.loadActiveLazyCellThrough(context.Background(), hash[:])
+		if err != nil {
+			return nil, fmt.Errorf("load lazy cell %x: %w", hash[:], err)
+		}
+		return loaded, nil
+	}
+
+	return s.cachedCellLoader(s.decodedCells, activeCellCacheNamespace, loadMiss)
+}
+
+// forgetCachedCellGeneration drops a retired generation's decoded cells from the
+// cache. Skipping it would leave cells of a closed celldb reachable from a live
+// cache.
+func (s *Store) forgetCachedCellGeneration(generation uint64) {
+	s.decodedCells.deleteGeneration(generation)
+}
+
+func (s *Store) cachedCellLoader(
+	cache *decodedCellCache,
+	cacheNamespace uint64,
+	loadMiss cell.LazyCellLoader,
+) cell.LazyCellLoader {
+	// Resolve the cache branch once rather than per lookup.
+	if cache == nil {
+		return loadMiss
+	}
+
+	// The record tier decodes with this closure itself: it is what
+	// newActiveCellLoader stores as activeCellLoader and what
+	// newLazyCellLoaderForGeneration threads into its misses, so a record-cache
+	// hit builds the same child placeholders a store read would.
+	var loader cell.LazyCellLoader
+	loader = func(hash cell.Hash) (*cell.Cell, error) {
+		return s.loadDecodedCell(context.Background(), cache, cacheNamespace, hash[:], loader, func(context.Context) (*cell.Cell, error) {
+			return loadMiss(hash)
+		})
+	}
+	return loader
+}
+
+type decodedCellLoadFlight struct {
+	done            chan struct{}
+	leaderCancelled bool
+	loaded          *cell.Cell
+	err             error
+}
+
+// decodedCellLoadGroup coalesces one cold (namespace, hash) load. The caller
+// that creates a flight performs the load synchronously; followers wait on its
+// result and may cancel independently. Keeping the leader synchronous preserves
+// I/O backpressure and avoids a goroutine/context allocation for every unique
+// cold cell in a collation.
+//
+// The in-flight table is sharded because it was the process's single largest
+// point of contention. A mutex profile taken on the testnet validator under
+// load — sampled as a delta over a 60 s window, so idle time is not counted —
+// showed one lock accumulating 136 s of goroutine blocking in those 60 seconds,
+// 38% of all contention in the process, on the path
+// loadLazyPrunedRefWithTrace -> Dictionary.findKeySliceInto -> loadDecodedCell.
+// More than two goroutines were waiting here at any instant, and they came from
+// every subsystem at once rather than from one budgeted pool.
+type decodedCellLoadGroup struct {
+	shards [decodedCellLoadShards]decodedCellLoadShard
+}
+
+// decodedCellLoadShards is sized against the machine, not against a worker
+// budget. The collator's proof estimator shards against collationParallelism
+// because only collation lanes enter it; this group is entered by collation,
+// by the validation of every other producer's candidate, by the account
+// prewarmer's workers, by live view and by the persistent state serializer, so
+// the concurrency it must spread is bounded by GOMAXPROCS. Sixty-four is the
+// first power of two above the 48 the validator runs with, and the mask below
+// needs a power of two.
+const decodedCellLoadShards = 64
+
+// decodedCellLoadShard is one independent slice of the in-flight table. The map
+// is built on first use, so a shard that never takes a cold miss costs one
+// mutex and one nil pointer.
+type decodedCellLoadShard struct {
+	mu      sync.Mutex
+	flights map[decodedCellCacheKey]*decodedCellLoadFlight
+	// Padded for the same reason proofEstimatorShard is: neighbouring shards
+	// are locked by different cores at the same moment, and a mutex plus a map
+	// header is 16 bytes, so four shards would otherwise share one cache line
+	// and give back as false sharing part of what the split removes.
+	_ [64]byte
+}
+
+// decodedCellLoadShardOf picks a shard from the LAST byte of the hash. The
+// decoded-cell cache keys its own shards on the FIRST four bytes, and taking a
+// different end keeps a cell's cache shard and its load shard uncorrelated, so
+// a hot cache shard does not imply a hot load shard.
+func (g *decodedCellLoadGroup) shardOf(key decodedCellCacheKey) *decodedCellLoadShard {
+	return &g.shards[int(key.hash[len(key.hash)-1])&(decodedCellLoadShards-1)]
+}
+
+func (g *decodedCellLoadGroup) do(
+	ctx context.Context,
+	key decodedCellCacheKey,
+	load func(context.Context) (*cell.Cell, error),
+) (*cell.Cell, error) {
+	shard := g.shardOf(key)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		shard.mu.Lock()
+		flight := shard.flights[key]
+		if flight != nil {
+			shard.mu.Unlock()
+
+			select {
+			case <-flight.done:
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if flight.leaderCancelled {
+					// Re-enter so one live follower becomes the next synchronous
+					// leader and the rest coalesce behind it. This can repeat I/O only
+					// on the rare cancellation edge and keeps every normal unique miss
+					// free of shared-context and cancellation-watcher allocations.
+					continue
+				}
+
+				return flight.loaded, flight.err
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if shard.flights == nil {
+			shard.flights = make(map[decodedCellCacheKey]*decodedCellLoadFlight)
+		}
+		flight = &decodedCellLoadFlight{done: make(chan struct{})}
+		shard.flights[key] = flight
+		shard.mu.Unlock()
+
+		loaded, err := load(ctx)
+		shard.mu.Lock()
+		flight.loaded = loaded
+		flight.err = err
+		ctxErr := ctx.Err()
+		flight.leaderCancelled = ctxErr != nil && errors.Is(err, ctxErr)
+		if shard.flights[key] == flight {
+			delete(shard.flights, key)
+		}
+		close(flight.done)
+		shard.mu.Unlock()
+
+		return loaded, err
+	}
+}
+
+// loadDecodedCell is the single cold-miss gate shared by direct state loads and
+// lazy child resolution. The cache is checked both before and inside the
+// flight: a winner may publish between those points, and consulting it again
+// avoids starting I/O after the answer already became resident.
+//
+// The record tier is consulted before the flight too: a hit there does no I/O,
+// so there is nothing to coalesce, and set still hands every racing caller the
+// one resident cell. loader is what the decoded cell's child placeholders
+// resolve through, the same loader loadMiss decodes with.
+func (s *Store) loadDecodedCell(
+	ctx context.Context,
+	cache *decodedCellCache,
+	cacheNamespace uint64,
+	hash []byte,
+	loader cell.LazyCellLoader,
+	loadMiss func(context.Context) (*cell.Cell, error),
+) (*cell.Cell, error) {
+	if cache == nil {
+		return loadMiss(ctx)
+	}
+
+	key := newDecodedCellCacheKey(cacheNamespace, hash)
+	if loaded, err := cache.getKey(key); err == nil {
+		s.lazyCellLoads.observeDecodedCache(key.hash[0])
+		return loaded, nil
+	}
+
+	if loaded, hit, err := s.decodeFromRecordCache(hash, loader); hit {
+		if err != nil {
+			return nil, err
+		}
+		return cache.set(cacheNamespace, key.hash[:], loaded), nil
+	}
+
+	return s.decodedCellLoads.do(ctx, key, func(loadCtx context.Context) (*cell.Cell, error) {
+		if loaded, cacheErr := cache.getKey(key); cacheErr == nil {
+			s.lazyCellLoads.observeDecodedCache(key.hash[0])
+			return loaded, nil
+		}
+
+		loaded, loadErr := loadMiss(loadCtx)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if err := loadCtx.Err(); err != nil {
+			return nil, err
+		}
+
+		return cache.set(cacheNamespace, key.hash[:], loaded), nil
+	})
+}
+
+func (s *Store) loadLazyCellFromGeneration(
+	ctx context.Context,
+	generation uint64,
+	hash []byte,
+	loader cell.LazyCellLoader,
+) (*cell.Cell, error) {
+	if generation == 0 {
+		return nil, fmt.Errorf("cell generation is zero")
+	}
+
+	return s.loadDecodedCell(ctx, s.decodedCells, generation, hash, loader, func(loadCtx context.Context) (*cell.Cell, error) {
+		return s.loadLazyCellMissFromGeneration(loadCtx, generation, hash, loader)
+	})
+}
+
+// loadLazyCellMissFromGeneration is the non-active-generation twin of
+// loadActiveLazyCellThrough below, and it reads through the SAME record cache
+// deliberately: the record tier is keyed by hash alone because cells are
+// content-addressed, so a record filed while a generation was active is
+// byte-identical when migration or cleanup reads it under another generation —
+// sharing the tier is what makes a generation swap start warm instead of cold.
+func (s *Store) loadLazyCellMissFromGeneration(ctx context.Context, generation uint64, hash []byte, loader cell.LazyCellLoader) (*cell.Cell, error) {
+	return s.loadLazyCellRecordThrough(ctx, hash, loader, func(loadCtx context.Context) (*cellStore, error) {
+		return s.acquireCellStore(loadCtx, generation)
+	})
+}
+
+// loadLazyCellRecordThrough is the body both cold paths share: the record tier
+// first, then the celldb generation `acquire` opens, filling the record cache
+// from the raw bytes on the way past. The two callers differ only in which
+// generation they open and which loader the decoded cell's child placeholders
+// resolve through, which is exactly what the two parameters carry.
+//
+// acquire is a callback rather than an opened store because a record-cache hit
+// must not open one at all: on a warm store that is the overwhelming majority
+// of calls, and acquiring costs a generation-lock round trip apiece.
+func (s *Store) loadLazyCellRecordThrough(
+	ctx context.Context,
+	hash []byte,
+	loader cell.LazyCellLoader,
+	acquire func(context.Context) (*cellStore, error),
+) (*cell.Cell, error) {
+	if loaded, hit, err := s.decodeFromRecordCache(hash, loader); hit {
+		if err != nil {
+			return nil, err
+		}
+		return loaded, nil
+	}
+
+	cells, err := acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cells.release()
+
+	readStarted := time.Now()
 	raw, closer, err := cells.get(hash)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = closer.Close() }()
 
-	s.lazyCellLoads.observePebble()
-	loaded, err := storage.DecodeLazyCellRecordTrusted(hash, raw, s.lazyCellLoaderForGeneration(generation))
+	// Timed around the store read alone: the decode below costs the same at
+	// every layer, so including it would blur the bands it is meant to separate.
+	s.lazyCellLoads.observeStoreRead(hash[0], time.Since(readStarted))
+	// The raw record bytes are in hand exactly here and nowhere cheaper: the
+	// arena insert is a copy of them, made before the closer returns them to
+	// pebble.
+	s.recordCache.put(hash, raw)
+	loaded, err := storage.DecodeLazyCellRecordTrusted(hash, raw, loader)
 	if err != nil {
 		return nil, fmt.Errorf("create lazy cell %x: %w", hash, err)
 	}
-	s.cellCache.set(generation, hash, loaded)
 	return loaded, nil
+}
+
+// recordCacheScratchPool holds the copy-out buffers for record-cache hits.
+// Records measured on a mainnet-fixture store run 104.5 B mean / 266 B max, so
+// one size class covers everything without per-hit allocation; decode copies
+// what it keeps, so the buffer is free for reuse the moment it returns.
+var recordCacheScratchPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, 512)
+		return &buf
+	},
+}
+
+// decodeFromRecordCache answers one cell load from the encoded record tier.
+// hit reports whether the record was there; on a hit the returned cell (or
+// error) is the answer and the caller files it in the decoded cache under its
+// own namespace.
+func (s *Store) decodeFromRecordCache(hash []byte, loader cell.LazyCellLoader) (loaded *cell.Cell, hit bool, err error) {
+	if s.recordCache == nil {
+		return nil, false, nil
+	}
+
+	scratch := recordCacheScratchPool.Get().(*[]byte)
+	raw := s.recordCache.get(hash, *scratch)
+	if raw == nil {
+		recordCacheScratchPool.Put(scratch)
+		return nil, false, nil
+	}
+	*scratch = raw
+
+	s.lazyCellLoads.observeRecordCache(hash[0])
+	loaded, err = storage.DecodeLazyCellRecordTrusted(hash, raw, loader)
+	recordCacheScratchPool.Put(scratch)
+	if err != nil {
+		return nil, true, fmt.Errorf("create lazy cell %x from record cache: %w", hash, err)
+	}
+	return loaded, true, nil
+}
+
+func (s *Store) loadActiveLazyCell(ctx context.Context, hash []byte) (*cell.Cell, error) {
+	return s.loadDecodedCell(ctx, s.decodedCells, activeCellCacheNamespace, hash, s.activeCellLoader, func(loadCtx context.Context) (*cell.Cell, error) {
+		return s.loadActiveLazyCellThrough(loadCtx, hash)
+	})
+}
+
+// loadActiveLazyCellThrough decodes one cell record from celldb for the active
+// generation, with s.activeCellLoader as what the decoded cell's child
+// placeholders will resolve through. Filing the result in the decoded cell
+// cache is loadDecodedCell's job, not this function's.
+//
+// A note on sizing, since this is where the cache is filled. This used to carry
+// a "cold vs resident" pair of distinct-cell counts per collation, presented as
+// two measurements. They were not comparable: the cold figure came from the
+// heavy bench arm (repeat=3, 747 transactions, 8,208 celldb decodes) and the
+// resident figure was DERIVED from the light arm (repeat=1: 5,456 cold minus
+// 2,542 rewritten = 2,914), joined by a "roughly half" that does not close
+// between the two arms. Both are removed rather than re-stated, because the
+// question they were introduced to settle — how much one consumer displaces
+// another between two caches — no longer exists with one cache. If a distinct
+// cell count per slot is needed again, measure it on ONE named arm and say
+// which.
+func (s *Store) loadActiveLazyCellThrough(ctx context.Context, hash []byte) (*cell.Cell, error) {
+	return s.loadLazyCellRecordThrough(ctx, hash, s.activeCellLoader, s.acquireActiveCellStore)
 }

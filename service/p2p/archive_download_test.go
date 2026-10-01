@@ -12,9 +12,11 @@ import (
 
 	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/gton/service/archive/packfile"
+	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"github.com/xssnick/tonutils-go/tl"
+	"github.com/xssnick/tonutils-go/ton"
 )
 
 func TestDownloadArchiveCanceledContextDoesNotCreateSubscription(t *testing.T) {
@@ -34,7 +36,7 @@ func TestDownloadArchiveCanceledContextDoesNotCreateSubscription(t *testing.T) {
 	}
 }
 
-func TestDownloadShardArchiveUsesHistoricalPublicOverlay(t *testing.T) {
+func TestDownloadShardArchiveUsesRootPublicOverlay(t *testing.T) {
 	node := newTestNode(t)
 	node.zeroStateFileHash = make([]byte, 32)
 	node.SetMonitorMinSplitDepth(0, 1)
@@ -54,15 +56,98 @@ func TestDownloadShardArchiveUsesHistoricalPublicOverlay(t *testing.T) {
 	}
 	_, requested := findSubscriptionForOverlay(t, node, shard.Workchain, shard.Shard)
 	_, ancestor := findSubscriptionForOverlay(t, node, shard.Workchain, topShard)
-	if requested == ancestor {
+	if requested || !ancestor {
 		t.Fatalf(
-			"historical archive public overlays: requested=%v ancestor=%v, want exactly one",
+			"archive public overlays: requested=%v root=%v, want only root",
 			requested,
 			ancestor,
 		)
 	}
 	if _, ok := findSubscriptionForOverlay(t, node, -1, topShard); ok {
 		t.Fatal("shard archive created a masterchain overlay fallback")
+	}
+}
+
+func TestDownloadArchiveRejectsZeroShard(t *testing.T) {
+	node := newTestNode(t)
+	node.zeroStateFileHash = make([]byte, 32)
+	session := node.BeginArchiveSession()
+	defer session.Close()
+	_, err := session.DownloadArchive(context.Background(), 1, archive.ShardID{Workchain: 0}, ArchiveDownloadOptions{})
+	if !errors.Is(err, sharddomain.ErrInvalidID) {
+		t.Fatalf("invalid shard error = %v, want ErrInvalidID", err)
+	}
+	if len(node.subscriptions) != 0 {
+		t.Fatal("invalid shard created an archive overlay")
+	}
+}
+
+func TestArchiveQuerySelectionKeepsWorkchainsSeparate(t *testing.T) {
+	node := newTestNode(t)
+	node.zeroStateFileHash = make([]byte, 32)
+	for _, workchain := range []int32{-1, 0, 7} {
+		shard := archive.ShardID{Workchain: workchain, Shard: topShard}
+		if workchain != -1 {
+			shard.Shard = 0x2800000000000000
+		}
+		sub, err := node.querySubscriptionForArchive(shard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sub.spec.Workchain != workchain || sub.spec.Shard != topShard {
+			t.Fatalf("archive %s selected wc=%d shard=%016x", shard.String(), sub.spec.Workchain, uint64(sub.spec.Shard))
+		}
+	}
+}
+
+func TestDownloadShardArchivesReuseRootPoolAndPreserveQueryShard(t *testing.T) {
+	node := newTestNode(t)
+	node.zeroStateFileHash = make([]byte, 32)
+	node.SetMonitorMinSplitDepth(0, 4)
+	root, err := node.subscriptionForOverlayBlock(ton.BlockIDExt{Workchain: 0, Shard: topShard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := node.BeginArchiveSession()
+	defer session.Close()
+	pool, err := session.archivePeerPool(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack := testArchivePackBytes("historical shard archive")
+	peer, transport := testArchiveDownloadPeerWithRLDP(t, "basechain-archive", 101, pack, 0)
+	if !addTestArchiveOnlyPeer(pool, peer) {
+		t.Fatal("could not seed the root archive peer")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := range 16 {
+		shard := archive.ShardID{Workchain: 0, Shard: int64((uint64(i)*2 + 1) << 59)}
+		seqno := uint32(7301281 + 100*i)
+		downloaded, err := session.DownloadArchive(ctx, seqno, shard, ArchiveDownloadOptions{})
+		if err != nil {
+			t.Fatalf("download %s through root archive peer: %v", shard.String(), err)
+		}
+		if downloaded.Shard != shard || downloaded.MasterchainSeqno != seqno || !bytes.Equal(downloaded.Data, pack) {
+			t.Fatalf("download changed the requested archive: %+v", downloaded)
+		}
+		found := false
+		for _, query := range transport.snapshot().asyncQueries {
+			info, ok := testOverlayQueryPayload(query.request).(GetShardArchiveInfo)
+			if !ok || info.MasterchainSeqno != int32(seqno) {
+				continue
+			}
+			if info.ShardPrefix.Workchain != shard.Workchain || info.ShardPrefix.Shard != shard.Shard {
+				t.Fatalf("archive query changed the original shard: %+v", info)
+			}
+			found = true
+		}
+		if !found {
+			t.Fatalf("no shard archive info query for seqno %d", seqno)
+		}
+	}
+	if len(node.subscriptions) != 1 || len(session.pools) != 1 || session.pools[root] != pool {
+		t.Fatalf("historical splits created extra overlays/pools: overlays=%d pools=%d", len(node.subscriptions), len(session.pools))
 	}
 }
 
@@ -1095,6 +1180,10 @@ func testArchiveDownloadPeerWithRLDP(t *testing.T, label string, archiveID int64
 	}
 	base.queryResponder = func(req tl.Serializable, result tl.Serializable) error {
 		payload := testOverlayQueryPayload(req)
+		if _, ok := payload.(overlay.GetRandomPeers); ok {
+			*result.(*overlay.NodesList) = overlay.NodesList{}
+			return nil
+		}
 		if _, ok := payload.(GetArchiveInfo); !ok {
 			t.Fatalf("unexpected archive info query payload %T", payload)
 		}
@@ -1113,7 +1202,7 @@ func testArchiveDownloadPeerWithRLDP(t *testing.T, label string, archiveID int64
 			overlay:   rldpOverlay,
 			overlayID: []byte{1},
 		},
-		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		announced: &overlay.NodeV2{Version: int32(time.Now().Unix())},
 		alive:     true,
 		release:   func() {},
 	}, archiveRLDP

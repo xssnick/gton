@@ -354,8 +354,11 @@ func (e *plumtreeEngine) handleSimple(
 	e.stats.NoteUsefulDelivery(time.Now(), state.part.timestamp)
 	e.delivered.add(state.broadcastID)
 	actions.Deliveries = append(actions.Deliveries, plumtreeDelivery{
-		Source: state.source,
-		Data:   state.data,
+		Source:      state.source,
+		SourceKey:   state.part.sourceKey.Key,
+		Immediate:   payloadContext.from,
+		BroadcastID: state.broadcastID,
+		Data:        state.data,
 	})
 	return actions, nil
 }
@@ -534,8 +537,11 @@ func (e *plumtreeEngine) handleFEC(
 	data := state.decodeBuffer
 	e.releaseFECDecoderLocked(state)
 	actions.Deliveries = append(actions.Deliveries, plumtreeDelivery{
-		Source: state.firstSource,
-		Data:   data,
+		Source:      state.firstSource,
+		SourceKey:   prepared.source.Key,
+		Immediate:   payloadContext.from,
+		BroadcastID: state.broadcastID,
+		Data:        data,
 	})
 	return actions, nil
 }

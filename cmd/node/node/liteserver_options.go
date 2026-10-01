@@ -10,7 +10,6 @@ import (
 	"github.com/xssnick/gton"
 	"github.com/xssnick/gton/api/liteserver"
 	nodeconfig "github.com/xssnick/gton/cmd/node/config"
-	"github.com/xssnick/gton/service/hooks"
 	"github.com/xssnick/gton/service/liveview"
 	"github.com/xssnick/gton/service/p2p"
 
@@ -32,53 +31,52 @@ type liteserverOptions struct {
 	ExternalBroadcastFanout   int
 }
 
-// configureLiteserver applies liteserver-related node options and returns the
-// liteserver extension factory, nil when the liteserver is disabled.
+// configureLiteserver applies the built-in liteserver configuration. RunNode
+// supplies its runtime Store and Network dependencies.
 func configureLiteserver(
 	runOpts *gton.NodeOptions,
 	cfg nodeconfig.Config,
 	runtimeOpts nodeconfig.RuntimeOptions,
 	globalConfig *liteclient.GlobalConfig,
 	queryConcurrency int,
-) (liteserverOptions, hooks.ExtensionFactory, error) {
+	retainNonfinalShardStates bool,
+) (liteserverOptions, error) {
 	opts, err := liteserverOptionsFromConfig(cfg, runtimeOpts)
 	if err != nil {
-		return liteserverOptions{}, nil, err
+		return liteserverOptions{}, err
 	}
 	opts.QueryConcurrency = queryConcurrency
+	runOpts.Liteserver = nil
 
 	runOpts.LiveView = &liveview.Options{
 		MasterBlockCache: opts.MasterBlockCache,
 		ShardBlockCache:  opts.ShardBlockCache,
-		NonFinalEnabled:  opts.NonFinalEnabled,
+		// Validator/collator readiness needs accepted shard states even when
+		// non-final liteserver queries are disabled. The liteserver exposure
+		// itself remains controlled exclusively by opts.NonFinalEnabled below.
+		NonFinalEnabled: opts.NonFinalEnabled || retainNonfinalShardStates,
 	}
 	runOpts.P2P.ExternalBroadcastCapacity = opts.ExternalBroadcastCapacity
 	runOpts.P2P.LocalExternalFanout = opts.ExternalBroadcastFanout
 	runOpts.P2P.AllowDuplicateExternals = opts.AllowDuplicateExternals
-
 	if !opts.Enabled {
-		return opts, nil, nil
+		return opts, nil
 	}
 
 	zeroState, err := liteserverZeroStateFromGlobalConfig(globalConfig)
 	if err != nil {
-		return liteserverOptions{}, nil, err
+		return liteserverOptions{}, err
 	}
-	return opts, liteserverExtensionFactory(opts, zeroState), nil
-}
-
-func liteserverExtensionFactory(opts liteserverOptions, zeroState ton.ZeroStateIDExt) hooks.ExtensionFactory {
-	return func(node hooks.Node) (hooks.Extension, error) {
-		return liteserver.NewExtension(node, liteserver.ExtensionConfig{
-			PrivateKey:              opts.PrivateKey,
-			ListenAddr:              opts.ListenAddr,
-			NonFinal:                opts.NonFinalEnabled,
-			AllowDuplicateExternals: opts.AllowDuplicateExternals,
-			ZeroState:               zeroState,
-			RequestLimits:           opts.Limits,
-			QueryConcurrency:        opts.QueryConcurrency,
-		})
+	runOpts.Liteserver = &gton.LiteserverOptions{
+		PrivateKey:              opts.PrivateKey,
+		ListenAddr:              opts.ListenAddr,
+		NonFinal:                opts.NonFinalEnabled,
+		AllowDuplicateExternals: opts.AllowDuplicateExternals,
+		ZeroState:               zeroState,
+		RequestLimits:           opts.Limits,
+		QueryConcurrency:        opts.QueryConcurrency,
 	}
+	return opts, nil
 }
 
 func liteserverOptionsFromConfig(cfg nodeconfig.Config, runtimeOpts nodeconfig.RuntimeOptions) (liteserverOptions, error) {

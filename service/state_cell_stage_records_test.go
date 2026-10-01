@@ -303,7 +303,7 @@ func TestLayeredWindowResolvesDependentApplyChain(t *testing.T) {
 			t.Fatalf("block %d prepared cells contain the stable subtree = %v, want %v", i, got, i == 1)
 		}
 
-		applied, err := window.applyMerkleUpdate([]*storage.BlockState{{Cell: previous}}, update, prepared)
+		applied, err := window.applyPreparedMerkleUpdate([]*storage.BlockState{{Cell: previous}}, update, prepared)
 		if err != nil {
 			t.Fatalf("apply block %d through the layered window: %v", i, err)
 		}

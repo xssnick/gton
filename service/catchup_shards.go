@@ -13,11 +13,25 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 )
 
-func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockIDExt, target ton.BlockIDExt) <-chan shardStateDownload {
+func (s *SyncCoordinator) downloadShardStateBlocks(ctx context.Context, start ton.BlockIDExt, target ton.BlockIDExt) <-chan shardStateDownload {
 	downloads := make(chan shardStateDownload, shardStateDownloadBuffer)
 
 	go func() {
 		defer close(downloads)
+
+		// A configured immediate hardfork pins the exact successor. Neither a
+		// local height index nor a peer's next-block answer may substitute a
+		// different branch. The regular prepare/apply stages still check the
+		// proof, previous block and state update before committing it.
+		immediateTarget := target.SeqNo > start.SeqNo && target.SeqNo-start.SeqNo == 1
+		if immediateTarget && s.node.IsHardfork(target) {
+			s.log.Info().
+				Str("current", storage.FormatBlockRef(start)).
+				Str("hardfork", storage.FormatBlockRef(target)).
+				Msg("downloading configured hardfork after current masterchain block")
+			s.downloadKnownChainBlocks(ctx, downloads, start, []ton.BlockIDExt{target}, SyncBlockSourcePeerCatchUp)
+			return
+		}
 
 		prev := start
 
@@ -151,7 +165,7 @@ func (s *Service) downloadShardStateBlocks(ctx context.Context, start ton.BlockI
 	return downloads
 }
 
-func (s *Service) lookupIndexedChainBlocks(ctx context.Context, prev ton.BlockIDExt, target ton.BlockIDExt, limit int) ([]ton.BlockIDExt, error) {
+func (s *SyncCoordinator) lookupIndexedChainBlocks(ctx context.Context, prev ton.BlockIDExt, target ton.BlockIDExt, limit int) ([]ton.BlockIDExt, error) {
 	blocks := make([]ton.BlockIDExt, 0, limit)
 	for seqno := prev.SeqNo + 1; seqno <= target.SeqNo && len(blocks) < limit; seqno++ {
 		ref := storage.BlockSeqRef{Workchain: prev.Workchain, Shard: prev.Shard, SeqNo: seqno}
@@ -174,7 +188,7 @@ func (s *Service) lookupIndexedChainBlocks(ctx context.Context, prev ton.BlockID
 	return blocks, nil
 }
 
-func (s *Service) lookupNextChainBlockDescriptions(ctx context.Context, prev ton.BlockIDExt, target ton.BlockIDExt, limit int) ([]ton.BlockIDExt, error) {
+func (s *SyncCoordinator) lookupNextChainBlockDescriptions(ctx context.Context, prev ton.BlockIDExt, target ton.BlockIDExt, limit int) ([]ton.BlockIDExt, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -210,7 +224,7 @@ func (s *Service) lookupNextChainBlockDescriptions(ctx context.Context, prev ton
 	return blocks, nil
 }
 
-func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<- shardStateDownload, prev ton.BlockIDExt, blocks []ton.BlockIDExt, source SyncBlockSource) bool {
+func (s *SyncCoordinator) downloadKnownChainBlocks(ctx context.Context, downloads chan<- shardStateDownload, prev ton.BlockIDExt, blocks []ton.BlockIDExt, source SyncBlockSource) bool {
 	if len(blocks) == 0 {
 		return true
 	}
@@ -338,7 +352,7 @@ func (s *Service) downloadKnownChainBlocks(ctx context.Context, downloads chan<-
 	return true
 }
 
-func (s *Service) downloadExactChainBlockWithRetry(ctx context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error) {
+func (s *SyncCoordinator) downloadExactChainBlockWithRetry(ctx context.Context, block ton.BlockIDExt) (p2p.DownloadedBlock, error) {
 	state := exactBlockDownloadProbeState{
 		started: time.Now(),
 	}
@@ -399,7 +413,7 @@ func (s *Service) downloadExactChainBlockWithRetry(ctx context.Context, block to
 // waitShardStateCatchUpRetry parks before the next download attempt. The caller
 // passes the wake it took before the attempt that missed, so state published
 // while that attempt ran is not waited out here.
-func (s *Service) waitShardStateCatchUpRetry(ctx context.Context, wake <-chan struct{}, delay time.Duration) error {
+func (s *SyncCoordinator) waitShardStateCatchUpRetry(ctx context.Context, wake <-chan struct{}, delay time.Duration) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 
@@ -413,7 +427,7 @@ func (s *Service) waitShardStateCatchUpRetry(ctx context.Context, wake <-chan st
 	}
 }
 
-func (s *Service) sendShardStateDownload(ctx context.Context, downloads chan<- shardStateDownload, item shardStateDownload) bool {
+func (s *SyncCoordinator) sendShardStateDownload(ctx context.Context, downloads chan<- shardStateDownload, item shardStateDownload) bool {
 	select {
 	case downloads <- item:
 		return true

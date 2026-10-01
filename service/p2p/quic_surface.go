@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
+	"github.com/xssnick/gton/service/p2p/internal/fastsync"
+	"github.com/xssnick/gton/service/p2p/internal/peerroute"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	adnlquic "github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
@@ -18,6 +21,9 @@ import (
 const quicStartupTimeout = 5 * time.Second
 
 const (
+	broadcastTwoStepSimpleSchema = "overlay.broadcastTwostepSimple flags:int date:int src:PublicKey src_adnl_id:int256 certificate:overlay.Certificate data:bytes extra:bytes signature:bytes = overlay.Broadcast"
+	broadcastTwoStepFECSchema    = "overlay.broadcastTwostepFec flags:int date:int src:PublicKey src_adnl_id:int256 certificate:overlay.Certificate data_hash:int256 data_size:int seqno:int part:bytes extra:bytes signature:bytes = overlay.Broadcast"
+
 	overlayQueryConstructorID            = uint32(0xccfd8443)
 	overlayQueryWithExtraConstructorID   = uint32(0x94ffc3e9)
 	overlayMessageConstructorID          = uint32(0x75252420)
@@ -25,12 +31,17 @@ const (
 	plainOverlayMessageEnvelopeSize      = 4 + PeerIDSize
 )
 
+var (
+	broadcastTwoStepSimpleConstructorID = tl.CRC(broadcastTwoStepSimpleSchema)
+	broadcastTwoStepFECConstructorID    = tl.CRC(broadcastTwoStepFECSchema)
+)
+
 var errQUICOverlayNotFound = errors.New("QUIC overlay is not subscribed")
 
 type authenticatedQUICPeer struct {
 	peer      *adnlquic.Peer
 	node      *Node
-	route     *peerRoute
+	route     *peerroute.Route
 	id        PeerID
 	publicKey ed25519.PublicKey
 	addr      string
@@ -41,19 +52,24 @@ type authenticatedQUICPeer struct {
 	// registeredAt bounds the idle age of a path that has not carried anything
 	// yet, so a freshly dialed peer is not swept before it is used.
 	registeredAt time.Time
+	// lastInbound is when the remote last delivered a query or message on this
+	// path, in unix nanoseconds. Both directions share the managed peer, so a
+	// dialed path the remote keeps feeding us over is not idle; any arrival
+	// counts, as an inbound packet does for the pooled ADNL transport.
+	lastInbound atomic.Int64
 }
 
-// lastActive reports when this path last carried an outbound payload. The stamp
-// lives on the transport itself (adnlquic.Peer.LastOutbound), so every send and
-// query updates it and no call site can be forgotten. QUIC keep-alive (5s) is
-// shorter than the idle timeout (15s), so without this a path never expires.
+// lastActive reports when this path last carried a payload in either direction.
+// The outbound stamp lives on the transport itself (adnlquic.Peer.LastOutbound),
+// so every send and query updates it and no call site can be forgotten; the
+// inbound one is taken by the query and message handlers. QUIC keep-alive (5s)
+// is shorter than the idle timeout (15s), so without this a path never expires.
 func (p *authenticatedQUICPeer) lastActive() time.Time {
+	lastActive := latestTime(p.registeredAt, time.Unix(0, p.lastInbound.Load()))
 	if p.peer != nil {
-		if at := p.peer.LastOutbound(); !at.IsZero() {
-			return at
-		}
+		lastActive = latestTime(lastActive, p.peer.LastOutbound())
 	}
-	return p.registeredAt
+	return lastActive
 }
 
 type quicMembershipCertificateKind uint8
@@ -211,7 +227,7 @@ func (n *Node) handleInboundQUICPeer(peer *adnlquic.Peer) error {
 		node: n,
 		// Shared with the pooled transport for the same peer: a separate route
 		// would split the learned QUIC address and the single-dial gate.
-		route:        n.peerRoutes.get(peerID),
+		route:        n.peerRoutes.Get(peerID),
 		id:           peerID,
 		publicKey:    peer.PeerKey(),
 		addr:         peer.RemoteAddr(),
@@ -279,18 +295,25 @@ func (n *Node) handleQUICQuery(
 	}
 	defer n.finishInbound()
 
+	now := time.Now()
+	peer.lastInbound.Store(now.UnixNano())
+
 	header, body, err := parseQUICQueryEnvelope(payload)
 	if err != nil {
 		return nil, fmt.Errorf("parse QUIC overlay query: %w", err)
 	}
-	now := time.Now()
 	sub, err := n.quicSubscription(header, peer.id, now)
 	if err != nil {
 		return nil, err
 	}
-	req, err := parseOneQUICOverlayObject(body)
-	if err != nil {
-		return nil, fmt.Errorf("parse QUIC overlay query body: %w", err)
+	var req tl.Serializable
+	if sub.private != nil {
+		req = tl.Raw(body)
+	} else {
+		req, err = parseOneQUICOverlayObject(body)
+		if err != nil {
+			return nil, fmt.Errorf("parse QUIC overlay query body: %w", err)
+		}
 	}
 	queryCtx, cancel := context.WithTimeout(ctx, peerQueryTimeout)
 	defer cancel()
@@ -304,14 +327,7 @@ func (n *Node) handleQUICQuery(
 		return nil, queryCtx.Err()
 	}
 
-	if repair, ok := req.(RepairPlumtreePart); ok {
-		if sub.plumtree == nil {
-			return nil, errPlumtreeDisabled
-		}
-		return sub.plumtree.HandleRepairQuery(queryCtx, peer.id, repair)
-	}
-
-	resp, err := sub.handlePeerQuery(queryCtx, peer.addr, req)
+	resp, err := sub.handlePeerQueryFrom(queryCtx, peer.id, peer.addr, req)
 	if err != nil {
 		if errors.Is(err, errOverlayInactive) {
 			sub.sendForgetPeerOverInboundPath(queryCtx, peer)
@@ -335,15 +351,40 @@ func (n *Node) handleQUICMessage(
 	}
 	defer n.finishInbound()
 
+	now := time.Now()
+	peer.lastInbound.Store(now.UnixNano())
+
 	header, body, err := parseQUICMessageEnvelope(payload)
 	if err != nil {
 		return fmt.Errorf("parse QUIC overlay message: %w", err)
 	}
-	sub, err := n.quicSubscription(header, peer.id, time.Now())
+	sub, err := n.quicSubscription(header, peer.id, now)
 	if err != nil {
 		return err
 	}
 
+	if sub.private != nil {
+		if isTwoStepBroadcast(body) {
+			message, err := parseOneQUICOverlayObject(body)
+			if err != nil {
+				return fmt.Errorf("parse QUIC private overlay broadcast: %w", err)
+			}
+			return sub.broadcastReceiver.HandleMessage(quicBroadcastSource{
+				id: &peer.id,
+			}, message)
+		}
+		if len(body) == 4 && binary.LittleEndian.Uint32(body) == forgetPeerConstructorID {
+			if current := sub.peerByID(peer.id); current != nil {
+				sub.removePeerIfCurrent(current)
+			}
+			return nil
+		}
+		return sub.handlePrivateOverlayMessage(ctx, peer.id, tl.Raw(body))
+	}
+	// forgetPeer is overlay membership control, not a broadcast.
+	if sub.chainBroadcastsPaused() && !(len(body) == 4 && binary.LittleEndian.Uint32(body) == forgetPeerConstructorID) {
+		return nil
+	}
 	if constructor, isPlumtree := plumtreeBroadcastConstructor(body); isPlumtree {
 		if sub.plumtree == nil {
 			return errPlumtreeDisabled
@@ -375,6 +416,19 @@ func (n *Node) handleQUICMessage(
 	return sub.broadcastReceiver.HandleMessage(quicBroadcastSource{
 		id: &peer.id,
 	}, msg)
+}
+
+func isTwoStepBroadcast(body []byte) bool {
+	if len(body) < 4 {
+		return false
+	}
+
+	switch binary.LittleEndian.Uint32(body) {
+	case broadcastTwoStepSimpleConstructorID, broadcastTwoStepFECConstructorID:
+		return true
+	default:
+		return false
+	}
 }
 
 func parseQUICOverlayBody(payload []byte, envelope tl.Serializable) ([]byte, error) {
@@ -542,12 +596,12 @@ func (s *overlaySubscription) authorizeQUICPeer(
 
 	if header.certificateKind == quicMembershipCertificateMember {
 		return s.fastSync.membership.AuthorizeMember(
-			peerID,
+			fastsync.ID(peerID),
 			header.certificate,
 			now,
 		)
 	}
 	// Empty and omitted are distinct TL states, but C++ resolves both through
 	// the enrolled peer's last verified certificate.
-	return s.fastSync.membership.AuthorizeOmitted(peerID, now)
+	return s.fastSync.membership.AuthorizeOmitted(fastsync.ID(peerID), now)
 }

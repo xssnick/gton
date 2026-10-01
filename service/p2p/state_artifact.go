@@ -11,10 +11,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
-	tnstate "github.com/xssnick/gton/service/state"
+	"github.com/xssnick/gton/internal/shardstate"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/ton"
@@ -26,7 +25,7 @@ const stateFileTempSuffix = ".part"
 type zeroStateSnapshotArtifact struct {
 	block  ton.BlockIDExt
 	data   []byte
-	writer storage.PeerServingStorageWriter
+	writer zeroStateWriter
 	stored bool
 }
 
@@ -267,7 +266,7 @@ func stateBOCParseOptions() cell.BOCParseOptions {
 	}
 }
 
-func stateBOCViewOptions(cells storage.StateCellTreeImporter) cell.BOCViewOptions {
+func stateBOCViewOptions(cells importedStateHashPolicy) cell.BOCViewOptions {
 	trustedHashes := false
 	if cells != nil {
 		trustedHashes = cells.TrustImportedStateCellHashes()
@@ -358,7 +357,7 @@ func (n *Node) decodeAndImportStagedStateCellTreeAs(ctx context.Context, logBloc
 	}
 	defer release()
 
-	view, file, err := staged.openBOCView(stateBOCViewOptions(n.storage))
+	view, file, err := staged.openBOCView(stateBOCViewOptions(n.stateArtifacts))
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse staged state boc: %w", errStateSnapshotInvalid, err)
 	}
@@ -398,7 +397,7 @@ func (n *Node) decodeAndImportSplitPartStagedStateCellTree(ctx context.Context, 
 		}
 	}()
 
-	view, file, err := staged.openBOCView(stateBOCViewOptions(n.storage))
+	view, file, err := staged.openBOCView(stateBOCViewOptions(n.stateArtifacts))
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse staged state boc: %w", errStateSnapshotInvalid, err)
 	}
@@ -472,7 +471,7 @@ func (n *Node) tryImportReusableStagedStateFileAs(ctx context.Context, block ton
 }
 
 func (n *Node) importStagedStateBOCView(ctx context.Context, storageBlock ton.BlockIDExt, staged *stagedStateFile, view *cell.BOCView) (*cell.Cell, error) {
-	lazyRoot, err := n.storage.ImportStateBOCView(ctx, storageBlock, view)
+	lazyRoot, err := n.stateArtifacts.ImportStateBOCView(ctx, storageBlock, view)
 	if err != nil {
 		return nil, err
 	}
@@ -499,16 +498,11 @@ func (n *Node) cacheImportedStagedBlockState(block ton.BlockIDExt, staged *stage
 }
 
 func (n *Node) savePersistentStateFile(block ton.BlockIDExt, master ton.BlockIDExt, staged *stagedStateFile, stateRootHash []byte) error {
-	if staged.path == "" || staged.persisted {
+	if n.stateArtifacts == nil || staged.path == "" || staged.persisted {
 		return nil
 	}
 
-	writer, _ := n.peerStorage.(storage.PeerServingStorageWriter)
-	if writer == nil {
-		return nil
-	}
-
-	if err := writer.SavePersistentStateFile(&storage.PersistentStateFile{
+	if err := n.stateArtifacts.SavePersistentStateFile(&storage.PersistentStateFile{
 		Block:            block,
 		MasterchainBlock: master,
 		EffectiveShard:   staged.effectiveShard,
@@ -708,7 +702,7 @@ func (a *splitPersistentStateSnapshotArtifact) ImportCells(ctx context.Context, 
 }
 
 func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells storage.StateCellTreeImporter) (*storage.BlockState, error) {
-	accounts, err := tnstate.NewShardAccountsAugDict()
+	accounts, err := shardstate.NewAccounts()
 	if err != nil {
 		return nil, err
 	}
@@ -734,7 +728,7 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 			return nil, err
 		}
 
-		partAccounts, err := tnstate.LoadShardAccountsRoot(root)
+		partAccounts, err := shardstate.LoadAccountsRoot(root)
 		if err != nil {
 			return nil, fmt.Errorf("%w: parse split state part %d accounts: %w", errStateSnapshotInvalid, i+1, err)
 		}
@@ -766,14 +760,14 @@ func (a *splitPersistentStateSnapshotArtifact) decode(ctx context.Context, cells
 		Int("parts", len(a.parts)).
 		Msg("merging split persistent state parts")
 
-	stateRoot, err := tnstate.MergeSplitStateAccounts(a.header.state, accounts)
+	stateRoot, err := shardstate.MergeAccounts(a.header.state, accounts)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errStateSnapshotInvalid, err)
 	}
 	if stateRoot.IsVirtualized() {
 		return nil, fmt.Errorf("%w: merged split state root is virtualized", errStateSnapshotInvalid)
 	}
-	stateRootHash := stateRoot.HashKey(0)
+	stateRootHash := stateRoot.HashKeyAt(0)
 	if !bytes.Equal(stateRootHash[:], a.stateRootHash) {
 		return nil, fmt.Errorf("%w: split state root hash mismatch", errStateSnapshotInvalid)
 	}
@@ -895,18 +889,18 @@ func (a *splitPersistentStateSnapshotArtifact) importSplitStatePartBOCView(ctx c
 }
 
 func (n *Node) loadImportedSplitStatePartRoot(ctx context.Context, part splitStatePart) (*cell.Cell, error) {
-	if n.storage == nil {
+	if n.stateArtifacts == nil {
 		return nil, storage.ErrNotFound
 	}
 	if len(part.rootHash) != 32 {
 		return nil, fmt.Errorf("split state part root hash size mismatch: %d", len(part.rootHash))
 	}
 
-	record, err := n.storage.CellRecord(ctx, part.rootHash)
+	record, err := n.stateArtifacts.CellRecord(ctx, part.rootHash)
 	if err != nil {
 		return nil, err
 	}
-	root, err := storage.LazyCellRecord(record, n.storage.LazyCellLoader())
+	root, err := storage.LazyCellRecord(record, n.stateArtifacts.LazyCellLoader())
 	if err != nil {
 		return nil, fmt.Errorf("create imported split state part lazy root: %w", err)
 	}
@@ -964,12 +958,11 @@ func (n *Node) persistentStateFilePath(block ton.BlockIDExt, master ton.BlockIDE
 }
 
 func (n *Node) loadReusablePersistentStateFile(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (*stagedStateFile, error) {
-	reader := n.reusablePersistentStateFileReader()
-	if reader == nil {
+	if n.stateArtifacts == nil {
 		return nil, storage.ErrNotFound
 	}
 
-	file, err := reader.PersistentStateFile(ctx, block, master, effectiveShard)
+	file, err := n.stateArtifacts.PersistentStateFile(ctx, block, master, effectiveShard)
 	if err != nil {
 		return nil, err
 	}
@@ -993,11 +986,6 @@ func (n *Node) loadReusablePersistentStateFile(ctx context.Context, block ton.Bl
 		return nil, fmt.Errorf("%w: staged state file size mismatch: got=%d want=%d", errStateSnapshotInvalid, stat.Size(), staged.size)
 	}
 	return staged, nil
-}
-
-func (n *Node) reusablePersistentStateFileReader() storage.PersistentStateFileStorage {
-	reader, _ := n.peerStorage.(storage.PersistentStateFileStorage)
-	return reader
 }
 
 func (n *Node) createStateFile(block ton.BlockIDExt, master ton.BlockIDExt, effectiveShard int64) (*os.File, string, string, error) {
@@ -1162,7 +1150,7 @@ func (d persistentStateSnapshotDownloader) stagePersistentStateFile(
 		return nil, err
 	}
 	path = finalPath
-	if err = syncStateFileDir(filepath.Dir(finalPath)); err != nil {
+	if err = storage.SyncDir(filepath.Dir(finalPath)); err != nil {
 		success = true
 		return nil, err
 	}
@@ -1202,23 +1190,4 @@ func removeIncompleteStateFiles(dir string) error {
 		}
 	}
 	return errors.Join(errs...)
-}
-
-func syncStateFileDir(path string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = file.Close() }()
-
-	// Windows does not support flushing directory handles. Opening the
-	// directory above still validates that it exists and is accessible.
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-
-	if err = file.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) {
-		return err
-	}
-	return nil
 }

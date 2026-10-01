@@ -148,6 +148,14 @@ func (n *Node) processOffloadedBroadcastDecode(ctx context.Context, req offloade
 		n.noteBroadcastDrop(req.overlay, req.kind, "broadcast_admission_closed")
 		return
 	}
+	if n.alreadyKnownBlockBroadcast(req.block) {
+		// the block was applied or delivered by another route while the job
+		// waited in the queue; the relay already happened when classify
+		// acknowledged the payload, so only the decode and its event are
+		// skipped, and the fingerprint stays deduplicated
+		n.noteBroadcastDrop(req.overlay, req.kind, "already_applied")
+		return
+	}
 
 	downloaded, sigSet, cacheErr := n.decodedBroadcasts.get(req.kind, req.block)
 	if errors.Is(cacheErr, errDecodedBroadcastProcessed) {

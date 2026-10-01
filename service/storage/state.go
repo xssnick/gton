@@ -27,7 +27,6 @@ type BlockState struct {
 	// MasterchainRef matches C++ BlockHandle::masterchain_ref_block:
 	// the masterchain block that applied/included this shard block, not BlockInfo.MasterRef.
 	MasterchainRef *ton.BlockIDExt
-	CellGeneration uint64
 	Cell           *cell.Cell
 	Parsed         *tlb.ShardStateUnsplit
 }

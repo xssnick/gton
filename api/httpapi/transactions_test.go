@@ -31,11 +31,11 @@ func TestTryLocateSourceTransactionFromBlock(t *testing.T) {
 		testHTTPAPIInternalMessage(account, destination, createdLT),
 	}
 	txCell := testHTTPAPIMessageTransaction(t, account, transactionLT, 0, make([]byte, 32), nil, outputs)
-	root := testHTTPAPIBlockWithAccountTxs(t, 0, masterchainShard, []testHTTPAPIAccountTxs{
+	root := testHTTPAPIBlockWithAccountTxs(t, []testHTTPAPIAccountTxs{
 		{account: foreignAccount, txs: map[uint64]*cell.Cell{1: cell.BeginCell().MustStoreUInt(0, 4).EndCell()}},
 		{account: account, txs: map[uint64]*cell.Cell{transactionLT: txCell}},
 	})
-	block := testHTTPAPIBlockIDForRoot(0, masterchainShard, 1, root)
+	block := testHTTPAPIBlockIDForRoot(1, root)
 	lookup := testHTTPAPIAccountLTLookup(0, account, createdLT)
 	store := newMessageLookupTestStore(map[accountLTLookup]ton.BlockIDExt{lookup: block}, []blockRoot{{block: block, root: root}})
 
@@ -73,14 +73,14 @@ func TestTryLocateResultTransactionFromBlocks(t *testing.T) {
 	createdLT := uint64(54)
 	transactionLT := uint64(1_000_060)
 
-	firstRoot := testHTTPAPIBlockWithAccountTxs(t, 0, masterchainShard, []testHTTPAPIAccountTxs{
+	firstRoot := testHTTPAPIBlockWithAccountTxs(t, []testHTTPAPIAccountTxs{
 		{account: foreignAccount, txs: map[uint64]*cell.Cell{60: cell.BeginCell().MustStoreUInt(0, 4).EndCell()}},
 	})
 	inbound := testHTTPAPIInternalMessage(source, destination, createdLT)
 	txCell := testHTTPAPIMessageTransaction(t, destination, transactionLT, 0, make([]byte, 32), inbound, nil)
-	resultRoot := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, destination, transactionLT, txCell)
-	firstBlock := testHTTPAPIBlockIDForRoot(0, masterchainShard, 1, firstRoot)
-	resultBlock := testHTTPAPIBlockIDForRoot(0, masterchainShard, 2, resultRoot)
+	resultRoot := testHTTPAPIBlockWithTransaction(t, destination, transactionLT, txCell)
+	firstBlock := testHTTPAPIBlockIDForRoot(1, firstRoot)
+	resultBlock := testHTTPAPIBlockIDForRoot(2, resultRoot)
 	firstLookup := testHTTPAPIAccountLTLookup(0, destination, createdLT)
 	resultLookup := testHTTPAPIAccountLTLookup(0, destination, createdLT+messageLookupLTStep)
 
@@ -130,12 +130,12 @@ func TestTryLocateResultTransactionFollowsAccountHistory(t *testing.T) {
 	latestTx := testHTTPAPIMessageTransaction(t, destination, 1_000_060, 500_000, resultTx.Hash(),
 		testHTTPAPIInternalMessage(bytes.Repeat([]byte{0x99}, 32), destination, createdLT), nil)
 	foreignTx := testHTTPAPIChainTransaction(t, foreignAccount, 60, 0, make([]byte, 32))
-	firstRoot := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, foreignAccount, 60, foreignTx)
-	resultRoot := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, destination, 500_000, resultTx)
-	latestRoot := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, destination, 1_000_060, latestTx)
-	firstBlock := testHTTPAPIBlockIDForRoot(0, masterchainShard, 1, firstRoot)
-	resultBlock := testHTTPAPIBlockIDForRoot(0, masterchainShard, 2, resultRoot)
-	latestBlock := testHTTPAPIBlockIDForRoot(0, masterchainShard, 3, latestRoot)
+	firstRoot := testHTTPAPIBlockWithTransaction(t, foreignAccount, 60, foreignTx)
+	resultRoot := testHTTPAPIBlockWithTransaction(t, destination, 500_000, resultTx)
+	latestRoot := testHTTPAPIBlockWithTransaction(t, destination, 1_000_060, latestTx)
+	firstBlock := testHTTPAPIBlockIDForRoot(1, firstRoot)
+	resultBlock := testHTTPAPIBlockIDForRoot(2, resultRoot)
+	latestBlock := testHTTPAPIBlockIDForRoot(3, latestRoot)
 	initialLookup := testHTTPAPIAccountLTLookup(0, destination, createdLT)
 	probeLookup := testHTTPAPIAccountLTLookup(0, destination, createdLT+messageLookupLTStep)
 	historyLookup := testHTTPAPIAccountLTLookup(0, destination, 500_000)
@@ -203,8 +203,8 @@ func TestTryLocateTransactionRequiresFullMessageIdentity(t *testing.T) {
 		wrongSource := bytes.Repeat([]byte{0x99}, 32)
 		txCell := testHTTPAPIMessageTransaction(t, expectedDestination, 80, 0, make([]byte, 32),
 			testHTTPAPIInternalMessage(wrongSource, expectedDestination, createdLT), nil)
-		root := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, expectedDestination, 80, txCell)
-		block := testHTTPAPIBlockIDForRoot(0, masterchainShard, 1, root)
+		root := testHTTPAPIBlockWithTransaction(t, expectedDestination, 80, txCell)
+		block := testHTTPAPIBlockIDForRoot(1, root)
 		lookup := testHTTPAPIAccountLTLookup(0, expectedDestination, createdLT)
 		store := newMessageLookupTestStore(map[accountLTLookup]ton.BlockIDExt{lookup: block},
 			[]blockRoot{{block: block, root: root}})
@@ -227,8 +227,8 @@ func TestTryLocateTransactionRequiresFullMessageIdentity(t *testing.T) {
 		outboundCreatedLT := transactionLT + 1
 		txCell := testHTTPAPIMessageTransaction(t, expectedSource, transactionLT, 0, make([]byte, 32), nil,
 			[]*tlb.Message{testHTTPAPIInternalMessage(expectedSource, wrongDestination, outboundCreatedLT)})
-		root := testHTTPAPIBlockWithTransaction(t, 0, masterchainShard, expectedSource, transactionLT, txCell)
-		block := testHTTPAPIBlockIDForRoot(0, masterchainShard, 1, root)
+		root := testHTTPAPIBlockWithTransaction(t, expectedSource, transactionLT, txCell)
+		block := testHTTPAPIBlockIDForRoot(1, root)
 		lookup := testHTTPAPIAccountLTLookup(0, expectedSource, outboundCreatedLT)
 		store := newMessageLookupTestStore(map[accountLTLookup]ton.BlockIDExt{lookup: block},
 			[]blockRoot{{block: block, root: root}})
@@ -530,10 +530,10 @@ func testHTTPAPIReplaceTransactionIO(t *testing.T, tx, io *cell.Cell) *cell.Cell
 	return builder.EndCell()
 }
 
-func testHTTPAPIBlockWithTransaction(t *testing.T, workchain int32, shard int64, account []byte, lt uint64, tx *cell.Cell) *cell.Cell {
+func testHTTPAPIBlockWithTransaction(t *testing.T, account []byte, lt uint64, tx *cell.Cell) *cell.Cell {
 	t.Helper()
 
-	return testHTTPAPIBlockWithAccountTxs(t, workchain, shard, []testHTTPAPIAccountTxs{
+	return testHTTPAPIBlockWithAccountTxs(t, []testHTTPAPIAccountTxs{
 		{account: account, txs: map[uint64]*cell.Cell{lt: tx}},
 	})
 }
@@ -543,7 +543,7 @@ type testHTTPAPIAccountTxs struct {
 	txs     map[uint64]*cell.Cell
 }
 
-func testHTTPAPIBlockWithAccountTxs(t testing.TB, workchain int32, shard int64, accounts []testHTTPAPIAccountTxs) *cell.Cell {
+func testHTTPAPIBlockWithAccountTxs(t testing.TB, accounts []testHTTPAPIAccountTxs) *cell.Cell {
 	t.Helper()
 
 	endLT := uint64(100)
@@ -590,7 +590,7 @@ func testHTTPAPIBlockWithAccountTxs(t testing.TB, workchain int32, shard int64, 
 	header.StartLt = 1
 	header.EndLt = endLT
 	header.GenUtime = 1000
-	header.Shard = tlb.ShardIdent{PrefixBits: 0, WorkchainID: workchain, ShardPrefix: uint64(shard)}
+	header.Shard = tlb.ShardIdent{PrefixBits: 0, WorkchainID: 0, ShardPrefix: 1 << 63}
 	header.PrevRef = tlb.BlkPrevInfo{Prev1: tlb.ExtBlkRef{
 		RootHash: bytes.Repeat([]byte{0x03}, 32),
 		FileHash: bytes.Repeat([]byte{0x04}, 32),
@@ -673,7 +673,7 @@ func BenchmarkWalkBlockTransactions(b *testing.B) {
 		}
 		accountTxs[accountIndex] = testHTTPAPIAccountTxs{account: account, txs: txs}
 	}
-	root := testHTTPAPIBlockWithAccountTxs(b, 0, masterchainShard, accountTxs)
+	root := testHTTPAPIBlockWithAccountTxs(b, accountTxs)
 	accounts, err := blockAccountBlocks(root)
 	if err != nil {
 		b.Fatal(err)
@@ -713,7 +713,7 @@ func BenchmarkFindBlockTransactionBefore(b *testing.B) {
 				account: target,
 				txs:     map[uint64]*cell.Cell{55: wantCell},
 			})
-			root := testHTTPAPIBlockWithAccountTxs(b, 0, masterchainShard, accountTxs)
+			root := testHTTPAPIBlockWithAccountTxs(b, accountTxs)
 			accounts, err := blockAccountBlocks(root)
 			if err != nil {
 				b.Fatal(err)
@@ -745,13 +745,13 @@ func mapValues(values map[string]string) url.Values {
 	return out
 }
 
-func testHTTPAPIBlockIDForRoot(workchain int32, shard int64, seqno uint32, root *cell.Cell) ton.BlockIDExt {
+func testHTTPAPIBlockIDForRoot(seqno uint32, root *cell.Cell) ton.BlockIDExt {
 	data := root.ToBOCWithOptions(cell.BOCSerializeOptions{WithCRC32C: false})
 	fileHash := sha256.Sum256(data)
 	rootHash := root.HashKey(0)
 	return ton.BlockIDExt{
-		Workchain: workchain,
-		Shard:     shard,
+		Workchain: 0,
+		Shard:     masterchainShard,
 		SeqNo:     seqno,
 		RootHash:  append([]byte(nil), rootHash[:]...),
 		FileHash:  append([]byte(nil), fileHash[:]...),
@@ -835,7 +835,7 @@ func TestBlockTransactionsCursorMatchesListTransactions(t *testing.T) {
 	acc3 := bytes.Repeat([]byte{0x33}, 32)
 	prev := bytes.Repeat([]byte{0x01}, 32)
 
-	root := testHTTPAPIBlockWithAccountTxs(t, 0, masterchainShard, []testHTTPAPIAccountTxs{
+	root := testHTTPAPIBlockWithAccountTxs(t, []testHTTPAPIAccountTxs{
 		{account: acc1, txs: map[uint64]*cell.Cell{
 			60: testHTTPAPIChainTransaction(t, acc1, 60, 20, prev),
 			20: testHTTPAPIChainTransaction(t, acc1, 20, 0, make([]byte, 32)),
@@ -849,7 +849,7 @@ func TestBlockTransactionsCursorMatchesListTransactions(t *testing.T) {
 			30: testHTTPAPIChainTransaction(t, acc3, 30, 10, prev),
 		}},
 	})
-	block := testHTTPAPIBlockIDForRoot(0, masterchainShard, 1, root)
+	block := testHTTPAPIBlockIDForRoot(1, root)
 
 	reference := testHTTPAPIListTransactions(t, root)
 	if len(reference) != 6 {
@@ -1009,14 +1009,14 @@ func TestTransactionsHistoryWalkReusesCachedBlock(t *testing.T) {
 	tx90 := testHTTPAPIChainTransaction(t, account, 90, 50, tx50.Hash())
 	tx100 := testHTTPAPIChainTransaction(t, account, 100, 90, tx90.Hash())
 
-	oldRoot := testHTTPAPIBlockWithAccountTxs(t, 0, masterchainShard, []testHTTPAPIAccountTxs{
+	oldRoot := testHTTPAPIBlockWithAccountTxs(t, []testHTTPAPIAccountTxs{
 		{account: account, txs: map[uint64]*cell.Cell{50: tx50}},
 	})
-	newRoot := testHTTPAPIBlockWithAccountTxs(t, 0, masterchainShard, []testHTTPAPIAccountTxs{
+	newRoot := testHTTPAPIBlockWithAccountTxs(t, []testHTTPAPIAccountTxs{
 		{account: account, txs: map[uint64]*cell.Cell{90: tx90, 100: tx100}},
 	})
-	oldBlock := testHTTPAPIBlockIDForRoot(0, masterchainShard, 1, oldRoot)
-	newBlock := testHTTPAPIBlockIDForRoot(0, masterchainShard, 2, newRoot)
+	oldBlock := testHTTPAPIBlockIDForRoot(1, oldRoot)
+	newBlock := testHTTPAPIBlockIDForRoot(2, newRoot)
 
 	store := &historyTestStore{
 		roots:     map[uint32]blockRoot{1: {block: oldBlock, root: oldRoot}, 2: {block: newBlock, root: newRoot}},

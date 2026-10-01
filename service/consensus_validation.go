@@ -28,7 +28,7 @@ type masterchainConsensusProof struct {
 	validatorCacheKey   masterchainValidatorCacheKey
 	keyBlock            bool
 	vertSeqnoIncr       bool
-	proofSignatures     *blockproof.ValidatorSignatureSet
+	proofSignatures     *blockproof.BlockSignatureSet
 	signaturePrepareErr error
 	signaturesChecked   bool
 	hardforkChecked     bool
@@ -76,7 +76,7 @@ func (c *masterchainValidatorCache) put(key masterchainValidatorCacheKey, valida
 	return validators
 }
 
-func (s *Service) checkMasterchainBlockConsensusWithProof(current *tnstore.BlockState, proof *masterchainConsensusProof) (*checkedMasterchainConsensus, error) {
+func (s *SyncCoordinator) checkMasterchainBlockConsensusWithProof(current *tnstore.BlockState, proof *masterchainConsensusProof) (*checkedMasterchainConsensus, error) {
 	if proof.block.Workchain != -1 || proof.block.Shard != topShard {
 		return nil, fmt.Errorf("consensus proof is not for masterchain block: %s", tnstore.FormatBlockRef(proof.block))
 	}
@@ -87,7 +87,7 @@ func (s *Service) checkMasterchainBlockConsensusWithProof(current *tnstore.Block
 	if !proof.prevRef.Equals(&current.Block) {
 		return nil, fmt.Errorf("%w: block=%s prev=%s current=%s", errMasterchainPrevMismatch, tnstore.FormatBlockRef(proof.block), tnstore.FormatBlockRef(proof.prevRef), tnstore.FormatBlockRef(current.Block))
 	}
-	currentHash := current.Cell.Virtualize(0).HashKey(0)
+	currentHash := current.Cell.Virtualize(0).HashKeyAt(0)
 	if proof.stateUpdateFromHash != currentHash {
 		return nil, fmt.Errorf("invalid previous state hash in proof %s: expected %x, got %x", tnstore.FormatBlockRef(proof.block), currentHash[:], proof.stateUpdateFromHash[:])
 	}
@@ -121,7 +121,7 @@ func (s *Service) checkMasterchainBlockConsensusWithProof(current *tnstore.Block
 	}, nil
 }
 
-func (s *Service) checkMasterchainHardforkConsensus(current *tnstore.BlockState, proof *masterchainConsensusProof, cause error) (*checkedMasterchainConsensus, error) {
+func (s *SyncCoordinator) checkMasterchainHardforkConsensus(current *tnstore.BlockState, proof *masterchainConsensusProof, cause error) (*checkedMasterchainConsensus, error) {
 	if !s.node.IsHardfork(proof.block) {
 		return nil, cause
 	}
@@ -150,7 +150,7 @@ func (c *checkedMasterchainConsensus) validateFor(current *tnstore.BlockState, b
 	return nil
 }
 
-func (s *Service) checkedConsensusForPreparedBlock(current *tnstore.BlockState, block PreparedBlock) (*checkedMasterchainConsensus, error) {
+func (s *SyncCoordinator) checkedConsensusForPreparedBlock(current *tnstore.BlockState, block PreparedBlock) (*checkedMasterchainConsensus, error) {
 	if block.consensusChecked != nil {
 		if err := block.consensusChecked.validateFor(current, block.ID); err != nil {
 			return nil, err
@@ -209,7 +209,7 @@ func (c *parsedProofCache) parse(block ton.BlockIDExt, proofRoot *cell.Cell) (*b
 	return parsed, nil
 }
 
-func (s *Service) prepareMasterchainConsensusProof(block ton.BlockIDExt, proofRoot *cell.Cell, verifiedSignaturesKey []byte) (*masterchainConsensusProof, error) {
+func (s *SyncCoordinator) prepareMasterchainConsensusProof(block ton.BlockIDExt, proofRoot *cell.Cell, verifiedSignaturesKey []byte) (*masterchainConsensusProof, error) {
 	parsed, err := s.parsedProofs.parse(block, proofRoot)
 	if err != nil {
 		return nil, err
@@ -226,7 +226,7 @@ func (s *Service) prepareMasterchainConsensusProof(block ton.BlockIDExt, proofRo
 // the full check exactly as before — the hardfork fallback must see the
 // original failure, and the miss path is the one that can populate the cache
 // from the previous state.
-func (s *Service) preverifyMasterchainConsensusSignatures(proof *masterchainConsensusProof) {
+func (s *SyncCoordinator) preverifyMasterchainConsensusSignatures(proof *masterchainConsensusProof) {
 	if proof == nil || proof.signaturesChecked || proof.hardforkChecked {
 		return
 	}
@@ -269,7 +269,7 @@ func masterchainConsensusProofFromParsed(block ton.BlockIDExt, parsed *blockproo
 		return nil, err
 	}
 
-	var proofSignatures *blockproof.ValidatorSignatureSet
+	var proofSignatures *blockproof.BlockSignatureSet
 	var signaturePrepareErr error
 	if parsed.Proof.Signatures == nil {
 		signaturePrepareErr = fmt.Errorf("masterchain block proof %s has no validator signatures", tnstore.FormatBlockRef(block))
@@ -277,9 +277,9 @@ func masterchainConsensusProofFromParsed(block ton.BlockIDExt, parsed *blockproo
 		proofSignatures, signaturePrepareErr = blockproof.PrepareMasterchainSignatureSet(block, parsed.Block, parsed.Proof.Signatures)
 	}
 
-	// The broadcast layer already verified a signature set for this block; if
-	// the proof carries exactly the same content, a second Ed25519 pass proves
-	// nothing new and is skipped.
+	// The finality broadcast already verified this exact BlockSignatures
+	// evidence, including the cell-declared weight. A second Ed25519 pass then
+	// proves nothing new and is skipped.
 	signaturesChecked := false
 	if proofSignatures != nil && signaturePrepareErr == nil && len(verifiedSignaturesKey) > 0 {
 		signaturesChecked = bytes.Equal(proofSignatures.ContentKey(block), verifiedSignaturesKey)
@@ -310,10 +310,10 @@ func stateUpdateFromHash(block ton.BlockIDExt, update *cell.Cell) (cell.Hash, er
 	if err != nil {
 		return cell.Hash{}, fmt.Errorf("read old state hash from %s: %w", tnstore.FormatBlockRef(block), err)
 	}
-	return oldState.HashKey(0), nil
+	return oldState.HashKeyAt(0), nil
 }
 
-func (s *Service) masterchainValidatorsForConsensus(current *tnstore.BlockState, blockID ton.BlockIDExt, key masterchainValidatorCacheKey) (*blockproof.PreparedValidatorSet, error) {
+func (s *SyncCoordinator) masterchainValidatorsForConsensus(current *tnstore.BlockState, blockID ton.BlockIDExt, key masterchainValidatorCacheKey) (*blockproof.PreparedValidatorSet, error) {
 	cached, err := s.validatorCache.get(key)
 	if err == nil {
 		return cached, nil

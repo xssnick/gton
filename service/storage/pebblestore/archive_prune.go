@@ -546,6 +546,7 @@ func (s *Store) removeArchivePackageFilesFromDiskLocked(paths []string) (int, ui
 			}
 			return deleted, deletedBytes, fmt.Errorf("remove archive package %s: %w", path, err)
 		}
+		s.artifactFiles.invalidate(path)
 		deleted++
 		if stat.Size() > 0 {
 			deletedBytes += uint64(stat.Size())
@@ -560,7 +561,7 @@ func (s *Store) removeArchivePackageFilesFromDiskLocked(paths []string) (int, ui
 	}
 	sort.Strings(dirPaths)
 	for _, dir := range dirPaths {
-		if err := syncDir(dir); err != nil {
+		if err := storage.SyncDir(dir); err != nil {
 			return deleted, deletedBytes, fmt.Errorf("sync archive package dir %s: %w", dir, err)
 		}
 	}

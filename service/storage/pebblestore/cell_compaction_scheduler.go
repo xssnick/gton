@@ -102,6 +102,12 @@ func (c *pebbleCompactionController) reserve(s *pebbleCompactionScheduler) bool 
 	if c.paused || c.stopped || s.unregistered || c.running >= c.effectiveMaxRunningLocked() {
 		return false
 	}
+	// Pebble leaves the per-DB CompactionConcurrencyRange to the scheduler.
+	// GetAllowedWithoutPermission reads only atomics, so it is safe under c.mu
+	// even when TrySchedule is called with the DB mutex held.
+	if s.running >= s.db.GetAllowedWithoutPermission() {
+		return false
+	}
 	c.running++
 	s.running++
 	return true
@@ -186,7 +192,7 @@ func (c *pebbleCompactionController) snapshotGrantSchedulers() []*pebbleCompacti
 
 	schedulers := make([]*pebbleCompactionScheduler, 0, len(c.schedulers))
 	for scheduler := range c.schedulers {
-		if scheduler.unregistered || scheduler.db == nil {
+		if scheduler.unregistered || scheduler.db == nil || scheduler.running >= scheduler.db.GetAllowedWithoutPermission() {
 			continue
 		}
 		schedulers = append(schedulers, scheduler)

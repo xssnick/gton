@@ -13,7 +13,7 @@ import (
 
 var errStateSerializationLowDiskSpace = errors.New("free disk space is below persistent state serialization minimum")
 
-func (s *Service) ensurePersistentStateSerializationDiskSpace(ctx context.Context, target ton.BlockIDExt, probe syncDiskSpaceProbe) error {
+func (s *StateLifecycle) ensurePersistentStateSerializationDiskSpace(ctx context.Context, target ton.BlockIDExt, probe syncDiskSpaceProbe) error {
 	path := strings.TrimSpace(s.syncDiskSpacePath)
 	if path == "" {
 		return nil
@@ -26,7 +26,7 @@ func (s *Service) ensurePersistentStateSerializationDiskSpace(ctx context.Contex
 	if status.AvailableBytes >= s.minStateSerializationDiskFreeBytes {
 		return nil
 	}
-	if s.persistentStateKeepRecent == PersistentStateKeepAll {
+	if s.maintenance.persistentStateKeepRecent == PersistentStateKeepAll {
 		s.stateSerializationLowDiskFields(s.stateSerializer.log.Error(), target, path, status.AvailableBytes).
 			Msg("persistent state serialization skipped because all existing states are retained")
 		return s.stateSerializationLowDiskError(path, status.AvailableBytes)
@@ -66,7 +66,7 @@ func (s *Service) ensurePersistentStateSerializationDiskSpace(ctx context.Contex
 	return s.stateSerializationLowDiskError(path, status.AvailableBytes)
 }
 
-func (s *Service) stateSerializationLowDiskFields(e *zerolog.Event, target ton.BlockIDExt, path string, availableBytes uint64) *zerolog.Event {
+func (s *StateLifecycle) stateSerializationLowDiskFields(e *zerolog.Event, target ton.BlockIDExt, path string, availableBytes uint64) *zerolog.Event {
 	return e.Err(errStateSerializationLowDiskSpace).
 		Str("target", storage.FormatBlockRef(target)).
 		Str("path", path).
@@ -76,7 +76,7 @@ func (s *Service) stateSerializationLowDiskFields(e *zerolog.Event, target ton.B
 		Str("required_size", formatByteSize(s.minStateSerializationDiskFreeBytes))
 }
 
-func (s *Service) stateSerializationLowDiskError(path string, availableBytes uint64) error {
+func (s *StateLifecycle) stateSerializationLowDiskError(path string, availableBytes uint64) error {
 	return fmt.Errorf("%w: available=%s required=%s path=%s", errStateSerializationLowDiskSpace, formatByteSize(availableBytes), formatByteSize(s.minStateSerializationDiskFreeBytes), path)
 }
 
@@ -88,10 +88,52 @@ func checkPersistentStateSerializationDiskSpace(path string, probe syncDiskSpace
 	return status, nil
 }
 
-func (s *Service) prunePreviousPersistentStateBeforeSerialization(ctx context.Context, target ton.BlockIDExt) (storage.PersistentStatePruneStats, error) {
-	stats, err := s.storage.PrunePreviousPersistentStateFiles(ctx, target.SeqNo)
+func (s *StateLifecycle) prunePreviousPersistentStateBeforeSerialization(ctx context.Context, target ton.BlockIDExt) (storage.PersistentStatePruneStats, error) {
+	stats, err := s.stateSerializer.store.PrunePreviousPersistentStateFiles(ctx, target.SeqNo)
 	if err != nil {
 		return stats, fmt.Errorf("delete previous persistent state before serialization %s: %w", storage.FormatBlockRef(target), err)
 	}
 	return stats, nil
+}
+
+func (s *StateLifecycle) prunePersistentStatesAfterSerialization(ctx context.Context, target ton.BlockIDExt) error {
+	keepRecent := s.maintenance.persistentStateKeepRecent
+	if keepRecent == PersistentStateKeepAll {
+		return nil
+	}
+
+	stats, err := s.stateSerializer.store.PrunePersistentStateFilesToLimit(ctx, target.SeqNo, keepRecent)
+	if err != nil {
+		return fmt.Errorf("prune persistent states after serialization %s: %w", storage.FormatBlockRef(target), err)
+	}
+
+	event := s.stateSerializer.log.Debug()
+	if stats.DeletedFileRecords > 0 {
+		event = s.stateSerializer.log.Info()
+	}
+	event.
+		Str("target", storage.FormatBlockRef(target)).
+		Int("keep_recent_groups", keepRecent).
+		Int("retained_recent_groups", stats.RetainedRecentGroups).
+		Uint32("oldest_retained_master_seqno", stats.OldestRetainedMasterSeqno).
+		Uint32("deleted_master_seqno", stats.DeletedMasterSeqno).
+		Int("deleted_file_records", stats.DeletedFileRecords).
+		Int("deleted_disk_files", stats.DeletedDiskFiles).
+		Uint64("freed_bytes", stats.DeletedDiskBytes).
+		Str("freed_size", formatByteSize(stats.DeletedDiskBytes)).
+		Msg("persistent state retention completed after serialization")
+	return nil
+}
+
+func (s *StateLifecycle) enforcePersistentStateRetentionAfterSerialization(ctx context.Context, target ton.BlockIDExt, scope PersistentStateSerializationScope) {
+	if scope != PersistentStateSerializationAll {
+		return
+	}
+
+	if err := s.prunePersistentStatesAfterSerialization(ctx, target); err != nil {
+		s.log.Error().
+			Err(err).
+			Str("persistent_state", storage.FormatBlockRef(target)).
+			Msg("failed to enforce persistent state retention after serialization")
+	}
 }

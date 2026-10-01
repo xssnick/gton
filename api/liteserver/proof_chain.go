@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/xssnick/gton/service/blockproof"
+	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/tl"
@@ -225,7 +226,7 @@ func (s *Server) previousBlockForPrefix(ctx context.Context, id ton.BlockIDExt, 
 		return ton.BlockIDExt{}, fmt.Errorf("previous block references are missing")
 	}
 	for _, prev := range meta.PrevRefs {
-		if blockproof.ShardIntersects(storage.ShardKeyFromBlock(prev), prefix) {
+		if prev.Workchain == prefix.Workchain && sharddomain.Intersects(prev.Shard, prefix.Shard) {
 			return prev, nil
 		}
 	}

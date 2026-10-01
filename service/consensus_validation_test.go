@@ -121,7 +121,7 @@ func TestMasterchainConsensusRejectsUnconfiguredHardforkFallback(t *testing.T) {
 	block := testBlockID(-1, topShard, 101)
 	current := testConsensusState(prev)
 	cause := errors.New("signature check failed")
-	svc := &Service{log: zerolog.Nop(), node: &p2p.Node{}}
+	svc := &SyncCoordinator{log: zerolog.Nop(), node: &p2p.Node{}}
 	proof := testHardforkConsensusProof(current, block, cause)
 
 	_, err := svc.checkMasterchainBlockConsensusWithProof(current, proof)
@@ -148,7 +148,7 @@ func TestMasterchainConsensusCheckedPathDoesNotLookupHardfork(t *testing.T) {
 	prev := testBlockID(-1, topShard, 100)
 	block := testBlockID(-1, topShard, 101)
 	current := testConsensusState(prev)
-	svc := &Service{log: zerolog.Nop()}
+	svc := &SyncCoordinator{log: zerolog.Nop()}
 	proof := testHardforkConsensusProof(current, block, nil)
 	proof.signaturesChecked = true
 
@@ -187,13 +187,16 @@ func TestPreverifyMasterchainConsensusSignatures(t *testing.T) {
 	proof := &masterchainConsensusProof{
 		block:             block,
 		validatorCacheKey: key,
-		proofSignatures: blockproof.NewOrdinaryValidatorSignatureSet(7, prepared.Hash(), []ton.Signature{{
-			NodeIDShort: nodeID,
-			Signature:   ed25519.Sign(priv, payload),
-		}}),
+		proofSignatures: &blockproof.BlockSignatureSet{
+			ValidatorSignatures: blockproof.NewOrdinaryValidatorSignatureSet(7, prepared.Hash(), []ton.Signature{{
+				NodeIDShort: nodeID,
+				Signature:   ed25519.Sign(priv, payload),
+			}}),
+			DeclaredWeight: 1,
+		},
 	}
 
-	svc := &Service{log: zerolog.Nop()}
+	svc := &SyncCoordinator{log: zerolog.Nop()}
 	svc.preverifyMasterchainConsensusSignatures(proof)
 	if proof.signaturesChecked {
 		t.Fatal("preverify marked the proof checked on a validator cache miss")
@@ -210,10 +213,13 @@ func TestPreverifyMasterchainConsensusSignatures(t *testing.T) {
 	badProof := &masterchainConsensusProof{
 		block:             block,
 		validatorCacheKey: key,
-		proofSignatures: blockproof.NewOrdinaryValidatorSignatureSet(7, prepared.Hash(), []ton.Signature{{
-			NodeIDShort: nodeID,
-			Signature:   make([]byte, 64),
-		}}),
+		proofSignatures: &blockproof.BlockSignatureSet{
+			ValidatorSignatures: blockproof.NewOrdinaryValidatorSignatureSet(7, prepared.Hash(), []ton.Signature{{
+				NodeIDShort: nodeID,
+				Signature:   make([]byte, 64),
+			}}),
+			DeclaredWeight: 1,
+		},
 	}
 	svc.preverifyMasterchainConsensusSignatures(badProof)
 	if badProof.signaturesChecked {
@@ -260,7 +266,7 @@ func TestParsedProofCacheDeduplicatesByRootPointer(t *testing.T) {
 	}
 }
 
-func testServiceWithHardfork(tb testing.TB, block ton.BlockIDExt) *Service {
+func testServiceWithHardfork(tb testing.TB, block ton.BlockIDExt) *SyncCoordinator {
 	tb.Helper()
 
 	node := &p2p.Node{}
@@ -270,7 +276,7 @@ func testServiceWithHardfork(tb testing.TB, block ton.BlockIDExt) *Service {
 	hardforkSet.SetMapIndex(testHardforkSetKey(tb, field.Type().Key(), block), reflect.ValueOf(struct{}{}))
 	setUnexportedReflectValue(field, hardforkSet)
 
-	return &Service{log: zerolog.Nop(), node: node}
+	return &SyncCoordinator{log: zerolog.Nop(), node: node}
 }
 
 func testHardforkSetKey(tb testing.TB, typ reflect.Type, block ton.BlockIDExt) reflect.Value {

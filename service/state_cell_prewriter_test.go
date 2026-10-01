@@ -92,11 +92,11 @@ func TestStateCellWindowCheckpointDoesNotWaitForBlockedPrewriteEnqueue(t *testin
 	second := cell.BeginCell().MustStoreUInt(0x74, 8).EndCell()
 	secondRecords := mustPreparedReachableStateCells(t, second)
 
-	writer.mu.Lock()
+	writer.queue.mu.Lock()
 	writerLocked := true
 	unlockWriter := func() {
 		if writerLocked {
-			writer.mu.Unlock()
+			writer.queue.mu.Unlock()
 			writerLocked = false
 		}
 	}

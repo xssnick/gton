@@ -32,18 +32,34 @@ func newExternalBroadcastPacer(opts ExternalBroadcastCapacityOptions) (*external
 	}, nil
 }
 
-func (p *externalBroadcastPacer) Wait(ctx context.Context, costBytes int64) error {
-	if costBytes <= 0 || p.bytesPerSecond == 0 {
-		return nil
-	}
-
+// Reserve books costBytes of broadcast capacity without waiting and returns
+// the time the broadcast may be sent.
+func (p *externalBroadcastPacer) Reserve(costBytes int64) (time.Time, error) {
 	now := p.now()
-	sendAt, err := p.reserve(now, costBytes)
-	if err != nil {
-		return err
+	if costBytes <= 0 || p.bytesPerSecond == 0 {
+		return now, nil
+	}
+	return p.reserve(now, costBytes)
+}
+
+// Cancel returns a reservation whose broadcast was never queued. Only the
+// latest reservation is returned: the ones booked after it are already
+// scheduled behind its slot, as in x/time/rate Reservation.Cancel.
+func (p *externalBroadcastPacer) Cancel(sendAt time.Time, costBytes int64) {
+	if costBytes <= 0 || p.bytesPerSecond == 0 {
+		return
 	}
 
-	delay := sendAt.Sub(now)
+	p.mx.Lock()
+	defer p.mx.Unlock()
+
+	if p.nextAvailable.Equal(sendAt.Add(p.duration(costBytes))) {
+		p.nextAvailable = sendAt
+	}
+}
+
+func (p *externalBroadcastPacer) Wait(ctx context.Context, sendAt time.Time) error {
+	delay := sendAt.Sub(p.now())
 	if delay <= 0 {
 		return nil
 	}

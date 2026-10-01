@@ -11,7 +11,7 @@ import (
 
 func TestPublishLiveBlockArtifactsAvailabilityPolicy(t *testing.T) {
 	flusher := &testLiveCheckpointFlusher{}
-	svc := &Service{log: zerolog.Nop(), liveState: flusher}
+	svc := &SyncCoordinator{log: zerolog.Nop(), liveState: flusher}
 	block := testBlockID(-1, topShard, 501)
 	downloaded := PreparedBlock{
 		ID:        block,

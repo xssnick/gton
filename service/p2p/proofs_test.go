@@ -34,7 +34,7 @@ func TestValidateDownloadedProofRejectsProofForMismatch(t *testing.T) {
 }
 
 func TestValidateDownloadedProofRejectsShardFullProof(t *testing.T) {
-	root := testPeerBlockRoot(t, 0, topShard, 172)
+	root := testPeerBlockRoot(t, 0, 172)
 	rootHash := root.HashKey()
 	block := ton.BlockIDExt{
 		Workchain: 0,

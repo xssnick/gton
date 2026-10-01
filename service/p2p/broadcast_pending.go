@@ -138,6 +138,15 @@ func (n *Node) processPendingBlockBroadcastDecodeRequests(ctx context.Context, r
 		if !n.canAcceptBroadcast(req.kind, false) {
 			continue
 		}
+		if n.alreadyKnownBlockBroadcast(req.block) {
+			// the previous state became available because the chain advanced,
+			// and the block itself may have arrived with it by another route;
+			// the payload was relayed at classify time, so there is nothing
+			// left to decode for
+			n.forgetPendingBlockBroadcastDecode(req.fingerprint)
+			n.noteBroadcastDrop(req.overlay, req.kind, "already_applied")
+			continue
+		}
 
 		started := n.startBroadcastPipelineStage()
 		downloaded, err := n.decodePendingBlockBroadcast(ctx, req)

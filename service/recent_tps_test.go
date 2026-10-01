@@ -61,7 +61,7 @@ func TestRecentTPSWindowDeduplicatesBlocks(t *testing.T) {
 }
 
 func TestRecentTPSTrackerSkipsExpiredBlockBeforeQueue(t *testing.T) {
-	tracker := newRecentTPSTracker(10 * time.Second)
+	tracker := newRecentTPSTracker()
 	block := testBlockID(0, topShard, 1)
 
 	tracker.observe(block, nil, 90, time.Unix(100, 0))
@@ -74,7 +74,7 @@ func TestRecentTPSTrackerSkipsExpiredBlockBeforeQueue(t *testing.T) {
 }
 
 func TestRecentTPSTrackerInvalidatesOnQueueOverflow(t *testing.T) {
-	tracker := newRecentTPSTracker(10 * time.Second)
+	tracker := newRecentTPSTracker()
 	root := cell.BeginCell().EndCell()
 	now := time.Unix(100, 0)
 
@@ -92,7 +92,7 @@ func TestRecentTPSTrackerInvalidatesOnQueueOverflow(t *testing.T) {
 func TestRecentTPSTrackerCountsInBackground(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		block, root, _, _ := mustStatusFixtureBlock(t)
-		tracker := newRecentTPSTracker(10 * time.Second)
+		tracker := newRecentTPSTracker()
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan struct{})
 		go func() {
@@ -119,7 +119,7 @@ func TestRecentTPSTrackerCountsInBackground(t *testing.T) {
 }
 
 func BenchmarkRecentTPSTrackerSkipExpiredBlock(b *testing.B) {
-	tracker := newRecentTPSTracker(10 * time.Second)
+	tracker := newRecentTPSTracker()
 	block := testBlockID(0, topShard, 1)
 	genUTime := uint32(time.Now().Add(-tracker.window).Unix())
 

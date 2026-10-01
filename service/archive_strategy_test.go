@@ -72,8 +72,8 @@ func TestArchiveSyncUntilProgressGoalKeepsCutoffWithoutBlockTime(t *testing.T) {
 }
 
 func TestArchivePipelineSchedulingUsesPendingWindowLimit(t *testing.T) {
-	runner := &archiveCatchUpRunner{
-		service: &Service{archiveCatchUpPrefetchWindows: 2},
+	runner := &archiveCatchUpRun{
+		archive: &ArchiveRunner{prefetchWindows: 2},
 		target:  testMasterBlockID(1000),
 	}
 	planning := &storage.CurrentState{ShardClientSeqno: 100}
@@ -93,8 +93,8 @@ func TestArchivePipelineSchedulingUsesPendingWindowLimit(t *testing.T) {
 }
 
 func TestArchivePipelineSchedulingStopsNearLiveTail(t *testing.T) {
-	runner := &archiveCatchUpRunner{
-		service: &Service{archiveCatchUpPrefetchWindows: 2},
+	runner := &archiveCatchUpRun{
+		archive: &ArchiveRunner{prefetchWindows: 2},
 		target:  testMasterBlockID(1000),
 	}
 	nowUnix := time.Now().Unix()
@@ -147,8 +147,8 @@ func TestMonitorMinSplitDepthReadsWorkchainDescriptor(t *testing.T) {
 }
 
 func TestArchivePipelineReadyWindowBacklog(t *testing.T) {
-	runner := &archiveCatchUpRunner{
-		service: &Service{archiveCatchUpPrefetchWindows: DefaultArchiveCatchUpPrefetchWindows},
+	runner := &archiveCatchUpRun{
+		archive: &ArchiveRunner{prefetchWindows: DefaultArchiveCatchUpPrefetchWindows},
 	}
 
 	if runner.archiveReadyWindowBacklog() != archiveReadyWindowBacklog {
@@ -169,8 +169,8 @@ func TestArchivePipelineReadyWindowBacklog(t *testing.T) {
 }
 
 func TestArchivePipelineReadyWindowErrorEmitsImmediately(t *testing.T) {
-	runner := &archiveCatchUpRunner{
-		service: &Service{archiveCatchUpPrefetchWindows: DefaultArchiveCatchUpPrefetchWindows},
+	runner := &archiveCatchUpRun{
+		archive: &ArchiveRunner{prefetchWindows: DefaultArchiveCatchUpPrefetchWindows},
 	}
 	if !runner.shouldEmitReadyArchiveWindow([]archivePendingWindow{testReadyArchiveWindow(errors.New("boom"))}) {
 		t.Fatal("pipeline should emit ready window errors immediately")
@@ -178,8 +178,8 @@ func TestArchivePipelineReadyWindowErrorEmitsImmediately(t *testing.T) {
 }
 
 func TestArchiveCheckpointBackpressureWaitsAtConfiguredWindowTarget(t *testing.T) {
-	runner := &archiveCatchUpRunner{
-		service:                &Service{archiveCatchUpCheckpointBlocks: 2000, checkpointBytes: DefaultCheckpointBytes, syncBackpressureWindows: DefaultSyncBackpressureWindows},
+	runner := &archiveCatchUpRun{
+		archive:                &ArchiveRunner{checkpointBlocks: 2000, state: &StateLifecycle{checkpointBytes: DefaultCheckpointBytes}, syncBackpressure: DefaultSyncBackpressureWindows},
 		checkpointDone:         make(chan archiveCheckpointResult),
 		checkpointBlocksTarget: 2000,
 		lastCheckpointSeqno:    1000,
@@ -209,7 +209,10 @@ func TestArchiveShardPrefixesIncludeIntermediateShardChanges(t *testing.T) {
 		{testBlockID(0, shard, 10)},
 	}
 
-	got := archiveShardImportPlansForBlockStatesMatching(2, startBlocks, stateBlocks, nil)
+	got, err := archiveShardImportPlansForBlockStatesMatching(2, startBlocks, stateBlocks, nil)
+	if err != nil {
+		t.Fatalf("plan shard prefixes: %v", err)
+	}
 	want := archive.ShardID{Workchain: 0, Shard: shard}
 	if len(got) != 1 || got[0].shard != want {
 		t.Fatalf("changed shard prefixes = %#v, want [%#v]", got, want)
@@ -222,7 +225,10 @@ func TestArchiveShardPrefixesIncludeIntermediateShardChanges(t *testing.T) {
 func TestArchiveShardPrefixesIncludeWideShardInEveryCoveredPrefix(t *testing.T) {
 	block := testBlockID(0, topShard, 11)
 
-	got := archiveShardImportPlansForBlockStatesMatching(2, nil, [][]ton.BlockIDExt{{block}}, nil)
+	got, err := archiveShardImportPlansForBlockStatesMatching(2, nil, [][]ton.BlockIDExt{{block}}, nil)
+	if err != nil {
+		t.Fatalf("plan shard prefixes: %v", err)
+	}
 	if len(got) != 4 {
 		t.Fatalf("wide shard prefixes = %#v, want 4 plans", got)
 	}
@@ -247,7 +253,10 @@ func TestArchiveShardPrefixesMissingFromBlockStatesOnlyReturnsUncoveredChanges(t
 		{next},
 	}
 
-	missing := archiveShardImportPlansMissingFromBlockStates(2, startBlocks, stateBlocks, nil)
+	missing, err := archiveShardImportPlansMissingFromBlockStates(2, startBlocks, stateBlocks, nil)
+	if err != nil {
+		t.Fatalf("plan missing shard prefixes: %v", err)
+	}
 	want := archive.ShardID{Workchain: 0, Shard: shard}
 	if len(missing) != 1 || missing[0].shard != want {
 		t.Fatalf("missing shard prefixes = %#v, want [%#v]", missing, want)
@@ -256,9 +265,12 @@ func TestArchiveShardPrefixesMissingFromBlockStatesOnlyReturnsUncoveredChanges(t
 		t.Fatalf("missing shard needed blocks = %#v, want [%s]", missing[0].needed, storage.FormatBlockRef(next))
 	}
 
-	covered := archiveShardImportPlansMissingFromBlockStates(2, startBlocks, stateBlocks, map[storage.BlockRootHash]PreparedBlock{
+	covered, err := archiveShardImportPlansMissingFromBlockStates(2, startBlocks, stateBlocks, map[storage.BlockRootHash]PreparedBlock{
 		storage.BlockKey(next): {ID: next},
 	})
+	if err != nil {
+		t.Fatalf("plan covered shard prefixes: %v", err)
+	}
 	if len(covered) != 0 {
 		t.Fatalf("covered shard prefixes = %#v, want none", covered)
 	}
@@ -268,7 +280,10 @@ func TestArchiveShardPrefixesSkipZeroStateTargets(t *testing.T) {
 	shard := int64(-1 << 61)
 	zero := testBlockID(0, shard, 0)
 
-	missing := archiveShardImportPlansMissingFromBlockStates(2, nil, [][]ton.BlockIDExt{{zero}}, nil)
+	missing, err := archiveShardImportPlansMissingFromBlockStates(2, nil, [][]ton.BlockIDExt{{zero}}, nil)
+	if err != nil {
+		t.Fatalf("plan zerostate shard prefixes: %v", err)
+	}
 	if len(missing) != 0 {
 		t.Fatalf("zerostate shard prefixes = %#v, want none", missing)
 	}
@@ -301,8 +316,8 @@ func TestArchiveCheckpointBackpressureWaitsAtByteLimit(t *testing.T) {
 	first[0] = 1
 	second[0] = 2
 
-	runner := &archiveCatchUpRunner{
-		service:                &Service{archiveCatchUpCheckpointBlocks: 2000, checkpointBytes: 1024, syncBackpressureWindows: DefaultSyncBackpressureWindows},
+	runner := &archiveCatchUpRun{
+		archive:                &ArchiveRunner{checkpointBlocks: 2000, state: &StateLifecycle{checkpointBytes: 1024}, syncBackpressure: DefaultSyncBackpressureWindows},
 		checkpointDone:         make(chan archiveCheckpointResult),
 		checkpointBlocksTarget: 2000,
 		lastCheckpointSeqno:    1000,
@@ -328,8 +343,8 @@ func TestArchiveCheckpointBackpressureCountsArtifactBytes(t *testing.T) {
 	first := &storage.BlockState{Block: testBlockID(0, topShard, 100)}
 	second := &storage.BlockState{Block: testBlockID(0, topShard, 101)}
 
-	runner := &archiveCatchUpRunner{
-		service:                &Service{archiveCatchUpCheckpointBlocks: 2000, checkpointBytes: 1024, syncBackpressureWindows: DefaultSyncBackpressureWindows},
+	runner := &archiveCatchUpRun{
+		archive:                &ArchiveRunner{checkpointBlocks: 2000, state: &StateLifecycle{checkpointBytes: 1024}, syncBackpressure: DefaultSyncBackpressureWindows},
 		checkpointDone:         make(chan archiveCheckpointResult),
 		checkpointBlocksTarget: 2000,
 		lastCheckpointSeqno:    1000,
@@ -362,17 +377,17 @@ func TestArchiveCheckpointBackpressureCountsArtifactBytes(t *testing.T) {
 }
 
 func TestArchiveCheckpointPersistsAtByteTarget(t *testing.T) {
-	service := &Service{
-		archiveCatchUpCheckpointBlocks: 2000,
-		archiveCatchUpCheckpointPeriod: time.Hour,
-		checkpointBytes:                1024,
+	archiveRunner := &ArchiveRunner{
+		checkpointBlocks: 2000,
+		checkpointPeriod: time.Hour,
+		state:            &StateLifecycle{checkpointBytes: 1024},
 	}
 	lastCheckpoint := time.Now()
 
-	if service.shouldPersistArchiveCatchUpCheckpoint(1001, 10_000, 1000, lastCheckpoint, 2000, 1023) {
+	if archiveRunner.shouldPersistArchiveCatchUpCheckpoint(1001, 10_000, 1000, lastCheckpoint, 2000, 1023) {
 		t.Fatal("checkpoint should not persist below byte target")
 	}
-	if !service.shouldPersistArchiveCatchUpCheckpoint(1001, 10_000, 1000, lastCheckpoint, 2000, 1024) {
+	if !archiveRunner.shouldPersistArchiveCatchUpCheckpoint(1001, 10_000, 1000, lastCheckpoint, 2000, 1024) {
 		t.Fatal("checkpoint should persist at byte target")
 	}
 }
@@ -383,7 +398,13 @@ func TestNextCheckpointUsesBlockAndByteTargets(t *testing.T) {
 	second[0] = 2
 
 	runner := &nextSyncRunner{
-		service:      &Service{nextBlockCheckpointBlocks: 10, checkpointBytes: 1024, syncBackpressureWindows: DefaultSyncBackpressureWindows},
+		checkpointPolicy: stateCheckpointPolicy{
+			blocks:              10,
+			bytes:               1024,
+			backpressureWindows: DefaultSyncBackpressureWindows,
+			backpressureBlocks:  10 * DefaultSyncBackpressureWindows,
+			backpressureBytes:   1024 * DefaultSyncBackpressureWindows,
+		},
 		stagedBlocks: 9,
 		stateCells:   newTestStateCellWindowCache(nil),
 	}
@@ -415,14 +436,14 @@ func TestNextCheckpointUsesBlockAndByteTargets(t *testing.T) {
 }
 
 func TestArchiveCheckpointAdaptiveTargetUsesConfiguredBackpressureWindows(t *testing.T) {
-	service := &Service{archiveCatchUpCheckpointBlocks: 2000, syncBackpressureWindows: DefaultSyncBackpressureWindows}
-	target := service.adaptArchiveCheckpointBlocks(4000, 2*time.Second)
+	archiveRunner := &ArchiveRunner{checkpointBlocks: 2000, syncBackpressure: DefaultSyncBackpressureWindows}
+	target := archiveRunner.adaptArchiveCheckpointBlocks(4000, 2*time.Second)
 	if target != 4000 {
 		t.Fatalf("adaptive checkpoint target = %d, want 4000", target)
 	}
 
-	runner := &archiveCatchUpRunner{
-		service:                service,
+	runner := &archiveCatchUpRun{
+		archive:                archiveRunner,
 		checkpointBlocksTarget: target,
 	}
 	if runner.archiveCheckpointBackpressureBlocks() != 16000 {
@@ -557,14 +578,14 @@ func testMasterBlockID(seqno uint32) ton.BlockIDExt {
 }
 
 func TestArchiveShardPrefixInputsIndexTargetsByMasterSeqno(t *testing.T) {
-	svc := &Service{}
+	archiveRunner := &ArchiveRunner{}
 	start := testArchiveStrategyMasterStateWithWorkchains(t, cell.NewDict(32))
 	states := map[uint32]*storage.BlockState{
 		11: testArchiveStrategyMasterStateWithWorkchains(t, cell.NewDict(32)),
 		12: testArchiveStrategyMasterStateWithWorkchains(t, cell.NewDict(32)),
 	}
 
-	inputs, err := svc.archiveShardPrefixInputsForWindow(start, states)
+	inputs, err := archiveRunner.archiveShardPrefixInputsForWindow(start, states)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -589,7 +610,7 @@ func TestApplyShardClientArchiveWindowReusesPlannedShardTargets(t *testing.T) {
 		},
 		shardTargets: map[uint32][]ton.BlockIDExt{11: {}},
 	}
-	runner := &archiveCatchUpRunner{}
+	runner := &archiveCatchUpRun{}
 
 	current := &storage.CurrentState{
 		ShardClientSeqno: 10,

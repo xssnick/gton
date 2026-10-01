@@ -34,7 +34,10 @@ func currentAccountBlocksFromState(current *storage.CurrentState, workchain int3
 		return liveview.CurrentAccountBlockIDs{}, storage.ErrNotFound
 	}
 
-	candidates := storage.AccountShardCandidates(workchain, account)
+	candidates, err := storage.AccountShardCandidates(workchain, account)
+	if err != nil {
+		return liveview.CurrentAccountBlockIDs{}, err
+	}
 	for i := len(candidates) - 1; i >= 0; i-- {
 		key := storage.ShardKey{Workchain: workchain, Shard: candidates[i]}
 		if shard, ok := current.Shards[key]; ok {

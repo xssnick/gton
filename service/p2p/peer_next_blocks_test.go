@@ -13,7 +13,7 @@ import (
 )
 
 type countingNextBlockStore struct {
-	tnstore.PeerServingStorage
+	PeerStorage
 	calls atomic.Int32
 }
 
@@ -22,7 +22,7 @@ func (s *countingNextBlockStore) NextBlockFull(
 	prev ton.BlockIDExt,
 ) (*tnstore.ServedBlockFull, error) {
 	s.calls.Add(1)
-	return s.PeerServingStorage.NextBlockFull(ctx, prev)
+	return s.PeerStorage.NextBlockFull(ctx, prev)
 }
 
 func TestNextBlocksFullTLValuesRoundTrip(t *testing.T) {
@@ -264,7 +264,7 @@ func TestServeNextBlocksFullStopsLikeCpp(t *testing.T) {
 
 	t.Run("proof link is not returned", func(t *testing.T) {
 		sub, store, prev, ids := nextBlocksTestSubscription(t, 1)
-		base := store.PeerServingStorage.(*testPeerStore)
+		base := store.PeerStorage.(*testPeerStore)
 		base.mu.Lock()
 		base.blocks[tnstore.BlockKey(ids[0])].IsLink = true
 		base.mu.Unlock()
@@ -294,12 +294,12 @@ func nextBlocksTestSubscription(
 	t.Helper()
 
 	base := newTestPeerStore()
-	store := &countingNextBlockStore{PeerServingStorage: base}
+	store := &countingNextBlockStore{PeerStorage: base}
 	logger := discardLogger()
 	node, err := New(Options{
-		Logger:             &logger,
-		PeerServingStorage: store,
-		StateFilesDir:      t.TempDir(),
+		Logger:        &logger,
+		PeerStorage:   store,
+		StateFilesDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -310,7 +310,7 @@ func nextBlocksTestSubscription(
 	prev := anchor
 	ids := make([]ton.BlockIDExt, 0, blockCount)
 	for i := 1; i <= blockCount; i++ {
-		root := testPeerBlockRoot(t, -1, topShard, uint32(i))
+		root := testPeerBlockRoot(t, -1, uint32(i))
 		blockData := serializeCompressedBlockRoot(root)
 		rootHash := root.HashKey()
 		fileHash := sha256.Sum256(blockData)

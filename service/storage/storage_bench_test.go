@@ -9,7 +9,7 @@ import (
 )
 
 func BenchmarkLoadCellGraph(b *testing.B) {
-	root, cells := benchmarkCellGraph(b, 4096, 4)
+	root, cells := benchmarkCellGraph(b, 4096)
 	records, err := CollectCellRecords(root)
 	if err != nil {
 		b.Fatalf("collect cell records: %v", err)
@@ -49,7 +49,7 @@ func BenchmarkLoadCellGraph(b *testing.B) {
 }
 
 func BenchmarkCollectCellRecords(b *testing.B) {
-	root, cells := benchmarkCellGraph(b, 4096, 4)
+	root, cells := benchmarkCellGraph(b, 4096)
 
 	b.ReportAllocs()
 	b.ReportMetric(float64(cells), "cells/op")
@@ -67,7 +67,7 @@ func BenchmarkCollectCellRecords(b *testing.B) {
 }
 
 func BenchmarkPrepareStateUpdateCells(b *testing.B) {
-	root, cells := benchmarkCellGraph(b, 4096, 4)
+	root, cells := benchmarkCellGraph(b, 4096)
 	update, err := cell.BeginCell().
 		MustStoreUInt(uint64(cell.MerkleUpdateCellType), 8).
 		MustStoreSlice(root.Hash(0), 256).
@@ -94,14 +94,12 @@ func BenchmarkPrepareStateUpdateCells(b *testing.B) {
 	}
 }
 
-func benchmarkCellGraph(tb testing.TB, leaves int, fanout int) (*cell.Cell, int) {
+func benchmarkCellGraph(tb testing.TB, leaves int) (*cell.Cell, int) {
 	tb.Helper()
 	if leaves <= 0 {
 		tb.Fatalf("leaves must be positive")
 	}
-	if fanout < 2 || fanout > 4 {
-		tb.Fatalf("fanout must be between 2 and 4")
-	}
+	const fanout = 4
 
 	level := make([]*cell.Cell, leaves)
 	total := 0

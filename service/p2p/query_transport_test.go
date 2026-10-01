@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xssnick/gton/service/archive"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
@@ -302,6 +304,87 @@ func BenchmarkQUICOverlayEnvelopeMessage(b *testing.B) {
 
 var quicOverlayEnvelopeBenchmarkWire []byte
 
+// appendQUICOverlayBodyDefaultCapacity is appendQUICOverlayBody before raw
+// bodies were joined at their exact size.
+func appendQUICOverlayBodyDefaultCapacity(
+	prefix []byte,
+	body tl.Serializable,
+) ([]byte, error) {
+	payload := make([]byte, 0, len(prefix)+tl.DefaultSerializeBufferSize)
+	payload = append(payload, prefix...)
+	return tl.Append(payload, body, true)
+}
+
+func TestQUICOverlayEnvelopeRawBodyMatchesDefaultCapacityJoin(t *testing.T) {
+	certificate := overlay.MemberCertificate{
+		IssuedBy: newFastSyncMembershipTestIssuer(t, 0x42).public,
+		Flags:    1,
+		Slot:     3,
+		ExpireAt: int32(time.Now().Add(time.Hour).Unix()),
+	}
+	overlayID := testPeerID("raw-body-envelope-equivalence").Bytes()
+
+	for _, member := range []*overlay.MemberCertificate{nil, &certificate} {
+		envelope, err := newQUICOverlayEnvelope(overlayID, member)
+		if err != nil {
+			t.Fatalf("create envelope: %v", err)
+		}
+		state := envelope.state.Load()
+
+		for _, size := range []int{0, 1, 256, 1024, 1536, 40 << 10} {
+			body := make(tl.Raw, size)
+			for i := range body {
+				body[i] = byte(i * 131)
+			}
+
+			query, err := envelope.Query(body)
+			if err != nil {
+				t.Fatalf("wrap %d-byte query: %v", size, err)
+			}
+			want, err := appendQUICOverlayBodyDefaultCapacity(state.queryPrefix, body)
+			if err != nil {
+				t.Fatalf("join %d-byte query: %v", size, err)
+			}
+			if !bytes.Equal(query, want) {
+				t.Fatalf("%d-byte query wire = %x, want %x", size, query, want)
+			}
+
+			message, err := envelope.Message(body)
+			if err != nil {
+				t.Fatalf("wrap %d-byte message: %v", size, err)
+			}
+			want, err = appendQUICOverlayBodyDefaultCapacity(state.messagePrefix, body)
+			if err != nil {
+				t.Fatalf("join %d-byte message: %v", size, err)
+			}
+			if !bytes.Equal(message, want) {
+				t.Fatalf("%d-byte message wire = %x, want %x", size, message, want)
+			}
+		}
+	}
+}
+
+func BenchmarkQUICOverlayEnvelopeQueryRaw(b *testing.B) {
+	overlayID := testPeerID("raw-query-envelope-benchmark").Bytes()
+	envelope, err := newQUICOverlayEnvelope(overlayID, nil)
+	if err != nil {
+		b.Fatalf("create envelope: %v", err)
+	}
+
+	for _, size := range []int{256, 1536} {
+		var request tl.Serializable = make(tl.Raw, size)
+		b.Run(fmt.Sprintf("body=%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				quicOverlayEnvelopeBenchmarkWire, err = envelope.Query(request)
+				if err != nil {
+					b.Fatalf("serialize query: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestRLDPPeerQueryTransportTypedRawAndStrictParsing(t *testing.T) {
 	answer := Capabilities{VersionMajor: 3, VersionMinor: 1, Flags: 7}
 	encoded, err := tl.Serialize(answer, true)
@@ -356,7 +439,7 @@ func TestQUICQueryTransportDoesNotFallbackWithoutRoute(t *testing.T) {
 	peer := &overlayPeer{
 		node:      newTestNode(t),
 		pub:       peerPublicKey,
-		route:     newPeerRoute(""),
+		route:     newTestPeerRoute(""),
 		overlayID: []byte{1},
 	}
 	transport := quicPeerQueryTransport{
@@ -382,7 +465,7 @@ func TestCustomQuerySelectionReadinessCooldownAndScope(t *testing.T) {
 	node.subscriptions["beta"] = second
 	node.subscriptions["alpha"] = first
 
-	selected, err := node.querySubscriptionForBlock(ton.BlockIDExt{})
+	selected, err := node.querySubscriptionForBlock(ton.BlockIDExt{Workchain: 0, Shard: topShard})
 	if err != nil {
 		t.Fatalf("select custom query overlay: %v", err)
 	}
@@ -395,6 +478,10 @@ func TestCustomQuerySelectionReadinessCooldownAndScope(t *testing.T) {
 	}
 	if historical != first {
 		t.Fatalf("historical overlay = %q, want custom %q", historical.spec.Name, first.spec.Name)
+	}
+	archiveSub, err := node.querySubscriptionForArchive(archive.ShardID{Workchain: 0, Shard: 0x2800000000000000})
+	if err != nil || archiveSub != first {
+		t.Fatalf("archive overlay = %p, error = %v, want custom %p", archiveSub, err, first)
 	}
 
 	candidates := first.queryCandidates(0, 0)
@@ -413,12 +500,16 @@ func TestCustomQuerySelectionReadinessCooldownAndScope(t *testing.T) {
 		t.Fatalf("query cooldown = %s, want %s", delay, customQueryFailureCooldown)
 	}
 
-	selected, err = node.querySubscriptionForBlock(ton.BlockIDExt{})
+	selected, err = node.querySubscriptionForBlock(ton.BlockIDExt{Workchain: 0, Shard: topShard})
 	if err != nil {
 		t.Fatalf("select second custom query overlay: %v", err)
 	}
 	if selected != second || selected.queryCandidates(0, 0)[0] != secondPeer {
 		t.Fatalf("selected overlay after cooldown = %q, want %q", selected.spec.Name, second.spec.Name)
+	}
+	archiveSub, err = node.querySubscriptionForArchive(archive.ShardID{Workchain: 0, Shard: 0x2800000000000000})
+	if err != nil || archiveSub != second {
+		t.Fatalf("archive overlay after cooldown = %p, error = %v, want custom %p", archiveSub, err, second)
 	}
 }
 
@@ -470,24 +561,28 @@ func TestHistoricalQuerySelectionSkipsFastSync(t *testing.T) {
 			selected.spec.Name,
 		)
 	}
+	archiveSub, err := node.querySubscriptionForArchive(archive.ShardID{Workchain: 0, Shard: shard})
+	if err != nil || archiveSub == fastSync || archiveSub.spec.Shard != topShard {
+		t.Fatalf("archive overlay = %p, error = %v, want public root", archiveSub, err)
+	}
 }
 
 func TestPublicQueryCandidatesUseOneHourAliveRandomFallback(t *testing.T) {
 	now := time.Now()
 	retained := testReadyQueryPeer("retained-public-fallback")
-	retained.announced = &overlay.Node{Version: int32(now.Add(-30 * time.Minute).Unix())}
+	retained.announced = &overlay.NodeV2{Version: int32(now.Add(-30 * time.Minute).Unix())}
 	retained.lastReceiveAt = now
 
 	expired := testReadyQueryPeer("expired-public-fallback")
-	expired.announced = &overlay.Node{Version: int32(now.Add(-publicRandomQueryFallbackTTL - time.Minute).Unix())}
+	expired.announced = &overlay.NodeV2{Version: int32(now.Add(-publicRandomQueryFallbackTTL - time.Minute).Unix())}
 	expired.lastReceiveAt = now
 
 	dead := testReadyQueryPeer("dead-public-fallback")
-	dead.announced = &overlay.Node{Version: int32(now.Add(-30 * time.Minute).Unix())}
+	dead.announced = &overlay.NodeV2{Version: int32(now.Add(-30 * time.Minute).Unix())}
 	dead.alive = false
 
 	pending := testReadyQueryPeer("pending-public-fallback")
-	pending.announced = &overlay.Node{Version: int32(now.Add(-30 * time.Minute).Unix())}
+	pending.announced = &overlay.NodeV2{Version: int32(now.Add(-30 * time.Minute).Unix())}
 	pending.pending = true
 
 	sub := testOverlaySubscription(&overlaySubscription{
@@ -512,7 +607,7 @@ func TestPublicQueryCandidatesUseOneHourAliveRandomFallback(t *testing.T) {
 	}
 
 	fresh := testReadyQueryPeer("fresh-public-query")
-	fresh.announced = &overlay.Node{Version: int32(now.Unix())}
+	fresh.announced = &overlay.NodeV2{Version: int32(now.Unix())}
 	fresh.lastReceiveAt = now
 	sub.peers[fresh.id] = fresh
 
@@ -522,7 +617,7 @@ func TestPublicQueryCandidatesUseOneHourAliveRandomFallback(t *testing.T) {
 	}
 
 	otherRetained := testReadyQueryPeer("other-retained-public-fallback")
-	otherRetained.announced = &overlay.Node{Version: int32(now.Add(-45 * time.Minute).Unix())}
+	otherRetained.announced = &overlay.NodeV2{Version: int32(now.Add(-45 * time.Minute).Unix())}
 	otherRetained.lastReceiveAt = now
 	sub.peers[otherRetained.id] = otherRetained
 	delete(sub.peers, fresh.id)

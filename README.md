@@ -2,7 +2,7 @@
 
 <img align="right" width="512px" src="https://github.com/user-attachments/assets/b7ec1bc3-6cb0-4e93-bcf0-6c019e295147">
 
-`gton` is a Go implementation of a TON full node with a liteserver API. It does not implement validator functionality. The node is designed to be an efficient API access point for services, backends of projects, indexers, wallets, and other infrastructure that needs fast synchronization and stable data serving under heavy load.
+`gton` is a Go implementation of a TON full node with a liteserver API. Its validator subsystem is under development and does not yet provide a complete production validation pipeline. The node is designed to be an efficient API access point for services, backends of projects, indexers, wallets, and other infrastructure that needs fast synchronization and stable data serving under heavy load.
 
 The project focuses on:
 
@@ -63,7 +63,7 @@ After startup node will sync with the latest blockchain state. First it will dow
 The main binary is `./cmd/node`.
 
 ```bash
-./gton-node [flags]
+./gton-node [flags] [status [full|db]]
 ```
 
 Supported flags:
@@ -71,8 +71,13 @@ Supported flags:
 | Flag | Description |
 | --- | --- |
 | `--config <path>` | Path to the JSON config. Defaults to `config.json`. |
+| `--data-dir <path>` | Override `storage.dir` from the node config. |
+| `--global-config-file <path>` | Override `ton.global_config_path` from the node config. |
 | `--ls-pubkey` | Print the liteserver public key (base64) and exit. |
 | `--adnl-id` | Print the ADNL id derived from `adnl.key` (base64) and exit. |
+| `--consensus-adnl-id` | Print the ADNL id used by the validator and collator (base64) and exit. |
+| `--validator-control-pubkey` | Print the boxed validator-control server public key in base64 and exit. |
+| `--dht-descriptor` | Print this node's signed public DHT descriptor as JSON and exit. |
 | `--version` | Print the build version and exit. |
 | `--verbosity <level>` | Global log verbosity: `trace`, `debug`, `info`, `warn`, `error`. |
 | `--log-types <list>` | Per-category log verbosity overrides, for example `liteserver=debug,p2p=warn`. |
@@ -87,6 +92,67 @@ Supported flags:
 | `--skip-cfg-check` | Continue startup after creating missing config file without manually reviewing it first. |
 | `--archive-checkpoint-period <duration>` | Maximum current-state checkpoint interval during archive catch-up. Defaults to `2m`. |
 | `--archive-prefetch-windows <n>` | Archive import window prefetch depth. Defaults to `2`. |
+
+## Creating a Test Network Genesis
+
+Build the standalone genesis utility:
+
+```bash
+go build -o gton-genesis ./cmd/genesis
+```
+
+The first run without arguments creates `genesis.json` with standard testnet
+settings and placeholders for three validators and one bootstrap DHT node. It
+does not create or modify any node config:
+
+```bash
+./gton-genesis
+```
+
+Validator signing keys are created later through validator control and are
+stored in the validator database, not in `config.json`. For a pre-seeded test
+genesis, use the keys produced by the genesis workflow; use the node commands
+for the network identities:
+
+```bash
+./gton-node --config node-0.json --adnl-id
+./gton-node --config node-0.json --dht-descriptor
+```
+
+Before exporting the DHT descriptor, set `adnl.external_addr` to an address
+reachable by the other nodes. Once all placeholders have been replaced, the
+second run creates a complete Pebble node database, the global config, and a
+resolved lock file:
+
+```bash
+./gton-genesis
+```
+
+All paths have defaults and can be overridden independently:
+
+```bash
+./gton-genesis \
+  --genesis ./genesis.json \
+  --data ./data \
+  --global-config ./global.config.json \
+  --lock ./genesis.lock.json
+```
+
+Start the seeded node with its own config and the generated artifacts:
+
+```bash
+./gton-node \
+  --config node-0.json \
+  --data-dir ./data \
+  --global-config-file ./global.config.json
+```
+
+Distribute the same `global.config.json` to every initial node. The closed
+generated data directory may also be copied to all three nodes before startup;
+it contains no node identity or private key. Alternatively, start one seeded
+node first and let the other nodes download the declared zerostates through the
+normal protocol. `genesis.lock.json` records the exact block hashes, validator
+key IDs, and bounceable testnet addresses for operator verification.
 
 ## Using Custom Overlays and Non-Final Blocks
 
@@ -142,13 +208,25 @@ Non-final data is kept in memory only. It is not applied to persistent state or 
 
 ## Console Commands
 
-After startup, the process reads commands from stdin. This is useful for manual diagnostics and maintenance without a separate RPC control interface.
+After startup, the process reads commands from stdin for diagnostics and maintenance.
+
+To read the same status from another process, run the binary in the directory containing `config.json`:
+
+```bash
+./gton-node status
+./gton-node status full
+./gton-node status db
+./gton-node --config /path/to/config.json status full
+```
+
+Place flags before `status`. These commands read the existing config, request `/status` from the local metrics HTTP server, print its text, and exit. They do not open node storage or start another node. A disabled server, connection failure, timeout, or HTTP error produces a non-zero exit code and a message on stderr.
 
 | Command | Description                                                                                                                                   |
 | --- |-----------------------------------------------------------------------------------------------------------------------------------------------|
 | `status` | Prints a short sync, p2p, liteserver, and TPS status.                                                                                         |
 | `status full` | Prints extended status with peer and overlay details.                                                                                         |
 | `status db` | Prints Pebble/meta DB and cell DB generation status: cache, disk, L0, compaction, memtable, and read/write rates.                             |
+| `status validator` | When the validator extension is enabled, prints group/session state and its isolated WAL-backed validator database status.                    |
 | `serialize <masterchain_seqno>` | Starts persistent state serialization for the given masterchain seqno.                                                                        |
 | `serialize cancel` | Cancels the current persistent state serialization.                                                                                           |
 | `migrate <masterchain_seqno>` | Starts cell DB generation migration from the persistent state of the given masterchain block. Migration is used for cell db size optimization |
@@ -159,6 +237,7 @@ Example:
 ```text
 status
 status db
+status validator
 serialize 48500000
 migrate 48500000
 ```
@@ -179,7 +258,7 @@ Builds a fresh cell database from a serialized state snapshot, catches it up to 
 
 ##### Persistent state cleanup
 
-Deletes expired state snapshot files while keeping recent snapshots and any snapshot still needed by an unfinished migration. This saves disk space without breaking state serving or an in-progress database migration.
+After a successful full serialization, immediately removes snapshot groups beyond `persistent_state_keep_recent`. Background cleanup also removes expired leftovers. A snapshot still needed by an unfinished migration is kept temporarily even when it exceeds the configured limit.
 
 ##### Archive cleanup
 
@@ -251,14 +330,13 @@ Simplified example:
     "cell_total_cache_size": 8589934592,
     "decoded_cell_cache_enabled": true,
     "decoded_cell_cache_shards": 64,
-    "decoded_cell_cache_bytes_per_entry": 16384,
-    "decoded_cell_cache_min_entries": 65536,
-    "decoded_cell_cache_max_entries": 1048576,
+    "decoded_cell_cache_entries": 131072,
+    "cell_record_cache_bytes": 4294967296,
     "cell_shard_memtable_size": 268435456,
     "cell_memtable_stop_writes_threshold": 4,
     "large_boc_shard_read_workers": 2,
     "persistent_state_large_boc_batch_size": 524288,
-    "persistent_state_keep_recent": 2,
+    "persistent_state_keep_recent": 1,
     "state_serialize_one_pass": false,
     "artifact_file_max_open": 512
   },
@@ -266,6 +344,19 @@ Simplified example:
     "enabled": true,
     "listen_addr": "127.0.0.1:9090",
     "namespace": "gton"
+  },
+  "validator": {
+    "enabled": false,
+    "control": {
+      "listen_addr": "127.0.0.1:3030",
+      "key": "<base64 ed25519 seed>",
+      "clients": [
+        {
+          "id": "<base64 client short key id>",
+          "permissions": 15
+        }
+      ]
+    }
   },
   "custom_overlays": [],
   "disable_state_serialization": false
@@ -294,6 +385,55 @@ Simplified example:
 | `listen_addr` | Local address for the p2p ADNL listener. Empty value switches p2p to client mode. |
 | `external_addr` | Public `ip:port` announced to other peers. |
 
+### `consensus_adnl`
+
+Dedicated network shared by the validator and standalone collator. Generated
+configs always include this block with `enabled: false`, a random independent
+key, and the detected public IP. With `enabled: false` or an omitted block,
+both roles use `adnl.key` and the ordinary P2P listener. Old configs without
+the block remain unchanged; an omitted `enabled` also means `false`.
+
+```json
+"consensus_adnl": {
+  "enabled": false,
+  "key": "<base64-encoded 32-byte Ed25519 seed>",
+  "listen_addr": "0.0.0.0:30305",
+  "external_addr": "203.0.113.10:30305"
+}
+```
+
+Set `enabled: true` to use the dedicated network. Its key and both addresses
+are required and validated only when enabled. The key must differ from the
+ordinary ADNL and DHT keys. The dedicated network has its own ADNL/RLDP
+connections, consensus overlays and identity-bound FastSync overlays; QUIC listens on the
+ADNL port plus 1000 (31305 in this example). Both dedicated ports use UDP and
+must be reachable at the advertised address. With NAT, forward both ports;
+the advertised QUIC port is also the advertised ADNL port plus 1000.
+Collisions with the ordinary ADNL, QUIC and DHT listeners or advertised
+endpoints are rejected.
+
+Public/custom overlays continue through the ordinary network. FastSync block
+synchronization, publication and membership certificates use the dedicated
+identity, matching the validator/collator registration. Both transports share
+the process DHT, blockchain state and broadcast processing; no second
+synchronizer is started. Full-node queries on the dedicated listener require
+FastSync membership. Changes take effect on restart.
+
+Use `./gton-node --config config.json --consensus-adnl-id` for validator
+elections and collator registration. `--adnl-id` continues to print the ordinary
+node identity. The validator-control `getConfig` and `addValidatorAdnlAddress`
+use the selected consensus identity.
+
+To move an existing validator to the dedicated port while preserving its
+identity, move its existing `adnl.key` seed into `consensus_adnl.key` and assign
+a new seed to `adnl.key`, then set `consensus_adnl.enabled: true`. Update
+memberships and certificates tied to the ordinary node identity as needed.
+This preserves validator key bindings and
+session storage; the feature changes no database format. A conflicting,
+unexpired validator key binding causes startup to fail with the affected IDs.
+Choosing a new consensus identity requires the corresponding election or
+collator registration; editing JSON does not rewrite existing key bindings.
+
 ### `dht`
 
 | Field | Description |
@@ -321,19 +461,49 @@ Simplified example:
 | Field | Description |
 | --- | --- |
 | `dir` | Pebble storage directory. |
-| `cell_total_cache_size` | Total cache budget for the cell DB, in bytes. Defaults to `8589934592` (8 GiB). |
+| `cell_total_cache_size` | Pebble **block cache** budget for the cell DB, in bytes. Off-heap, opaque to the Go GC. Defaults to `8589934592` (8 GiB). |
 | `decoded_cell_cache_enabled` | Enables the in-process decoded lazy-cell cache. Defaults to `true`. |
-| `decoded_cell_cache_shards` | Number of LRU shards in the decoded lazy-cell cache. Defaults to `64`. |
-| `decoded_cell_cache_bytes_per_entry` | Estimated bytes per decoded cell cache entry used to derive capacity from `cell_total_cache_size`. Defaults to `16384`. |
-| `decoded_cell_cache_min_entries` | Minimum decoded cell cache entries. Defaults to `65536`. |
-| `decoded_cell_cache_max_entries` | Maximum decoded cell cache entries. Defaults to `1048576`. |
+| `decoded_cell_cache_shards` | Number of shards in the decoded lazy-cell cache. Defaults to `64`. Clamped down to the entry count when there are fewer entries than shards. |
+| `decoded_cell_cache_entries` | Capacity of the in-process **decoded** cell cache, in entries. Defaults to `131072`; `0` uses the default. The set-associative table rounds the per-shard budget down to its bucket geometry, so the effective capacity (logged at open) can be slightly below an odd request, never above. **Hard upper bound `1048576` (1 Mi) entries — a larger value is rejected at load and the node does not start.** |
+| `cell_record_cache_bytes` | Arena budget for the encoded cell **record** cache, in bytes — the tier between the decoded cache and the pebble block cache, holding raw celldb records pre-decode. Defaults to `4294967296` (4 GiB) when the field is absent; an explicit `0` disables the tier. Under cgo builds (the deployed binary) the arenas are malloc'd outside the Go GC; under `CGO_ENABLED=0` they fall back to Go-heap noscan bytes, which the GC never scans but which count as live heap for GOGC pacing and GOMEMLIMIT. The derived lookup index adds ~22-25% on top of this budget (both figures are logged at open). Values above `1099511627776` (1 TiB) are rejected as typos; positive dust values are clamped up to the smallest workable ring. |
+| `service_decoded_cell_cache_entries` | Deprecated: former name of `decoded_cell_cache_entries`. Still honoured when the current name is absent, and warned about at startup. |
+| `operation_decoded_cell_cache_entries` | Deprecated and ignored: sized a second decoded cache that no longer exists. Warned about at startup. |
+| `decoded_cell_cache_bytes_per_entry` | Deprecated and ignored: capacity is no longer derived from a byte budget. Warned about at startup. |
+| `decoded_cell_cache_min_entries` | Deprecated and ignored. Warned about at startup. |
+| `decoded_cell_cache_max_entries` | Deprecated and ignored. Warned about at startup. |
 | `cell_shard_memtable_size` | Memtable size for one cell DB shard, in bytes. |
 | `cell_memtable_stop_writes_threshold` | Pebble stop-writes threshold for memtables. |
 | `large_boc_shard_read_workers` | Per-cell-DB-shard parallel readers for large-BOC state serialization loads. Defaults to `2`; `0` uses the default. |
 | `persistent_state_large_boc_batch_size` | Large-BOC serialization batch size for persistent state files, in cells. Defaults to `524288`; `0` uses the default. |
-| `persistent_state_keep_recent` | Number of recent persistent-state groups always retained. Defaults to `2`; `0` also uses the default for compatibility with older configs. Set to `-1` to retain every persistent state and disable persistent-state cleanup, including low-disk emergency pruning. Older groups outside this count are still retained until their protocol TTL expires. |
+| `persistent_state_keep_recent` | Maximum number of recent fully serialized persistent-state groups retained after a successful full serialization. Defaults to `1`; `0` also uses the default for compatibility with older configs. Set to `-1` to retain every persistent state and disable persistent-state cleanup, including low-disk emergency pruning. A group still needed by an unfinished cell-generation migration is retained temporarily even when it exceeds this limit. |
 | `state_serialize_one_pass` | Forces persistent state serialization to use one-pass large-BOC serialization for every state part. Defaults to `false`. |
 | `artifact_file_max_open` | Open-file limit for block/state artifacts. |
+
+**Sizing the two cell caches.** `cell_total_cache_size` and `decoded_cell_cache_entries` are
+independent knobs over different tiers, and raising one does not move the other. `cell_total_cache_size`
+is pebble's block cache: compressed blocks in one off-heap arena, so its cost is bytes and nothing
+else, and below it the OS page cache holds the rest of celldb for free. That is where bulk capacity
+belongs — raise it freely on a large machine.
+
+`decoded_cell_cache_entries` bounds fully decoded `*cell.Cell` trees on the Go heap. Each entry is
+roughly 10 live objects and ~820 B, and **every GC mark cycle scans all of them**, so its cost is paid
+per collection rather than once. Mark cost tracks the object COUNT, which is why the knob is an entry
+count and not a byte budget, and why the default is small relative to the pebble cache. Raising it by
+a factor of eight raises steady-state mark work by about the same factor. Earlier releases derived this
+capacity from `cell_total_cache_size`; that coupling is gone, so a node that raises the pebble cache no
+longer silently multiplies its live object count.
+
+For the same reason the knob has a **hard ceiling of 1048576 entries**, enforced when the config is
+loaded rather than clamped silently: a value above it fails startup with the reason. That ceiling is
+about 10 M live objects and ~820 MiB, and it is the same bound the removed derivation was clamped to —
+when the derivation went away the clamp went with it, which left the knob unbounded above and let a
+config put back exactly the object count the resize had removed. The deprecated alias
+`service_decoded_cell_cache_entries` is checked against the same ceiling when it is the value that wins.
+
+There is one decoded cell cache for the whole process — the lightserver, archive import, sync,
+collation and validation all share it. It is not splittable per consumer: the collator and the
+validator must hold the same `*cell.Cell` for a given parent, because the validator's live-successor
+carry-back compares tip states by pointer, and two caches cannot both supply one object.
 
 ### `metrics`
 
@@ -343,7 +513,25 @@ Simplified example:
 | `listen_addr` | HTTP listener address for `/metrics`, for example `127.0.0.1:9090`. |
 | `namespace` | Prometheus metric prefix. Defaults to `gton`; must match `[A-Za-z_][A-Za-z0-9_]*`. |
 
+### `validator`
+
+| Field | Description |
+| --- | --- |
+| `enabled` | Starts the validator workflow and the authenticated validator-control endpoint. |
+| `control.listen_addr` | TCP listen address. The generated default is loopback-only: `127.0.0.1:3030`. |
+| `control.key` | Base64-encoded Ed25519 seed for the control server transport identity. |
+| `control.clients[].id` | Base64-encoded 32-byte TON short ID of a trusted validator-console/MTC client key. |
+| `control.clients[].permissions` | C++ validator-engine permission mask: default `1`, modify `2`, unsafe signing `4`; MTC normally uses `15`. |
+
+The control server implements the MTC election path: `getStats`, `getConfig`,
+`generateKeyPair`, `addValidatorPermanentKey`, `addValidatorTempKey`,
+`exportPublicKey`, `addValidatorAdnlAddress`, and `sign`. Generated validator
+keys and their election metadata are persisted under `storage.dir/validator`;
+the trusted-client allowlist and authenticated connections remain in memory.
+
 ### `custom_overlays`
+
+Unknown JSON fields are ignored throughout the node config, including `@type` keys in overlay definitions copied from the C++ node.
 
 List of private overlay definitions. Empty by default. Each overlay has:
 
@@ -367,9 +555,9 @@ Each `nodes` entry has:
 
 When `true`, automatic persistent state serialization is disabled. Manual serialization through the `serialize` console command is still a separate service operation.
 
-## Metrics
+## Metrics and status
 
-To enable the Prometheus endpoint, add:
+New configs enable the metrics and status HTTP server on `127.0.0.1:9090` by default:
 
 ```json
 {
@@ -381,11 +569,16 @@ To enable the Prometheus endpoint, add:
 }
 ```
 
-Metrics are exposed at:
+The server exposes:
 
 ```text
 http://127.0.0.1:9090/metrics
+http://127.0.0.1:9090/status
+http://127.0.0.1:9090/status?mode=full
+http://127.0.0.1:9090/status?mode=db
 ```
+
+The status endpoints return the same plain text as the stdin commands `status`, `status full`, and `status db`, including while the node is syncing. Set `metrics.enabled` to `false` to disable both endpoints. Existing configs that explicitly disable metrics retain that setting; enable it to use the CLI status commands. An omitted `metrics` section now uses the enabled loopback default. The CLI uses loopback addresses, translating wildcard listeners to `127.0.0.1` or `::1`; bind a loopback or wildcard address to use it. If the HTTP listener is exposed beyond localhost, `/status` is accessible along with `/metrics`.
 
 The exported metrics cover liteserver latency, sync lag, block download/apply, checkpoint persistence, p2p queues, rebroadcasting, blocksync, and Pebble/cell DB status. The full metric list and PromQL examples are documented in [METRICS.md](METRICS.md). A Grafana dashboard is available in `metrics.json`.
 
@@ -413,16 +606,16 @@ func main() {
 
 `node.Run` uses the same CLI and config bootstrap as the standard `./cmd/node`
 binary. It reads `config.json` (or the path passed through `--config`), starts
-the built-in extensions enabled there, including the liteserver and HTTP API,
-and composes them with the supplied extension factories. Multiple factories
-can be passed to `node.Run`.
+the configured liteserver and HTTP API as root-owned servers, and separately
+composes the supplied extension factories. Multiple factories can be passed to
+`node.Run`.
 
 `gton.RunNode` is the lower-level entry point for a binary that owns its full
 startup flow. It accepts already resolved `gton.NodeOptions`; it does not read
-`config.json` or add the built-in extensions automatically. Loading a config
+`config.json` or configure the built-in API servers automatically. Loading a config
 with `Config.RuntimeOptions` and passing only `RuntimeOptions.Node` therefore
 does not enable the liteserver or HTTP API. A custom bootstrap must configure
-and compose those extensions explicitly.
+`NodeOptions.Liteserver` and `NodeOptions.HTTPAPI` explicitly.
 
 For example, a fully custom binary can parse its own CLI and config files, then
 pass typed startup values to `gton.RunNode`:
@@ -513,14 +706,28 @@ replay checker example. The example is a separate Go module with a local
 `replace` to the repository root, so it does not become part of the main
 module's `./...` package set.
 
+Optional hooks adapters for the API servers live in `extensions/httpapi` and
+`extensions/liteserver`. They were moved out of `api/httpapi` and
+`api/liteserver` so core API packages never import the extension SDK. Custom
+binaries using the old `api/*/NewExtension` entry points must switch those two
+imports to `extensions/*`; no forwarding shim is kept in core.
+
 The extension factory must have this signature:
 
 ```go
 func New(node hooks.Node) (hooks.Extension, error)
 ```
 
-`hooks.Node` gives the extension a small capability surface:
-`Network` can send external messages, `Store` is a read-only live view backed by the same store/cache layer used by the liteserver, and `Logger` is a zerolog logger with `source=extension`. It does not expose block download methods or storage modifiers.
+`hooks.Node` gives the extension a small capability surface. `Network` can send
+external messages and submit an already decoded local block to the normal node
+pipeline. `PrivateOverlays` creates extension-owned fixed-membership overlays;
+it exposes authenticated message, query, and broadcast transport without
+depending on validator types. `BlockBroadcasts` accepts validator-produced
+candidate and accepted-block artifacts for node-owned publication.
+`Store` is a read-only live view backed by the same store/cache layer used by
+the liteserver, while `TVM`, `Commands`, `Metrics`, and `Logger` expose their
+corresponding runtime capabilities. None of these APIs exposes block download
+control or direct storage mutation.
 
 The returned value receives hook events through:
 
@@ -536,7 +743,15 @@ type Extension interface {
 
 `OnBlockApplied` is called after a block state update is applied and before that block flow can continue to checkpoint or persist. Block apply hook delivery is at least once: the same block apply call may be repeated if the node crashes or is hard-stopped before the block flow is fully persisted/checkpointed. If the method returns an error, the node retries the same event after a short delay and does not advance that block flow until the extension returns `nil`. This retry only blocks the affected block dependency branch; shard block apply is parallel, so other independent branches may continue and may call the same extension concurrently.
 
-`Start` is called after the node services are started. `Close` is called during shutdown and should block until the extension exits or the context is done. Extensions with no background work should return `nil`.
+`Start` is called after the P2P node is ready and before the sync coordinator
+and state/maintenance workers start. P2P callbacks can begin as the node becomes
+ready, so factories must initialize all hook-visible state eagerly; `Start`
+should only launch background work. During shutdown the node stops and joins all
+ordinary hook delivery before calling `Close`; no new hook can begin and every
+already admitted hook has returned. P2P remains available during `Close` so an
+extension can deterministically retire private overlays, then the node stops the
+network. `Close` should block until the extension exits or the context is done.
+Extensions with no background work should return `nil`.
 
 `OnExternalMessage` is called after an external message is accepted by TVM emulation and before it is rebroadcast further. `event.IsLocal` is `true` when the message came from this node's local API path and `false` for overlay broadcasts. If the method returns an error, that external message is dropped without retry.
 

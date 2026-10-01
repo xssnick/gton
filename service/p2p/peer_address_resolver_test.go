@@ -11,6 +11,7 @@ import (
 	"time"
 
 	adnladdr "github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/dht"
 )
 
 type countingPeerAddressDHT struct {
@@ -120,6 +121,22 @@ func TestPeerAddressResolverCachesRecentFailure(t *testing.T) {
 	}
 	if got := backend.calls.Load(); got != 1 {
 		t.Fatalf("failed DHT address lookups = %d, want 1", got)
+	}
+}
+
+func TestPeerAddressResolverDoesNotCacheMissingDHTValue(t *testing.T) {
+	id := testPeerID("missing-peer-address")
+	backend := &countingPeerAddressDHT{err: dht.ErrDHTValueIsNotFound}
+	node := &Node{dht: backend}
+
+	for range 2 {
+		_, _, err := node.resolvePeerAddresses(context.Background(), id)
+		if !errors.Is(err, dht.ErrDHTValueIsNotFound) {
+			t.Fatalf("resolve missing peer address error = %v", err)
+		}
+	}
+	if got := backend.calls.Load(); got != 2 {
+		t.Fatalf("missing DHT address lookups = %d, want 2", got)
 	}
 }
 

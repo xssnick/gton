@@ -207,13 +207,13 @@ func (s archiveWindowPipelineSnapshot) windowsString() string {
 	return fmt.Sprintf("pending=%d ready=%d", s.pendingWindows, s.readyWindows)
 }
 
-func (r *archiveCatchUpRunner) startPipelineWaitProgress() {
+func (r *archiveCatchUpRun) startPipelineWaitProgress() {
 	if r.pipelineWaitStarted.IsZero() {
 		r.pipelineWaitStarted = time.Now()
 	}
 }
 
-func (r *archiveCatchUpRunner) accountPipelineWaitProgress(now time.Time) {
+func (r *archiveCatchUpRun) accountPipelineWaitProgress(now time.Time) {
 	if r.pipelineWaitStarted.IsZero() {
 		return
 	}
@@ -223,12 +223,12 @@ func (r *archiveCatchUpRunner) accountPipelineWaitProgress(now time.Time) {
 	r.pipelineWaitStarted = now
 }
 
-func (r *archiveCatchUpRunner) stopPipelineWaitProgress(now time.Time) {
+func (r *archiveCatchUpRun) stopPipelineWaitProgress(now time.Time) {
 	r.accountPipelineWaitProgress(now)
 	r.pipelineWaitStarted = time.Time{}
 }
 
-func (r *archiveCatchUpRunner) recordArchiveWindowProgress(window *shardClientArchiveWindow, applyElapsed time.Duration) {
+func (r *archiveCatchUpRun) recordArchiveWindowProgress(window *shardClientArchiveWindow, applyElapsed time.Duration) {
 	stats := &r.progressStats
 	stats.windows++
 	stats.masterPrefetchWait += window.masterWait
@@ -266,7 +266,7 @@ func (w *shardClientArchiveWindow) releaseImportedData() {
 	w.appliedStates = appliedStateSet{}
 }
 
-func (r *archiveCatchUpRunner) recordArchiveCheckpointProgress(checkpointBlocks uint32, elapsed time.Duration) {
+func (r *archiveCatchUpRun) recordArchiveCheckpointProgress(checkpointBlocks uint32, elapsed time.Duration) {
 	if checkpointBlocks == 0 {
 		return
 	}
@@ -288,7 +288,7 @@ func archiveCatchUpDominantStage(stages ...archiveCatchUpStageTiming) string {
 	return best.name
 }
 
-func (r *archiveCatchUpRunner) logProgress() error {
+func (r *archiveCatchUpRun) logProgress() error {
 	if _, err := r.finishCheckpoint(false); err != nil {
 		return err
 	}
@@ -312,7 +312,7 @@ func (r *archiveCatchUpRunner) logProgress() error {
 	eta := formatCatchUpETA(done, total, time.Since(r.started))
 	progressGoal := r.archiveProgressGoalAt(now)
 
-	event := r.service.log.Info().
+	event := r.archive.log.Info().
 		Uint32("current", r.current.Masterchain.Block.SeqNo).
 		Uint32("target", r.target.SeqNo).
 		Str("catchup_method", "archive_shard_client").
@@ -322,7 +322,7 @@ func (r *archiveCatchUpRunner) logProgress() error {
 		Int64("window_archive_bytes", windowStats.bytes).
 		Uint64("window_archive_blocks", windowStats.blocks)
 	if progressGoal.kind == archiveProgressGoalSyncUntil {
-		event = event.Uint32("sync_until", r.service.syncUntil)
+		event = event.Uint32("sync_until", r.archive.syncUntil)
 		if progressGoal.knownRemaining() {
 			event = event.Int64("remaining_sync_until_seconds", progressGoal.remainingSeconds)
 		}
@@ -334,7 +334,7 @@ func (r *archiveCatchUpRunner) logProgress() error {
 		} else {
 			eta = "unknown"
 		}
-	} else if blockUTime := blockStateUtime(r.ctx, r.service.storage, &r.current.Masterchain); blockUTime != 0 {
+	} else if blockUTime := blockStateUtime(r.ctx, r.archive.storage, &r.current.Masterchain); blockUTime != 0 {
 		lagSeconds := now.Unix() - blockUTime
 		remainingLag := remainingLagSeconds(lagSeconds)
 		event = event.
@@ -409,7 +409,7 @@ func isArchiveCatchUpRetryError(err error) bool {
 		isExpectedRetryError(err)
 }
 
-func (s *Service) shouldPersistArchiveCatchUpCheckpoint(seqno uint32, targetSeqno uint32, lastCheckpointSeqno uint32, lastCheckpoint time.Time, checkpointBlocks uint32, pendingBytes uint64) bool {
+func (a *ArchiveRunner) shouldPersistArchiveCatchUpCheckpoint(seqno uint32, targetSeqno uint32, lastCheckpointSeqno uint32, lastCheckpoint time.Time, checkpointBlocks uint32, pendingBytes uint64) bool {
 	if seqno <= lastCheckpointSeqno {
 		return false
 	}
@@ -419,8 +419,8 @@ func (s *Service) shouldPersistArchiveCatchUpCheckpoint(seqno uint32, targetSeqn
 	if seqno-lastCheckpointSeqno >= checkpointBlocks {
 		return true
 	}
-	if pendingBytes >= s.checkpointBytes {
+	if pendingBytes >= a.state.checkpointTargetBytes() {
 		return true
 	}
-	return time.Since(lastCheckpoint) >= s.archiveCatchUpCheckpointPeriod
+	return time.Since(lastCheckpoint) >= a.checkpointPeriod
 }

@@ -13,10 +13,10 @@ import (
 
 func TestLogArchiveWindowApplyProgress(t *testing.T) {
 	var out bytes.Buffer
-	svc := &Service{log: zerolog.New(&out).Level(zerolog.InfoLevel)}
+	archiveRunner := &ArchiveRunner{log: zerolog.New(&out).Level(zerolog.InfoLevel)}
 	started := time.Now().Add(-10 * time.Second)
-	runner := &archiveCatchUpRunner{
-		service:    svc,
+	runner := &archiveCatchUpRun{
+		archive:    archiveRunner,
 		current:    &storage.CurrentState{Masterchain: storage.BlockState{Block: testBlockID(-1, topShard, 100)}},
 		target:     testBlockID(-1, topShard, 200),
 		started:    started,

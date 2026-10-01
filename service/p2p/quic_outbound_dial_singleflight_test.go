@@ -15,7 +15,7 @@ import (
 )
 
 // requestBackgroundQUICDial (quic_outbound.go) bounds background relay dials to
-// exactly one goroutine per route via the quicDialSpawned CAS, resetting it in
+// exactly one goroutine per route via the background dial claim, resetting it in
 // the spawned closure's defer and on runAsync refusal. The tests below drive
 // many concurrent requests against one route and assert only a single dial
 // goroutine is ever in flight, and that the flag is always released.
@@ -61,7 +61,7 @@ func TestRequestBackgroundQUICDialSingleFlightPerRoute(t *testing.T) {
 		node:  node,
 		id:    remoteID,
 		pub:   remotePub,
-		route: newPeerRoute(""),
+		route: newTestPeerRoute(""),
 	}
 
 	t.Cleanup(func() {
@@ -107,18 +107,20 @@ func TestRequestBackgroundQUICDialSingleFlightPerRoute(t *testing.T) {
 	if maxInFlight != 1 {
 		t.Fatalf("in-flight background dial goroutines = %d, want 1", maxInFlight)
 	}
-	if !peer.route.quicDialSpawned.Load() {
-		t.Fatal("in-flight dial did not hold the quicDialSpawned claim")
+	if peer.route.ClaimBackgroundQUICDial() {
+		peer.route.ReleaseBackgroundQUICDial()
+		t.Fatal("in-flight dial did not hold the background dial claim")
 	}
 
 	// Completing the dial (context cancel -> DHT returns, dialGated finishes)
 	// must release the claim so the next window can dial again.
 	cancel()
 	node.wg.Wait()
-	if peer.route.quicDialSpawned.Load() {
-		t.Fatal("quicDialSpawned stayed claimed after the dial completed")
+	if !peer.route.ClaimBackgroundQUICDial() {
+		t.Fatal("background dial stayed claimed after the dial completed")
 	}
-	if !peer.route.quicDialPermitted(time.Now()) {
+	peer.route.ReleaseBackgroundQUICDial()
+	if !peer.route.QUICDialPermitted(time.Now()) {
 		t.Fatal("route did not permit a fresh dial after the previous one completed")
 	}
 }
@@ -137,14 +139,15 @@ func TestRequestBackgroundQUICDialResetsClaimWhenRunAsyncRefuses(t *testing.T) {
 		node:  node,
 		id:    remoteID,
 		pub:   remotePub,
-		route: newPeerRoute(""),
+		route: newTestPeerRoute(""),
 	}
 
 	peer.requestBackgroundQUICDial()
 
-	if peer.route.quicDialSpawned.Load() {
-		t.Fatal("refused background dial left quicDialSpawned claimed")
+	if !peer.route.ClaimBackgroundQUICDial() {
+		t.Fatal("refused background dial left its claim held")
 	}
+	peer.route.ReleaseBackgroundQUICDial()
 	for range 100 {
 		runtime.Gosched()
 	}

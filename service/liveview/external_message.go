@@ -116,6 +116,8 @@ func externalMessageLimitsFromConfigRoot(root *cell.Cell) (ExternalMessageSizeLi
 		return ExternalMessageSizeLimits{MaxSize: cfg.MaxExtMsgSize, MaxDepth: cfg.MaxExtMsgDepth}, nil
 	case tlb.SizeLimitsConfigV2:
 		return ExternalMessageSizeLimits{MaxSize: cfg.MaxExtMsgSize, MaxDepth: cfg.MaxExtMsgDepth}, nil
+	case tlb.SizeLimitsConfigV3:
+		return ExternalMessageSizeLimits{MaxSize: cfg.MaxExtMsgSize, MaxDepth: cfg.MaxExtMsgDepth}, nil
 	default:
 		return ExternalMessageSizeLimits{}, fmt.Errorf("unsupported size limits config %T", limits.Config)
 	}
@@ -128,18 +130,13 @@ func externalMessageAccountFromAccountsRoot(accountsRoot *cell.Cell, addr *addre
 		return shard, account, err
 	}
 
-	value, err := accountsRoot.AsDict(256).LoadValue(blockproof.AccountKey(addr.Data()))
+	value, err := accountsRoot.AsAugDict(256, tlb.AugShardAccounts{}).LoadValue(blockproof.AccountKey(addr.Data()))
 	if errors.Is(err, cell.ErrNoSuchKeyInDict) {
 		shard := emptyShardAccount()
 		account, parseErr := accountStateFromShardAccount(shard)
 		return shard, account, parseErr
 	}
 	if err != nil {
-		return nil, nil, err
-	}
-
-	var extra tlb.DepthBalanceInfo
-	if err = tlb.LoadFromCell(&extra, value); err != nil {
 		return nil, nil, err
 	}
 

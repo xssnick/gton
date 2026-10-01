@@ -44,7 +44,7 @@ func TestBroadcastTargetsExpiredRefreshIsSingleflight(t *testing.T) {
 
 func TestBroadcastTargetsExcludeDeferredQUICRouteOnlyFromPlumtree(t *testing.T) {
 	peerID := testPeerID("deferred-plumtree-route")
-	route := newPeerRoute("127.0.0.1:3000")
+	route := newTestPeerRoute("127.0.0.1:3000")
 	peer := &overlayPeer{
 		id:          peerID,
 		route:       route,
@@ -67,7 +67,7 @@ func TestBroadcastTargetsExcludeDeferredQUICRouteOnlyFromPlumtree(t *testing.T) 
 		)
 	}
 
-	route.deferQUICDial(time.Now())
+	route.DeferQUICDial(time.Now())
 	snapshot = sub.buildBroadcastTargetsSnapshot()
 	if len(snapshot.peers) != 1 ||
 		len(snapshot.broadcast) != 1 ||
@@ -112,12 +112,12 @@ func TestBuildBroadcastTargetsSnapshotKeepsWholeCustomRoster(t *testing.T) {
 				fixedMember:   tt.kind == overlayKindCustomFixed,
 				alive:         true,
 				lastReceiveAt: now,
-				announced:     &overlay.Node{Version: int32(now.Unix())},
+				announced:     &overlay.NodeV2{Version: int32(now.Unix())},
 			}
 			silent := &overlayPeer{
 				id:          silentID,
 				fixedMember: tt.kind == overlayKindCustomFixed,
-				announced:   &overlay.Node{Version: int32(now.Unix())},
+				announced:   &overlay.NodeV2{Version: int32(now.Unix())},
 			}
 			sub := testOverlaySubscription(&overlaySubscription{
 				spec: overlaySpec{Kind: tt.kind},

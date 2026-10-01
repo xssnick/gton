@@ -1,0 +1,1100 @@
+package msgpool
+
+import (
+	"errors"
+	"math/rand/v2"
+	"runtime"
+	"sync"
+	"testing"
+
+	"github.com/xssnick/tonutils-go/address"
+	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/tvm/cell"
+)
+
+func TestBranchCandidateLineageAndBoundedCut(t *testing.T) {
+	pool, branch, base := branchFixture(t, 3)
+	defer pool.Close()
+	defer branch.Close()
+
+	firstAdded := imsg(1_100, 11)
+	bindTestMessages(testOwner, 11, []*InternalMessage{firstAdded})
+	first := sref(11, 0xc1).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID:    first,
+		Seqno: 11,
+		Base:  []CandidateSource{{Source: baseSource, Visible: base}},
+		Delta: &InternalsDelta{
+			Added:       []*InternalMessage{firstAdded},
+			RemovedKeys: []QueueKey{imsg(1_000, 0).Key},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	secondAdded := imsg(1_200, 12)
+	bindTestMessages(testOwner, 12, []*InternalMessage{secondAdded})
+	second := sref(12, 0xc2).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID:     second,
+		Parent: &first,
+		Seqno:  12,
+		Delta: &InternalsDelta{
+			Added:            []*InternalMessage{secondAdded},
+			RemovedEnvHashes: [][32]byte{firstAdded.EnvHash},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cut, err := branch.Cut(CutRequest{
+		Sources:      map[ShardIdent]CutSource{baseSource: {Visible: base}},
+		CandidateTip: &second,
+		Limit:        2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLts(t, cut, 1_001, 1_002)
+	if !cut.More {
+		t.Fatal("bounded branch cut did not report its remaining candidate addition")
+	}
+	if loaded := cut.LoadMore(2); loaded != 1 {
+		t.Fatalf("candidate continuation loaded %d messages, want 1", loaded)
+	}
+	requireLts(t, cut, 1_001, 1_002, 1_200)
+	if cut.More {
+		t.Fatal("candidate continuation did not drain")
+	}
+
+	cut, err = branch.Cut(CutRequest{
+		Sources:      map[ShardIdent]CutSource{baseSource: {Visible: base}},
+		CandidateTip: &second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLts(t, cut, 1_001, 1_002, 1_200)
+}
+
+func TestBranchBoundedCutLoadsImmutablePages(t *testing.T) {
+	pool, branch, base := branchFixture(t, 5)
+	defer pool.Close()
+
+	cut, err := branch.Cut(CutRequest{
+		Sources: map[ShardIdent]CutSource{baseSource: {Visible: base}},
+		Limit:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLts(t, cut, 1_000, 1_001)
+	if !cut.More {
+		t.Fatal("first page reported a drained cut")
+	}
+
+	// The continuation owns the immutable cursor snapshots, not the branch
+	// registry. Closing the session after acquisition must not change the input
+	// a build already owns.
+	branch.Close()
+	if loaded := cut.LoadMore(2); loaded != 2 {
+		t.Fatalf("second page loaded %d messages, want 2", loaded)
+	}
+	requireLts(t, cut, 1_000, 1_001, 1_002, 1_003)
+	if !cut.More {
+		t.Fatal("second page reported a drained cut")
+	}
+
+	if loaded := cut.LoadMore(2); loaded != 1 {
+		t.Fatalf("final page loaded %d messages, want 1", loaded)
+	}
+	requireLts(t, cut, 1_000, 1_001, 1_002, 1_003, 1_004)
+	if cut.More {
+		t.Fatal("final page left the cut incomplete")
+	}
+	if loaded := cut.LoadMore(2); loaded != 0 {
+		t.Fatalf("drained cut loaded %d extra messages", loaded)
+	}
+}
+
+func BenchmarkBranchCutMaterialization(b *testing.B) {
+	pool, branch, base := branchFixture(b, 8_192)
+	defer pool.Close()
+	defer branch.Close()
+	request := CutRequest{
+		Sources: map[ShardIdent]CutSource{baseSource: {Visible: base}},
+	}
+
+	b.Run("whole_queue", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := branch.Cut(request); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("front_page", func(b *testing.B) {
+		b.ReportAllocs()
+		paged := request
+		paged.Limit = internalCutBenchmarkPageSize
+		for b.Loop() {
+			if _, err := branch.Cut(paged); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+const internalCutBenchmarkPageSize = 256
+
+func TestBranchMergeBaseAndCandidateRetry(t *testing.T) {
+	pool := New(Config{})
+	defer pool.Close()
+	internals := pool.Internals()
+	if err := internals.ReconcileDestinations([]ShardIdent{testOwner}); err != nil {
+		t.Fatal(err)
+	}
+
+	leftRef := sref(100, 0x41)
+	rightRef := sref(103, 0xc1)
+	left := []*InternalMessage{imsg(100, 1), imsg(300, 3)}
+	right := []*InternalMessage{imsg(200, 2), imsg(400, 4)}
+	bindTestMessages(leftShard, leftRef.Seqno, left)
+	bindTestMessages(rightShard, rightRef.Seqno, right)
+	if err := internals.Seed(testOwner, leftShard, leftRef, left, uint64(len(left))); err != nil {
+		t.Fatal(err)
+	}
+	if err := internals.Seed(testOwner, rightShard, rightRef, right, uint64(len(right))); err != nil {
+		t.Fatal(err)
+	}
+	branch, err := internals.OpenBranch(testOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer branch.Close()
+
+	added := imsg(250, 5)
+	bindTestMessages(testOwner, 104, []*InternalMessage{added})
+	tip := sref(104, 0xa1).RootHash
+	request := CandidateRequest{
+		ID:    tip,
+		Seqno: 104,
+		Base: []CandidateSource{
+			{Source: leftShard, Visible: leftRef},
+			{Source: rightShard, Visible: rightRef},
+		},
+		Delta: &InternalsDelta{
+			Added:       []*InternalMessage{added},
+			RemovedKeys: []QueueKey{left[0].Key, right[1].Key},
+		},
+	}
+	if err = branch.AddCandidate(request); err != nil {
+		t.Fatal(err)
+	}
+	if err = branch.AddCandidate(request); err != nil {
+		t.Fatalf("idempotent candidate retry: %v", err)
+	}
+	conflict := request
+	conflict.Delta = &InternalsDelta{RemovedTotal: 1}
+	if err = branch.AddCandidate(conflict); !errors.Is(err, ErrCutStale) {
+		t.Fatalf("conflicting candidate retry = %v", err)
+	}
+
+	cut, err := branch.Cut(CutRequest{
+		Sources: map[ShardIdent]CutSource{
+			leftShard:  {Visible: leftRef},
+			rightShard: {Visible: rightRef},
+		},
+		CandidateTip: &tip,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLts(t, cut, 200, 250, 300)
+}
+
+func TestBranchReusesLinearParentAfterItsPromotion(t *testing.T) {
+	pool, branch, base := branchFixture(t, 2)
+	defer pool.Close()
+	defer branch.Close()
+
+	parent := sref(11, 0xc1).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID:    parent,
+		Seqno: 11,
+		Base:  []CandidateSource{{Source: baseSource, Visible: base}},
+		Delta: &InternalsDelta{RemovedKeys: []QueueKey{imsg(1_000, 0).Key}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	added := imsg(1_200, 12)
+	bindTestMessages(testOwner, 12, []*InternalMessage{added})
+	delta := &InternalsDelta{
+		Added:       []*InternalMessage{added},
+		RemovedKeys: []QueueKey{imsg(1_001, 1).Key},
+	}
+	candidate := sref(12, 0xc2).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID: candidate, Parent: &parent, Seqno: 12, Delta: delta,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	promoted := CandidateRequest{
+		ID: candidate,
+		Base: []CandidateSource{{
+			Source:  testOwner,
+			Visible: SourceRef{Seqno: 11, RootHash: parent},
+		}},
+		Seqno: 12,
+		Delta: delta,
+	}
+	if err := branch.ReusePromotedCandidate(promoted); err != nil {
+		t.Fatalf("verify Parent=P as Base=P without a new snapshot: %v", err)
+	}
+	if ownership, err := branch.AddOrReusePromotedCandidate(promoted); err != nil {
+		t.Fatalf("reuse Parent=P as Base=P: %v", err)
+	} else if ownership != CandidateInstallReused {
+		t.Fatalf("promoted candidate ownership = %d, want reused", ownership)
+	}
+	if err := branch.AddCandidate(promoted); !errors.Is(err, ErrCutStale) {
+		t.Fatalf("strict AddCandidate accepted the representation change: %v", err)
+	}
+
+	conflictingDelta := promoted
+	conflictingDelta.Delta = &InternalsDelta{}
+	if _, err := branch.AddOrReusePromotedCandidate(conflictingDelta); !errors.Is(err, ErrCutStale) {
+		t.Fatalf("reuse with another delta = %v, want ErrCutStale", err)
+	}
+	conflictingBase := promoted
+	conflictingBase.Base = []CandidateSource{{
+		Source:  testOwner,
+		Visible: SourceRef{Seqno: 11, RootHash: [32]byte{0xdd}},
+	}}
+	if _, err := branch.AddOrReusePromotedCandidate(conflictingBase); !errors.Is(err, ErrCutStale) {
+		t.Fatalf("reuse with another applied base = %v, want ErrCutStale", err)
+	}
+	mergeBase := promoted
+	mergeBase.Base = append(mergeBase.Base, CandidateSource{Source: leftShard, Visible: base})
+	if _, err := branch.AddOrReusePromotedCandidate(mergeBase); !errors.Is(err, ErrCutStale) {
+		t.Fatalf("reuse with a merge base = %v, want ErrCutStale", err)
+	}
+	missing := promoted
+	missing.ID = [32]byte{0xee}
+	if err := branch.ReusePromotedCandidate(missing); !errors.Is(err, ErrCandidateNotFound) {
+		t.Fatalf("reuse of missing candidate = %v, want ErrCandidateNotFound", err)
+	}
+
+	cut, err := branch.Cut(CutRequest{
+		Sources:      map[ShardIdent]CutSource{baseSource: {Visible: base}},
+		CandidateTip: &candidate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLts(t, cut, 1_200)
+}
+
+func TestBranchReusesLinearBaseAsItsCandidateParent(t *testing.T) {
+	pool, branch, base := branchFixture(t, 2)
+	defer pool.Close()
+	defer branch.Close()
+
+	parent := sref(11, 0xd1).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID:    parent,
+		Seqno: 11,
+		Base:  []CandidateSource{{Source: baseSource, Visible: base}},
+		Delta: &InternalsDelta{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Internals().ApplyBlock(
+		testOwner,
+		baseSource,
+		SourceRef{Seqno: 11, RootHash: parent},
+		&InternalsDelta{},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	added := imsg(1_200, 13)
+	bindTestMessages(testOwner, 12, []*InternalMessage{added})
+	delta := &InternalsDelta{
+		Added:       []*InternalMessage{added},
+		RemovedKeys: []QueueKey{imsg(1_001, 1).Key},
+	}
+	candidate := sref(12, 0xd2).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID: candidate,
+		Base: []CandidateSource{{
+			Source:  testOwner,
+			Visible: SourceRef{Seqno: 11, RootHash: parent},
+		}},
+		Seqno: 12,
+		Delta: delta,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	retry := CandidateRequest{
+		ID: candidate, Parent: &parent, Seqno: 12, Delta: delta,
+	}
+	if err := branch.ReusePromotedCandidate(retry); err != nil {
+		t.Fatalf("verify Base=P as Parent=P: %v", err)
+	}
+	if ownership, err := branch.AddOrReusePromotedCandidate(retry); err != nil {
+		t.Fatalf("reuse Base=P as Parent=P: %v", err)
+	} else if ownership != CandidateInstallReused {
+		t.Fatalf("continued candidate ownership = %d, want reused", ownership)
+	}
+
+	cut, err := branch.Cut(CutRequest{
+		Sources:      map[ShardIdent]CutSource{baseSource: {Visible: base}},
+		CandidateTip: &candidate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLts(t, cut, 1_000, 1_200)
+}
+
+func TestBranchAllowsRemoveAndReaddAcrossCandidateLineage(t *testing.T) {
+	pool, branch, base := branchFixture(t, 1)
+	defer pool.Close()
+	defer branch.Close()
+
+	original := imsg(1_000, 0)
+	first := sref(11, 0xc1).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID:    first,
+		Seqno: 11,
+		Base:  []CandidateSource{{Source: baseSource, Visible: base}},
+		Delta: &InternalsDelta{RemovedKeys: []QueueKey{original.Key}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readded := imsg(1_000, 0)
+	bindTestMessages(testOwner, 12, []*InternalMessage{readded})
+	second := sref(12, 0xc2).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID:     second,
+		Parent: &first,
+		Seqno:  12,
+		Delta:  &InternalsDelta{Added: []*InternalMessage{readded}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cut, err := branch.Cut(CutRequest{
+		Sources:      map[ShardIdent]CutSource{baseSource: {Visible: base}},
+		CandidateTip: &second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cut.Messages) != 1 || cut.Messages[0] != readded {
+		t.Fatalf("re-added queue identity resolved to %+v", cut.Messages)
+	}
+}
+
+func TestBranchCandidatesAreSessionPrivate(t *testing.T) {
+	pool := New(Config{})
+	defer pool.Close()
+	internals := pool.Internals()
+	if err := internals.ReconcileDestinations([]ShardIdent{testOwner}); err != nil {
+		t.Fatal(err)
+	}
+	base := sref(10, 0xaa)
+	if err := internals.Seed(testOwner, baseSource, base, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	left, err := internals.OpenBranch(testOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Close()
+	right, err := internals.OpenBranch(testOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer right.Close()
+
+	for index := 0; index < maxTrackedCandidates; index++ {
+		for marker, branch := range map[byte]*Branch{0x10: left, 0x80: right} {
+			id := [32]byte{marker, byte(index + 1)}
+			if err = branch.AddCandidate(CandidateRequest{
+				ID:    id,
+				Seqno: 11,
+				Base:  []CandidateSource{{Source: baseSource, Visible: base}},
+				Delta: &InternalsDelta{},
+			}); err != nil {
+				t.Fatalf("branch %x candidate %d: %v", marker, index, err)
+			}
+		}
+	}
+	if stats := internals.Stats(); stats.Candidates != 0 {
+		t.Fatalf("session-private candidates leaked into shared destination stats: %+v", stats)
+	}
+}
+
+func TestBranchSameCandidateAllowsSessionPrivateLineage(t *testing.T) {
+	pool, parentBranch, base := branchFixture(t, 0)
+	defer pool.Close()
+	defer parentBranch.Close()
+
+	parent := sref(11, 0xc1).RootHash
+	if err := parentBranch.AddCandidate(CandidateRequest{
+		ID:    parent,
+		Seqno: 11,
+		Base:  []CandidateSource{{Source: baseSource, Visible: base}},
+		Delta: &InternalsDelta{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	committed := sref(11, 0xb1)
+	if err := pool.Internals().Seed(testOwner, baseSource, committed, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	baseBranch, err := pool.Internals().OpenBranch(testOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer baseBranch.Close()
+
+	target := sref(12, 0xc2).RootHash
+	if err := parentBranch.AddCandidate(CandidateRequest{
+		ID:     target,
+		Parent: &parent,
+		Seqno:  12,
+		Delta:  &InternalsDelta{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := baseBranch.AddCandidate(CandidateRequest{
+		ID:    target,
+		Seqno: 12,
+		Base:  []CandidateSource{{Source: baseSource, Visible: committed}},
+		Delta: &InternalsDelta{},
+	}); err != nil {
+		t.Fatalf("same candidate conflicted across private session lineages: %v", err)
+	}
+}
+
+func TestBranchLineageIsNotLimitedBySharedCandidateCache(t *testing.T) {
+	pool, branch, base := branchFixture(t, 1)
+	defer pool.Close()
+	defer branch.Close()
+
+	var tip [32]byte
+	for index := 0; index < maxTrackedCandidates+2; index++ {
+		id := [32]byte{0xc0, byte(index), byte(index >> 8)}
+		request := CandidateRequest{
+			ID:    id,
+			Seqno: base.Seqno + uint32(index) + 1,
+			Delta: &InternalsDelta{},
+		}
+		if index == 0 {
+			request.Base = []CandidateSource{{Source: baseSource, Visible: base}}
+		} else {
+			request.Parent = &tip
+		}
+		if err := branch.AddCandidate(request); err != nil {
+			t.Fatalf("candidate %d: %v", index, err)
+		}
+		tip = id
+	}
+
+	cut, err := branch.Cut(CutRequest{
+		Sources:      map[ShardIdent]CutSource{baseSource: {Visible: base}},
+		CandidateTip: &tip,
+		Limit:        1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLts(t, cut, 1_000)
+}
+
+func TestBranchPinnedBaseSurvivesFeedCompactionAndTopologyReplacement(t *testing.T) {
+	pool, branch, base := branchFixture(t, 256)
+	defer pool.Close()
+	defer branch.Close()
+
+	tip := sref(11, 0xc1).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID: tip, Seqno: 11,
+		Base:  []CandidateSource{{Source: baseSource, Visible: base}},
+		Delta: &InternalsDelta{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	removed := make([]QueueKey, 130)
+	for index := range removed {
+		removed[index] = imsg(uint64(1_000+index), uint16(index)).Key
+	}
+	if err := pool.Internals().ApplyBlock(testOwner, baseSource, sref(11, 0xbb), &InternalsDelta{
+		RemovedKeys: removed, RemovedTotal: len(removed),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Internals().ReconcileDestinations(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Internals().ReconcileDestinations([]ShardIdent{testOwner}); err != nil {
+		t.Fatal(err)
+	}
+
+	cut, err := branch.Cut(CutRequest{
+		Sources:      map[ShardIdent]CutSource{baseSource: {Visible: base}},
+		CandidateTip: &tip,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cut.Messages) != 256 {
+		t.Fatalf("pinned pre-compaction base contains %d messages, want 256", len(cut.Messages))
+	}
+}
+
+func TestBranchExplicitStateSeedUsesPinnedDestination(t *testing.T) {
+	pool := New(Config{})
+	defer pool.Close()
+	internals := pool.Internals()
+	if err := internals.ReconcileDestinations([]ShardIdent{testOwner}); err != nil {
+		t.Fatal(err)
+	}
+	branch, err := internals.OpenBranch(testOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer branch.Close()
+	if err = internals.ReconcileDestinations([]ShardIdent{leftShard}); err != nil {
+		t.Fatal(err)
+	}
+
+	source := testOwner
+	visible := sref(10, 0xaa)
+	message := deltaInternalMsg(t, deltaAddr(0, 0x11), deltaAddr(0, 0x22), 1_000)
+	envelope := deltaEnvelope(t, message, regularNext(96))
+	hop, err := AccountPrefixFromAddress(deltaAddr(0, 0x22))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := MakeQueueKey(hop, message.HashKey())
+	state := stateRootWithQueue(t, queueDictCell(t, map[QueueKey]tlb.EnqueuedMsg{
+		key: {EnqueuedLT: 1_000, Msg: envelope},
+	}), 1, true)
+	seeded, err := branch.SeedSourceFromStateRoot(source, visible, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seeded) != 1 || seeded[0].Key != key {
+		t.Fatalf("returned seed messages = %+v, want queue key %x", seeded, key)
+	}
+	tip := sref(11, 0xc1).RootHash
+	if err = branch.AddCandidate(CandidateRequest{
+		ID: tip, Seqno: 11,
+		Base:  []CandidateSource{{Source: source, Visible: visible}},
+		Delta: &InternalsDelta{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cut, err := branch.Cut(CutRequest{
+		Sources:      map[ShardIdent]CutSource{source: {Visible: visible}},
+		CandidateTip: &tip,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cut.Messages) != 1 || cut.Messages[0].Key != key {
+		t.Fatalf("pinned routing seed = %+v", cut.Messages)
+	}
+}
+
+func TestBranchPinSourceStaleThenExplicitStateSeed(t *testing.T) {
+	pool := New(Config{})
+	defer pool.Close()
+	internals := pool.Internals()
+	if err := internals.ReconcileDestinations([]ShardIdent{testOwner}); err != nil {
+		t.Fatal(err)
+	}
+
+	const count = 129
+	source := testOwner
+	visible := sref(10, 0xaa)
+	queue := make(map[QueueKey]tlb.EnqueuedMsg, count)
+	for index := range count {
+		message := deltaInternalMsg(t, deltaAddr(0, 0xee), deltaAddr(0, byte(index+1)), uint64(1_000+index))
+		envelope := deltaEnvelope(t, message, regularNext(96))
+		hop, err := AccountPrefixFromAddress(deltaAddr(0, byte(index+1)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := MakeQueueKey(hop, message.HashKey())
+		queue[key] = tlb.EnqueuedMsg{EnqueuedLT: uint64(1_000 + index), Msg: envelope}
+	}
+	state := stateRootWithQueue(t, queueDictCell(t, queue), count, true)
+	messages, total, err := seedFromStateRoot(state, testOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindTestMessages(source, visible.Seqno, messages)
+	if err = internals.Seed(testOwner, source, visible, messages, total); err != nil {
+		t.Fatal(err)
+	}
+	branch, err := internals.OpenBranch(testOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer branch.Close()
+
+	removed := make([]QueueKey, 65)
+	for index := range removed {
+		removed[index] = messages[index].Key
+	}
+	if err = internals.ApplyBlock(testOwner, source, sref(11, 0xbb), &InternalsDelta{
+		RemovedKeys:  removed,
+		RemovedTotal: len(removed),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err = branch.PinSource(source, visible); !errors.Is(err, ErrCutStale) {
+		t.Fatalf("pin before compacted history floor = %v", err)
+	}
+
+	seeded, err := branch.SeedSourceFromStateRoot(source, visible, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seeded) != count {
+		t.Fatalf("returned seed messages = %d, want %d", len(seeded), count)
+	}
+	tip := sref(11, 0xc1).RootHash
+	if err = branch.AddCandidate(CandidateRequest{
+		ID: tip, Seqno: 11,
+		Base:  []CandidateSource{{Source: source, Visible: visible}},
+		Delta: &InternalsDelta{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cut, err := branch.Cut(CutRequest{
+		Sources:      map[ShardIdent]CutSource{source: {Visible: visible}},
+		CandidateTip: &tip,
+		Limit:        1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cut.Messages) != 1 || !cut.More {
+		t.Fatalf("seeded bounded cut = %+v", cut)
+	}
+}
+
+// TestBranchSeedSourceMatchesWholeQueueWalk holds the branch seed to the walk it
+// used to be: every queue entry decoded and routed through the branch's pinned
+// router. The narrowed walk skips subtrees and entries bound elsewhere, and a
+// mistake there drops messages silently, so the gate is the same messages in the
+// same order on randomized queues, over both the split and the sequential arm,
+// for destinations that own a workchain, share it at several depths, or sit on
+// the far side of a split bit.
+func TestBranchSeedSourceMatchesWholeQueueWalk(t *testing.T) {
+	destinations := []ShardIdent{
+		{Workchain: 0, Shard: ShardAll},
+		{Workchain: 0, Shard: 1 << 62},
+		{Workchain: 0, Shard: 3 << 62},
+		{Workchain: 0, Shard: 1 << 61},
+		{Workchain: 0, Shard: 7 << 61},
+		{Workchain: 0, Shard: 0x0080000000000000},
+		{Workchain: 0, Shard: 0x0380000000000000},
+		{Workchain: -1, Shard: ShardAll},
+	}
+	source := ShardIdent{Workchain: 0, Shard: ShardAll}
+	visible := sref(10, 0xaa)
+
+	for _, tc := range []struct {
+		name  string
+		size  int
+		split bool
+	}{
+		// Keys spread over both workchains: KeyPrefixes splits, the parallel arm
+		// runs and the prefix filter prunes.
+		{name: "split queue", size: 1_024, split: true},
+		// Every key under one 38-bit prefix: the walk cannot split and takes
+		// the sequential arm, which routes per entry only.
+		{name: "one prefix queue", size: 256, split: false},
+	} {
+		for seed := range uint64(4) {
+			rng := rand.New(rand.NewPCG(seed, uint64(tc.size)))
+			entries := make(map[QueueKey]tlb.EnqueuedMsg, tc.size)
+			for range tc.size {
+				data := make([]byte, 32)
+				for index := range data {
+					data[index] = byte(rng.Uint32())
+				}
+				workchain := byte(0)
+				if tc.split && rng.IntN(8) == 0 {
+					workchain = 0xff
+				}
+				if !tc.split {
+					data[0] = byte(rng.IntN(4))
+				}
+				destination := address.NewAddress(0, workchain, data)
+				// A narrow lt range makes equal-lt runs, so the hash tie-break of
+				// the order is exercised too.
+				lt := uint64(1_000 + rng.IntN(tc.size/4))
+				message := deltaInternalMsg(t, deltaAddr(0, 0x11), destination, lt)
+				hop, err := AccountPrefixFromAddress(destination)
+				if err != nil {
+					t.Fatal(err)
+				}
+				entries[MakeQueueKey(hop, message.HashKey())] = tlb.EnqueuedMsg{
+					EnqueuedLT: lt, Msg: deltaEnvelope(t, message, regularNext(96)),
+				}
+			}
+			state := stateRootWithQueue(t, queueDictCell(t, entries), uint64(len(entries)), true)
+			queueInfo, err := StateOutMsgQueueInfo(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prefixes, err := queueInfo.OutQueue.KeyPrefixes(queueKeyWorkchainBits+seedWalkPrefixBits, seedWalkMaxTasks)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (len(prefixes) >= 2) != tc.split {
+				t.Fatalf("%s seed %d: fixture has %d prefixes, the wanted arm is never reached",
+					tc.name, seed, len(prefixes))
+			}
+
+			seededAny, narrowedAny := false, false
+			for _, destination := range destinations {
+				pool := New(Config{})
+				if err = pool.Internals().ReconcileDestinations([]ShardIdent{destination}); err != nil {
+					t.Fatal(err)
+				}
+				branch, err := pool.Internals().OpenBranch(destination)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				whole, _, err := routedSeedsFromStateRootWith(state, source, visible, branch.routing, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				sequential, _, err := routedSeedsFromStateRootWith(state, source, visible, branch.routing, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !equalBranchMessages(whole[0].Messages, sequential[0].Messages) {
+					t.Fatalf("%s seed %d destination %016x: the whole-queue walks disagree", tc.name, seed, destination.Shard)
+				}
+
+				seeded, err := branch.SeedSourceFromStateRoot(source, visible, state)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !equalBranchMessages(seeded, whole[0].Messages) {
+					t.Fatalf("%s seed %d destination %d:%016x: seeded %d messages, the whole-queue walk %d",
+						tc.name, seed, destination.Workchain, destination.Shard, len(seeded), len(whole[0].Messages))
+				}
+				seededAny = seededAny || len(seeded) > 0
+				narrowedAny = narrowedAny || len(seeded) < len(entries)
+
+				branch.Close()
+				pool.Close()
+			}
+			if !seededAny || !narrowedAny {
+				t.Fatalf("%s seed %d: the fixture seeded something=%t, narrowed something=%t",
+					tc.name, seed, seededAny, narrowedAny)
+			}
+		}
+	}
+}
+
+func TestBranchDeltaUsesPinnedDestinationAfterTopologyChange(t *testing.T) {
+	pool := New(Config{})
+	defer pool.Close()
+	internals := pool.Internals()
+	if err := internals.ReconcileDestinations([]ShardIdent{testOwner}); err != nil {
+		t.Fatal(err)
+	}
+	branch, err := internals.OpenBranch(testOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer branch.Close()
+	if err = internals.ReconcileDestinations([]ShardIdent{leftShard}); err != nil {
+		t.Fatal(err)
+	}
+
+	message := deltaInternalMsg(t, deltaAddr(0, 0x11), deltaAddr(0, 0x22), 1_000)
+	envelope := deltaEnvelope(t, message, regularNext(96))
+	dictionary := newOutDescrDict(t)
+	setDescr(t, dictionary, message.Hash(), cellForNewExport(envelope))
+	delta, err := branch.DeltaFromBlockRoot(testOwner, sref(11, 0xbb), deltaBlockRoot(t, dictionary.AsCell()), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delta.AddedTotal != 1 || len(delta.Added) != 1 || delta.Added[0].Source != testOwner {
+		t.Fatalf("pinned candidate delta = %+v", delta)
+	}
+}
+
+func TestBranchRetainDropAndClose(t *testing.T) {
+	pool, branch, base := branchFixture(t, 0)
+	defer pool.Close()
+
+	root := sref(11, 0xc1).RootHash
+	child := sref(12, 0xc2).RootHash
+	sibling := sref(12, 0xd2).RootHash
+	requests := []CandidateRequest{
+		{ID: root, Seqno: 11, Base: []CandidateSource{{Source: baseSource, Visible: base}}, Delta: &InternalsDelta{}},
+		{ID: child, Parent: &root, Seqno: 12, Delta: &InternalsDelta{}},
+		{ID: sibling, Parent: &root, Seqno: 12, Delta: &InternalsDelta{}},
+	}
+	for _, request := range requests {
+		if err := branch.AddCandidate(request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := branch.Retain(&child); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := branch.Cut(CutRequest{
+		Sources: map[ShardIdent]CutSource{baseSource: {Visible: base}}, CandidateTip: &sibling,
+	}); !errors.Is(err, ErrCutStale) {
+		t.Fatalf("discarded sibling cut = %v", err)
+	}
+	branch.DropCandidate(root)
+	if _, err := branch.Cut(CutRequest{
+		Sources: map[ShardIdent]CutSource{baseSource: {Visible: base}}, CandidateTip: &child,
+	}); !errors.Is(err, ErrCutStale) {
+		t.Fatalf("dropped child cut = %v", err)
+	}
+	branch.Close()
+	branch.Close()
+	if err := branch.Retain(nil); !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed branch retain = %v", err)
+	}
+}
+
+func TestBranchRetainPreservesSelectedDescendants(t *testing.T) {
+	pool, branch, base := branchFixture(t, 0)
+	defer pool.Close()
+
+	root := sref(11, 0xc1).RootHash
+	selected := sref(12, 0xc2).RootHash
+	diverged := sref(12, 0xd2).RootHash
+	descendant := sref(13, 0xc3).RootHash
+	requests := []CandidateRequest{
+		{ID: root, Seqno: 11, Base: []CandidateSource{{Source: baseSource, Visible: base}}, Delta: &InternalsDelta{}},
+		{ID: selected, Parent: &root, Seqno: 12, Delta: &InternalsDelta{}},
+		{ID: diverged, Parent: &root, Seqno: 12, Delta: &InternalsDelta{}},
+		{ID: descendant, Parent: &selected, Seqno: 13, Delta: &InternalsDelta{}},
+	}
+	for _, request := range requests {
+		if err := branch.AddCandidate(request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := branch.Retain(&selected); err != nil {
+		t.Fatal(err)
+	}
+	if !branch.HasCandidate(root) || !branch.HasCandidate(selected) || !branch.HasCandidate(descendant) {
+		t.Fatal("selected lineage or its live descendant was discarded")
+	}
+	if branch.HasCandidate(diverged) {
+		t.Fatal("fork which diverged before the selected tip was retained")
+	}
+
+	next := sref(14, 0xc4).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID: next, Parent: &descendant, Seqno: 14, Delta: &InternalsDelta{},
+	}); err != nil {
+		t.Fatalf("append after retaining selected lineage: %v", err)
+	}
+}
+
+func TestBranchConcurrentFeedCutRetainAndClose(t *testing.T) {
+	pool, branch, base := branchFixture(t, 1)
+	defer pool.Close()
+	tip := sref(11, 0xc1).RootHash
+	if err := branch.AddCandidate(CandidateRequest{
+		ID: tip, Seqno: 11,
+		Base:  []CandidateSource{{Source: baseSource, Visible: base}},
+		Delta: &InternalsDelta{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var workers sync.WaitGroup
+	workers.Add(4)
+	go func() {
+		defer workers.Done()
+		for range 128 {
+			_, err := branch.Cut(CutRequest{
+				Sources: map[ShardIdent]CutSource{baseSource: {Visible: base}}, CandidateTip: &tip,
+			})
+			if err != nil && !errors.Is(err, ErrClosed) {
+				if !errors.Is(err, ErrCutStale) {
+					panic(err)
+				}
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		for range 128 {
+			if err := branch.Retain(&tip); err != nil && !errors.Is(err, ErrClosed) {
+				panic(err)
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		_ = pool.Internals().ApplyBlock(testOwner, baseSource, sref(11, 0xbb), &InternalsDelta{})
+		_ = pool.Internals().ReconcileDestinations(nil)
+		_ = pool.Internals().ReconcileDestinations([]ShardIdent{testOwner})
+	}()
+	go func() {
+		defer workers.Done()
+		runtime.Gosched()
+		branch.Close()
+	}()
+	workers.Wait()
+	branch.Close()
+}
+
+func branchFixture(t testing.TB, count int) (*Pool, *Branch, SourceRef) {
+	t.Helper()
+	pool := New(Config{})
+	internals := pool.Internals()
+	if err := internals.ReconcileDestinations([]ShardIdent{testOwner}); err != nil {
+		pool.Close()
+		t.Fatal(err)
+	}
+	messages := make([]*InternalMessage, count)
+	for index := range messages {
+		messages[index] = imsg(uint64(1_000+index), uint16(index))
+	}
+	bindTestMessages(baseSource, 10, messages)
+	base := sref(10, 0xaa)
+	if err := internals.Seed(testOwner, baseSource, base, messages, uint64(count)); err != nil {
+		pool.Close()
+		t.Fatal(err)
+	}
+	branch, err := internals.OpenBranch(testOwner)
+	if err != nil {
+		pool.Close()
+		t.Fatal(err)
+	}
+
+	return pool, branch, base
+}
+
+func cellForNewExport(envelope *cell.Cell) *cell.Cell {
+	return cell.BeginCell().MustStoreUInt(0b001, 3).MustStoreRef(envelope).
+		MustStoreRef(cell.BeginCell().MustStoreUInt(1, 1).EndCell()).EndCell()
+}
+
+// TestBranchSourcePinnableMatchesPinSource pins the probe to the operation it
+// predicts. The per-slot masterchain view pick asks SourcePinnable of every
+// neighbour top a candidate view registers before it commits to that view, and
+// only a probe that answers exactly what PinSource would answer keeps the pick
+// honest: a stricter probe rejects views whose tops are in fact already
+// committed and walks the node back to a stale masterchain view — the frozen
+// view that starves a leader window of imported internals; a looser one lets
+// the slot discover the miss inside the build, where it costs the from-state
+// seed walk or, on a build that may not seed, the slot itself.
+//
+// The pinned-run tail pins the other half: once a run is pinned into the
+// branch it stays pinnable for the whole session, even after the committed
+// history that produced it is gone, so a window that pinned a top early does
+// not lose it mid-window to a trim.
+func TestBranchSourcePinnableMatchesPinSource(t *testing.T) {
+	cases := []struct {
+		name    string
+		source  ShardIdent
+		visible func(base SourceRef) SourceRef
+		want    bool
+	}{
+		{
+			name:    "untracked source",
+			source:  leftShard,
+			visible: func(base SourceRef) SourceRef { return base },
+		},
+		{
+			name:    "ahead of the committed top",
+			source:  baseSource,
+			visible: func(base SourceRef) SourceRef { return SourceRef{Seqno: base.Seqno + 1, RootHash: base.RootHash} },
+		},
+		{
+			name:    "below the seed floor",
+			source:  baseSource,
+			visible: func(base SourceRef) SourceRef { return SourceRef{Seqno: base.Seqno - 1, RootHash: base.RootHash} },
+		},
+		{
+			name:    "root hash mismatch at the position",
+			source:  baseSource,
+			visible: func(base SourceRef) SourceRef { return sref(base.Seqno, 0xbb) },
+		},
+		{
+			name:    "exact committed top",
+			source:  baseSource,
+			visible: func(base SourceRef) SourceRef { return base },
+			want:    true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// A fresh branch per case: PinSource caches what it pins, so a
+			// shared branch would answer a later probe from that cache
+			// instead of from committed state, and the disagreement this
+			// test looks for could not appear.
+			pool, branch, base := branchFixture(t, 3)
+			defer pool.Close()
+			defer branch.Close()
+
+			visible := tc.visible(base)
+			probe := branch.SourcePinnable(tc.source, visible)
+			err := branch.PinSource(tc.source, visible)
+			if probe != (err == nil) {
+				t.Fatalf("SourcePinnable = %v, PinSource = %v", probe, err)
+			}
+			if probe != tc.want {
+				t.Fatalf("SourcePinnable = %v, want %v (PinSource = %v)", probe, tc.want, err)
+			}
+		})
+	}
+
+	t.Run("pinned run outlives its committed history", func(t *testing.T) {
+		pool, branch, base := branchFixture(t, 3)
+		defer pool.Close()
+		defer branch.Close()
+
+		if err := branch.PinSource(baseSource, base); err != nil {
+			t.Fatal(err)
+		}
+		// Applying past the retained history window moves the run's floor
+		// beyond the pinned position, the same way a neighbour that keeps
+		// producing does to a top pinned at the start of a leader window.
+		for seqno := base.Seqno + 1; seqno <= base.Seqno+maxSourceRefHistory; seqno++ {
+			if err := pool.Internals().ApplyBlock(
+				testOwner, baseSource, sref(seqno, byte(seqno)), &InternalsDelta{},
+			); err != nil {
+				t.Fatalf("apply %d: %v", seqno, err)
+			}
+		}
+		if err := pool.Internals().ValidateSourceRef(testOwner, baseSource, base); !errors.Is(err, ErrCutStale) {
+			t.Fatalf("committed state still holds the pinned position: %v", err)
+		}
+
+		if !branch.SourcePinnable(baseSource, base) {
+			t.Fatal("probe lost a run this branch already holds")
+		}
+		if err := branch.PinSource(baseSource, base); err != nil {
+			t.Fatalf("PinSource disagrees with the probe on a held run: %v", err)
+		}
+	})
+}

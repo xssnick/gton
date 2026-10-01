@@ -50,22 +50,25 @@ func (s *overlaySubscription) liveTierRoom() int {
 	return s.livePeerLimit() - len(s.peers)
 }
 
-// promotionCandidates are directory rows worth attaching: not already live, with
-// an address to dial and a fresh announcement. Shuffled so every node does not
-// converge on the same few peers.
+// promotionCandidates are directory rows worth attaching: not already live,
+// reachable without a DHT lookup and carrying a fresh announcement. Shuffled so
+// every node does not converge on the same few peers.
 func (s *overlaySubscription) promotionCandidates() []*directoryEntry {
 	now := time.Now()
 
 	s.mx.Lock()
 	candidates := make([]*directoryEntry, 0, len(s.directory))
 	for id, entry := range s.directory {
-		if entry.live || entry.adnlAddr == "" {
+		if entry.live {
 			continue
 		}
 		if _, attached := s.peers[id]; attached {
 			continue
 		}
 		if entry.announced == nil || !announcedNodeIsFresh(entry.announced, now) {
+			continue
+		}
+		if !s.directoryEntryReachableLocked(entry) {
 			continue
 		}
 		candidates = append(candidates, entry.clone())

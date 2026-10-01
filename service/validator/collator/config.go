@@ -1,0 +1,437 @@
+package collator
+
+import (
+	"bytes"
+	"fmt"
+	"slices"
+
+	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/tvm"
+	"github.com/xssnick/tonutils-go/tvm/cell"
+)
+
+const defaultCandidateSizeLimit = uint32(4 << 20)
+
+// SizeLimitsConfigV1 predates the serialized defer threshold. The protocol
+// initializes that field to 256 before unpacking the older constructor.
+const legacyDeferOutQueueSizeLimit = uint64(256)
+
+// Config contains immutable per-epoch data used by block collation. It is the
+// single home for data derived from a configuration root and its actual contract
+// address: parsed once, shared across lanes and across blocks, never
+// mutated by a consumer.
+//
+// The caveat that decides whether a field may live here: PrepareConfig runs
+// twice in different worlds. From localConfigCache.prepare it runs on a
+// materialized, untraced root, and from deriveMasterConfigTransition's fresh
+// branch it runs on the configuration root reached through the block's accounts
+// — that one IS under the block's read set, which the Merkle update descends and
+// the collated-size estimate resolves membership against. So a field derived
+// from cells the masterchain block already reads is free, and a field whose
+// derivation reaches a cell nothing else on that path reads changes the
+// masterchain block bytes. Nothing here may be rerouted onto the traced in-state
+// configuration root for convenience.
+type Config struct {
+	execution          *tvm.PreparedBlockchainConfig
+	configAddress      [32]byte
+	globalVersion      uint32
+	capabilities       uint64
+	basechain          chainConfig
+	basechainWorkchain workchainPolicy
+	// workchains is config parameter 12 parsed once per config epoch, mirroring
+	// block::Config::workchains_. The masterchain shard passes read it from here
+	// instead of re-parsing the same immutable root on every block.
+	workchains             map[int32]*masterShardWorkchainInfo
+	masterchain            chainConfig
+	burning                tlb.BurningConfig
+	maxBlockBytes          uint32
+	maxCollatedBytes       uint32
+	deferOutQueueSizeLimit uint64
+	// gas is the semantic gas allowance of config parameters 20/21 folded with
+	// the epoch block limits, indexed like tvm's masterchain index: 0 basechain,
+	// 1 masterchain. It is epoch data because blockLimitsAtTime rewrites only
+	// ltDelta, never gas, so the hard gas threshold does not move within an epoch.
+	gas [2]gasAccounting
+	// specials is the masterchain fundamental-contract set of parameter 31 plus
+	// the actual configuration contract from McStateExtra.ConfigParams.
+	specials masterSpecials
+	// fees names the destinations of the two masterchain special messages:
+	// parameter 3 (fee collector, falling back to the elector of parameter 1)
+	// and parameter 2 (minter, falling back to the configuration contract).
+	fees feeDestinations
+	// footprint is what parsing this configuration read, recorded when the
+	// configuration was prepared. Master collation replays it instead of
+	// re-parsing; a nil footprint simply means it re-parses.
+	footprint *configFootprint
+}
+
+// gasAccounting is the per-chain gas allowance a transaction may consume before
+// the semantic verifier rejects the block.
+//
+// err carries the overflow rejection instead of failing PrepareConfig, so an
+// epoch stays preparable and the rejection still happens where it happens today:
+// inside the verification of one block. Failing here would take the whole config
+// epoch down, and with it shard collation, over a masterchain-shaped defect.
+type gasAccounting struct {
+	normal  uint64
+	special uint64
+	err     error
+}
+
+// masterSpecials is the identity list of the masterchain special accounts.
+// Which of them actually execute, and at what logical time, stays per-block in
+// processMasterTickTock and verifyMasterTickTock; only the identities are epoch
+// data.
+type masterSpecials struct {
+	// ordered is parameter-31 dictionary order with the configuration contract
+	// appended last when parameter 31 does not already list it.
+	// processMasterTickTock executes in exactly this order, and the order decides
+	// logical time assignment, so it is block bytes and not a presentation
+	// detail.
+	ordered [][32]byte
+	// sorted is ordered by ascending account id, which is the order
+	// verifyMasterTickTock already imposes on itself.
+	sorted [][32]byte
+	// set is the same identities as a membership test. It is shared by every
+	// consumer of one epoch and must never be written to.
+	set map[[32]byte]struct{}
+}
+
+// feeDestination is one masterchain special-message recipient.
+//
+// err is the exact error the tlb accessor returned, because the master paths
+// embed it in their rejection and the wording is asserted by their tests.
+type feeDestination struct {
+	addr [32]byte
+	ok   bool
+	err  error
+}
+
+type feeDestinations struct {
+	collector feeDestination
+	minter    feeDestination
+}
+
+type workchainPolicy struct {
+	present      bool
+	enabledSince uint32
+	basic        bool
+	active       bool
+}
+
+type chainConfig struct {
+	limits    blockLimits
+	createFee tlb.Coins
+	fwdPrices tlb.ConfigMsgForwardPrices
+}
+
+// loadBlockCreateFees refuses a non-minimal fee the way fetch_config_params
+// does: both fees go through block::tlb::t_Grams.as_integer_to
+// (transaction.cpp:4363-4367), whose VarUInteger 16 refuses a nonzero length
+// with a zero leading byte (block-parse.cpp:320-323). The generated ConfigParam
+// 14 in valid_config_data accepts that encoding, so a valid configuration can
+// still be refused here. Trailing data after the fees is not checked here; on
+// a configuration transition validateMasterConfigData has already refused it.
+func loadBlockCreateFees(raw tlb.BlockchainConfig) (tlb.BlockCreateFees, error) {
+	parameter, err := raw.GetParam(tlb.ConfigParamBlockCreateFees)
+	if err != nil {
+		return tlb.BlockCreateFees{}, err
+	}
+	s, err := parameter.BeginParse()
+	if err != nil {
+		return tlb.BlockCreateFees{}, err
+	}
+	if err = configTag(s, 0x6b, 8); err != nil {
+		return tlb.BlockCreateFees{}, err
+	}
+
+	var fees tlb.BlockCreateFees
+	for _, fee := range []*tlb.Coins{&fees.MasterchainBlockFee, &fees.BasechainBlockFee} {
+		length, err := s.PreloadUInt(4)
+		if err != nil {
+			return tlb.BlockCreateFees{}, err
+		}
+		if length != 0 {
+			head, err := s.PreloadUInt(12)
+			if err != nil {
+				return tlb.BlockCreateFees{}, err
+			}
+			if head&0xff == 0 {
+				return tlb.BlockCreateFees{}, fmt.Errorf("nonminimal Grams encoding")
+			}
+		}
+		if err = fee.LoadFromCell(s); err != nil {
+			return tlb.BlockCreateFees{}, err
+		}
+	}
+	return fees, nil
+}
+
+// PrepareConfig derives immutable collation data for one config epoch.
+// configAddress is the actual contract from McStateExtra.ConfigParams, which
+// may differ from the optional relocation request in parameter 0.
+func PrepareConfig(execution *tvm.PreparedBlockchainConfig, configAddress [32]byte) (*Config, error) {
+	raw := tlb.BlockchainConfig{Root: execution.Root()}
+
+	globalVersion, err := raw.GetGlobalVersion()
+	if err != nil {
+		return nil, fmt.Errorf("%w: load global version: %v", ErrInvalidInput, err)
+	}
+	if _, err := raw.GetGlobalID(); err != nil {
+		return nil, fmt.Errorf("%w: load blockchain global id: %v", ErrInvalidInput, err)
+	}
+	basechainLimits, err := prepareChainConfig(raw, false)
+	if err != nil {
+		return nil, err
+	}
+	createFees, err := loadBlockCreateFees(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: load block creation fees: %v", ErrInvalidInput, err)
+	}
+	basechainLimits.createFee = createFees.BasechainBlockFee
+
+	masterchainLimits, err := prepareChainConfig(raw, true)
+	if err != nil {
+		return nil, err
+	}
+	masterchainLimits.createFee = createFees.MasterchainBlockFee
+
+	burning, err := raw.GetBurningConfig()
+	if err != nil {
+		return nil, fmt.Errorf("%w: load fee burning config: %v", ErrInvalidInput, err)
+	}
+	// An absent parameter 5 means the zero burning config: burn 0/1.
+	// tonutils represents the absent denominator as zero, so normalize only
+	// that exact absence shape; a present invalid fraction is rejected.
+	if burning.FeeBurnDenom == 0 {
+		if burning.FeeBurnNum != 0 || burning.BlackholeAddr != nil {
+			return nil, fmt.Errorf("%w: fee burning denominator is zero", ErrInvalidInput)
+		}
+		burning.FeeBurnDenom = 1
+	}
+	if burning.FeeBurnNum > burning.FeeBurnDenom {
+		return nil, fmt.Errorf("%w: fee burning numerator exceeds denominator", ErrInvalidInput)
+	}
+	consensus, err := raw.GetConsensusConfig()
+	if err != nil {
+		return nil, fmt.Errorf("%w: load consensus config: %v", ErrInvalidInput, err)
+	}
+	maxBlockBytes, maxCollatedBytes, err := candidateSizeLimits(consensus)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+	}
+	deferOutQueueSizeLimit, err := configDeferOutQueueSizeLimit(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+	}
+	workchains, err := loadMasterShardWorkchains(execution.Root())
+	if err != nil {
+		return nil, fmt.Errorf("%w: load workchain policies: %v", ErrInvalidInput, err)
+	}
+	var basechainWorkchain workchainPolicy
+	if workchain := workchains[0]; workchain != nil {
+		basechainWorkchain = workchainPolicy{
+			present:      true,
+			enabledSince: workchain.enabledSince,
+			basic:        workchain.basic,
+			active:       workchain.active,
+		}
+	}
+
+	specials, err := deriveMasterSpecials(raw, configAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Config{
+		configAddress:          configAddress,
+		execution:              execution,
+		globalVersion:          globalVersion.Version,
+		capabilities:           globalVersion.Capabilities,
+		basechain:              basechainLimits,
+		basechainWorkchain:     basechainWorkchain,
+		workchains:             workchains,
+		masterchain:            masterchainLimits,
+		burning:                burning,
+		maxBlockBytes:          maxBlockBytes,
+		maxCollatedBytes:       maxCollatedBytes,
+		deferOutQueueSizeLimit: deferOutQueueSizeLimit,
+		gas: [2]gasAccounting{
+			deriveGasAccounting(execution, basechainLimits.limits, false),
+			deriveGasAccounting(execution, masterchainLimits.limits, true),
+		},
+		specials: specials,
+		fees:     deriveFeeDestinations(raw),
+	}, nil
+}
+
+// deriveGasAccounting folds config parameter 20 or 21 into the epoch gas
+// allowance the semantic verifier charges against.
+//
+// It reads the prices off the prepared execution config, which decoded them when
+// the epoch was prepared, so this touches no cell at all.
+func deriveGasAccounting(
+	execution *tvm.PreparedBlockchainConfig,
+	limits blockLimits,
+	masterchain bool,
+) gasAccounting {
+	prices, ok := execution.GasPrices(masterchain)
+	if !ok {
+		// Unreachable through parseMasterConfigEpoch, whose strict preparation
+		// requires both params; reachable only for a caller that prepares a
+		// partial config for tooling.
+		return gasAccounting{err: fmt.Errorf("%w: %s gas prices are absent from the configuration",
+			ErrInvalidInput, chainName(masterchain))}
+	}
+	normal, err := semanticGasLimit(limits.gas[3], prices.GasLimit)
+	if err != nil {
+		return gasAccounting{err: err}
+	}
+	special, err := semanticGasLimit(limits.gas[3], prices.SpecialGasLimit)
+	if err != nil {
+		return gasAccounting{err: err}
+	}
+	return gasAccounting{normal: normal, special: special}
+}
+
+// deriveMasterSpecials keeps the parameter-31 dictionary order and appends the
+// actual configuration contract when it is not already fundamental. Parameter
+// 0 may be absent or request relocation to a contract that cannot be installed.
+func deriveMasterSpecials(raw tlb.BlockchainConfig, configAddress [32]byte) (masterSpecials, error) {
+	fundamental, err := raw.GetFundamentalSmartContractAddresses()
+	if err != nil {
+		return masterSpecials{}, fmt.Errorf("%w: load fundamental smart contracts: %v", ErrInvalidInput, err)
+	}
+	var ordered [][32]byte
+	listed := false
+	err = fundamental.Addresses.ForEachBorrowed(false, false, func(item cell.DictItemView) error {
+		key, err := item.Key.LoadSlice(256)
+		if err != nil || item.Key.BitsLeft() != 0 || item.Value.BitsLeft() != 0 || item.Value.RefsNum() != 0 {
+			return fmt.Errorf("%w: fundamental smart contract entry is malformed", ErrInvalidInput)
+		}
+		accountID := [32]byte(key)
+		ordered = append(ordered, accountID)
+		listed = listed || accountID == configAddress
+		return nil
+	})
+	if err != nil {
+		return masterSpecials{}, err
+	}
+	if !listed {
+		ordered = append(ordered, configAddress)
+	}
+	return newMasterSpecials(ordered), nil
+}
+
+// newMasterSpecials derives the three views of one identity list together.
+//
+// It is the only constructor, including for tests: a replay that could be handed
+// a set without the matching order would silently verify a masterchain block
+// against an empty tick/tock list.
+func newMasterSpecials(ordered [][32]byte) masterSpecials {
+	sorted := slices.Clone(ordered)
+	slices.SortFunc(sorted, func(left, right [32]byte) int {
+		return bytes.Compare(left[:], right[:])
+	})
+	set := make(map[[32]byte]struct{}, len(ordered))
+	for _, accountID := range ordered {
+		set[accountID] = struct{}{}
+	}
+
+	return masterSpecials{ordered: ordered, sorted: sorted, set: set}
+}
+
+// deriveFeeDestinations resolves config parameters 3 and 2 with their fallbacks.
+//
+// It reads cells validateMasterConfigData has already read on every
+// masterchain block, since
+// parameters 0 through 3 all go through its exactBits256 check before this runs.
+// These reads therefore preserve the transition read set.
+func deriveFeeDestinations(raw tlb.BlockchainConfig) feeDestinations {
+	return feeDestinations{
+		collector: feeDestinationOf(raw.GetFeeCollectorAddress()),
+		minter:    feeDestinationOf(raw.GetMinterAddress()),
+	}
+}
+
+func feeDestinationOf(addr []byte, err error) feeDestination {
+	if err != nil || len(addr) != 32 {
+		return feeDestination{err: err}
+	}
+	return feeDestination{addr: [32]byte(addr), ok: true}
+}
+
+func configDeferOutQueueSizeLimit(raw tlb.BlockchainConfig) (uint64, error) {
+	limits, err := raw.GetSizeLimitsConfig()
+	if err != nil {
+		return 0, fmt.Errorf("load size limits: %v", err)
+	}
+
+	switch value := limits.Config.(type) {
+	case tlb.SizeLimitsConfigV1:
+		return legacyDeferOutQueueSizeLimit, nil
+	case tlb.SizeLimitsConfigV2:
+		return uint64(value.DeferOutQueueSizeLimit), nil
+	case tlb.SizeLimitsConfigV3:
+		return uint64(value.DeferOutQueueSizeLimit), nil
+	default:
+		return 0, fmt.Errorf("unsupported size limits config %T", value)
+	}
+}
+
+func prepareChainConfig(raw tlb.BlockchainConfig, masterchain bool) (chainConfig, error) {
+	rawLimits, err := raw.GetBlockLimits(masterchain)
+	if err != nil {
+		return chainConfig{}, fmt.Errorf("%w: load %s block limits: %v", ErrInvalidInput, chainName(masterchain), err)
+	}
+	limits, err := parseBlockLimits(rawLimits)
+	if err != nil {
+		return chainConfig{}, err
+	}
+	forwardPrices, err := raw.GetMsgForwardPrices(masterchain)
+	if err != nil {
+		return chainConfig{}, fmt.Errorf("%w: load %s forwarding prices: %v", ErrInvalidInput, chainName(masterchain), err)
+	}
+
+	return chainConfig{limits: limits, fwdPrices: *forwardPrices}, nil
+}
+
+func chainName(masterchain bool) string {
+	if masterchain {
+		return "masterchain"
+	}
+	return "basechain"
+}
+
+func verifyBasechainWorkchain(config *Config, masterchainUtime uint32) error {
+	workchain := config.basechainWorkchain
+	if !workchain.present {
+		return fmt.Errorf("%w: basechain is absent from workchain config", ErrInvalidInput)
+	}
+	if !workchain.active || !workchain.basic {
+		return fmt.Errorf("%w: basechain is inactive or uses an extended address format", ErrInvalidInput)
+	}
+	if masterchainUtime < workchain.enabledSince {
+		return fmt.Errorf("%w: basechain is not enabled at reference masterchain time", ErrInvalidInput)
+	}
+
+	return nil
+}
+
+func candidateSizeLimits(config tlb.ConsensusConfig) (uint32, uint32, error) {
+	switch value := config.Config.(type) {
+	case nil:
+		// Networks without consensus config use the protocol candidate cap.
+		return defaultCandidateSizeLimit, defaultCandidateSizeLimit, nil
+	case tlb.ConsensusConfigV1:
+		return value.MaxBlockBytes, value.MaxCollatedBytes, nil
+	case tlb.ConsensusConfigV2:
+		return value.MaxBlockBytes, value.MaxCollatedBytes, nil
+	case tlb.ConsensusConfigV3:
+		return value.MaxBlockBytes, value.MaxCollatedBytes, nil
+	case tlb.ConsensusConfigV4:
+		return value.MaxBlockBytes, value.MaxCollatedBytes, nil
+	default:
+		return 0, 0, fmt.Errorf("unsupported consensus config %T", value)
+	}
+}

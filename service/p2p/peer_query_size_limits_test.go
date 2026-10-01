@@ -4,13 +4,12 @@ import (
 	"context"
 	"testing"
 
-	tnstore "github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/ton"
 )
 
 type sliceCallCountingPeerStore struct {
-	tnstore.PeerServingStorage
+	PeerStorage
 	persistentStateSliceCalls int
 	archiveSliceCalls         int
 }
@@ -77,7 +76,7 @@ func TestSliceQueriesRejectInvalidCPlusPlusSizesBeforeStorage(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := &sliceCallCountingPeerStore{
-				PeerServingStorage: newTestPeerStore(),
+				PeerStorage: newTestPeerStore(),
 			}
 			sub := &overlaySubscription{
 				node: &Node{peerStorage: store},
@@ -128,7 +127,7 @@ func TestSliceQueriesAcceptExactCPlusPlusBoundary(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := &sliceCallCountingPeerStore{
-				PeerServingStorage: newTestPeerStore(),
+				PeerStorage: newTestPeerStore(),
 			}
 			sub := &overlaySubscription{
 				node: &Node{peerStorage: store},

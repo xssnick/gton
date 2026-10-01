@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -26,7 +27,7 @@ func (s *Store) BlockState(ctx context.Context, block ton.BlockIDExt) (*storage.
 	event.Msg("loading block state lazy root from storage")
 
 	rootLoadStarted := time.Now()
-	root, err := s.loadLazyCellFromGeneration(ctx, 0, state.StateRootHash)
+	root, err := s.loadActiveLazyCell(ctx, state.StateRootHash)
 	if err != nil {
 		return nil, fmt.Errorf("load state root cell: %w", err)
 	}
@@ -232,9 +233,13 @@ func (s *Store) LookupBlockBySeqNoForPrefix(ctx context.Context, ref storage.Blo
 		default:
 		}
 
+		candidateShard, err := shard.FromAccountPrefix(uint64(ref.Shard), depth)
+		if err != nil {
+			return ton.BlockIDExt{}, err
+		}
 		candidateKey := storage.BlockHistoryKey{
 			Workchain: ref.Workchain,
-			Shard:     storage.AccountShardPrefix(uint64(ref.Shard), depth),
+			Shard:     candidateShard,
 		}
 		block, err := lookupBlockBySeqNoInHistoryWithIterator(iter, candidateKey, ref.SeqNo, &prefixBuf, &seekBuf)
 		if errors.Is(err, errBlockHistoryMissing) {
@@ -453,116 +458,7 @@ func (s *Store) LookupBlockByAccountLT(ctx context.Context, workchain int32, acc
 }
 
 func (s *Store) LookupBlockByLTForPrefix(ctx context.Context, key storage.BlockHistoryKey, lt uint64) (ton.BlockIDExt, error) {
-	prefix := hotKeyBlockLTWorkchainPrefix(key.Workchain)
-
-	db, err := s.acquireHotDB(ctx)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	defer s.releaseHotDB()
-
-	snap := db.NewSnapshot()
-	defer func() { _ = snap.Close() }()
-
-	iter, err := snap.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	defer func() { _ = iter.Close() }()
-
-	var prefixBuf, seekBuf [32]byte
-	direct, directErr := lookupBlockByLTInHistoryWithIterator(iter, key, lt, &prefixBuf, &seekBuf)
-	if directErr == nil {
-		meta, metaErr := blockLookupMetaFromReader(snap, direct.block)
-		if metaErr != nil && !errors.Is(metaErr, storage.ErrNotFound) {
-			return ton.BlockIDExt{}, metaErr
-		}
-
-		// As in the unix-time lookup, only the masterchain may skip the descent
-		// on the shard alone: a workchain root shard splits, so its history is
-		// no more authoritative than any other.
-		directSafe := key.Workchain == -1
-		// The hit covers lt, so no prefix along the account path can hold an
-		// earlier match: a block with a smaller seqno ends before this one
-		// starts, hence before lt. The strict comparison preserves the split
-		// boundary: at StartLT the parent block may be the exact C++ result.
-		if metaErr == nil && meta.startLT != 0 && meta.startLT < lt {
-			directSafe = true
-		}
-		if directSafe {
-			if metaErr != nil {
-				return ton.BlockIDExt{}, metaErr
-			}
-			if meta.flags&storage.BlockMetaHasServedFull == 0 {
-				return ton.BlockIDExt{}, storage.ErrNotFound
-			}
-			return direct.block, nil
-		}
-	} else if !errors.Is(directErr, storage.ErrNotFound) && !errors.Is(directErr, errBlockHistoryMissing) {
-		return ton.BlockIDExt{}, directErr
-	}
-
-	var best blockHistoryIndexRef
-	found := false
-	historyFound := false
-
-	maxDepth := uint32(60)
-	if key.Workchain == -1 {
-		maxDepth = 0
-	}
-	for depth := uint32(0); depth <= maxDepth; depth++ {
-		select {
-		case <-ctx.Done():
-			return ton.BlockIDExt{}, ctx.Err()
-		default:
-		}
-
-		candidateKey := storage.BlockHistoryKey{
-			Workchain: key.Workchain,
-			Shard:     storage.AccountShardPrefix(uint64(key.Shard), depth),
-		}
-		ref, err := lookupBlockByLTInHistoryWithIterator(iter, candidateKey, lt, &prefixBuf, &seekBuf)
-		if errors.Is(err, errBlockHistoryMissing) {
-			if historyFound {
-				break
-			}
-			continue
-		}
-		historyFound = true
-		if errors.Is(err, storage.ErrNotFound) {
-			if iterErr := iter.Error(); iterErr != nil {
-				return ton.BlockIDExt{}, iterErr
-			}
-			continue
-		}
-		if err != nil {
-			return ton.BlockIDExt{}, err
-		}
-		if ref.exact {
-			if err = requireServedFullBlock(snap, ref.block); err != nil {
-				return ton.BlockIDExt{}, err
-			}
-			return ref.block, nil
-		}
-
-		if !found || best.seqno > ref.seqno {
-			best = ref
-			found = true
-		}
-	}
-	if err = iter.Error(); err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if !found {
-		return ton.BlockIDExt{}, storage.ErrNotFound
-	}
-	if err = requireServedFullBlock(snap, best.block); err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	return best.block, nil
+	return s.lookupBlockByHistoryForPrefix(ctx, key, logicalTimeHistoryLookup(lt))
 }
 
 type blockHistoryIndexRef struct {
@@ -572,41 +468,6 @@ type blockHistoryIndexRef struct {
 }
 
 var errBlockHistoryMissing = errors.New("block history is missing")
-
-func lookupBlockByLTInHistoryWithIterator(iter *pebble.Iterator, key storage.BlockHistoryKey, lt uint64, prefixBuf, seekBuf *[32]byte) (blockHistoryIndexRef, error) {
-	prefix := appendHotKeyBlockLTPrefix(prefixBuf[:0], key)
-	seek := appendHotKeyBlockLTSeekGE(seekBuf[:0], key, lt)
-	ok := iter.SeekGE(seek)
-	if ok && bytes.HasPrefix(iter.Key(), prefix) {
-		indexedLT := binary.BigEndian.Uint64(iter.Key()[len(prefix) : len(prefix)+8])
-		ref, err := decodeBlockLTIndexKey(iter.Key())
-		if err != nil {
-			return blockHistoryIndexRef{}, err
-		}
-		block, err := decodeBlockIDFromHashes(ref.Workchain, ref.Shard, ref.SeqNo, iter.Value())
-		if err != nil {
-			return blockHistoryIndexRef{}, err
-		}
-		return blockHistoryIndexRef{block: block, seqno: ref.SeqNo, exact: indexedLT == lt}, nil
-	}
-	if err := iter.Error(); err != nil {
-		return blockHistoryIndexRef{}, err
-	}
-
-	var previous bool
-	if ok {
-		previous = iter.Prev()
-	} else {
-		previous = iter.SeekLT(seek)
-	}
-	if previous && bytes.HasPrefix(iter.Key(), prefix) {
-		return blockHistoryIndexRef{}, storage.ErrNotFound
-	}
-	if err := iter.Error(); err != nil {
-		return blockHistoryIndexRef{}, err
-	}
-	return blockHistoryIndexRef{}, errBlockHistoryMissing
-}
 
 func lookupBlockByLTWithIterator(iter *pebble.Iterator, key storage.BlockHistoryKey, lt uint64) (blockHistoryIndexRef, error) {
 	prefix := hotKeyBlockLTPrefix(key)
@@ -630,143 +491,7 @@ func (s *Store) LookupBlockByUnixTime(ctx context.Context, key storage.BlockHist
 }
 
 func (s *Store) LookupBlockByUnixTimeForPrefix(ctx context.Context, key storage.BlockHistoryKey, utime uint32) (ton.BlockIDExt, error) {
-	prefix := hotKeyBlockUTimeWorkchainPrefix(key.Workchain)
-
-	db, err := s.acquireHotDB(ctx)
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	defer s.releaseHotDB()
-
-	snap := db.NewSnapshot()
-	defer func() { _ = snap.Close() }()
-
-	iter, err := snap.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	defer func() { _ = iter.Close() }()
-
-	var prefixBuf, seekBuf, boundBuf [32]byte
-	direct, directErr := lookupBlockByUnixTimeInHistoryWithIterator(iter, key, utime, &prefixBuf, &seekBuf)
-	if directErr == nil {
-		// Only the masterchain may skip the descent outright: its shard prefix
-		// never splits, so AccountShardPrefix collapses every depth onto this
-		// same history and maxDepth below is zero. A workchain root shard does
-		// split, so it has to be judged like any other history.
-		directSafe := key.Workchain == -1
-		if !directSafe {
-			directSafe, err = unixTimeHitIsSeqnoBracketed(iter, key, direct.seqno, &boundBuf)
-			if err != nil {
-				return ton.BlockIDExt{}, err
-			}
-		}
-		if directSafe {
-			if err = requireServedFullBlock(snap, direct.block); err != nil {
-				return ton.BlockIDExt{}, err
-			}
-			return direct.block, nil
-		}
-	} else if !errors.Is(directErr, storage.ErrNotFound) && !errors.Is(directErr, errBlockHistoryMissing) {
-		return ton.BlockIDExt{}, directErr
-	}
-
-	var best blockHistoryIndexRef
-	found := false
-	historyFound := false
-
-	maxDepth := uint32(60)
-	if key.Workchain == -1 {
-		maxDepth = 0
-	}
-	for depth := uint32(0); depth <= maxDepth; depth++ {
-		select {
-		case <-ctx.Done():
-			return ton.BlockIDExt{}, ctx.Err()
-		default:
-		}
-
-		candidateKey := storage.BlockHistoryKey{
-			Workchain: key.Workchain,
-			Shard:     storage.AccountShardPrefix(uint64(key.Shard), depth),
-		}
-		ref, err := lookupBlockByUnixTimeInHistoryWithIterator(iter, candidateKey, utime, &prefixBuf, &seekBuf)
-		if errors.Is(err, errBlockHistoryMissing) {
-			if historyFound {
-				break
-			}
-			continue
-		}
-		historyFound = true
-		if errors.Is(err, storage.ErrNotFound) {
-			if iterErr := iter.Error(); iterErr != nil {
-				return ton.BlockIDExt{}, iterErr
-			}
-			continue
-		}
-		if err != nil {
-			return ton.BlockIDExt{}, err
-		}
-		if ref.exact {
-			if err = requireServedFullBlock(snap, ref.block); err != nil {
-				return ton.BlockIDExt{}, err
-			}
-			return ref.block, nil
-		}
-
-		if !found || best.seqno > ref.seqno {
-			best = ref
-			found = true
-		}
-	}
-	if err = iter.Error(); err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	if !found {
-		return ton.BlockIDExt{}, storage.ErrNotFound
-	}
-	if err = requireServedFullBlock(snap, best.block); err != nil {
-		return ton.BlockIDExt{}, err
-	}
-	return best.block, nil
-}
-
-func lookupBlockByUnixTimeInHistoryWithIterator(iter *pebble.Iterator, key storage.BlockHistoryKey, utime uint32, prefixBuf, seekBuf *[32]byte) (blockHistoryIndexRef, error) {
-	prefix := appendHotKeyBlockUTimePrefix(prefixBuf[:0], key)
-	seek := appendHotKeyBlockUTimeSeekGE(seekBuf[:0], key, utime)
-	ok := iter.SeekGE(seek)
-	if ok && bytes.HasPrefix(iter.Key(), prefix) {
-		indexedUTime := binary.BigEndian.Uint32(iter.Key()[len(prefix) : len(prefix)+4])
-		ref, err := decodeBlockUTimeIndexKey(iter.Key())
-		if err != nil {
-			return blockHistoryIndexRef{}, err
-		}
-		block, err := decodeBlockIDFromHashes(ref.Workchain, ref.Shard, ref.SeqNo, iter.Value())
-		if err != nil {
-			return blockHistoryIndexRef{}, err
-		}
-		return blockHistoryIndexRef{block: block, seqno: ref.SeqNo, exact: indexedUTime == utime}, nil
-	}
-	if err := iter.Error(); err != nil {
-		return blockHistoryIndexRef{}, err
-	}
-
-	var previous bool
-	if ok {
-		previous = iter.Prev()
-	} else {
-		previous = iter.SeekLT(seek)
-	}
-	if previous && bytes.HasPrefix(iter.Key(), prefix) {
-		return blockHistoryIndexRef{}, storage.ErrNotFound
-	}
-	if err := iter.Error(); err != nil {
-		return blockHistoryIndexRef{}, err
-	}
-	return blockHistoryIndexRef{}, errBlockHistoryMissing
+	return s.lookupBlockByHistoryForPrefix(ctx, key, unixTimeHistoryLookup(utime))
 }
 
 // unixTimeHitIsSeqnoBracketed reports whether a direct hit can be returned

@@ -5,25 +5,16 @@ import (
 	"testing"
 )
 
-func TestObserveBlockReceivedSkipsWhenDisabled(t *testing.T) {
+func TestObserveBlockReceivedSkipsWithoutObserver(t *testing.T) {
+	node := &Node{}
+
+	node.observeBlockReceived(context.Background(), &DownloadedBlock{ID: testBlockID(0, topShard, 43)}, true)
+}
+
+func TestObserveBlockReceivedPublishesWhenConfigured(t *testing.T) {
 	observer := &testBlockReceivedObserver{}
 	node := &Node{
 		blockReceivedObserver: observer,
-		blockReceivedHooks:    observer.BlockReceivedHooksEnabled(),
-	}
-
-	node.observeBlockReceived(context.Background(), &DownloadedBlock{ID: testBlockID(0, topShard, 43)}, true)
-
-	if len(observer.events) != 0 {
-		t.Fatalf("block received events = %d, want 0", len(observer.events))
-	}
-}
-
-func TestObserveBlockReceivedPublishesWhenEnabled(t *testing.T) {
-	observer := &testBlockReceivedObserver{hooks: true}
-	node := &Node{
-		blockReceivedObserver: observer,
-		blockReceivedHooks:    observer.BlockReceivedHooksEnabled(),
 	}
 	downloaded := &DownloadedBlock{ID: testBlockID(0, topShard, 44)}
 
@@ -38,10 +29,9 @@ func TestObserveBlockReceivedPublishesWhenEnabled(t *testing.T) {
 }
 
 func TestObserveDownloadedBlockReceivedPublishesSigned(t *testing.T) {
-	observer := &testBlockReceivedObserver{hooks: true}
+	observer := &testBlockReceivedObserver{}
 	node := &Node{
 		blockReceivedObserver: observer,
-		blockReceivedHooks:    observer.BlockReceivedHooksEnabled(),
 	}
 	downloaded := &DownloadedBlock{ID: testBlockID(0, topShard, 45)}
 

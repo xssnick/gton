@@ -23,7 +23,7 @@ const (
 	serviceMaintenanceTaskStateSerialization
 )
 
-func (s *Service) runDelayedServiceMaintenance(ctx context.Context) {
+func (s *MaintenanceRunner) runDelayedServiceMaintenance(ctx context.Context) {
 	s.log.Info().
 		Dur("delay", serviceMaintenanceStartDelay).
 		Msg("delaying service maintenance worker start")
@@ -38,9 +38,9 @@ func (s *Service) runDelayedServiceMaintenance(ctx context.Context) {
 	case <-timer.C:
 	}
 
-	if s.syncUntilFrozen() {
+	if s.sync.syncUntilFrozen() {
 		s.log.Info().
-			Uint32("sync_until", s.syncUntil).
+			Uint32("sync_until", s.sync.syncUntilTarget()).
 			Msg("skipping service maintenance after sync_until")
 		return
 	}
@@ -48,7 +48,7 @@ func (s *Service) runDelayedServiceMaintenance(ctx context.Context) {
 	s.runServiceMaintenance(ctx)
 }
 
-func (s *Service) runServiceMaintenance(ctx context.Context) {
+func (s *MaintenanceRunner) runServiceMaintenance(ctx context.Context) {
 	nextPersistentStateGC := time.Now()
 	var nextArchiveGC time.Time
 	if s.archiveTTL > 0 {
@@ -58,9 +58,9 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 	var nextStateSerialization time.Time
 
 	for {
-		if s.syncUntilFrozen() {
+		if s.sync.syncUntilFrozen() {
 			s.log.Info().
-				Uint32("sync_until", s.syncUntil).
+				Uint32("sync_until", s.sync.syncUntilTarget()).
 				Msg("stopping service maintenance after sync_until")
 			return
 		}
@@ -167,7 +167,7 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 
 		case serviceMaintenanceTaskStateSerialization:
 			delay := stateSerializationIdlePollDelay
-			err := s.processPersistentStateSerialization(ctx)
+			err := s.state.processPersistentStateSerialization(ctx)
 			if errors.Is(err, context.Canceled) {
 				return
 			}
@@ -203,9 +203,9 @@ func (s *Service) runServiceMaintenance(ctx context.Context) {
 	}
 }
 
-func (s *Service) enableAutomaticStateSerialization() {
+func (s *MaintenanceRunner) enableAutomaticStateSerialization() {
 	if s.automaticStateSerializationReady.CompareAndSwap(false, true) {
-		s.wakeServiceMaintenance()
+		s.wake()
 	}
 }
 
@@ -225,7 +225,7 @@ func nextServiceMaintenanceTask(persistentStateGCDue bool, archiveGCDue bool, ce
 	return serviceMaintenanceTaskNone
 }
 
-func (s *Service) cellGenerationMigrationPending(ctx context.Context) (bool, error) {
+func (s *MaintenanceRunner) cellGenerationMigrationPending(ctx context.Context) (bool, error) {
 	store := s.storage
 
 	_, err := store.PendingCellGenerationMigration(ctx)
@@ -238,8 +238,8 @@ func (s *Service) cellGenerationMigrationPending(ctx context.Context) (bool, err
 	return true, nil
 }
 
-func (s *Service) runPendingCellGenerationMigration(ctx context.Context) (bool, error) {
-	if s.syncUntilFrozen() {
+func (s *MaintenanceRunner) runPendingCellGenerationMigration(ctx context.Context) (bool, error) {
+	if s.sync.syncUntilFrozen() {
 		return false, nil
 	}
 
@@ -259,7 +259,7 @@ func (s *Service) runPendingCellGenerationMigration(ctx context.Context) (bool, 
 	}
 	defer migrationLease.release()
 
-	runCtx, run, err := s.beginCellGenerationMigrationRun(s.shutdownContext)
+	runCtx, run, err := s.state.beginCellGenerationMigrationRun(s.shutdownContext)
 	if err != nil {
 		return false, err
 	}
@@ -268,12 +268,12 @@ func (s *Service) runPendingCellGenerationMigration(ctx context.Context) (bool, 
 		if runFinished {
 			return
 		}
-		s.finishCellGenerationMigrationRun(run)
+		s.state.finishCellGenerationMigrationRun(run)
 		runFinished = true
 	}
 	defer finishRun()
 
-	generation, err := store.BeginCellGeneration(runCtx, pending.OriginPersistentState)
+	generation, err := s.state.beginCellGeneration(runCtx, pending.OriginPersistentState)
 	if err != nil {
 		return false, fmt.Errorf("begin pending cell generation: %w", err)
 	}
@@ -281,7 +281,7 @@ func (s *Service) runPendingCellGenerationMigration(ctx context.Context) (bool, 
 		return false, fmt.Errorf("pending cell generation changed from %d to %d", pending.ID, generation)
 	}
 
-	metrics, waitingForCompaction, err := s.cellGenerationCompactionWait(runCtx, store, pending.ID)
+	metrics, waitingForCompaction, err := s.state.cellGenerationCompactionWait(runCtx, pending.ID)
 	if err != nil {
 		return false, err
 	}
@@ -302,7 +302,7 @@ func (s *Service) runPendingCellGenerationMigration(ctx context.Context) (bool, 
 	}
 
 	started := time.Now()
-	err = s.runCellGenerationMigration(runCtx, store, pending.OriginPersistentState)
+	err = s.state.runCellGenerationMigration(runCtx, pending.OriginPersistentState)
 	finishRun()
 	if err != nil {
 		if errors.Is(err, errCellGenerationMigrationAborted) {
@@ -356,7 +356,7 @@ func serviceMaintenanceWaitDelay(times ...time.Time) time.Duration {
 	return delay
 }
 
-func (s *Service) waitServiceMaintenanceWake(ctx context.Context, delay time.Duration) bool {
+func (s *MaintenanceRunner) waitServiceMaintenanceWake(ctx context.Context, delay time.Duration) bool {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 

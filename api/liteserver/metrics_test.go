@@ -10,10 +10,12 @@ import (
 	"github.com/xssnick/gton/internal/metrics"
 )
 
+var _ MetricsRegistry = (*metrics.Metrics)(nil)
+
 func TestLiteserverMetricsRegisterAndObserveQueries(t *testing.T) {
 	namespace := "testgton"
 	m := metrics.New(namespace)
-	observer, err := liteserverQueryObserver(m)
+	observer, err := NewQueryObserver(m)
 	if err != nil {
 		t.Fatalf("register liteserver metrics: %v", err)
 	}
@@ -53,7 +55,7 @@ func TestLiteserverMetricsRegisterAndObserveQueries(t *testing.T) {
 func TestLiteserverMetricsTreatUnspecifiedLSErrorAsError(t *testing.T) {
 	namespace := "testgton"
 	m := metrics.New(namespace)
-	observer, err := liteserverQueryObserver(m)
+	observer, err := NewQueryObserver(m)
 	if err != nil {
 		t.Fatalf("register liteserver metrics: %v", err)
 	}
@@ -90,7 +92,7 @@ func TestLiteserverMetricsTreatUnspecifiedLSErrorAsError(t *testing.T) {
 func TestLiteserverMetricsUseUnspecifiedReasonForUnclassifiedErrors(t *testing.T) {
 	namespace := "testgton"
 	m := metrics.New(namespace)
-	observer, err := liteserverQueryObserver(m)
+	observer, err := NewQueryObserver(m)
 	if err != nil {
 		t.Fatalf("register liteserver metrics: %v", err)
 	}
@@ -118,7 +120,7 @@ func TestLiteserverMetricsUseUnspecifiedReasonForUnclassifiedErrors(t *testing.T
 }
 
 func TestLiteserverMetricsDisabledWithoutRegistry(t *testing.T) {
-	observer, err := liteserverQueryObserver(nil)
+	observer, err := NewQueryObserver(nil)
 	if err != nil {
 		t.Fatalf("disabled liteserver metrics: %v", err)
 	}

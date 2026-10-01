@@ -24,6 +24,7 @@ func TestArchiveImportCacheKeepsSuccessfulLoadUntilDropBefore(t *testing.T) {
 	}
 
 	loads := 0
+	//nolint:unparam // archiveImportCache.load requires an error result; this fixture is intentionally successful.
 	load := func(context.Context) (*archiveImportResult, error) {
 		loads++
 		return &archiveImportResult{
@@ -121,7 +122,7 @@ func TestArchiveImportCacheDropRemovesOnlyExactEntry(t *testing.T) {
 	}
 }
 
-func TestDropArchiveWindowImportCacheRemovesEverySource(t *testing.T) {
+func TestDropArchiveWindowShardImportCachePreservesMasterSource(t *testing.T) {
 	ctx := context.Background()
 	cache := newArchiveImportCache()
 	masterKey := archiveImportCacheKey{
@@ -150,8 +151,8 @@ func TestDropArchiveWindowImportCacheRemovesEverySource(t *testing.T) {
 		t.Fatalf("load shard cache: %v", err)
 	}
 
-	runner := &archiveCatchUpRunner{importCache: cache}
-	runner.dropArchiveWindowImportCache(&shardClientArchiveWindow{
+	runner := &archiveCatchUpRun{importCache: cache}
+	runner.dropArchiveWindowShardImportCache(&shardClientArchiveWindow{
 		archiveImports: []*archiveImportResult{master.imported, shard.imported},
 	})
 
@@ -162,7 +163,7 @@ func TestDropArchiveWindowImportCacheRemovesEverySource(t *testing.T) {
 			stats:  &archive.ImportStats{},
 			blocks: map[storage.BlockRootHash]PreparedBlock{},
 		}, nil
-	}); err != nil || loaded.cached {
+	}); err != nil || !loaded.cached {
 		t.Fatalf("master cache after window drop = cached:%v err:%v", loaded.cached, err)
 	}
 	shardReloads := 0
@@ -175,8 +176,8 @@ func TestDropArchiveWindowImportCacheRemovesEverySource(t *testing.T) {
 	}); err != nil || loaded.cached {
 		t.Fatalf("shard cache after window drop = cached:%v err:%v", loaded.cached, err)
 	}
-	if masterReloads != 1 || shardReloads != 1 {
-		t.Fatalf("window cache reloads = master:%d shard:%d, want 1/1", masterReloads, shardReloads)
+	if masterReloads != 0 || shardReloads != 1 {
+		t.Fatalf("window cache reloads = master:%d shard:%d, want 0/1", masterReloads, shardReloads)
 	}
 }
 
@@ -207,6 +208,7 @@ func TestArchiveImportCacheConcurrentMissIsolatesEveryCaller(t *testing.T) {
 	const callers = 32
 	var loads atomic.Int64
 	release := make(chan struct{})
+	//nolint:unparam // archiveImportCache.load requires an error result; this fixture is intentionally successful.
 	load := func(context.Context) (*archiveImportResult, error) {
 		loads.Add(1)
 		// Hold the loader open so the other callers pile up as waiters.

@@ -416,6 +416,15 @@ func waitStateSnapshotRetry(ctx context.Context) error {
 }
 
 func (s *Syncer) downloadBlockState(ctx context.Context, block ton.BlockIDExt, master ton.BlockIDExt, splitDepth uint32) (blockStateSnapshot, error) {
+	if block.SeqNo == 0 {
+		state, err := s.ImportZeroState(ctx, block, master)
+		if err != nil {
+			return blockStateSnapshot{}, err
+		}
+
+		return blockStateSnapshot{state: state}, nil
+	}
+
 	state, err := s.storage.BlockState(ctx, block)
 	if err == nil {
 		s.log.Info().

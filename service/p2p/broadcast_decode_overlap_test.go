@@ -115,7 +115,7 @@ func (o *lockedBroadcastPipelineObserver) count(stage, result string) int {
 func testStateAwareCompressedV2Broadcast(t *testing.T, seqno uint32, state *cell.Cell) (tonnodeapi.BlockBroadcastCompressedV2, ton.BlockIDExt) {
 	t.Helper()
 
-	blockCell := testPeerBlockRoot(t, 0, topShard, seqno)
+	blockCell := testPeerBlockRoot(t, 0, seqno)
 	blockBOC := serializeCompressedBlockRoot(blockCell)
 	blockHash := blockCell.HashKey()
 	block := ton.BlockIDExt{
@@ -151,7 +151,7 @@ func testGatedDecodeNode(t *testing.T, seqno uint32) (*Node, *overlaySubscriptio
 	t.Helper()
 
 	node := newTestNode(t)
-	node.storage = newTestPebbleStore(t)
+	node.stateArtifacts = newTestPebbleStore(t)
 	verifier := &testGatedBroadcastSignatureVerifier{release: make(chan error, 1)}
 	node.signatureVerifier = verifier
 	state := cell.BeginCell().MustStoreUInt(uint64(seqno), 16).EndCell()

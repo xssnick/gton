@@ -11,8 +11,7 @@ import (
 
 const (
 	// A Plumtree forwarding decision contains at most this many distinct
-	// non-eager destinations. Keeping one round buffered avoids retaining an
-	// unbounded number of immutable payloads behind a flow-controlled peer.
+	// non-eager destinations.
 	plumtreeOutboundBatchLimit = plumtreeActiveNeighbourLimit
 
 	// C++ stops treating an eager peer as active after this many unacknowledged
@@ -209,7 +208,7 @@ func (r *plumtreeRuntime) prepareOutboundBatch(
 }
 
 func (r *plumtreeRuntime) enqueueOutbounds(batch plumtreeWireBatch) {
-	if len(batch.sends) == 0 {
+	if len(batch.sends) == 0 || r.sub.chainBroadcastsPaused() {
 		return
 	}
 
@@ -227,17 +226,23 @@ func (r *plumtreeRuntime) sendOutboundBatch(
 	peerID PeerID,
 	wires [][]byte,
 ) {
+	if r.sub.chainBroadcastsPaused() {
+		return
+	}
 	path, err := r.sub.quicPeerPath(peerID)
 	if err != nil {
 		return
 	}
-	if !path.route.quicReady(time.Now()) {
+	if !path.route.QUICReady(time.Now()) {
 		return
 	}
 
 	peer, err := path.dialGated(ctx)
 	if err == nil {
 		for _, wire := range wires {
+			if r.sub.chainBroadcastsPaused() {
+				return
+			}
 			err = peer.SendOutboundMessage(ctx, wire)
 			if err != nil {
 				break
@@ -284,8 +289,8 @@ func (r *plumtreeRuntime) runOutboundWorker(
 		renewWindow := sendCtx == nil
 		if !renewWindow {
 			deadline, hasDeadline := sendCtx.Deadline()
-			renewWindow = !hasDeadline ||
-				sendCtx.Err() != nil ||
+			renewWindow = sendCtx.Err() != nil ||
+				!hasDeadline ||
 				time.Until(deadline) < plumtreeOutboundTimeout/2
 		}
 		if renewWindow {
@@ -295,10 +300,7 @@ func (r *plumtreeRuntime) runOutboundWorker(
 			// Plumtree fanout is best-effort. Sharing one deadline window
 			// across consecutive jobs keeps every send bounded to 2.5-5s
 			// without allocating a timer and context for every peer batch.
-			sendCtx, cancel = context.WithTimeout(
-				parent,
-				plumtreeOutboundTimeout,
-			)
+			sendCtx, cancel = newPlumtreeOutboundSendWindow(parent)
 		}
 
 		r.sendOutboundBatch(sendCtx, job.peer, job.wires)
@@ -309,4 +311,8 @@ func (r *plumtreeRuntime) runOutboundWorker(
 			return
 		}
 	}
+}
+
+func newPlumtreeOutboundSendWindow(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, plumtreeOutboundTimeout)
 }

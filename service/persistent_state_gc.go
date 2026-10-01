@@ -6,22 +6,22 @@ import (
 )
 
 const (
-	DefaultPersistentStateKeepRecent = 2
+	DefaultPersistentStateKeepRecent = 1
 	PersistentStateKeepAll           = -1
 	persistentStateGCInterval        = 30 * time.Minute
 	persistentStateGCRetryDelay      = 5 * time.Minute
 	persistentStateGCMaxFilesPerRun  = 256
 )
 
-func (s *Service) runPersistentStateGCOnce(ctx context.Context) (bool, error) {
+func (s *MaintenanceRunner) runPersistentStateGCOnce(ctx context.Context) (bool, error) {
 	if s.persistentStateKeepRecent == PersistentStateKeepAll {
 		s.log.Debug().Msg("skipping persistent state gc because all states are retained")
 		return false, nil
 	}
 
-	if s.syncUntilFrozen() {
+	if s.sync.syncUntilFrozen() {
 		s.log.Debug().
-			Uint32("sync_until", s.syncUntil).
+			Uint32("sync_until", s.sync.syncUntilTarget()).
 			Msg("skipping persistent state gc after sync_until")
 		return false, nil
 	}

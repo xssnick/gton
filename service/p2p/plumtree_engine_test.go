@@ -284,6 +284,51 @@ func TestPlumtreeEngineOriginalSenderUsesOneEagerPeerAndPrunesPayloads(t *testin
 	}
 }
 
+func TestPlumtreeEngineOriginalSenderTransitionResetsPeerTopology(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_800_000_060, 0)
+	engine := plumtreeEngineTestNew(
+		t,
+		plumtreeEngineTestPeer(1),
+		false,
+		&plumtreeEngineTestPeers{receives: make(map[PeerID]bool)},
+		&plumtreeEngineTestVerifier{},
+		func() time.Time { return now },
+	)
+	peer := plumtreeEngineTestPeer(2)
+	engine.mu.Lock()
+	engine.promoteEagerLocked(&engine.slots[0], peer, true, now)
+	engine.slots[1].reservePending(peer, now)
+	engine.mu.Unlock()
+
+	engine.SetOriginalSender(true)
+
+	engine.mu.Lock()
+	if !engine.isOriginalSender || engine.localEagerLimit != plumtreeOriginalEagerLimit {
+		engine.mu.Unlock()
+		t.Fatal("engine did not enter the original-sender role")
+	}
+	for i := range engine.slots {
+		if engine.slots[i].eagerCount != 0 || engine.slots[i].pendingCount != 0 {
+			engine.mu.Unlock()
+			t.Fatalf("slot %d retained routing state across role transition", i)
+		}
+	}
+	if len(engine.activities) != 0 {
+		engine.mu.Unlock()
+		t.Fatal("role transition retained eager activity")
+	}
+	engine.mu.Unlock()
+
+	engine.SetOriginalSender(false)
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if engine.isOriginalSender || engine.localEagerLimit != plumtreeRegularEagerLimit {
+		t.Fatal("engine did not leave the original-sender role")
+	}
+}
+
 func TestPlumtreeEngineAcceptsOnlyDecodedValueIdentityVariants(t *testing.T) {
 	t.Parallel()
 
@@ -1179,6 +1224,7 @@ func TestPlumtreeForwardPayloadIHaveFanoutExcludesEager(t *testing.T) {
 	from := active[0]
 	eager := active[1]
 	slot := &engine.slots[0]
+	engine.mu.Lock()
 	engine.promoteEagerLocked(slot, from, true, now)
 	engine.promoteEagerLocked(slot, eager, true, now)
 
@@ -1197,6 +1243,7 @@ func TestPlumtreeForwardPayloadIHaveFanoutExcludesEager(t *testing.T) {
 		&verdicts,
 		&actions,
 	)
+	engine.mu.Unlock()
 
 	iHavePeers := make(map[PeerID]struct{}, plumtreeIHaveFanout)
 	fullCount := 0
@@ -1220,11 +1267,12 @@ func TestPlumtreeForwardPayloadIHaveFanoutExcludesEager(t *testing.T) {
 	if fullCount != 1 {
 		t.Fatalf("full payloads = %d, want 1", fullCount)
 	}
-	if len(iHavePeers) != plumtreeIHaveFanout {
+	wantIHave := min(plumtreeIHaveFanout, len(active)-2)
+	if len(iHavePeers) != wantIHave {
 		t.Fatalf(
 			"IHAVE peers = %d, want %d",
 			len(iHavePeers),
-			plumtreeIHaveFanout,
+			wantIHave,
 		)
 	}
 }
@@ -1238,6 +1286,9 @@ func BenchmarkPlumtreeForwardPayloadActions(b *testing.B) {
 		dataSize:  1,
 	}
 	now := time.Unix(1_000_000, 0)
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
 
 	b.ReportAllocs()
 	for b.Loop() {
@@ -1272,6 +1323,9 @@ func BenchmarkPlumtreeForwardAllFECActions(b *testing.B) {
 		parts[index].dataSize = 1
 	}
 
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+
 	b.ReportAllocs()
 	for b.Loop() {
 		actions := plumtreeActions{
@@ -1298,6 +1352,70 @@ func BenchmarkPlumtreeForwardAllFECActions(b *testing.B) {
 			int(plumtreeFECTotalParts)*plumtreeIHaveFanout {
 			b.Fatalf("outbounds = %d", len(actions.Outbounds))
 		}
+	}
+}
+
+func BenchmarkPlumtreeReceiveVerdicts(b *testing.B) {
+	engine, active := plumtreeForwardBenchmarkEngine()
+	slot := &engine.slots[0]
+	eager := active[:plumtreeRegularEagerLimit]
+	for index, peer := range eager {
+		slot.eager[index] = peer
+		slot.eagerCount++
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		verdicts := engine.slotReceiveVerdictsLocked(slot)
+		if !verdicts.receivesBroadcasts(eager[len(eager)-1]) {
+			b.Fatal("active peer rejected")
+		}
+	}
+}
+
+func TestPlumtreeReceiveVerdictScratchGrowsAndResets(t *testing.T) {
+	const peerCount = plumtreeActiveNeighbourLimit + 1
+
+	receives := make(map[PeerID]bool, peerCount)
+	engine := &plumtreeEngine{
+		peers: &plumtreeEngineTestPeers{receives: receives},
+	}
+	peers := make([]PeerID, 0, peerCount)
+	for index := range peerCount {
+		peer := plumtreeEngineTestPeer(byte(index + 1))
+		peers = append(peers, peer)
+		receives[peer] = true
+
+		tree := int(plumtreeFECTreeOffset) + index/plumtreeRegularEagerLimit
+		slot := &engine.slots[tree]
+		slot.eager[slot.eagerCount] = peer
+		slot.eagerCount++
+	}
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+
+	verdicts := engine.fecEagerReceiveVerdictsLocked()
+	if len(verdicts.peers) != peerCount {
+		t.Fatalf("verdict peers = %d, want %d", len(verdicts.peers), peerCount)
+	}
+	for _, peer := range peers {
+		if !verdicts.receivesBroadcasts(peer) {
+			t.Fatalf("peer %x rejected", peer[:4])
+		}
+	}
+
+	slot := &engine.slots[0]
+	slot.eager[0] = peers[0]
+	slot.eagerCount = 1
+	verdicts = engine.slotReceiveVerdictsLocked(slot)
+	if len(verdicts.peers) != 1 || !verdicts.receivesBroadcasts(peers[0]) {
+		t.Fatal("slot verdict scratch did not reset")
+	}
+	if verdicts.receivesBroadcasts(peers[len(peers)-1]) {
+		t.Fatal("slot verdict retained a peer from the previous resolution")
 	}
 }
 
@@ -1499,24 +1617,6 @@ func plumtreeEngineTestWaitForFECCommitLock(t *testing.T, want int) {
 		runtime.Gosched()
 	}
 	t.Fatalf("%d concurrent FEC handlers did not reach the commit lock", want)
-}
-
-// Drives one repair round the way plumtreeRuntime does: drain the deadline,
-// then turn each candidate into a query. The test verifier accepts everything,
-// so this stands in for the off-lock signature check.
-func plumtreeEngineTestDrainRepairs(
-	t *testing.T,
-	engine *plumtreeEngine,
-	now time.Time,
-) []plumtreeRepairAction {
-	t.Helper()
-
-	return plumtreeEngineTestStartRepairs(
-		t,
-		engine,
-		now,
-		engine.Alarm(now).Candidates,
-	)
 }
 
 func plumtreeEngineTestStartRepairs(

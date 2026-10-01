@@ -52,17 +52,34 @@ func (n *Node) checkBlockFinalitySignatures(kind string, block ton.BlockIDExt, s
 	})
 }
 
-func (n *Node) validateShardDescriptionBroadcast(block ton.BlockIDExt, catchainSeqno int32, data []byte) (*ShardBlockDescription, error) {
+type shardDescriptionValidationResult struct {
+	description *ShardBlockDescription
+	root        *cell.Cell
+}
+
+func (n *Node) validateShardDescriptionBroadcast(block ton.BlockIDExt, catchainSeqno int32, data []byte) (shardDescriptionValidationResult, error) {
 	if n.signatureVerifier == nil {
-		return nil, fmt.Errorf("broadcast signature verifier is not configured")
+		return shardDescriptionValidationResult{}, fmt.Errorf("broadcast signature verifier is not configured")
+	}
+	root, err := cell.FromBOC(data)
+	if err != nil {
+		return shardDescriptionValidationResult{}, fmt.Errorf("parse shard top block description boc: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(n.runCtx, broadcastSignatureTimeout)
 	defer cancel()
 
-	return n.signatureVerifier.ValidateShardDescriptionBroadcast(ctx, ShardDescriptionSignatureCheck{
+	description, err := n.signatureVerifier.ValidateShardDescriptionBroadcast(ctx, ShardDescriptionSignatureCheck{
 		Block:         block,
 		CatchainSeqno: catchainSeqno,
-		Data:          data,
+		Root:          root,
 	})
+	if err != nil {
+		return shardDescriptionValidationResult{}, err
+	}
+	if description == nil {
+		return shardDescriptionValidationResult{}, fmt.Errorf("validated shard block description is empty")
+	}
+
+	return shardDescriptionValidationResult{description: description, root: root}, nil
 }

@@ -1,0 +1,3118 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source that scrapes the GTON metrics endpoint.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    },
+    {
+      "type": "panel",
+      "id": "stat",
+      "name": "Stat",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "timeseries",
+      "name": "Time series",
+      "version": ""
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "1 when the standalone extension can collect controller, backend, and storage status.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "0": {
+                  "color": "red",
+                  "text": "unavailable"
+                },
+                "1": {
+                  "color": "green",
+                  "text": "available"
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "links": [],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "min(${metric_namespace}_collator_status_available{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\"})",
+          "legendFormat": "status",
+          "refId": "A"
+        }
+      ],
+      "title": "Standalone status",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Current standalone controller sessions by projection state.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "id": 2,
+      "links": [],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(${metric_namespace}_collator_controller_sessions{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\"}) by (state)",
+          "legendFormat": "{{state}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Controller sessions",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Currently active and retrying backend windows, plus candidate builds in flight.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "id": 3,
+      "links": [],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(${metric_namespace}_collator_status_windows{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\"}) by (state)",
+          "legendFormat": "{{state}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(${metric_namespace}_collator_builds_inflight{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\"})",
+          "legendFormat": "builds",
+          "refId": "B"
+        }
+      ],
+      "title": "Active work",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "End-to-end successful candidate build duration at the 95th percentile.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 1,
+          "mappings": [],
+          "noValue": "—",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "id": 4,
+      "links": [],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, chain) (rate(${metric_namespace}_collator_build_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",result=\"success\"}[$__rate_interval])))",
+          "instant": true,
+          "legendFormat": "{{chain}} p95",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Collation p95",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "id": 38,
+      "panels": [],
+      "title": "MASTERCHAIN",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Mean candidate time by non-overlapping stage, including state preparation, queue cleanup, message execution, account finalization, state-update construction, collated proofs, serialization, and final bookkeeping.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "id": 8,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"acquire_inputs\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"acquire_inputs\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "acquire inputs",
+          "instant": false,
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"prepare_state\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"prepare_state\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "prepare state",
+          "instant": false,
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"cleanup_out_queue\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"cleanup_out_queue\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "cleanup out queue",
+          "instant": false,
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"execute_internal_messages\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"execute_internal_messages\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "execute internal messages",
+          "instant": false,
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"execute_external_messages\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"execute_external_messages\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "execute external messages",
+          "instant": false,
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"finalize_accounts\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"finalize_accounts\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "finalize accounts",
+          "instant": false,
+          "range": true,
+          "refId": "F"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"build_state_update\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"build_state_update\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "build state update",
+          "instant": false,
+          "range": true,
+          "refId": "G"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"serialize_candidate\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"serialize_candidate\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "serialize candidate",
+          "instant": false,
+          "range": true,
+          "refId": "H"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"finalize_candidate\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"finalize_candidate\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "finalize candidate",
+          "instant": false,
+          "range": true,
+          "refId": "I"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"wait_external_messages\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"wait_external_messages\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "wait for external messages",
+          "instant": false,
+          "range": true,
+          "refId": "J"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"resolve_candidate_state\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"resolve_candidate_state\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "resolve candidate state",
+          "instant": false,
+          "range": true,
+          "refId": "K"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"restore_candidate\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"restore_candidate\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "restore candidate",
+          "instant": false,
+          "range": true,
+          "refId": "L"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"sign_candidate\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"sign_candidate\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "sign candidate",
+          "instant": false,
+          "range": true,
+          "refId": "M"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"commit_candidate_state\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"commit_candidate_state\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "commit state",
+          "instant": false,
+          "range": true,
+          "refId": "N"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"wait_broadcast_slot\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"wait_broadcast_slot\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "wait for broadcast slot",
+          "instant": false,
+          "range": true,
+          "refId": "O"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"persist_candidate\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"persist_candidate\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "persist candidate",
+          "instant": false,
+          "range": true,
+          "refId": "P"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"deliver_candidate\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"deliver_candidate\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "deliver candidate",
+          "instant": false,
+          "range": true,
+          "refId": "Q"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"processed_info\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"processed_info\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "processed info",
+          "instant": false,
+          "range": true,
+          "refId": "R"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"claimed_local_cleanup\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"claimed_local_cleanup\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "claimed local cleanup",
+          "instant": false,
+          "range": true,
+          "refId": "S"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"flush_batches\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"flush_batches\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "flush batches",
+          "instant": false,
+          "range": true,
+          "refId": "T"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"validation_closure\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"validation_closure\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "validation closure",
+          "instant": false,
+          "range": true,
+          "refId": "U"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"serialize_block\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"serialize_block\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "serialize block",
+          "instant": false,
+          "range": true,
+          "refId": "V"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"build_collated_proofs\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",stage=\"build_collated_proofs\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "build collated proofs",
+          "instant": false,
+          "range": true,
+          "refId": "W"
+        }
+      ],
+      "title": "Collation stages",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Successfully delivered candidates divided by the combined actual duration of recently completed local leader windows, excluding idle time. Uses a one-minute window and shows zero when no window completion is observed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 18,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 15
+      },
+      "id": 5,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "((sum(increase(${metric_namespace}_collator_candidate_production_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",result=\"success\"}[1m])) / clamp_min(sum(increase(${metric_namespace}_collator_window_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",result=\"success\"}[1m])), 1e-9)) * (sum(irate(${metric_namespace}_collator_windows_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",result=\"success\"}[1m])) > bool 0)) or vector(0)",
+          "instant": false,
+          "legendFormat": "produced blocks/s (our window)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Block throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Build results excluding success and not_ready. Not_ready is normal input waiting and is not mixed with failures.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 15
+      },
+      "id": 22,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (chain, result) (rate(${metric_namespace}_collator_builds_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",result!~\"success|not_ready\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "{{result}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Build problems",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Successful end-to-end candidate production duration through persistence, state commit, scheduling, and delivery.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 15
+      },
+      "id": 7,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, chain, kind) (rate(${metric_namespace}_collator_candidate_production_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",result=\"success\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "{{kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Candidate delivery p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "95th-percentile outbound queue size after producing a masterchain candidate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "id": 23,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(${metric_namespace}_collator_candidate_out_queue_messages_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\"}[$__rate_interval])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "out queue",
+          "refId": "A"
+        }
+      ],
+      "title": "Outbound queue size p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "95th percentile of exact block and collated-data gauge samples for locally produced masterchain candidates. When multiple candidates are produced between Prometheus scrapes, only the latest one is visible.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "id": 13,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "quantile_over_time(0.95, ${metric_namespace}_collator_candidate_size_bytes{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",origin=\"collation\"}[$__rate_interval])",
+          "instant": false,
+          "legendFormat": "{{part}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Produced candidate size p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Exact contents of the latest masterchain candidate produced by this node. External messages are stacked with internal and tick-tock transactions; the separate total-transactions series is intentionally omitted. Each scraped value is exact; when multiple candidates are produced between Prometheus scrapes, only the latest one is visible.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
+      "id": 24,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "${metric_namespace}_collator_candidate_latest_messages{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",kind=\"external\"}",
+          "instant": false,
+          "range": true,
+          "legendFormat": "external",
+          "refId": "A"
+        },
+        {
+          "expr": "clamp_min(${metric_namespace}_collator_candidate_latest_transactions{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\"} - on(job, instance, mode, chain) ${metric_namespace}_collator_candidate_latest_messages{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",kind=\"external\"}, 0)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "internal + tick-tock",
+          "refId": "B"
+        }
+      ],
+      "title": "Latest produced block contents (exact)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Positive schedule lateness and pipeline build lead by event. Shardchain build_start excludes the first slot of each window; build_lead measures the head start of a pipelined build.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 38
+      },
+      "id": 9,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, chain, event) (rate(${metric_namespace}_collator_schedule_lateness_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "{{event}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Schedule lateness p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rare decisions explaining empty blocks, waiting, and overload. All stacked series use events per second.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 38
+      },
+      "id": 18,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (chain, deadline, action) (rate(${metric_namespace}_collator_deadline_events_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "{{deadline}}/{{action}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (chain, reason) (rate(${metric_namespace}_collator_overload_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",reason!=\"none\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "overload/{{reason}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (chain, reason) (rate(${metric_namespace}_collator_external_stop_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\",reason!=\"ready_drained\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "external/{{reason}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Deadlines and pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Cleanup stop reasons. Rising budget means the wall-clock budget is binding; block_full means the block limit is binding.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 38
+      },
+      "id": 19,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (chain, reason) (rate(${metric_namespace}_collator_queue_cleanup_stop_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Out-queue cleanup",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Producer alarms requiring investigation: short collated proofs, mandatory dequeue overflow, or a rebuild after exceeding the candidate size limit.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 46
+      },
+      "id": 25,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (chain, alarm) (rate(${metric_namespace}_collator_alarms_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"masterchain\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "{{alarm}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Operator-actionable errors",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 54
+      },
+      "id": 39,
+      "panels": [],
+      "title": "SHARDCHAIN",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Mean candidate time by non-overlapping stage, including state preparation, queue cleanup, message execution, account finalization, state-update construction, collated proofs, serialization, and final bookkeeping.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 55
+      },
+      "id": 27,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"acquire_inputs\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"acquire_inputs\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "acquire inputs",
+          "instant": false,
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"prepare_state\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"prepare_state\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "prepare state",
+          "instant": false,
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"cleanup_out_queue\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"cleanup_out_queue\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "cleanup out queue",
+          "instant": false,
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"execute_internal_messages\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"execute_internal_messages\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "execute internal messages",
+          "instant": false,
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"execute_external_messages\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"execute_external_messages\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "execute external messages",
+          "instant": false,
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"finalize_accounts\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"finalize_accounts\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "finalize accounts",
+          "instant": false,
+          "range": true,
+          "refId": "F"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"build_state_update\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"build_state_update\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "build state update",
+          "instant": false,
+          "range": true,
+          "refId": "G"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"serialize_candidate\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"serialize_candidate\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "serialize candidate",
+          "instant": false,
+          "range": true,
+          "refId": "H"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"finalize_candidate\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"finalize_candidate\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "finalize candidate",
+          "instant": false,
+          "range": true,
+          "refId": "I"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"wait_external_messages\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"wait_external_messages\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "wait for external messages",
+          "instant": false,
+          "range": true,
+          "refId": "J"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"resolve_candidate_state\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"resolve_candidate_state\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "resolve candidate state",
+          "instant": false,
+          "range": true,
+          "refId": "K"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"restore_candidate\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"restore_candidate\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "restore candidate",
+          "instant": false,
+          "range": true,
+          "refId": "L"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"sign_candidate\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"sign_candidate\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "sign candidate",
+          "instant": false,
+          "range": true,
+          "refId": "M"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"commit_candidate_state\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"commit_candidate_state\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "commit state",
+          "instant": false,
+          "range": true,
+          "refId": "N"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"wait_broadcast_slot\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"wait_broadcast_slot\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "wait for broadcast slot",
+          "instant": false,
+          "range": true,
+          "refId": "O"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"persist_candidate\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"persist_candidate\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "persist candidate",
+          "instant": false,
+          "range": true,
+          "refId": "P"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"deliver_candidate\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"deliver_candidate\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "deliver candidate",
+          "instant": false,
+          "range": true,
+          "refId": "Q"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"processed_info\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"processed_info\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "processed info",
+          "instant": false,
+          "range": true,
+          "refId": "R"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"claimed_local_cleanup\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"claimed_local_cleanup\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "claimed local cleanup",
+          "instant": false,
+          "range": true,
+          "refId": "S"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"flush_batches\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"flush_batches\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "flush batches",
+          "instant": false,
+          "range": true,
+          "refId": "T"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"validation_closure\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"validation_closure\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "validation closure",
+          "instant": false,
+          "range": true,
+          "refId": "U"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"serialize_block\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"serialize_block\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "serialize block",
+          "instant": false,
+          "range": true,
+          "refId": "V"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_collator_stage_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"build_collated_proofs\"}[$__rate_interval])) / clamp_min(sum(rate(${metric_namespace}_collator_stage_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",stage=\"build_collated_proofs\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "build collated proofs",
+          "instant": false,
+          "range": true,
+          "refId": "W"
+        }
+      ],
+      "title": "Collation stages",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Successfully delivered candidates divided by the combined actual duration of recently completed local leader windows, excluding idle time. Uses a one-minute window and shows zero when no window completion is observed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 18,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 65
+      },
+      "id": 28,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "((sum(increase(${metric_namespace}_collator_candidate_production_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",result=\"success\"}[1m])) / clamp_min(sum(increase(${metric_namespace}_collator_window_duration_seconds_sum{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",result=\"success\"}[1m])), 1e-9)) * (sum(irate(${metric_namespace}_collator_windows_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",result=\"success\"}[1m])) > bool 0)) or vector(0)",
+          "instant": false,
+          "legendFormat": "produced blocks/s (our window)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Block throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Build results excluding success and not_ready. Not_ready is normal input waiting and is not mixed with failures.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 65
+      },
+      "id": 29,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (chain, result) (rate(${metric_namespace}_collator_builds_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",result!~\"success|not_ready\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "{{result}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Build problems",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Successful end-to-end candidate production duration through persistence, state commit, scheduling, and delivery.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 65
+      },
+      "id": 30,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, chain, kind) (rate(${metric_namespace}_collator_candidate_production_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",result=\"success\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "{{kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Candidate delivery p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "95th-percentile outbound queue size after producing a shardchain candidate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 72
+      },
+      "id": 31,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(${metric_namespace}_collator_candidate_out_queue_messages_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\"}[$__rate_interval])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "out queue",
+          "refId": "A"
+        }
+      ],
+      "title": "Outbound queue size p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "95th percentile of exact block and collated-data gauge samples for locally produced shardchain candidates. When multiple candidates are produced between Prometheus scrapes, only the latest one is visible.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 72
+      },
+      "id": 32,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "quantile_over_time(0.95, ${metric_namespace}_collator_candidate_size_bytes{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",origin=\"collation\"}[$__rate_interval])",
+          "instant": false,
+          "legendFormat": "{{part}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Produced candidate size p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Exact external and internal message counts in the latest shardchain candidate produced by this node. The separate total-transactions series is intentionally omitted. Each scraped value is exact; when multiple candidates are produced between Prometheus scrapes, only the latest one is visible.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 80
+      },
+      "id": 33,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "${metric_namespace}_collator_candidate_latest_messages{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",kind=~\"external|internal\"}",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{kind}} messages",
+          "refId": "A"
+        }
+      ],
+      "title": "Latest produced block contents (exact)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Positive schedule lateness and pipeline build lead by event. Shardchain build_start excludes the first slot of each window; build_lead measures the head start of a pipelined build.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 88
+      },
+      "id": 34,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, chain, event) (rate(${metric_namespace}_collator_schedule_lateness_seconds_bucket{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\"}[$__rate_interval])))",
+          "instant": false,
+          "legendFormat": "{{event}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Schedule lateness p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rare decisions explaining empty blocks, waiting, and overload. All stacked series use events per second.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 88
+      },
+      "id": 35,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (chain, deadline, action) (rate(${metric_namespace}_collator_deadline_events_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "{{deadline}}/{{action}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (chain, reason) (rate(${metric_namespace}_collator_overload_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",reason!=\"none\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "overload/{{reason}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (chain, reason) (rate(${metric_namespace}_collator_external_stop_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\",reason!=\"ready_drained\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "external/{{reason}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Deadlines and pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Cleanup stop reasons. Rising budget means the wall-clock budget is binding; block_full means the block limit is binding.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 88
+      },
+      "id": 36,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (chain, reason) (rate(${metric_namespace}_collator_queue_cleanup_stop_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Out-queue cleanup",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Producer alarms requiring investigation: short collated proofs, mandatory dequeue overflow, or a rebuild after exceeding the candidate size limit.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 96
+      },
+      "id": 37,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (chain, alarm) (rate(${metric_namespace}_collator_alarms_total{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\",chain=\"shardchain\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "{{alarm}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Operator-actionable errors",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 104
+      },
+      "id": 40,
+      "panels": [],
+      "title": "COLLATOR STORAGE",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Standalone collator durable record counts and pending write pressure.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 105
+      },
+      "id": 15,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(${metric_namespace}_collator_storage_records{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\"}) by (type)",
+          "legendFormat": "{{type}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(${metric_namespace}_collator_storage_pending_writes{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\"})",
+          "legendFormat": "pending writes",
+          "refId": "B"
+        }
+      ],
+      "title": "Collator storage records",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Physical Pebble footprint and compaction debt for the standalone collator database.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 113
+      },
+      "id": 16,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(${metric_namespace}_collator_storage_db_bytes{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\"}) by (type)",
+          "legendFormat": "{{type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Collator Pebble bytes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "L0 growth, read amplification, and active compactions explain storage-induced persistence stalls.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 113
+      },
+      "id": 17,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "max(${metric_namespace}_collator_storage_db_read_amp{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\"})",
+          "legendFormat": "read amp",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(${metric_namespace}_collator_storage_db_l0_files{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\"})",
+          "legendFormat": "L0 files",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(${metric_namespace}_collator_storage_db_l0_sublevels{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\"})",
+          "legendFormat": "L0 sublevels",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(${metric_namespace}_collator_storage_db_compactions_in_progress{job=~\"$job\",instance=~\"$instance\",mode=\"standalone\"})",
+          "legendFormat": "compactions",
+          "refId": "D"
+        }
+      ],
+      "title": "Collator Pebble health",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 121
+      },
+      "id": 41,
+      "panels": [],
+      "title": "NODE STORAGE",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Where cells were actually loaded from. Layers become more expensive from memory through cache and page cache to disk.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 55,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 3,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 122
+      },
+      "id": 20,
+      "links": [],
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": true,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\",instance=~\"$instance\",layer=\"state_window\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "resident state window",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\",instance=~\"$instance\",layer=\"decoded_cache\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "decoded cell cache",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\",instance=~\"$instance\",layer=\"record_cache\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "record cache",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\",instance=~\"$instance\",layer=\"block_cache\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "Pebble block cache",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\",instance=~\"$instance\",layer=\"page_cache\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "OS page cache",
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "expr": "sum(rate(${metric_namespace}_storage_lazy_cell_loads_total{job=~\"$job\",instance=~\"$instance\",layer=\"disk\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "disk",
+          "range": true,
+          "refId": "F"
+        }
+      ],
+      "title": "Lazy-cell loads by layer",
+      "type": "timeseries"
+    }
+  ],
+  "preload": false,
+  "refresh": "10s",
+  "schemaVersion": 41,
+  "tags": [
+    "gton",
+    "standalone-collator",
+    "operations",
+    "prometheus"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "regex": "",
+        "current": {
+          "text": "",
+          "value": "${DS_PROMETHEUS}",
+          "selected": true
+        },
+        "options": [],
+        "multi": false,
+        "includeAll": false,
+        "skipUrlSync": false,
+        "allowCustomValue": true,
+        "hide": 0,
+        "refresh": 1,
+        "type": "datasource",
+        "query": "prometheus"
+      },
+      {
+        "name": "metric_namespace",
+        "current": {
+          "selected": true,
+          "text": "gton",
+          "value": "gton"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "gton",
+            "value": "gton"
+          }
+        ],
+        "multi": false,
+        "includeAll": false,
+        "label": "namespace",
+        "skipUrlSync": false,
+        "allowCustomValue": true,
+        "hide": 2,
+        "type": "custom",
+        "query": "gton"
+      },
+      {
+        "name": "job",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "label": "Job",
+        "skipUrlSync": false,
+        "regex": "",
+        "definition": "label_values(${metric_namespace}_collator_status_available{mode=\"standalone\"}, job)",
+        "options": [],
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "allowCustomValue": true,
+        "hide": 0,
+        "refresh": 1,
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(${metric_namespace}_collator_status_available{mode=\"standalone\"}, job)",
+          "refId": "PrometheusVariableQueryEditor-Job"
+        },
+        "sort": 1
+      },
+      {
+        "name": "instance",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "label": "Instance",
+        "skipUrlSync": false,
+        "regex": "",
+        "definition": "label_values(${metric_namespace}_collator_status_available{job=~\"$job\",mode=\"standalone\"}, instance)",
+        "options": [],
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "allowCustomValue": true,
+        "hide": 0,
+        "refresh": 1,
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(${metric_namespace}_collator_status_available{job=~\"$job\",mode=\"standalone\"}, instance)",
+          "refId": "PrometheusVariableQueryEditor-Instance"
+        },
+        "sort": 1
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m"
+    ],
+    "hidden": false
+  },
+  "timezone": "browser",
+  "title": "GTON Standalone Collator Metrics",
+  "uid": "gton-standalone-collator-metrics",
+  "version": 1,
+  "weekStart": "",
+  "description": "Standalone collator operations dashboard aligned with the validator dashboard. MASTERCHAIN and SHARDCHAIN show collation metrics with fixed chain filters; controller status, collator storage, and node storage are shown separately."
+}

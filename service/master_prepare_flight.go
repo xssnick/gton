@@ -40,7 +40,7 @@ type masterPrepareCall struct {
 
 // prepareVerifiedMasterchainBlockShared is prepareVerifiedBlockForApply for
 // masterchain blocks that more than one pipeline may prepare at the same time.
-func (s *Service) prepareVerifiedMasterchainBlockShared(ctx context.Context, block VerifiedBlock) (PreparedBlock, error) {
+func (s *SyncCoordinator) prepareVerifiedMasterchainBlockShared(ctx context.Context, block VerifiedBlock) (PreparedBlock, error) {
 	cells, elapsed, err := s.preparedMasterchainStateCells(ctx, block)
 	if err != nil {
 		return PreparedBlock{}, err
@@ -48,7 +48,7 @@ func (s *Service) prepareVerifiedMasterchainBlockShared(ctx context.Context, blo
 	return preparedBlockWithStateCells(block, cells, elapsed), nil
 }
 
-func (s *Service) preparedMasterchainStateCells(ctx context.Context, block VerifiedBlock) (storage.StateCellRecords, time.Duration, error) {
+func (s *SyncCoordinator) preparedMasterchainStateCells(ctx context.Context, block VerifiedBlock) (storage.StateCellRecords, time.Duration, error) {
 	// Keyed on the block, never on its previous ref: two blocks can follow the
 	// same prev, and a consumer must never be handed the other one's cells.
 	return s.masterPrepare.do(ctx, storage.BlockKey(block.ID), func() (storage.StateCellRecords, error) {

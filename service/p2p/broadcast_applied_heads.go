@@ -85,3 +85,31 @@ func (n *Node) alreadyAppliedBroadcast(block ton.BlockIDExt) bool {
 	applied, ok := (*heads)[storage.ShardKeyFromBlock(block)]
 	return ok && applied > 0 && block.SeqNo <= applied
 }
+
+// alreadyHeldBlockBroadcast reports a shard block whose payload this node
+// already holds while the applied gates above still let it through, because
+// they advance only with a committed masterchain state: a block the service
+// applied, or a validator accepted, but has not flushed yet sits in the shared
+// live block cache; a block whose signed copy an earlier broadcast decoded and
+// handed to the apply path sits in the hot shard broadcast cache. Both answer
+// the reference node's handle->received() from the TL header alone, so
+// classify relays the payload without buying a signature pass or a decode for
+// a block the apply path can only discard. The masterchain keeps its seqno
+// gate, which is the reference's only pre-decode exit.
+func (n *Node) alreadyHeldBlockBroadcast(block ton.BlockIDExt) bool {
+	if isMasterchainBlock(block) {
+		return false
+	}
+	if n.liveBlockCache != nil && n.liveBlockCache.HasBlockData(block) {
+		return true
+	}
+	return n.shardBroadcastCache != nil && n.shardBroadcastCache.HasBlock(block)
+}
+
+// alreadyKnownBlockBroadcast is the late safety net for a payload classify let
+// through: by the time a decode worker or the pending-decode processor picks
+// the job up, the block may have been applied or delivered by another route,
+// and the decode would only feed a result nothing consumes.
+func (n *Node) alreadyKnownBlockBroadcast(block ton.BlockIDExt) bool {
+	return n.alreadyAppliedBroadcast(block) || n.alreadyHeldBlockBroadcast(block)
+}

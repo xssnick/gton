@@ -86,7 +86,6 @@ func TestFastSyncCertificateSnapshotCodec(t *testing.T) {
 			firstIssuer,
 			node,
 			1,
-			0,
 			int32(now.Add(time.Hour).Unix()),
 		),
 		fastSyncMembershipTestCertificate(
@@ -94,7 +93,6 @@ func TestFastSyncCertificateSnapshotCodec(t *testing.T) {
 			secondIssuer,
 			node,
 			2,
-			0,
 			int32(now.Add(2*time.Hour).Unix()),
 		),
 	}
@@ -151,7 +149,6 @@ func TestFastSyncCertificatePersistsAndLoadsAfterRestart(t *testing.T) {
 		issuer,
 		node.localID,
 		1,
-		0,
 		int32(now.Add(time.Hour).Unix()),
 	)
 	if err := node.importFastSyncCertificate(certificate, now); err != nil {
@@ -191,7 +188,6 @@ func TestLoadFastSyncCertificatesCompactsInvalidEntries(t *testing.T) {
 			validIssuer,
 			localID,
 			1,
-			0,
 			int32(now.Add(time.Hour).Unix()),
 		),
 		fastSyncMembershipTestCertificate(
@@ -199,7 +195,6 @@ func TestLoadFastSyncCertificatesCompactsInvalidEntries(t *testing.T) {
 			expiredIssuer,
 			localID,
 			2,
-			0,
 			int32(now.Add(-10*time.Second).Unix()),
 		),
 		fastSyncMembershipTestCertificate(
@@ -207,7 +202,6 @@ func TestLoadFastSyncCertificatesCompactsInvalidEntries(t *testing.T) {
 			wrongNodeIssuer,
 			otherID,
 			3,
-			0,
 			int32(now.Add(time.Hour).Unix()),
 		),
 	}
@@ -255,7 +249,6 @@ func TestLoadFastSyncCertificatesDeletesExpiredSnapshot(t *testing.T) {
 			issuer,
 			localID,
 			1,
-			0,
 			int32(now.Add(-10*time.Second).Unix()),
 		),
 	})
@@ -293,7 +286,6 @@ func TestFastSyncCertificatePersistenceFailureKeepsMemoryUnchanged(t *testing.T)
 		issuer,
 		node.localID,
 		1,
-		0,
 		int32(now.Add(time.Hour).Unix()),
 	)
 

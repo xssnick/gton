@@ -155,7 +155,11 @@ func (s *Store) SaveStateCheckpointEntries(ctx context.Context, blocks []storage
 	}
 
 	states := checkpointEntryStates(blocks)
-	prepared, timing, err := s.prepareBlockStatesForSave(ctx, states, cells)
+	cellGeneration, err := s.activeCellGenerationID()
+	if err != nil {
+		return storage.StateCheckpointTiming{}, err
+	}
+	prepared, timing, err := s.prepareBlockStatesForSave(ctx, cellGeneration, states, cells)
 	if err != nil {
 		return timing, err
 	}
@@ -178,7 +182,8 @@ func (s *Store) SaveStateCheckpointEntries(ctx context.Context, blocks []storage
 		return timing, err
 	}
 	artifactCommitted = true
-	return timing, s.replacePreparedBlockStatesWithLazyRoots(prepared)
+	s.replacePreparedBlockStatesWithLazyRoots(prepared)
+	return timing, nil
 }
 
 func validateCheckpointStateArtifacts(entries []storage.StateCheckpointBlock) error {
@@ -322,22 +327,10 @@ func (s *Store) DeleteStateMetadataBeforeCellGenerationSwitch(ctx context.Contex
 	return deleted, nil
 }
 
-func (s *Store) prepareBlockStatesForSave(ctx context.Context, states []*storage.BlockState, cells storage.StateCellRecords) ([]preparedBlockStateSave, storage.StateCheckpointTiming, error) {
-	cellGeneration, err := s.activeCellGenerationID()
-	if err != nil {
-		return nil, storage.StateCheckpointTiming{}, err
-	}
-	return s.prepareBlockStatesForSaveInGeneration(ctx, cellGeneration, states, cells, false)
-}
-
-func (s *Store) prepareBlockStatesForSaveInGeneration(ctx context.Context, cellGeneration uint64, states []*storage.BlockState, cells storage.StateCellRecords, strictGeneration bool) ([]preparedBlockStateSave, storage.StateCheckpointTiming, error) {
-	if cellGeneration == 0 {
-		return nil, storage.StateCheckpointTiming{}, fmt.Errorf("cell generation is zero")
-	}
+func (s *Store) prepareBlockStatesForSave(ctx context.Context, cellGeneration uint64, states []*storage.BlockState, cells storage.StateCellRecords) ([]preparedBlockStateSave, storage.StateCheckpointTiming, error) {
 	prepared := make([]preparedBlockStateSave, 0, len(states))
 	seen := make(map[storage.BlockRootHash]struct{}, len(states))
 	trees := make([]stateCellTreeSave, 0, len(states))
-	treePreparedIndexes := make([]int, 0, len(states))
 	usePreparedCells := !cells.Empty()
 	for _, state := range states {
 		if state == nil {
@@ -353,33 +346,21 @@ func (s *Store) prepareBlockStatesForSaveInGeneration(ctx context.Context, cellG
 		if err != nil {
 			return nil, storage.StateCheckpointTiming{}, err
 		}
-		if saved.CellGeneration == 0 {
-			saved.CellGeneration = cellGeneration
-		}
-		if strictGeneration && saved.CellGeneration != cellGeneration {
-			return nil, storage.StateCheckpointTiming{}, fmt.Errorf("block state %s belongs to cell generation %d, expected %d", storage.FormatBlockRef(saved.Block), saved.CellGeneration, cellGeneration)
-		}
-
 		next := preparedBlockStateSave{
 			original:      state,
 			saved:         saved,
 			stateRootHash: stateRootHash,
 		}
 		if saved.Cell != nil {
-			if saved.Cell.IsLazy() {
-				next.lazyRoot = saved.Cell
-			} else {
-				next.stateRootHash = saved.Cell.HashKey(0)
+			if !saved.Cell.IsLazy() {
+				next.stateRootHash = saved.Cell.HashKeyAt(0)
 				if !usePreparedCells {
 					trees = append(trees, stateCellTreeSave{
 						block:          saved.Block,
 						root:           saved.Cell,
-						cellGeneration: saved.CellGeneration,
+						cellGeneration: cellGeneration,
 					})
-				} else {
-					next.lazyRoot = saved.Cell
 				}
-				treePreparedIndexes = append(treePreparedIndexes, len(prepared))
 			}
 		}
 		prepared = append(prepared, next)
@@ -407,30 +388,38 @@ func (s *Store) prepareBlockStatesForSaveInGeneration(ctx context.Context, cellG
 		for i := range prepared {
 			prepared[i].flushCells = true
 		}
+
+		// Flushed here, before the checkpoint takes artifactPublishMu: the cells
+		// only have to be durable ahead of the hot metadata commit, and a celldb
+		// write stall under that lock would park the artifact prewriter for as
+		// long as it lasts.
+		flushStarted := time.Now()
+		err = s.flushCellDBs(cellGeneration)
+		timing.CellsFlush = time.Since(flushStarted)
+		if err != nil {
+			return nil, timing, fmt.Errorf("flush generation %d state cells before state metadata: %w", cellGeneration, err)
+		}
 	}
-	for _, idx := range treePreparedIndexes {
-		if prepared[idx].lazyRoot != nil {
+	for i := range prepared {
+		if prepared[i].saved.Cell == nil {
 			continue
 		}
 
-		var lazyRoot *cell.Cell
-		lazyRoot, err = s.loadLazyCellFromGeneration(ctx, prepared[idx].saved.CellGeneration, prepared[idx].stateRootHash[:])
+		lazyRoot, err := s.loadActiveLazyCell(ctx, prepared[i].stateRootHash[:])
 		if err != nil {
 			return nil, timing, fmt.Errorf("load persisted lazy state root: %w", err)
 		}
-		prepared[idx].lazyRoot = lazyRoot
+		prepared[i].lazyRoot = lazyRoot
 	}
-	if !usePreparedCells {
-		for i := range prepared {
-			if prepared[i].lazyRoot == nil || !shouldParseSavedLazyState(prepared[i].saved) {
-				continue
-			}
-			parsed, err := storage.ParseStateProof(&prepared[i].saved.Block, prepared[i].lazyRoot, nil, prepared[i].saved.StateRootHash, nil)
-			if err != nil {
-				return nil, timing, fmt.Errorf("parse persisted lazy state root: %w", err)
-			}
-			prepared[i].parsed = parsed
+	for i := range prepared {
+		if prepared[i].lazyRoot == nil || !shouldParseSavedLazyState(prepared[i].saved) {
+			continue
 		}
+		parsed, err := storage.ParseStateProof(&prepared[i].saved.Block, prepared[i].lazyRoot, nil, prepared[i].saved.StateRootHash, nil)
+		if err != nil {
+			return nil, timing, fmt.Errorf("parse persisted lazy state root: %w", err)
+		}
+		prepared[i].parsed = parsed
 	}
 	return prepared, timing, nil
 }
@@ -444,7 +433,7 @@ func prepareBlockStateHeader(state *storage.BlockState) (storage.BlockState, cel
 	}
 
 	if len(saved.StateRootHash) == 0 && saved.Cell != nil {
-		hash := saved.Cell.HashKey(0)
+		hash := saved.Cell.HashKeyAt(0)
 		saved.StateRootHash = hash[:]
 	}
 	if len(saved.StateRootHash) == 0 {
@@ -455,7 +444,7 @@ func prepareBlockStateHeader(state *storage.BlockState) (storage.BlockState, cel
 	}
 	copy(stateRootHash[:], saved.StateRootHash)
 	if saved.Cell != nil {
-		cellRootHash := saved.Cell.HashKey(0)
+		cellRootHash := saved.Cell.HashKeyAt(0)
 		if cellRootHash != stateRootHash {
 			return storage.BlockState{}, stateRootHash, fmt.Errorf("block state root hash mismatch: got=%x want=%x", cellRootHash[:], stateRootHash[:])
 		}
@@ -478,23 +467,6 @@ func (s *Store) savePreparedBlockStateRecords(prepared []preparedBlockStateSave,
 			flushCells = true
 			break
 		}
-	}
-
-	flushStarted := time.Now()
-	if flushCells {
-		generations := make(map[uint64]struct{})
-		for _, state := range prepared {
-			if state.flushCells {
-				generations[state.saved.CellGeneration] = struct{}{}
-			}
-		}
-		for generation := range generations {
-			if err := s.flushCellDBs(generation); err != nil {
-				timing.CellsFlush = time.Since(flushStarted)
-				return timing, fmt.Errorf("flush generation %d state cells before state metadata: %w", generation, err)
-			}
-		}
-		timing.CellsFlush = time.Since(flushStarted)
 	}
 
 	syncArtifacts := len(artifactWrites) != 0 || len(artifactRegistrations) != 0
@@ -811,7 +783,7 @@ func verifyCellGenerationSwitchCurrent(db *pebble.DB, expectedMaster ton.BlockID
 	if !durable.Masterchain.Block.Equals(&expectedMaster) {
 		return fmt.Errorf("durable current state changed from %s to %s before cell generation switch: %w", storage.FormatBlockRef(expectedMaster), storage.FormatBlockRef(durable.Masterchain.Block), storage.ErrCurrentStateAdvanced)
 	}
-	if !currentStateBlockRefsEqual(durable, current) {
+	if !durable.BlockRefsEqual(current) {
 		return fmt.Errorf("durable current state no longer matches candidate before cell generation switch: %w", storage.ErrCurrentStateAdvanced)
 	}
 	if err := verifyCellGenerationSwitchStateMetadata(db, current); err != nil {
@@ -831,10 +803,10 @@ func verifyCellGenerationSwitchProgress(db *pebble.DB, generation uint64, curren
 	if err != nil {
 		return fmt.Errorf("decode durable cell generation migration progress before switch: %w", err)
 	}
-	if !currentStateBlockRefsEqual(progress, current) {
+	if !progress.BlockRefsEqual(current) {
 		return fmt.Errorf("durable cell generation migration progress no longer matches switch current")
 	}
-	if !currentStateRootsEqual(progress, current) {
+	if !progress.RootsEqual(current) {
 		return fmt.Errorf("durable cell generation migration progress roots no longer match switch current")
 	}
 	return nil
@@ -862,49 +834,6 @@ func verifyCellGenerationSwitchBlockStateMetadata(db *pebble.DB, label string, c
 		return fmt.Errorf("load durable current %s state %s metadata: %w", label, storage.FormatBlockRef(current.Block), err)
 	}
 	return validateCurrentStateBlockMetaMatch(label, current, saved)
-}
-
-func currentStateBlockRefsEqual(left *storage.CurrentState, right *storage.CurrentState) bool {
-	if left.ShardClientSeqno != right.ShardClientSeqno {
-		return false
-	}
-	if !left.Masterchain.Block.Equals(&right.Masterchain.Block) {
-		return false
-	}
-	if len(left.Shards) != len(right.Shards) {
-		return false
-	}
-	for _, key := range storage.SortedShardKeys(left.Shards) {
-		leftShard := left.Shards[key]
-		rightShard, ok := right.Shards[key]
-		if !ok {
-			return false
-		}
-		if !leftShard.Block.Equals(&rightShard.Block) {
-			return false
-		}
-	}
-	return true
-}
-
-func currentStateRootsEqual(left *storage.CurrentState, right *storage.CurrentState) bool {
-	if !bytes.Equal(left.Masterchain.StateRootHash, right.Masterchain.StateRootHash) {
-		return false
-	}
-	if len(left.Shards) != len(right.Shards) {
-		return false
-	}
-	for _, key := range storage.SortedShardKeys(left.Shards) {
-		leftShard := left.Shards[key]
-		rightShard, ok := right.Shards[key]
-		if !ok {
-			return false
-		}
-		if !bytes.Equal(leftShard.StateRootHash, rightShard.StateRootHash) {
-			return false
-		}
-	}
-	return true
 }
 
 func deleteStateMetadataBeforeImportedState(ctx context.Context, db *pebble.DB, batch *pebble.Batch, origin ton.BlockIDExt, keep map[storage.BlockRootHash]struct{}) (int, error) {
@@ -1010,16 +939,13 @@ func (s *Store) verifyBlockStateRootPresentInCellStore(ctx context.Context, cell
 	return nil
 }
 
-func (s *Store) replacePreparedBlockStatesWithLazyRoots(prepared []preparedBlockStateSave) error {
+func (s *Store) replacePreparedBlockStatesWithLazyRoots(prepared []preparedBlockStateSave) {
 	for _, state := range prepared {
 		if state.saved.Cell == nil {
 			continue
 		}
-		if err := s.replaceBlockStateWithLazyRoot(state.original, state.saved, state.parsed, state.lazyRoot); err != nil {
-			return err
-		}
+		s.replaceBlockStateWithLazyRoot(state.original, state.saved, state.parsed, state.lazyRoot)
 	}
-	return nil
 }
 
 func (s *Store) logBlockStateCheckpoint(prepared []preparedBlockStateSave, current *storage.CurrentState, flushCells bool, timing storage.StateCheckpointTiming) {

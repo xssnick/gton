@@ -17,6 +17,20 @@ import (
 	"github.com/xssnick/gton/service"
 )
 
+func TestLoadPreservesExplicitMetricsDisable(t *testing.T) {
+	path := writeTestConfig(t, `{"metrics":{"enabled":false}}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Metrics.Enabled {
+		t.Fatal("explicit metrics disable was overridden")
+	}
+	if cfg.Metrics.ListenAddr != DefaultMetricsListen {
+		t.Fatalf("metrics listen address = %q", cfg.Metrics.ListenAddr)
+	}
+}
+
 func TestLoadDefaults(t *testing.T) {
 	path := writeTestConfig(t, `{}`)
 
@@ -69,10 +83,16 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.DisableStateSerialization {
 		t.Fatal("state serialization should be enabled by default")
 	}
-	if cfg.Metrics.Enabled {
-		t.Fatal("metrics should be disabled by default")
+	if cfg.Validator.Enabled {
+		t.Fatal("validator should be disabled by default")
 	}
-	if cfg.Metrics.ListenAddr != "" {
+	if cfg.Collator.Enabled {
+		t.Fatal("standalone collator should be disabled by default")
+	}
+	if !cfg.Metrics.Enabled {
+		t.Fatal("metrics should be enabled by default")
+	}
+	if cfg.Metrics.ListenAddr != DefaultMetricsListen {
 		t.Fatalf("unexpected metrics listen addr %q", cfg.Metrics.ListenAddr)
 	}
 	if cfg.Metrics.Namespace != DefaultMetricsNamespace {
@@ -114,14 +134,8 @@ func TestLoadDefaults(t *testing.T) {
 	if int64(decodedCellCache.Shards) != DefaultDecodedCellCacheShards {
 		t.Fatalf("unexpected decoded cell cache shards %d", decodedCellCache.Shards)
 	}
-	if decodedCellCache.BytesPerEntry != DefaultDecodedCellCacheBytesPerEntry {
-		t.Fatalf("unexpected decoded cell cache bytes per entry %d", decodedCellCache.BytesPerEntry)
-	}
-	if int64(decodedCellCache.MinEntries) != DefaultDecodedCellCacheMinEntries {
-		t.Fatalf("unexpected decoded cell cache min entries %d", decodedCellCache.MinEntries)
-	}
-	if int64(decodedCellCache.MaxEntries) != DefaultDecodedCellCacheMaxEntries {
-		t.Fatalf("unexpected decoded cell cache max entries %d", decodedCellCache.MaxEntries)
+	if int64(decodedCellCache.Entries) != DefaultDecodedCellCacheEntries {
+		t.Fatalf("unexpected decoded cell cache entries %d", decodedCellCache.Entries)
 	}
 	cellShardMemTableSize := storageOpts.CellShardMemTableSize
 	if int64(cellShardMemTableSize) != DefaultCellShardMemTable {
@@ -151,11 +165,378 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+// Deprecated byte knobs from older configs must not affect current cache sizing.
+func TestLoadAcceptsDeprecatedDecodedCellCacheByteKnobs(t *testing.T) {
+	path := writeTestConfig(t, `{
+	  "storage": {
+	    "cell_total_cache_size": 17179869184,
+	    "decoded_cell_cache_enabled": true,
+	    "decoded_cell_cache_shards": 64,
+	    "decoded_cell_cache_bytes_per_entry": 16384,
+	    "decoded_cell_cache_min_entries": 65536,
+	    "decoded_cell_cache_max_entries": 1048576
+	  }
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config with deprecated knobs: %v", err)
+	}
+	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("runtime options: %v", err)
+	}
+
+	// cell_total_cache_size keeps its meaning: it is the pebble block cache.
+	if runtimeOpts.Node.Storage.CellTotalCacheSize != 16<<30 {
+		t.Fatalf("pebble cell cache size = %d, want %d",
+			runtimeOpts.Node.Storage.CellTotalCacheSize, int64(16<<30))
+	}
+
+	// The dead knobs size nothing. In particular min_entries = 65536 must NOT
+	// clamp anything: it is a floor from a derivation that no longer happens,
+	// and honouring it would override any smaller value an operator sets today.
+	decoded := runtimeOpts.Node.Storage.DecodedCellCache
+	if int64(decoded.Entries) != DefaultDecodedCellCacheEntries {
+		t.Fatalf("entries = %d, want %d", decoded.Entries, DefaultDecodedCellCacheEntries)
+	}
+
+	// And nothing is warned about, because these are exactly the values the node
+	// itself wrote. Every deployment on earth carries them, so a warning here
+	// would fire for all of them and would say something untrue: that a setting
+	// somebody chose has stopped working. The warning is for a choice, and this
+	// config records no choice.
+	if dead := DeprecatedDecodedCellCacheFields(cfg.Storage); len(dead) != 0 {
+		t.Fatalf("the node's own stock values are reported as deprecated: %v", dead)
+	}
+}
+
+// The same three knobs, at values no released build ever wrote. Somebody typed
+// these, they no longer do anything, and that is the case the warning exists
+// for.
+func TestDeprecatedDecodedCellCacheKnobsWarnWhenTunedByHand(t *testing.T) {
+	path := writeTestConfig(t, `{
+	  "storage": {
+	    "decoded_cell_cache_bytes_per_entry": 4096,
+	    "decoded_cell_cache_min_entries": 131072,
+	    "decoded_cell_cache_max_entries": 4194304
+	  }
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config with hand-tuned dead knobs: %v", err)
+	}
+	dead := DeprecatedDecodedCellCacheFields(cfg.Storage)
+	if len(dead) != 3 {
+		t.Fatalf("deprecated fields reported = %v, want all three byte knobs", dead)
+	}
+}
+
+// The decoded cache is bounded in entries because its cost is GC mark work over
+// roughly ten live objects per entry, paid on every collection. When the
+// derivation that used to size it was removed, the clamp that bounded the
+// derivation went with it and the knob was left open at the top — so a config
+// could put back exactly the object count the resize removed.
+func TestDecodedCellCacheEntriesAreBoundedAbove(t *testing.T) {
+	for _, field := range []string{"decoded_cell_cache_entries", "service_decoded_cell_cache_entries"} {
+		path := writeTestConfig(t, `{"storage": {"`+field+`": 8388608}}`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("load config with an oversized %s: %v", field, err)
+		}
+		if _, err = cfg.RuntimeOptions(gton.DefaultNodeOptions()); err == nil {
+			t.Fatalf("storage.%s accepted 8 Mi entries, %d times the ceiling",
+				field, 8<<20/MaxDecodedCellCacheEntries)
+		}
+	}
+
+	// The ceiling itself is usable.
+	path := writeTestConfig(t, `{"storage": {"decoded_cell_cache_entries": 1048576}}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("the ceiling itself was rejected: %v", err)
+	}
+	if int64(opts.Node.Storage.DecodedCellCache.Entries) != MaxDecodedCellCacheEntries {
+		t.Fatalf("entries at the ceiling = %d, want %d",
+			opts.Node.Storage.DecodedCellCache.Entries, MaxDecodedCellCacheEntries)
+	}
+}
+
+// A config written by the two-cache build carries the service/operation pair.
+// The service value must still be applied rather than silently reverting to
+// the default.
+func TestLoadHonoursTheRenamedServiceEntriesKnob(t *testing.T) {
+	path := writeTestConfig(t, `{
+	  "storage": {
+	    "decoded_cell_cache_enabled": true,
+	    "decoded_cell_cache_shards": 64,
+	    "service_decoded_cell_cache_entries": 4096,
+	    "operation_decoded_cell_cache_entries": 1024
+	  }
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config written by the two-cache build: %v", err)
+	}
+	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("runtime options: %v", err)
+	}
+
+	if got := runtimeOpts.Node.Storage.DecodedCellCache.Entries; got != 4096 {
+		t.Fatalf("entries = %d, want the operator's 4096 carried over from the old name", got)
+	}
+
+	// The old name is reported as renamed-but-honoured, not as dead.
+	renamed := RenamedDecodedCellCacheFields(cfg.Storage)
+	if renamed["storage.service_decoded_cell_cache_entries"] != "storage.decoded_cell_cache_entries" {
+		t.Fatalf("renamed fields = %v, want the service knob mapped to the new name", renamed)
+	}
+	// The operation knob really is dead: there is no second cache to size, and
+	// folding its value into the single one would misstate the operator's intent.
+	dead := DeprecatedDecodedCellCacheFields(cfg.Storage)
+	if len(dead) != 1 || dead[0] != "storage.operation_decoded_cell_cache_entries" {
+		t.Fatalf("deprecated fields = %v, want only the operation knob", dead)
+	}
+}
+
+// When both names are present the current one wins and the old one is reported
+// as ignored rather than honoured, so the two messages can never both be true.
+func TestLoadPrefersTheCurrentEntriesKnobOverTheAlias(t *testing.T) {
+	path := writeTestConfig(t, `{
+	  "storage": {
+	    "decoded_cell_cache_entries": 8192,
+	    "service_decoded_cell_cache_entries": 4096
+	  }
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("runtime options: %v", err)
+	}
+
+	if got := runtimeOpts.Node.Storage.DecodedCellCache.Entries; got != 8192 {
+		t.Fatalf("entries = %d, want the current knob's 8192", got)
+	}
+	if renamed := RenamedDecodedCellCacheFields(cfg.Storage); len(renamed) != 0 {
+		t.Fatalf("renamed fields = %v, want none: the alias is ignored, not honoured", renamed)
+	}
+	dead := DeprecatedDecodedCellCacheFields(cfg.Storage)
+	if len(dead) != 1 || dead[0] != "storage.service_decoded_cell_cache_entries" {
+		t.Fatalf("deprecated fields = %v, want the shadowed alias", dead)
+	}
+}
+
+// An operator who sets the current knob gets exactly what they asked for, and
+// nothing is reported.
+func TestLoadExplicitDecodedCellCacheEntries(t *testing.T) {
+	path := writeTestConfig(t, `{
+	  "storage": {
+	    "decoded_cell_cache_entries": 4096
+	  }
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("runtime options: %v", err)
+	}
+
+	if got := runtimeOpts.Node.Storage.DecodedCellCache.Entries; got != 4096 {
+		t.Fatalf("entries = %d, want 4096", got)
+	}
+	if len(DeprecatedDecodedCellCacheFields(cfg.Storage)) != 0 {
+		t.Fatal("a config using only the current knob should report nothing deprecated")
+	}
+	if len(RenamedDecodedCellCacheFields(cfg.Storage)) != 0 {
+		t.Fatal("a config using only the current knob should report nothing renamed")
+	}
+}
+
+func TestLoadEnablesValidator(t *testing.T) {
+	serverSeed := bytes.Repeat([]byte{0x11}, ed25519.SeedSize)
+	clientID := bytes.Repeat([]byte{0x22}, 32)
+	path := writeTestConfig(t, `{"validator":{"enabled":true,"control":{"listen_addr":"127.0.0.1:3030","key":"`+
+		base64.StdEncoding.EncodeToString(serverSeed)+`","clients":[{"id":"`+
+		base64.StdEncoding.EncodeToString(clientID)+`","permissions":15}]}}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Validator.Enabled ||
+		!bytes.Equal(cfg.Validator.Control.Key, serverSeed) ||
+		len(cfg.Validator.Control.Clients) != 1 ||
+		!bytes.Equal(cfg.Validator.Control.Clients[0].ID, clientID) ||
+		cfg.Validator.Control.Clients[0].Permissions != 15 {
+		t.Fatal("validator was not enabled")
+	}
+}
+
+func TestLoadConsensusADNL(t *testing.T) {
+	seed := testSeed(3)
+	path := writeTestConfig(t, `{"consensus_adnl":{"enabled":true,"key":"`+
+		base64.StdEncoding.EncodeToString(seed)+
+		`","listen_addr":"0.0.0.0:30305","external_addr":"203.0.113.10:30305"}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConsensusADNL == nil || !cfg.ConsensusADNL.Enabled {
+		t.Fatal("consensus ADNL configuration was not loaded")
+	}
+	if !bytes.Equal(cfg.ConsensusADNL.Key, seed) {
+		t.Fatal("unexpected consensus ADNL seed")
+	}
+	if cfg.ConsensusADNL.ListenAddr != "0.0.0.0:30305" ||
+		cfg.ConsensusADNL.ExternalAddr != "203.0.113.10:30305" {
+		t.Fatal("unexpected consensus ADNL endpoints")
+	}
+
+	if err = write(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.ConsensusADNL == nil || !reloaded.ConsensusADNL.Enabled ||
+		!bytes.Equal(reloaded.ConsensusADNL.Key, seed) {
+		t.Fatal("consensus ADNL seed was not preserved when saving the config")
+	}
+}
+
+func TestLoadConsensusADNLOmitted(t *testing.T) {
+	path := writeTestConfig(t, `{"validator":{"enabled":true}}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConsensusADNL != nil {
+		t.Fatal("old configuration must retain the primary ADNL identity")
+	}
+
+	if err = write(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(`"consensus_adnl"`)) {
+		t.Fatal("saving an old configuration unexpectedly adds consensus_adnl")
+	}
+}
+
+func TestLoadConsensusADNLDoesNotDefaultEnabledBlock(t *testing.T) {
+	path := writeTestConfig(t, `{"consensus_adnl":{"enabled":true}}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConsensusADNL == nil {
+		t.Fatal("explicit enabled consensus ADNL configuration was discarded")
+	}
+	if _, err = cfg.RuntimeOptions(gton.DefaultNodeOptions()); err == nil {
+		t.Fatal("explicit enabled consensus ADNL configuration must fail validation")
+	}
+}
+
+func TestLoadConsensusADNLDisabled(t *testing.T) {
+	type testCase struct {
+		name      string
+		json      string
+		wantBlock bool
+	}
+	for _, tc := range []testCase{
+		{name: "legacy omission", json: `{}`},
+		{name: "null", json: `{"consensus_adnl":null}`},
+		{name: "empty block", json: `{"consensus_adnl":{}}`, wantBlock: true},
+		{name: "explicit disable", json: `{"consensus_adnl":{"enabled":false}}`, wantBlock: true},
+		{
+			name:      "omitted enable ignores invalid fields",
+			json:      `{"consensus_adnl":{"key":"AQ==","listen_addr":"invalid","external_addr":"invalid"}}`,
+			wantBlock: true,
+		},
+		{
+			name: "explicit disable ignores invalid fields",
+			json: `{"consensus_adnl":{"enabled":false,"key":"AQ==",` +
+				`"listen_addr":"invalid","external_addr":"invalid"}}`,
+			wantBlock: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeTestConfig(t, tc.json))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (cfg.ConsensusADNL != nil) != tc.wantBlock {
+				t.Fatalf("consensus block present = %t, want %t", cfg.ConsensusADNL != nil, tc.wantBlock)
+			}
+			if cfg.ConsensusADNL != nil && cfg.ConsensusADNL.Enabled {
+				t.Fatal("consensus network was enabled without enabled:true")
+			}
+
+			runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+			if err != nil {
+				t.Fatalf("disabled consensus network was validated: %v", err)
+			}
+			if runtimeOpts.Node.P2P.PrivateNetwork != nil {
+				t.Fatal("disabled consensus network changed the primary transport mode")
+			}
+		})
+	}
+}
+
+func TestLoadIgnoresValidatorKeysInConfig(t *testing.T) {
+	path := writeTestConfig(t, `{"validator":{"enabled":true,"keys":[]}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.Validator.Enabled {
+		t.Fatal("validator should be enabled")
+	}
+}
+
+func TestLoadStandaloneCollatorAllowlist(t *testing.T) {
+	id := bytes.Repeat([]byte{0x44}, 32)
+	path := writeTestConfig(t, `{"collator":{"enabled":true,"validator_allowlist":{"enabled":true,"adnl_ids":["`+
+		base64.StdEncoding.EncodeToString(id)+`"]}}}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Collator.Enabled || !cfg.Collator.ValidatorAllowlist.Enabled ||
+		len(cfg.Collator.ValidatorAllowlist.ADNLIDs) != 1 ||
+		!bytes.Equal(cfg.Collator.ValidatorAllowlist.ADNLIDs[0], id) {
+		t.Fatalf("unexpected collator config: %+v", cfg.Collator)
+	}
+}
+
 func TestLoadCustomOverlays(t *testing.T) {
 	nodeID := bytes.Repeat([]byte{0x11}, 32)
 	path := writeTestConfig(t, `{"custom_overlays":[{
+		"@type":"engine.validator.customOverlay",
 		"name":"private-a",
 		"nodes":[{
+			"@type":"engine.validator.customOverlayNode",
 			"adnl_id":"`+base64.StdEncoding.EncodeToString(nodeID)+`",
 			"msg_sender":true,
 			"msg_sender_priority":7,
@@ -163,6 +544,7 @@ func TestLoadCustomOverlays(t *testing.T) {
 			"accept_queries":true
 		}],
 		"sender_shards":[{
+			"@type":"tonNode.shardId",
 			"workchain":0,
 			"shard":-9223372036854775808
 		}],
@@ -413,9 +795,7 @@ func TestStorageOptions(t *testing.T) {
 			"cell_total_cache_size": 8589934592,
 			"decoded_cell_cache_enabled": false,
 			"decoded_cell_cache_shards": 16,
-			"decoded_cell_cache_bytes_per_entry": 8192,
-			"decoded_cell_cache_min_entries": 1000,
-			"decoded_cell_cache_max_entries": 2000,
+			"decoded_cell_cache_entries": 2000,
 			"cell_shard_memtable_size": 1073741824,
 			"cell_memtable_stop_writes_threshold": 3,
 			"large_boc_shard_read_workers": 8,
@@ -447,14 +827,8 @@ func TestStorageOptions(t *testing.T) {
 	if decodedCellCache.Shards != 16 {
 		t.Fatalf("unexpected decoded cell cache shards %d", decodedCellCache.Shards)
 	}
-	if decodedCellCache.BytesPerEntry != 8192 {
-		t.Fatalf("unexpected decoded cell cache bytes per entry %d", decodedCellCache.BytesPerEntry)
-	}
-	if decodedCellCache.MinEntries != 1000 {
-		t.Fatalf("unexpected decoded cell cache min entries %d", decodedCellCache.MinEntries)
-	}
-	if decodedCellCache.MaxEntries != 2000 {
-		t.Fatalf("unexpected decoded cell cache max entries %d", decodedCellCache.MaxEntries)
+	if decodedCellCache.Entries != 2000 {
+		t.Fatalf("unexpected decoded cell cache entries %d", decodedCellCache.Entries)
 	}
 	if storageOpts.CellShardMemTableSize != 1<<30 {
 		t.Fatalf("unexpected cell shard memtable size %d", storageOpts.CellShardMemTableSize)
@@ -479,6 +853,64 @@ func TestStorageOptions(t *testing.T) {
 	}
 }
 
+// The record cache knob's three meanings, pinned separately because a JSON
+// int64 usually cannot carry all of them: ABSENT takes the 4 GiB default (an
+// existing config from before the knob gets the tier on upgrade), an explicit
+// value is honoured, and an explicit ZERO is the off switch rather than "give
+// me the default".
+func TestCellRecordCacheBytesKnob(t *testing.T) {
+	absent := writeTestConfig(t, `{"storage": {"dir": "data/node"}}`)
+	cfg, err := Load(absent)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	storageOpts, err := storageOptionsFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("storage options: %v", err)
+	}
+	if storageOpts.CellRecordCacheBytes != DefaultCellRecordCacheBytes {
+		t.Fatalf("absent knob = %d, want the %d default", storageOpts.CellRecordCacheBytes, DefaultCellRecordCacheBytes)
+	}
+
+	explicit := writeTestConfig(t, `{"storage": {"dir": "data/node", "cell_record_cache_bytes": 1073741824}}`)
+	if cfg, err = Load(explicit); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if storageOpts, err = storageOptionsFromConfig(cfg); err != nil {
+		t.Fatalf("storage options: %v", err)
+	}
+	if storageOpts.CellRecordCacheBytes != 1<<30 {
+		t.Fatalf("explicit knob = %d, want 1 GiB", storageOpts.CellRecordCacheBytes)
+	}
+
+	disabled := writeTestConfig(t, `{"storage": {"dir": "data/node", "cell_record_cache_bytes": 0}}`)
+	if cfg, err = Load(disabled); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if storageOpts, err = storageOptionsFromConfig(cfg); err != nil {
+		t.Fatalf("storage options: %v", err)
+	}
+	if storageOpts.CellRecordCacheBytes != 0 {
+		t.Fatalf("explicit zero = %d, want 0 (disabled)", storageOpts.CellRecordCacheBytes)
+	}
+
+	negative := writeTestConfig(t, `{"storage": {"dir": "data/node", "cell_record_cache_bytes": -1}}`)
+	if cfg, err = Load(negative); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if _, err = storageOptionsFromConfig(cfg); err == nil {
+		t.Fatal("negative record cache bytes should be rejected")
+	}
+
+	absurd := writeTestConfig(t, `{"storage": {"dir": "data/node", "cell_record_cache_bytes": 1099511627777}}`)
+	if cfg, err = Load(absurd); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if _, err = storageOptionsFromConfig(cfg); err == nil {
+		t.Fatal("a >1 TiB record cache budget should be rejected as a typo")
+	}
+}
+
 func TestDecodedCellCacheOptionsRejectInvalidValues(t *testing.T) {
 	tests := []struct {
 		name string
@@ -488,6 +920,22 @@ func TestDecodedCellCacheOptionsRejectInvalidValues(t *testing.T) {
 			name: "negative shards",
 			cfg:  Config{Storage: Storage{DecodedCellCacheShards: -1}},
 		},
+		{
+			name: "negative entries",
+			cfg:  Config{Storage: Storage{DecodedCellCacheEntries: -1}},
+		},
+		// The renamed alias and the dead operation knob are range-checked too,
+		// so a negative left in an old config is reported rather than skipped.
+		{
+			name: "negative service entries alias",
+			cfg:  Config{Storage: Storage{ServiceDecodedCellCacheEntries: -1}},
+		},
+		{
+			name: "negative operation entries",
+			cfg:  Config{Storage: Storage{OperationDecodedCellCacheEntries: -1}},
+		},
+		// The deprecated knobs no longer size anything, but a negative value is
+		// still reported rather than quietly ignored.
 		{
 			name: "negative bytes per entry",
 			cfg:  Config{Storage: Storage{DecodedCellCacheBytesPerEntry: -1}},
@@ -499,10 +947,6 @@ func TestDecodedCellCacheOptionsRejectInvalidValues(t *testing.T) {
 		{
 			name: "negative max entries",
 			cfg:  Config{Storage: Storage{DecodedCellCacheMaxEntries: -1}},
-		},
-		{
-			name: "min over max",
-			cfg:  Config{Storage: Storage{DecodedCellCacheMinEntries: 20, DecodedCellCacheMaxEntries: 10}},
 		},
 	}
 
@@ -619,25 +1063,18 @@ func TestStorageOptionsPersistentStateKeepRecent(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsUnknownFields(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-	}{
-		{
-			name: "logging",
-			body: `{"logging":{"level":"debug"}}`,
-		},
+func TestLoadIgnoresUnknownFields(t *testing.T) {
+	path := writeTestConfig(t, `{
+		"logging":{"level":"debug"},
+		"ton":{"sync_before":123,"unknown_option":{"values":[1,true,null]}}
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config with unknown fields: %v", err)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			path := writeTestConfig(t, tt.body)
-
-			if _, err := Load(path); err == nil {
-				t.Fatal("expected unknown config field to fail")
-			}
-		})
+	if cfg.TON.SyncBefore != 123 {
+		t.Fatalf("unexpected sync before %d", cfg.TON.SyncBefore)
 	}
 }
 
@@ -660,8 +1097,40 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if len(cfg.DHT.Key) != ed25519.SeedSize {
 		t.Fatal("expected generated DHT key")
 	}
+	if cfg.ConsensusADNL == nil || cfg.ConsensusADNL.Enabled {
+		t.Fatal("generated config must include a disabled consensus ADNL network")
+	}
+	if len(cfg.ConsensusADNL.Key) != ed25519.SeedSize {
+		t.Fatal("expected generated consensus ADNL key")
+	}
+	if bytes.Equal(cfg.ConsensusADNL.Key, cfg.ADNL.Key) || bytes.Equal(cfg.ConsensusADNL.Key, cfg.DHT.Key) {
+		t.Fatal("generated consensus ADNL must have an independent key")
+	}
+	if cfg.ConsensusADNL.ListenAddr != defaultConsensusADNLListen ||
+		cfg.ConsensusADNL.ExternalAddr != "203.0.113.20:30305" {
+		t.Fatal("unexpected generated consensus ADNL addresses")
+	}
+	runtimeOpts, err := cfg.RuntimeOptions(gton.DefaultNodeOptions())
+	if err != nil {
+		t.Fatalf("generated runtime options: %v", err)
+	}
+	if runtimeOpts.Node.P2P.PrivateNetwork != nil {
+		t.Fatal("generated disabled consensus block changed runtime transport mode")
+	}
 	if len(cfg.Lite.Key) != ed25519.SeedSize {
 		t.Fatal("expected generated liteserver key")
+	}
+	if len(cfg.Validator.Control.Key) != ed25519.SeedSize {
+		t.Fatalf("generated validator control key has length %d", len(cfg.Validator.Control.Key))
+	}
+	if cfg.Validator.Control.ListenAddr != DefaultValidatorControlListen {
+		t.Fatalf("generated validator control listen addr = %q", cfg.Validator.Control.ListenAddr)
+	}
+	if cfg.Validator.Control.Clients == nil || len(cfg.Validator.Control.Clients) != 0 {
+		t.Fatalf("generated validator control clients = %#v, want empty list", cfg.Validator.Control.Clients)
+	}
+	if cfg.Validator.Enabled || cfg.Collator.Enabled {
+		t.Fatal("generated validator and collator should be disabled")
 	}
 	if cfg.ADNL.ListenAddr != defaultADNLListen {
 		t.Fatalf("unexpected ADNL listen addr %q", cfg.ADNL.ListenAddr)
@@ -719,14 +1188,23 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.Storage.DecodedCellCacheShards != DefaultDecodedCellCacheShards {
 		t.Fatalf("unexpected decoded cell cache shards %d", cfg.Storage.DecodedCellCacheShards)
 	}
-	if cfg.Storage.DecodedCellCacheBytesPerEntry != DefaultDecodedCellCacheBytesPerEntry {
-		t.Fatalf("unexpected decoded cell cache bytes per entry %d", cfg.Storage.DecodedCellCacheBytesPerEntry)
+	if cfg.Storage.DecodedCellCacheEntries != DefaultDecodedCellCacheEntries {
+		t.Fatalf("unexpected decoded cell cache entries %d", cfg.Storage.DecodedCellCacheEntries)
 	}
-	if cfg.Storage.DecodedCellCacheMinEntries != DefaultDecodedCellCacheMinEntries {
-		t.Fatalf("unexpected decoded cell cache min entries %d", cfg.Storage.DecodedCellCacheMinEntries)
+	// A generated config must not carry the old names at all, so a fresh node
+	// never emits a knob it would then have to warn about.
+	if cfg.Storage.ServiceDecodedCellCacheEntries != 0 {
+		t.Fatalf("generated config carries the renamed service knob: %d", cfg.Storage.ServiceDecodedCellCacheEntries)
 	}
-	if cfg.Storage.DecodedCellCacheMaxEntries != DefaultDecodedCellCacheMaxEntries {
-		t.Fatalf("unexpected decoded cell cache max entries %d", cfg.Storage.DecodedCellCacheMaxEntries)
+	if cfg.Storage.OperationDecodedCellCacheEntries != 0 {
+		t.Fatalf("generated config carries the dead operation knob: %d", cfg.Storage.OperationDecodedCellCacheEntries)
+	}
+	if len(RenamedDecodedCellCacheFields(cfg.Storage)) != 0 {
+		t.Fatalf("generated config carries renamed knobs: %v", RenamedDecodedCellCacheFields(cfg.Storage))
+	}
+	// A freshly generated config carries none of the dead knobs.
+	if len(DeprecatedDecodedCellCacheFields(cfg.Storage)) != 0 {
+		t.Fatalf("generated config carries deprecated knobs: %v", DeprecatedDecodedCellCacheFields(cfg.Storage))
 	}
 	if cfg.Storage.LargeBOCShardReadWorkers != DefaultLargeBOCShardReadWorkers {
 		t.Fatalf("unexpected large boc shard read workers %d", cfg.Storage.LargeBOCShardReadWorkers)
@@ -768,8 +1246,8 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if cfg.TON.SyncBackpressureWindows != DefaultSyncBackpressureWindows {
 		t.Fatalf("unexpected sync backpressure windows %d", cfg.TON.SyncBackpressureWindows)
 	}
-	if cfg.Metrics.Enabled {
-		t.Fatal("expected generated metrics to be disabled")
+	if !cfg.Metrics.Enabled || cfg.Metrics.ListenAddr != DefaultMetricsListen {
+		t.Fatalf("generated metrics = %+v, want enabled on %s", cfg.Metrics, DefaultMetricsListen)
 	}
 	if cfg.Metrics.Namespace != DefaultMetricsNamespace {
 		t.Fatalf("unexpected generated metrics namespace %q", cfg.Metrics.Namespace)
@@ -819,6 +1297,16 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	if !bytes.Contains(data, []byte(`"custom_overlays": []`)) {
 		t.Fatal("generated config should use an empty custom_overlays list")
 	}
+	if !bytes.Contains(data, []byte(`"validator": {`)) ||
+		!bytes.Contains(data, []byte(`"collator": {`)) {
+		t.Fatal("generated config should contain validator and collator sections")
+	}
+	if !bytes.Contains(data, []byte("\"consensus_adnl\": {\n    \"enabled\": false,")) {
+		t.Fatal("generated config must persist the explicit disabled consensus ADNL block")
+	}
+	if bytes.Contains(data, []byte(`"enable_validator"`)) {
+		t.Fatal("generated config should not contain the legacy enable_validator field")
+	}
 	if bytes.Contains(data, []byte(`"fast_sync_member_certificates"`)) {
 		t.Fatal("generated config should not contain fast_sync_member_certificates")
 	}
@@ -832,6 +1320,10 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if !bytes.Equal(loaded.ADNL.Key, cfg.ADNL.Key) {
 		t.Fatal("generated config was not persisted")
+	}
+	if loaded.ConsensusADNL == nil || loaded.ConsensusADNL.Enabled ||
+		!bytes.Equal(loaded.ConsensusADNL.Key, cfg.ConsensusADNL.Key) {
+		t.Fatal("generated disabled consensus ADNL identity was not persisted")
 	}
 	if loaded.TON.GlobalConfigPath != wantGlobalConfigPath {
 		t.Fatalf("unexpected persisted global config path %q", loaded.TON.GlobalConfigPath)
@@ -847,6 +1339,21 @@ func TestLoadOrCreateWritesGeneratedConfig(t *testing.T) {
 	}
 	if loaded.TON.SyncBackpressureWindows != DefaultSyncBackpressureWindows {
 		t.Fatalf("unexpected persisted sync_backpressure_windows %d", loaded.TON.SyncBackpressureWindows)
+	}
+}
+
+func TestGenerateConsensusADNLUsesFreshSeed(t *testing.T) {
+	externalIP := func(context.Context) (string, error) { return "203.0.113.20", nil }
+	first, err := generate(t.Context(), externalIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := generate(t.Context(), externalIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(first.ConsensusADNL.Key, second.ConsensusADNL.Key) {
+		t.Fatal("independent configs reused the same consensus ADNL key")
 	}
 }
 
@@ -900,7 +1407,7 @@ func TestSyncUntilValidation(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.TON.SyncUntil = 0
 
-	syncUntil, err := uint32ConfigValueAllowZero("ton.sync_until", cfg.TON.SyncUntil)
+	syncUntil, err := syncUntilConfigValue(cfg.TON.SyncUntil)
 	if err != nil {
 		t.Fatalf("zero sync_until should be allowed: %v", err)
 	}
@@ -909,12 +1416,12 @@ func TestSyncUntilValidation(t *testing.T) {
 	}
 
 	cfg.TON.SyncUntil = -1
-	if _, err = uint32ConfigValueAllowZero("ton.sync_until", cfg.TON.SyncUntil); err == nil {
+	if _, err = syncUntilConfigValue(cfg.TON.SyncUntil); err == nil {
 		t.Fatal("expected negative sync_until to fail")
 	}
 
 	cfg.TON.SyncUntil = int64(^uint32(0)) + 1
-	if _, err = uint32ConfigValueAllowZero("ton.sync_until", cfg.TON.SyncUntil); err == nil {
+	if _, err = syncUntilConfigValue(cfg.TON.SyncUntil); err == nil {
 		t.Fatal("expected too large sync_until to fail")
 	}
 }

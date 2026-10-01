@@ -4,7 +4,13 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
+	"math"
+	"strings"
 	"testing"
+
+	"github.com/xssnick/gton/service/shard"
+	"github.com/xssnick/gton/service/storage"
 
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/tl"
@@ -14,6 +20,115 @@ import (
 )
 
 const testTopShard = int64(-1 << 63)
+
+func TestBlockIDExtTLBFromBlockRejectsZeroShard(t *testing.T) {
+	_, err := blockIDExtTLBFromBlock(ton.BlockIDExt{Workchain: 0, Shard: 0, SeqNo: 1})
+	if !errors.Is(err, shard.ErrInvalidID) {
+		t.Fatalf("error = %v, want ErrInvalidID", err)
+	}
+}
+
+func TestBlockIDExtTLBFromBlockRejectsNonTLBShardIdent(t *testing.T) {
+	tests := []struct {
+		name      string
+		workchain int32
+		shard     int64
+		want      string
+	}{
+		{
+			name:      "invalid workchain",
+			workchain: math.MinInt32,
+			shard:     shard.Root,
+			want:      "workchain is invalid",
+		},
+		{
+			name:      "prefix depth 61",
+			workchain: 0,
+			shard:     1 << 2,
+			want:      "prefix length 61",
+		},
+		{
+			name:      "prefix depth 62",
+			workchain: 0,
+			shard:     1 << 1,
+			want:      "prefix length 62",
+		},
+		{
+			name:      "prefix depth 63",
+			workchain: 0,
+			shard:     1,
+			want:      "prefix length 63",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			id := testBlockID(test.workchain, 1)
+			id.Shard = test.shard
+
+			_, err := blockIDExtTLBFromBlock(id)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestBlockIDExtTLBFromBlockAcceptsMaximumTLBShardDepth(t *testing.T) {
+	id := testBlockID(0, 1)
+	id.Shard = 1 << 3
+
+	encoded, err := blockIDExtTLBFromBlock(id)
+	if err != nil {
+		t.Fatalf("encode maximum-depth shard: %v", err)
+	}
+	if encoded.ShardID.PrefixBits != 60 {
+		t.Fatalf("prefix length = %d, want 60", encoded.ShardID.PrefixBits)
+	}
+	if got := encoded.blockID(); got.Workchain != id.Workchain || got.Shard != id.Shard {
+		t.Fatalf("decoded shard = (%d,%016x), want (%d,%016x)", got.Workchain, uint64(got.Shard), id.Workchain, uint64(id.Shard))
+	}
+}
+
+func TestBlockIDExtTLBFromBlockRejectsMalformedHashes(t *testing.T) {
+	tests := []struct {
+		name     string
+		rootHash []byte
+		fileHash []byte
+	}{
+		{name: "short root hash", rootHash: make([]byte, 31), fileHash: make([]byte, 32)},
+		{name: "long root hash", rootHash: make([]byte, 33), fileHash: make([]byte, 32)},
+		{name: "short file hash", rootHash: make([]byte, 32), fileHash: make([]byte, 31)},
+		{name: "long file hash", rootHash: make([]byte, 32), fileHash: make([]byte, 33)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			id := testBlockID(0, 1)
+			id.RootHash = test.rootHash
+			id.FileHash = test.fileHash
+
+			_, err := blockIDExtTLBFromBlock(id)
+			if !errors.Is(err, storage.ErrInvalidBlockIDHashes) {
+				t.Fatalf("error = %v, want ErrInvalidBlockIDHashes", err)
+			}
+		})
+	}
+}
+
+func TestShardProofLookupShardRejectsZero(t *testing.T) {
+	_, err := shardProofLookupShard(0)
+	if !errors.Is(err, shard.ErrInvalidID) {
+		t.Fatalf("error = %v, want ErrInvalidID", err)
+	}
+}
+
+func TestFindShardLeafRejectsZeroShard(t *testing.T) {
+	_, _, err := findShardLeaf(nil, 0, false)
+	if !errors.Is(err, shard.ErrInvalidID) {
+		t.Fatalf("error = %v, want ErrInvalidID", err)
+	}
+}
 
 func TestCheckProofShapeMatchesCXXProofAndProofLinkRules(t *testing.T) {
 	master := testBlockID(-1, 10)
@@ -78,6 +193,53 @@ func TestCheckProofShapeRejectsProofForMismatch(t *testing.T) {
 				t.Fatal("proof with mismatched ProofFor was accepted")
 			}
 		})
+	}
+}
+
+func TestParseBlockSignatureSetRejectsTrailingData(t *testing.T) {
+	ordinary := testSignatureSet(0x12345678, 33, 0)
+	simplex, err := tlb.ToCell(&blockSignaturesSimplex{
+		ValidatorSetHash: 0x12345678,
+		CatchainSeqno:    33,
+		SessionID:        make([]byte, 32),
+		CandidateData:    cell.BeginCell().MustStoreBinarySnake([]byte{1}).EndCell(),
+	})
+	if err != nil {
+		t.Fatalf("serialize simplex signatures: %v", err)
+	}
+
+	trailingRef := cell.BeginCell().EndCell()
+	tests := []struct {
+		name string
+		root *cell.Cell
+	}{
+		{name: "ordinary bit", root: ordinary.ToBuilder().MustStoreBoolBit(true).EndCell()},
+		{name: "ordinary ref", root: ordinary.ToBuilder().MustStoreRef(trailingRef).EndCell()},
+		{name: "simplex bit", root: simplex.ToBuilder().MustStoreBoolBit(true).EndCell()},
+		{name: "simplex ref", root: simplex.ToBuilder().MustStoreRef(trailingRef).EndCell()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ParseBlockSignatureSetCell(tt.root); err == nil {
+				t.Fatal("block signatures with trailing data were accepted")
+			}
+		})
+	}
+}
+
+func TestParseBlockSignatureSetRejectsTooManySignatures(t *testing.T) {
+	root := cell.BeginCell().
+		MustStoreUInt(0x11, 8).
+		MustStoreUInt(0x12345678, 32).
+		MustStoreUInt(33, 32).
+		MustStoreUInt(maxBlockSignatures+1, 32).
+		MustStoreUInt(0, 64).
+		MustStoreDict(nil).
+		EndCell()
+
+	if _, err := ParseBlockSignatureSetCell(root); err == nil {
+		t.Fatal("block signatures above the C++ limit were accepted")
 	}
 }
 
@@ -269,21 +431,32 @@ func TestValidatorSignatureSetFinalitySignaturesCellRoundTrip(t *testing.T) {
 		t.Fatalf("payload: %v", err)
 	}
 	signatures := testSignatures(t, validators[:3], privateKeys[:3], payload)
+	signatures[0], signatures[2] = signatures[2], signatures[0]
 	signed := NewSimplexValidatorSignatureSet(catchainSeqno, setHash, signatures, true, sessionID, 11, candidate)
 
 	signaturesCell, err := signed.FinalitySignaturesCell(prepared)
 	if err != nil {
 		t.Fatalf("signatures cell: %v", err)
 	}
-	parsed, err := ParseValidatorSignatureSetCell(signaturesCell)
+	parsed, err := ParseBlockSignatureSetCell(signaturesCell)
 	if err != nil {
 		t.Fatalf("parse signatures cell: %v", err)
 	}
-	if !bytes.Equal(parsed.ContentKey(block), signed.ContentKey(block)) {
+	if !bytes.Equal(parsed.ValidatorSignatures.ContentKey(block), signed.ContentKey(block)) {
 		t.Fatalf("content key mismatch after round trip")
 	}
-	if err = CheckPreparedSignatures(block, parsed, prepared); err != nil {
+	if err = CheckPreparedBlockSignatures(block, parsed, prepared); err != nil {
 		t.Fatalf("check parsed signatures: %v", err)
+	}
+	wire, err := LiteSignatureSet(signaturesCell)
+	if err != nil {
+		t.Fatalf("decode signatures cell for wire: %v", err)
+	}
+	serialized := wire.(ton.SignatureSetSimplex).Signatures
+	for i := range signatures {
+		if !bytes.Equal(serialized[i].NodeIDShort, signatures[i].NodeIDShort) {
+			t.Fatalf("serialized signature %d changed certificate order", i)
+		}
 	}
 
 	approve := NewSimplexValidatorSignatureSet(catchainSeqno, setHash, nil, false, sessionID, 11, candidate)
@@ -358,9 +531,56 @@ func TestCheckPreparedSignaturesRejectsSimplexCandidateBlockMismatch(t *testing.
 
 func TestCheckPreparedMasterchainSignaturesRejectsNonFinalSimplex(t *testing.T) {
 	block := testBlockID(-1, 78)
-	set := NewSimplexValidatorSignatureSet(9, 0x12345678, nil, false, make([]byte, 32), 11, []byte{0x01})
+	set := &BlockSignatureSet{
+		ValidatorSignatures: NewSimplexValidatorSignatureSet(9, 0x12345678, nil, false, make([]byte, 32), 11, []byte{0x01}),
+	}
 	if err := CheckPreparedMasterchainSignatures(block, set, nil); err == nil {
 		t.Fatal("expected non-final simplex masterchain signatures to be rejected")
+	}
+}
+
+func TestCheckPreparedMasterchainSignaturesRejectsForgedCellWeight(t *testing.T) {
+	block := testBlockID(-1, 84)
+	validators, privateKeys := testValidators(t, 1)
+	catchainSeqno := uint32(12)
+	prepared, err := PrepareValidatorSet(catchainSeqno, validators)
+	if err != nil {
+		t.Fatalf("prepare validator set: %v", err)
+	}
+
+	base := NewOrdinaryValidatorSignatureSet(catchainSeqno, prepared.Hash(), nil)
+	payload, err := signaturePayload(block, base)
+	if err != nil {
+		t.Fatalf("signature payload: %v", err)
+	}
+	signed := NewOrdinaryValidatorSignatureSet(
+		catchainSeqno,
+		prepared.Hash(),
+		testSignatures(t, validators, privateKeys, payload),
+	)
+	dict, actualWeight, err := signed.signaturesDict(prepared)
+	if err != nil {
+		t.Fatalf("signature dictionary: %v", err)
+	}
+	cellSet, err := tlb.ToCell(&blockSignaturesOrdinary{
+		ValidatorSetHash: prepared.Hash(),
+		CatchainSeqno:    catchainSeqno,
+		SigCount:         uint32(signed.SignatureCount()),
+		SigWeight:        actualWeight + 1,
+		Signatures:       dict,
+	})
+	if err != nil {
+		t.Fatalf("serialize forged block signatures: %v", err)
+	}
+	parsed, err := ParseBlockSignatureSetCell(cellSet)
+	if err != nil {
+		t.Fatalf("parse forged block signatures: %v", err)
+	}
+	if parsed.DeclaredWeight != actualWeight+1 {
+		t.Fatalf("declared weight = %d, want %d", parsed.DeclaredWeight, actualWeight+1)
+	}
+	if err = CheckPreparedMasterchainSignatures(block, parsed, prepared); err == nil {
+		t.Fatal("masterchain proof with forged signature weight was accepted")
 	}
 }
 

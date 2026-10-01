@@ -62,6 +62,62 @@ func ShardBlocksFromMasterState(state *storage.BlockState) ([]ton.BlockIDExt, er
 	if err != nil {
 		return nil, fmt.Errorf("load shard hashes for %s: %w", storage.FormatBlockRef(state.Block), err)
 	}
+
+	// Zerostates may omit an active workchain from ShardHashes. C++ shard-client
+	// fills those entries from config 12 so a fresh node still downloads every
+	// configured workchain zerostate.
+	if extra.ConfigParams.Config.Params == nil {
+		return shards, nil
+	}
+	config := tlb.BlockchainConfig{Root: extra.ConfigParams.Config.Params.AsCell()}
+	workchains, err := config.GetWorkchains()
+	if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
+		return shards, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load workchains for %s: %w", storage.FormatBlockRef(state.Block), err)
+	}
+	if workchains == nil || workchains.Workchains == nil {
+		return shards, nil
+	}
+
+	present := make(map[int32]struct{}, len(shards))
+	for _, shard := range shards {
+		present[shard.Workchain] = struct{}{}
+	}
+	items, err := workchains.Workchains.LoadAll()
+	if err != nil {
+		return nil, fmt.Errorf("load workchain dictionary for %s: %w", storage.FormatBlockRef(state.Block), err)
+	}
+	for _, item := range items {
+		workchain, err := item.Key.LoadInt(32)
+		if err != nil {
+			return nil, fmt.Errorf("load workchain id for %s: %w", storage.FormatBlockRef(state.Block), err)
+		}
+		workchainID := int32(workchain)
+		if _, exists := present[workchainID]; exists {
+			continue
+		}
+
+		var descriptor tlb.WorkchainDescr
+		if err = tlb.LoadFromCell(&descriptor, item.Value); err != nil {
+			return nil, fmt.Errorf("load workchain %d descriptor for %s: %w", workchainID, storage.FormatBlockRef(state.Block), err)
+		}
+		fields := descriptor.Fields()
+		if !fields.Active {
+			continue
+		}
+		if len(fields.ZeroStateRootHash) != 32 || len(fields.ZeroStateFileHash) != 32 {
+			return nil, fmt.Errorf("workchain %d has invalid zerostate hashes", workchainID)
+		}
+
+		shards = append(shards, ton.BlockIDExt{
+			Workchain: workchainID,
+			Shard:     masterchainShard,
+			RootHash:  fields.ZeroStateRootHash,
+			FileHash:  fields.ZeroStateFileHash,
+		})
+	}
 	return shards, nil
 }
 

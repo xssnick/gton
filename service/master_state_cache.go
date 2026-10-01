@@ -47,13 +47,13 @@ type monitorSplitDepthKey struct {
 	workchain  int32
 }
 
-func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockState, block *PreparedBlock, shardTargets []ton.BlockIDExt) {
+func (s *SyncCoordinator) rememberMasterState(ctx context.Context, state *storage.BlockState, block *PreparedBlock) {
 	if state.Block.Workchain != -1 || state.Block.Shard != topShard || state.Cell == nil {
 		return
 	}
 
 	s.rememberAppliedMasterCompressedState(state)
-	s.updateP2PShardOverlays(ctx, state, block, shardTargets)
+	s.updateP2PShardOverlays(ctx, state, block, nil)
 }
 
 // rememberAppliedMasterCompressedState publishes a freshly applied masterchain
@@ -61,7 +61,7 @@ func (s *Service) rememberMasterState(ctx context.Context, state *storage.BlockS
 // decompression cache read by the p2p broadcast decode, and the consensus cache
 // read when the next block's proof is validated. Both gate the next live head,
 // so the apply loop runs this before the slower publish and overlay work.
-func (s *Service) rememberAppliedMasterCompressedState(state *storage.BlockState) {
+func (s *SyncCoordinator) rememberAppliedMasterCompressedState(state *storage.BlockState) {
 	if state.Block.Workchain != -1 || state.Block.Shard != topShard || state.Cell == nil {
 		return
 	}
@@ -94,7 +94,7 @@ func (s *Service) rememberAppliedMasterCompressedState(state *storage.BlockState
 	}
 }
 
-func (s *Service) updateMasterDependentCachesForKeyBlock(state *storage.BlockState, block *PreparedBlock) error {
+func (s *SyncCoordinator) updateMasterDependentCachesForKeyBlock(state *storage.BlockState, block *PreparedBlock) error {
 	if !block.Meta.Has(storage.BlockMetaIsKeyBlock) {
 		return nil
 	}
@@ -111,7 +111,7 @@ func (s *Service) updateMasterDependentCachesForKeyBlock(state *storage.BlockSta
 
 // RememberCompressedBlockState stores a state for compressed p2p broadcasts,
 // which chain freshly decoded merkle updates onto their base state.
-func (s *Service) RememberCompressedBlockState(state *storage.BlockState) bool {
+func (s *SyncCoordinator) RememberCompressedBlockState(state *storage.BlockState) bool {
 	if state.Cell == nil {
 		return false
 	}
@@ -149,7 +149,7 @@ func (s *Service) RememberCompressedBlockState(state *storage.BlockState) bool {
 	return true
 }
 
-func (s *Service) cachedCompressedBlockState(block ton.BlockIDExt) (*storage.BlockState, error) {
+func (s *SyncCoordinator) cachedCompressedBlockState(block ton.BlockIDExt) (*storage.BlockState, error) {
 	key := storage.BlockKey(block)
 	now := time.Now()
 
@@ -167,7 +167,7 @@ func (s *Service) cachedCompressedBlockState(block ton.BlockIDExt) (*storage.Blo
 	return storage.CloneBlockState(entry.state), nil
 }
 
-func (s *Service) pruneCompressedBlockStatesLocked(now time.Time) {
+func (s *SyncCoordinator) pruneCompressedBlockStatesLocked(now time.Time) {
 	if len(s.compressedStateCache) == 0 {
 		s.compressedStateOrder = nil
 		s.compressedStateOrderHead = 0
@@ -193,7 +193,7 @@ func (s *Service) pruneCompressedBlockStatesLocked(now time.Time) {
 	}
 }
 
-func (s *Service) evictOldestCompressedBlockStateLocked() {
+func (s *SyncCoordinator) evictOldestCompressedBlockStateLocked() {
 	for s.compressedStateOrderHead < len(s.compressedStateOrder) {
 		oldest := s.compressedStateOrder[s.compressedStateOrderHead]
 		s.compressedStateOrderHead++
@@ -213,7 +213,7 @@ func (s *Service) evictOldestCompressedBlockStateLocked() {
 	s.compressedStateOrderHead = 0
 }
 
-func (s *Service) compactCompressedBlockStateOrderLocked() {
+func (s *SyncCoordinator) compactCompressedBlockStateOrderLocked() {
 	write := 0
 	for _, ordered := range s.compressedStateOrder[s.compressedStateOrderHead:] {
 		entry, ok := s.compressedStateCache[ordered.key]
@@ -227,13 +227,13 @@ func (s *Service) compactCompressedBlockStateOrderLocked() {
 	s.compressedStateOrderHead = 0
 }
 
-func (s *Service) resetMonitorSplitDepthCache() {
+func (s *SyncCoordinator) resetMonitorSplitDepthCache() {
 	s.monitorSplitDepthMu.Lock()
 	clear(s.monitorSplitDepth)
 	s.monitorSplitDepthMu.Unlock()
 }
 
-func (s *Service) cachedMonitorMinSplitDepth(state *storage.BlockState, workchain int32) (uint32, error) {
+func (s *SyncCoordinator) cachedMonitorMinSplitDepth(state *storage.BlockState, workchain int32) (uint32, error) {
 	key := monitorSplitDepthKey{
 		masterRoot: storage.BlockKey(state.Block),
 		workchain:  workchain,
@@ -261,7 +261,7 @@ func (s *Service) cachedMonitorMinSplitDepth(state *storage.BlockState, workchai
 	return depth, nil
 }
 
-func (s *Service) updateP2PShardOverlays(ctx context.Context, state *storage.BlockState, block *PreparedBlock, shardTargets []ton.BlockIDExt) {
+func (s *SyncCoordinator) updateP2PShardOverlays(ctx context.Context, state *storage.BlockState, block *PreparedBlock, shardTargets []ton.BlockIDExt) {
 	if !s.updateP2PMonitorMinSplitDepth(state) {
 		return
 	}
@@ -272,7 +272,7 @@ func (s *Service) updateP2PShardOverlays(ctx context.Context, state *storage.Blo
 // non-key masters it is a cache hit, and node.overlayBlockForDownload needs the
 // depth before the next shard download picks an overlay, so it stays on the
 // apply loop even when the reconcile below is deferred.
-func (s *Service) updateP2PMonitorMinSplitDepth(state *storage.BlockState) bool {
+func (s *SyncCoordinator) updateP2PMonitorMinSplitDepth(state *storage.BlockState) bool {
 	depth, err := s.cachedMonitorMinSplitDepth(state, 0)
 	if err != nil {
 		s.log.Debug().
@@ -291,7 +291,7 @@ func (s *Service) updateP2PMonitorMinSplitDepth(state *storage.BlockState) bool 
 // activate/deactivate sweep. It must run after updateP2PMonitorMinSplitDepth
 // (the active set is computed at the monitor depth) and after the key-block
 // validator config was published.
-func (s *Service) reconcileP2PShardOverlays(ctx context.Context, state *storage.BlockState, block *PreparedBlock, shardTargets []ton.BlockIDExt) {
+func (s *SyncCoordinator) reconcileP2PShardOverlays(ctx context.Context, state *storage.BlockState, block *PreparedBlock, shardTargets []ton.BlockIDExt) {
 	// Every reconcile — deferred or synchronous (startup, archive import) —
 	// funnels through here, because each one deactivates every shard overlay
 	// outside its own set: two running at once, or an older one landing after a
@@ -367,7 +367,7 @@ type masterShardOverlayUpdate struct {
 // concurrently is not — each one deactivates every shard overlay outside its
 // own set, so a late older update would wipe overlays a newer one just
 // activated.
-func (s *Service) scheduleP2PShardOverlayUpdate(state *storage.BlockState, targets []ton.BlockIDExt) {
+func (s *SyncCoordinator) scheduleP2PShardOverlayUpdate(state *storage.BlockState, targets []ton.BlockIDExt) {
 	if state == nil || state.Block.Workchain != -1 || state.Block.Shard != topShard {
 		return
 	}
@@ -388,7 +388,7 @@ func (s *Service) scheduleP2PShardOverlayUpdate(state *storage.BlockState, targe
 	s.runAsync(s.runP2PShardOverlayUpdates)
 }
 
-func (s *Service) runP2PShardOverlayUpdates() {
+func (s *SyncCoordinator) runP2PShardOverlayUpdates() {
 	ctx := s.shutdownContext
 	if ctx == nil {
 		ctx = context.Background()
@@ -405,15 +405,11 @@ func (s *Service) runP2PShardOverlayUpdates() {
 		}
 		s.shardOverlayMu.Unlock()
 
-		if s.reconcileOverlaysHook != nil {
-			s.reconcileOverlaysHook(ctx, *update)
-			continue
-		}
 		s.reconcileP2PShardOverlays(ctx, update.state, nil, update.targets)
 	}
 }
 
-func (s *Service) masterBlockShardTargets(ctx context.Context, state *storage.BlockState, block *PreparedBlock, precomputed []ton.BlockIDExt) ([]ton.BlockIDExt, error) {
+func (s *SyncCoordinator) masterBlockShardTargets(ctx context.Context, state *storage.BlockState, block *PreparedBlock, precomputed []ton.BlockIDExt) ([]ton.BlockIDExt, error) {
 	// The apply pipeline already parsed the block and derived the shard targets
 	// before applying its transition; reuse them instead of a second full block
 	// parse on the hot path. ShardBlocksFromMasterBlock is a pure function of the
@@ -458,7 +454,7 @@ func (s *Service) masterBlockShardTargets(ctx context.Context, state *storage.Bl
 	return state2.ShardBlocksFromMasterBlock(state.Block, parsed)
 }
 
-func (s *Service) loadMasterStateForConsensus(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
+func (s *SyncCoordinator) loadMasterStateForConsensus(ctx context.Context, block ton.BlockIDExt) (*storage.BlockState, error) {
 	if block.Workchain == -1 && block.Shard == topShard {
 		key := storage.BlockKey(block)
 
@@ -473,7 +469,7 @@ func (s *Service) loadMasterStateForConsensus(ctx context.Context, block ton.Blo
 	return s.storage.BlockState(ctx, block)
 }
 
-func (s *Service) StateRootForCompressedBlock(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
+func (s *SyncCoordinator) StateRootForCompressedBlock(ctx context.Context, block ton.BlockIDExt) (*cell.Cell, error) {
 	// The compressed-state cache holds in-memory apply-time or decode-chained
 	// trees (materialized at least along recently changed paths); it must be
 	// consulted before currentStatus/liveState, whose Cell roots are swapped
@@ -487,9 +483,7 @@ func (s *Service) StateRootForCompressedBlock(ctx context.Context, block ton.Blo
 		return nil, err
 	}
 
-	s.currentStatusMu.RLock()
-	state, err = currentStateBlockState(s.currentStatus, block)
-	s.currentStatusMu.RUnlock()
+	state, err = s.status.currentBlockState(block)
 
 	if err == nil {
 		if state.Cell != nil {

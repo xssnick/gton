@@ -185,7 +185,7 @@ func nonfinalStateRoot(state *storage.BlockState) (*cell.Cell, error) {
 
 	root := state.Cell.Virtualize(0)
 	if len(state.StateRootHash) > 0 {
-		hash := root.HashKey(0)
+		hash := root.HashKeyAt(0)
 		if !bytes.Equal(hash[:], state.StateRootHash) {
 			return nil, fmt.Errorf("previous state root hash mismatch for %s: got=%x want=%x", storage.FormatBlockRef(state.Block), hash[:], state.StateRootHash)
 		}
@@ -212,7 +212,7 @@ func nonfinalLoadStateRoot(hash cell.Hash, records storage.StateCellRecords, bas
 }
 
 func nonfinalLazyCellRecord(hash cell.Hash, encoded []byte, loader cell.LazyCellLoader) (*cell.Cell, error) {
-	return storage.LazyCellRecord(storage.DecodeCellRecordTrusted(hash[:], encoded), loader)
+	return storage.DecodeLazyCellRecordTrusted(hash[:], encoded, loader)
 }
 
 func nonfinalSnapshotStateRecords(root *cell.Cell) (storage.StateCellRecords, error) {

@@ -31,7 +31,7 @@ func newShardBroadcastBlockCache(ttl time.Duration, maxBytes int64, maxItems int
 	}
 }
 
-func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tnstore.BlockMeta, blockRoot *cell.Cell, proofRoot *cell.Cell, stateUpdate *cell.Cell, now time.Time) error {
+func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, now time.Time) error {
 	if c.maxItems <= 0 || c.maxBytes <= 0 {
 		return fmt.Errorf("shard broadcast cache is disabled")
 	}
@@ -46,15 +46,12 @@ func (c *shardBroadcastBlockCache) storeAt(downloaded DownloadedBlock, meta *tns
 		key:          key,
 		block:        cloneBlockID(downloaded.ID),
 		kind:         downloaded.Kind,
-		blockRoot:    blockRoot,
-		proofRoot:    proofRoot,
-		stateUpdate:  stateUpdate,
 		blockBOC:     downloaded.BlockBOC,
 		proofBOC:     downloaded.ProofBOC,
 		isLink:       downloaded.IsLink,
-		meta:         meta.Clone(),
 		sourcePeerID: downloaded.SourcePeerID,
 		bytes:        size,
+		hot:          downloadedHotCacheEntry(downloaded),
 
 		signaturesVerifiedKey: append([]byte(nil), downloaded.SignaturesVerifiedKey...),
 	}
@@ -72,7 +69,7 @@ func (c *shardBroadcastBlockCache) HasBlock(block ton.BlockIDExt) bool {
 }
 
 func shardBroadcastBlockCacheSize(blockBOC []byte, proofBOC []byte) int64 {
-	return int64(len(blockBOC)*2 + len(proofBOC)*2 + shardBroadcastBlockCacheOverhead)
+	return int64(len(blockBOC) + len(proofBOC) + shardBroadcastBlockCacheOverhead)
 }
 
 func cloneBlockID(block ton.BlockIDExt) ton.BlockIDExt {
@@ -86,7 +83,7 @@ func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) bool {
 		return false
 	}
 
-	validated, err := validateShardBroadcastBlock(downloaded)
+	_, err := validateShardBroadcastBlock(downloaded)
 	if err != nil {
 		n.log.Debug().
 			Err(err).
@@ -95,7 +92,7 @@ func (n *Node) rememberShardBroadcastBlock(downloaded *DownloadedBlock) bool {
 		return false
 	}
 
-	if err = n.shardBroadcastCache.storeAt(*downloaded, validated.meta, validated.blockRoot, validated.proofRoot, validated.stateUpdate, time.Now()); err != nil {
+	if err = n.shardBroadcastCache.storeAt(*downloaded, time.Now()); err != nil {
 		n.log.Debug().
 			Err(err).
 			Stringer("block", tnstore.BlockRef(downloaded.ID)).
@@ -154,8 +151,11 @@ func (n *Node) notifyShardBroadcastBlock(block ton.BlockIDExt) {
 	n.shardBroadcastWaiters.notify(key)
 }
 
-func (n *Node) runShardBroadcastCacheJanitor(ctx context.Context) {
-	interval := shardBroadcastBlockCacheTTL / 2
+func (n *Node) runBroadcastBlockCacheJanitor(ctx context.Context) {
+	interval := broadcastBlockCacheHotTTL
+	if ttlInterval := shardBroadcastBlockCacheTTL / 2; ttlInterval < interval {
+		interval = ttlInterval
+	}
 	if interval <= 0 {
 		interval = time.Second
 	}
@@ -168,6 +168,7 @@ func (n *Node) runShardBroadcastCacheJanitor(ctx context.Context) {
 			return
 		case now := <-ticker.C:
 			n.shardBroadcastCache.prune(now)
+			n.masterchainNextBroadcastCache.prune(now)
 		}
 	}
 }

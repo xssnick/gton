@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 )
 
@@ -28,6 +29,14 @@ type plumtreeRuntime struct {
 	statsTimingInitialized bool
 	statsTimingEpoch       int64
 	statsJitter            plumtreeStatsJitter
+
+	lifecycleMu sync.Mutex
+	runCtx      context.Context
+	runCancel   context.CancelFunc
+	started     bool
+	closing     bool
+	workWG      sync.WaitGroup
+	closeOnce   sync.Once
 }
 
 type plumtreeMessageResult struct {
@@ -56,9 +65,10 @@ func newPlumtreeRuntime(sub *overlaySubscription) (*plumtreeRuntime, error) {
 			LocalID: sub.node.localID,
 			IsOriginalSender: sub.fastSync != nil &&
 				sub.fastSync.spec.localValidator,
-			Now: time.Now,
+			CanOriginate: true,
+			Now:          time.Now,
 		},
-		sub.node.plumtreeBudget,
+		sub.node.chainNode().plumtreeBudget,
 		sub,
 		newPlumtreeSignatureVerifier(
 			policySource,
@@ -84,8 +94,53 @@ func newPlumtreeRuntime(sub *overlaySubscription) (*plumtreeRuntime, error) {
 		origin:       origin,
 		stats:        stats,
 		wake:         make(chan struct{}, 1),
-		outbound:     make(chan plumtreeWireBatch, plumtreeOutboundBatchLimit),
+		// A batch holds at least one send, so any burst the outbound queue can
+		// admit fits here. The engine has already recorded these sends, and a
+		// dropped batch is never retried.
+		outbound: make(chan plumtreeWireBatch, plumtreeOutboundQueueLimit),
 	}, nil
+}
+
+// Start launches the runtime once. The runtime joins every goroutine it starts;
+// the subscription only supplies the parent lifetime.
+func (r *plumtreeRuntime) Start(parent context.Context) {
+	r.lifecycleMu.Lock()
+	if r.started || r.closing {
+		r.lifecycleMu.Unlock()
+		return
+	}
+
+	r.started = true
+	r.runCtx, r.runCancel = context.WithCancel(parent)
+	ctx := r.runCtx
+	r.workWG.Add(1)
+	r.lifecycleMu.Unlock()
+
+	go func() {
+		defer r.workWG.Done()
+		r.runLoop(ctx)
+	}()
+}
+
+// Wait joins only work owned by this runtime. It does not close the engine;
+// Close performs that after stopping admission and joining the same work.
+func (r *plumtreeRuntime) Wait() {
+	r.workWG.Wait()
+}
+
+func (r *plumtreeRuntime) Close() {
+	r.closeOnce.Do(func() {
+		r.lifecycleMu.Lock()
+		r.closing = true
+		cancel := r.runCancel
+		r.lifecycleMu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+		r.workWG.Wait()
+		r.engine.Close()
+	})
 }
 
 func (r *plumtreeRuntime) HandleMessage(
@@ -96,6 +151,9 @@ func (r *plumtreeRuntime) HandleMessage(
 ) error {
 	if !r.sub.isActive() {
 		return errOverlayInactive
+	}
+	if r.sub.chainBroadcastsPaused() {
+		return nil
 	}
 
 	result, err := r.processMessage(ctx, from, wire, body)
@@ -218,6 +276,48 @@ func (r *plumtreeRuntime) OriginateSimple(
 	return r.applyActions(actions)
 }
 
+func (r *plumtreeRuntime) OriginateSimpleWithSigner(
+	signer overlay.BroadcastSigner,
+	flags int32,
+	broadcastID [sha256.Size]byte,
+	data []byte,
+) error {
+	if !r.sub.isActive() {
+		return errOverlayInactive
+	}
+	origin, err := newPlumtreeSignerOrigin(signer, r.sub.quicEnvelope)
+	if err != nil {
+		return err
+	}
+	actions, err := r.engine.OriginateSimple(origin, flags, broadcastID, data)
+	r.notifyAlarmChanged()
+	if err != nil {
+		return err
+	}
+	return r.applyActions(actions)
+}
+
+func (r *plumtreeRuntime) originateSimpleWithCertificate(
+	certificate any,
+	flags int32,
+	broadcastID [sha256.Size]byte,
+	data []byte,
+) error {
+	if !r.sub.isActive() {
+		return errOverlayInactive
+	}
+	origin, err := r.origin.withCertificate(certificate)
+	if err != nil {
+		return err
+	}
+	actions, err := r.engine.OriginateSimple(origin, flags, broadcastID, data)
+	r.notifyAlarmChanged()
+	if err != nil {
+		return err
+	}
+	return r.applyActions(actions)
+}
+
 func (r *plumtreeRuntime) OriginateFEC(
 	flags int32,
 	data []byte,
@@ -234,6 +334,46 @@ func (r *plumtreeRuntime) OriginateFEC(
 	return r.applyActions(actions)
 }
 
+func (r *plumtreeRuntime) OriginateFECWithSigner(
+	signer overlay.BroadcastSigner,
+	flags int32,
+	data []byte,
+) error {
+	if !r.sub.isActive() {
+		return errOverlayInactive
+	}
+	origin, err := newPlumtreeSignerOrigin(signer, r.sub.quicEnvelope)
+	if err != nil {
+		return err
+	}
+	actions, err := r.engine.OriginateFEC(origin, flags, data)
+	r.notifyAlarmChanged()
+	if err != nil {
+		return err
+	}
+	return r.applyActions(actions)
+}
+
+func (r *plumtreeRuntime) originateFECWithCertificate(
+	certificate any,
+	flags int32,
+	data []byte,
+) error {
+	if !r.sub.isActive() {
+		return errOverlayInactive
+	}
+	origin, err := r.origin.withCertificate(certificate)
+	if err != nil {
+		return err
+	}
+	actions, err := r.engine.OriginateFEC(origin, flags, data)
+	r.notifyAlarmChanged()
+	if err != nil {
+		return err
+	}
+	return r.applyActions(actions)
+}
+
 func (r *plumtreeRuntime) HandleRepairQuery(
 	_ context.Context,
 	from PeerID,
@@ -242,6 +382,9 @@ func (r *plumtreeRuntime) HandleRepairQuery(
 	if !r.sub.isActive() {
 		return nil, errOverlayInactive
 	}
+	if r.sub.chainBroadcastsPaused() {
+		return tl.Serialize(BroadcastNotFound{}, true)
+	}
 	r.stats.telemetry.noteMessageReceived(plumtreeMessageRepairQuery)
 	return r.engine.HandleRepairQuery(time.Now(), from, request)
 }
@@ -249,6 +392,9 @@ func (r *plumtreeRuntime) HandleRepairQuery(
 func (r *plumtreeRuntime) applyActions(
 	actions plumtreeActions,
 ) error {
+	if r.sub.chainBroadcastsPaused() {
+		return nil
+	}
 	r.enqueueOutbounds(r.prepareOutboundBatch(actions.Outbounds))
 	r.startVerifiedRepairs(actions.Candidates)
 	for _, delivery := range actions.Deliveries {
@@ -302,6 +448,13 @@ func (r *plumtreeRuntime) deliver(delivery plumtreeDelivery) error {
 		return fmt.Errorf("parse Plumtree payload: %w", err)
 	}
 
+	r.sub.node.chainNode().noteBroadcast(
+		"received",
+		r.sub.spec.Name,
+		broadcastKindLabel(message),
+		DeliveryPlumtree,
+	)
+
 	r.sub.handleOverlayBroadcastPayload(
 		nil,
 		message,
@@ -313,6 +466,41 @@ func (r *plumtreeRuntime) deliver(delivery plumtreeDelivery) error {
 	return nil
 }
 
+func (n *Node) OriginatePlumtreeSimple(
+	ctx context.Context,
+	overlayID PeerID,
+	signer overlay.BroadcastSigner,
+	flags int32,
+	broadcastID [sha256.Size]byte,
+	payload []byte,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sub := n.subscriptionByOverlayShortID(overlayID[:])
+	if sub == nil || sub.plumtree == nil {
+		return errPlumtreeDisabled
+	}
+	return sub.plumtree.OriginateSimpleWithSigner(signer, flags, broadcastID, payload)
+}
+
+func (n *Node) OriginatePlumtreeFEC(
+	ctx context.Context,
+	overlayID PeerID,
+	signer overlay.BroadcastSigner,
+	flags int32,
+	payload []byte,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sub := n.subscriptionByOverlayShortID(overlayID[:])
+	if sub == nil || sub.plumtree == nil {
+		return errPlumtreeDisabled
+	}
+	return sub.plumtree.OriginateFECWithSigner(signer, flags, payload)
+}
+
 // Checks the signature a buffered announcer deferred, then asks the survivors for
 // the part. Serial and on the caller's goroutine: candidates for one part carry
 // the same source signature over the same preimage, so only the first pays key
@@ -321,6 +509,15 @@ func (r *plumtreeRuntime) deliver(delivery plumtreeDelivery) error {
 // A candidate that fails is dropped and its peer banned for 5s. Nothing reaches
 // the network before the signature holds.
 func (r *plumtreeRuntime) startVerifiedRepairs(candidates []plumtreeRepairCandidate) {
+	if len(candidates) == 0 {
+		return
+	}
+
+	ctx, ok := r.repairContext()
+	if !ok {
+		return
+	}
+
 	for _, candidate := range candidates {
 		now := time.Now()
 		if err := validatePlumtreeTimestamp(candidate.PayloadTimestamp, now); err != nil {
@@ -329,7 +526,7 @@ func (r *plumtreeRuntime) startVerifiedRepairs(candidates []plumtreeRepairCandid
 
 		plumtreeIHaveVerifiableTotal.Add(1)
 		if _, err := r.engine.verifier.VerifyPlumtree(
-			r.sub.node.runCtx,
+			ctx,
 			plumtreeVerification{
 				From:        candidate.Peer,
 				Source:      candidate.Source,
@@ -352,32 +549,66 @@ func (r *plumtreeRuntime) startVerifiedRepairs(candidates []plumtreeRepairCandid
 }
 
 func (r *plumtreeRuntime) startRepair(action plumtreeRepairAction) {
-	r.sub.node.runAsync(func() {
-		if err := r.runRepair(action); err != nil {
+	ctx, ok := r.beginRepair()
+	if !ok {
+		_ = r.engine.FinishRepair(action.ID)
+		return
+	}
+
+	go func() {
+		defer r.workWG.Done()
+		if err := r.runRepair(ctx, action); err != nil {
 			r.sub.log.Debug().
 				Err(err).
 				Str("peer_id", action.To.String()).
 				Msg("Plumtree repair failed")
 		}
-	})
+	}()
 }
 
-func (r *plumtreeRuntime) runRepair(action plumtreeRepairAction) error {
+func (r *plumtreeRuntime) repairContext() (context.Context, bool) {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+
+	if !r.started || r.closing || r.runCtx.Err() != nil {
+		return nil, false
+	}
+	return r.runCtx, true
+}
+
+func (r *plumtreeRuntime) beginRepair() (context.Context, bool) {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+
+	if !r.started || r.closing || r.runCtx.Err() != nil {
+		return nil, false
+	}
+	r.workWG.Add(1)
+	return r.runCtx, true
+}
+
+func (r *plumtreeRuntime) runRepair(
+	parent context.Context,
+	action plumtreeRepairAction,
+) error {
 	// The successful path consumes the attempt inside HandleRepair*; every other
 	// exit releases the slot here, as a harmless unknown-attempt no-op.
 	defer func() {
 		_ = r.engine.FinishRepair(action.ID)
 	}()
+	if r.sub.chainBroadcastsPaused() {
+		return nil
+	}
 
 	path, err := r.sub.quicPeerPath(action.To)
 	if err != nil {
 		return err
 	}
-	if !path.route.quicReady(time.Now()) {
+	if !path.route.QUICReady(time.Now()) {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(r.sub.node.runCtx, action.Timeout)
+	ctx, cancel := context.WithTimeout(parent, action.Timeout)
 	defer cancel()
 
 	peer, err := path.dialGated(ctx)
@@ -396,6 +627,9 @@ func (r *plumtreeRuntime) runRepair(action plumtreeRepairAction) error {
 		return fmt.Errorf("query Plumtree repair: %w", err)
 	}
 
+	if r.sub.chainBroadcastsPaused() {
+		return nil
+	}
 	actions, err := r.processRepairAnswer(ctx, action, answer)
 	r.notifyAlarmChanged()
 	deliveryErr := r.applyActions(actions)
@@ -472,7 +706,7 @@ func (r *plumtreeRuntime) notifyAlarmChanged() {
 	}
 }
 
-func (r *plumtreeRuntime) run(ctx context.Context) {
+func (r *plumtreeRuntime) runLoop(ctx context.Context) {
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
 		<-timer.C
@@ -524,24 +758,21 @@ func (r *plumtreeRuntime) run(ctx context.Context) {
 		}
 
 		now := time.Now()
-		next, scheduled := r.nextAlarm(now)
-		var alarm <-chan time.Time
-		if scheduled {
-			delay := time.Until(next)
-			if delay < 0 {
-				delay = 0
-			}
-			timer.Reset(delay)
-			alarm = timer.C
+		next := r.nextAlarm(now)
+		delay := time.Until(next)
+		if delay < 0 {
+			delay = 0
 		}
+		timer.Reset(delay)
+		alarm := timer.C
 
 		select {
 		case <-ctx.Done():
 			return
 		case <-r.wake:
-			stopPlumtreeTimer(timer, scheduled)
+			stopPlumtreeTimer(timer)
 		case batch := <-r.outbound:
-			stopPlumtreeTimer(timer, scheduled)
+			stopPlumtreeTimer(timer)
 			dropped := queue.add(batch)
 			if dropped > 0 && dropLogEnabled {
 				droppedSinceLog += dropped
@@ -555,28 +786,33 @@ func (r *plumtreeRuntime) run(ctx context.Context) {
 				}
 			}
 		case peer := <-done:
-			stopPlumtreeTimer(timer, scheduled)
+			stopPlumtreeTimer(timer)
 			queue.finish(peer)
 			activeSends--
 		case <-alarm:
 			handledAt := time.Now()
-			r.tickStats(ctx, handledAt)
+			r.tickStats(handledAt)
 			actions := r.engine.Alarm(handledAt)
 			_ = r.applyActions(actions)
 		}
 	}
 }
 
-func (r *plumtreeRuntime) nextAlarm(now time.Time) (time.Time, bool) {
+func (r *plumtreeRuntime) RemovePeer(peer PeerID) {
+	r.engine.RemovePeer(peer)
+	r.notifyAlarmChanged()
+}
+
+func (r *plumtreeRuntime) nextAlarm(now time.Time) time.Time {
 	next, scheduled := r.engine.NextAlarm()
 	statsAt := r.stats.NextAt(now, r.statsJitterAt(now))
 	if !scheduled || statsAt.Before(next) {
-		return statsAt, true
+		return statsAt
 	}
-	return next, true
+	return next
 }
 
-func (r *plumtreeRuntime) tickStats(ctx context.Context, now time.Time) {
+func (r *plumtreeRuntime) tickStats(now time.Time) {
 	jitter := r.statsJitterAt(now)
 	schedule := r.stats.Schedule(now, jitter)
 	eager := r.engine.statsEagerSnapshot(schedule.rotatingTree)
@@ -637,8 +873,8 @@ func (r *plumtreeRuntime) statsJitterAt(now time.Time) plumtreeStatsJitter {
 	return r.statsJitter
 }
 
-func stopPlumtreeTimer(timer *time.Timer, running bool) {
-	if !running || timer.Stop() {
+func stopPlumtreeTimer(timer *time.Timer) {
+	if timer.Stop() {
 		return
 	}
 	select {
@@ -686,8 +922,11 @@ func (s *overlaySubscription) plumtreePinnedPeers() []PeerID {
 
 func (s *overlaySubscription) PlumtreePeerReceivesBroadcasts(peer PeerID) bool {
 	s.mx.Lock()
-	_, rosterPeer := s.peers[peer]
-	receives := !s.removed && !s.inactive && rosterPeer
+	row := s.peers[peer]
+	receives := !s.removed && !s.inactive && row != nil
+	if receives && s.fastSync == nil {
+		receives = row.receivesBroadcasts()
+	}
 	s.mx.Unlock()
 	if receives && s.fastSync != nil {
 		return s.fastSync.peerReceivesBroadcasts(peer)
@@ -702,8 +941,11 @@ func (s *overlaySubscription) PlumtreePeersReceiveBroadcasts(
 	s.mx.Lock()
 	alive := !s.removed && !s.inactive
 	for i, peer := range peers {
-		_, rosterPeer := s.peers[peer]
-		out[i] = alive && rosterPeer
+		row := s.peers[peer]
+		out[i] = alive && row != nil
+		if out[i] && s.fastSync == nil {
+			out[i] = row.receivesBroadcasts()
+		}
 	}
 	s.mx.Unlock()
 
@@ -722,7 +964,6 @@ func (n *Node) removePlumtreePeer(peer PeerID) {
 		if entry.sub.plumtree == nil {
 			continue
 		}
-		entry.sub.plumtree.engine.RemovePeer(peer)
-		entry.sub.plumtree.notifyAlarmChanged()
+		entry.sub.plumtree.RemovePeer(peer)
 	}
 }

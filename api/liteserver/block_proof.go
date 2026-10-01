@@ -193,7 +193,7 @@ func (s *Server) checkKnownMasterBlock(base *blockProofBase, id ton.BlockIDExt) 
 		return nil
 	}
 
-	old, err := runMethodOldMasterBlockID(base.prevBlocks, id.SeqNo)
+	old, err := blockproof.OldMasterBlockID(base.prevBlocks, id.SeqNo)
 	if err != nil {
 		return err
 	}
@@ -403,28 +403,11 @@ func blockProofPrevBlocks(stateRoot *cell.Cell) (*tlb.OldMcBlocksInfoAugDict, er
 		return nil, err
 	}
 
-	loader, err := prefix.Info.BeginParse()
+	info, err := blockproof.LoadMasterStateInfo(prefix.Info)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := loader.LoadUInt(16); err != nil {
-		return nil, err
-	}
-	if _, err := loader.LoadUInt(32); err != nil {
-		return nil, err
-	}
-	if _, err := loader.LoadUInt(32); err != nil {
-		return nil, err
-	}
-	if _, err := loader.LoadBoolBit(); err != nil {
-		return nil, err
-	}
-
-	prevBlocks := &tlb.OldMcBlocksInfoAugDict{}
-	if err := prevBlocks.LoadFromCell(loader); err != nil {
-		return nil, err
-	}
-	return prevBlocks, nil
+	return info.PrevBlocks, nil
 }
 
 func keyBlockFromPrevBlocks(prevBlocks *tlb.OldMcBlocksInfoAugDict, seqno uint32, next bool) (ton.BlockIDExt, error) {
@@ -448,7 +431,7 @@ func keyBlockFromPrevBlocks(prevBlocks *tlb.OldMcBlocksInfoAugDict, seqno uint32
 				return 0, err
 			}
 			if ref.IsKey && ((next && ref.BlkRef.SeqNo >= seqno) || (!next && ref.BlkRef.SeqNo <= seqno)) {
-				found = runMethodExtBlkRef(ref.BlkRef)
+				found = blockIDFromExtRef(masterchainID, masterchainShard, ref.BlkRef)
 				return 1, nil
 			}
 			return 0, nil

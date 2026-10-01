@@ -25,7 +25,7 @@ type exactBlockDownloadProbeDecision struct {
 	urgentFanout      bool
 }
 
-func (s *Service) exactBlockDownloadProbeDecision(state exactBlockDownloadProbeState) exactBlockDownloadProbeDecision {
+func (s *SyncCoordinator) exactBlockDownloadProbeDecision(state exactBlockDownloadProbeState) exactBlockDownloadProbeDecision {
 	decision := exactBlockDownloadProbeDecision{
 		peerLimit:         exactBlockDownloadProbePeers,
 		stagedPeerLimit:   exactBlockDownloadProbePeers,
@@ -70,7 +70,7 @@ func (d exactBlockDownloadProbeDecision) probeTimeout() time.Duration {
 	return nextBlockBootstrapLiveProbeTimeout
 }
 
-func (s *Service) downloadExactChainBlockProbe(ctx context.Context, block ton.BlockIDExt, state exactBlockDownloadProbeState) (p2p.DownloadedBlock, SyncBlockSource, error) {
+func (s *SyncCoordinator) downloadExactChainBlockProbe(ctx context.Context, block ton.BlockIDExt, state exactBlockDownloadProbeState) (p2p.DownloadedBlock, SyncBlockSource, error) {
 	decision := s.exactBlockDownloadProbeDecision(state)
 	queryCtx, cancel := context.WithTimeout(ctx, decision.probeTimeout())
 	defer cancel()

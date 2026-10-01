@@ -31,6 +31,7 @@ type PreparedBlock struct {
 
 	IsLink       bool
 	Origin       SyncBlockOrigin
+	Source       SyncBlockSource
 	SourcePeerID p2p.PeerID
 }
 
@@ -48,6 +49,7 @@ type VerifiedBlock struct {
 	consensusChecked *checkedMasterchainConsensus
 
 	IsLink       bool
+	Source       SyncBlockSource
 	SourcePeerID p2p.PeerID
 }
 
@@ -69,7 +71,7 @@ func parsePreparedBlock(block PreparedBlock) (*tlb.Block, error) {
 	return storage.ParseVerifiedBlockCell(block.ID, block.BlockRoot)
 }
 
-func (s *Service) verifyDownloadedBlock(downloaded p2p.DownloadedBlock) (VerifiedBlock, error) {
+func (s *SyncCoordinator) verifyDownloadedBlock(downloaded p2p.DownloadedBlock) (VerifiedBlock, error) {
 	if len(downloaded.BlockBOC) == 0 {
 		return VerifiedBlock{}, fmt.Errorf("block %s has no block BOC", downloaded.BlockRef())
 	}
@@ -162,6 +164,11 @@ func checkVerifiedMasterchainBlockFollows(prev ton.BlockIDExt, block VerifiedBlo
 }
 
 func preparedBlockWithStateCells(block VerifiedBlock, cells storage.StateCellRecords, elapsed time.Duration) PreparedBlock {
+	origin := syncBlockOriginForKind(block.Kind)
+	if block.Source == SyncBlockSourceInternal {
+		origin = SyncBlockOriginOther
+	}
+
 	return PreparedBlock{
 		ID:                        block.ID,
 		BlockBOC:                  block.BlockBOC,
@@ -175,12 +182,13 @@ func preparedBlockWithStateCells(block VerifiedBlock, cells storage.StateCellRec
 		consensus:                 block.consensus,
 		consensusChecked:          block.consensusChecked,
 		IsLink:                    block.IsLink,
-		Origin:                    syncBlockOriginForKind(block.Kind),
+		Origin:                    origin,
+		Source:                    block.Source,
 		SourcePeerID:              block.SourcePeerID,
 	}
 }
 
-func (s *Service) prepareDownloadedBlockForApply(downloaded p2p.DownloadedBlock) (PreparedBlock, error) {
+func (s *SyncCoordinator) prepareDownloadedBlockForApply(downloaded p2p.DownloadedBlock) (PreparedBlock, error) {
 	started := time.Now()
 	block, err := s.verifyDownloadedBlock(downloaded)
 	if err != nil {

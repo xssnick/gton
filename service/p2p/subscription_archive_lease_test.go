@@ -19,7 +19,7 @@ func TestSetActiveShardOverlaysDefersLeasedSubscriptionDeactivation(t *testing.T
 	if err := node.SetActiveShardOverlays([]ton.BlockIDExt{{Workchain: 0, Shard: leftShard}}); err != nil {
 		t.Fatalf("set active left overlay: %v", err)
 	}
-	leftSub := testSubscriptionForOverlay(t, node, 0, leftShard)
+	leftSub := testSubscriptionForBasechainOverlay(t, node, leftShard)
 	release, err := leftSub.beginArchiveUse()
 	if err != nil {
 		t.Fatalf("begin archive use: %v", err)
@@ -173,7 +173,7 @@ func TestArchiveUseLeaseKeepsEnsurePeersActive(t *testing.T) {
 	peerID := testPeerID("archive-lease-peer")
 	sub.peers[peerID] = &overlayPeer{
 		id:        peerID,
-		announced: &overlay.Node{Version: int32(time.Now().Unix())},
+		announced: &overlay.NodeV2{Version: int32(time.Now().Unix())},
 		overlay:   &overlay.ADNLOverlayWrapper{},
 		release:   func() {},
 		alive:     true,

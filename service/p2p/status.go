@@ -174,6 +174,9 @@ type fecReceiverCounterSnapshot struct {
 
 func (n *Node) StatusSnapshot() StatusSnapshot {
 	subscriptions := n.subscriptionsSnapshot()
+	if n.privateNetwork != nil {
+		subscriptions = append(subscriptions, n.privateNetwork.subscriptionsSnapshot()...)
+	}
 	snapshot := StatusSnapshot{
 		ListenAddr:    n.listenAddr,
 		Offline:       n.IsOffline(),
@@ -185,6 +188,12 @@ func (n *Node) StatusSnapshot() StatusSnapshot {
 	snapshot.QUICPeers = len(n.quicPeers)
 	n.quicPeersMx.RUnlock()
 	snapshot.QUICPeersAccepted = n.quicPeersAccepted.Load()
+	if n.privateNetwork != nil {
+		n.privateNetwork.quicPeersMx.RLock()
+		snapshot.QUICPeers += len(n.privateNetwork.quicPeers)
+		n.privateNetwork.quicPeersMx.RUnlock()
+		snapshot.QUICPeersAccepted += n.privateNetwork.quicPeersAccepted.Load()
+	}
 
 	n.latestBlocksMx.RLock()
 	if n.observedMasterchain != nil {
@@ -390,7 +399,11 @@ func (n *Node) peerRebroadcastQueueStatusSnapshot() (QueueStatusSnapshot, QueueS
 	regular := QueueStatusSnapshot{Name: "rebroadcast"}
 	local := QueueStatusSnapshot{Name: "local_rebroadcast"}
 
-	for _, sub := range n.subscriptionsSnapshot() {
+	subscriptions := n.subscriptionsSnapshot()
+	if n.privateNetwork != nil {
+		subscriptions = append(subscriptions, n.privateNetwork.subscriptionsSnapshot()...)
+	}
+	for _, sub := range subscriptions {
 		for _, peer := range sub.peersSnapshot() {
 			localPeer, regularPeer, ok := peer.rebroadcastQueueSnapshots()
 			if !ok {
@@ -407,7 +420,11 @@ func (n *Node) peerRebroadcastQueueStatusSnapshot() (QueueStatusSnapshot, QueueS
 func (n *Node) twoStepQueueStatusSnapshot() (QueueStatusSnapshot, bool) {
 	total := QueueStatusSnapshot{Name: twoStepRebroadcastQueueName}
 	found := false
-	for _, sub := range n.subscriptionsSnapshot() {
+	subscriptions := n.subscriptionsSnapshot()
+	if n.privateNetwork != nil {
+		subscriptions = append(subscriptions, n.privateNetwork.subscriptionsSnapshot()...)
+	}
+	for _, sub := range subscriptions {
 		next, ok := sub.twoStepQueueStatusSnapshot()
 		if !ok {
 			continue

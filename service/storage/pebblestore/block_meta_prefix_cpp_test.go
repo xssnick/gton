@@ -8,6 +8,7 @@ import (
 	"sort"
 	"testing"
 
+	sharddomain "github.com/xssnick/gton/service/shard"
 	"github.com/xssnick/gton/service/storage"
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -54,7 +55,10 @@ func cppBlockCommon(
 		maxDepth = 0
 	}
 	for depth := uint32(0); depth <= maxDepth; depth++ {
-		prefix := storage.AccountShardPrefix(uint64(shard), depth)
+		prefix, err := sharddomain.FromAccountPrefix(uint64(shard), depth)
+		if err != nil {
+			panic(err)
+		}
 		entries, ok := histories[prefix]
 		if !ok || len(entries) == 0 {
 			if !seenAny {
@@ -184,7 +188,7 @@ func (tl *shardTimeline) histories() map[int64][]cppHistoryEntry {
 	return histories
 }
 
-func (tl *shardTimeline) save(t *testing.T, store *Store) {
+func (tl *shardTimeline) save(t testing.TB, store *Store) {
 	t.Helper()
 
 	// Go through the served-artifact path rather than SaveBlockMeta: the index
@@ -212,7 +216,7 @@ func (tl *shardTimeline) save(t *testing.T, store *Store) {
 	}
 }
 
-func openLookupTestStore(t *testing.T) *Store {
+func openLookupTestStore(t testing.TB) *Store {
 	t.Helper()
 
 	store, err := Open(Options{Dir: t.TempDir()})
@@ -225,6 +229,32 @@ func openLookupTestStore(t *testing.T) *Store {
 		}
 	})
 	return store
+}
+
+func BenchmarkPrefixHistoryLookup(b *testing.B) {
+	store := openLookupTestStore(b)
+	timeline := splitMergeTimeline(0)
+	timeline.save(b, store)
+	key := storage.BlockHistoryKey{Workchain: 0, Shard: 0x4000000000000000}
+	ctx := context.Background()
+
+	b.Run("lt", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := store.LookupBlockByLTForPrefix(ctx, key, 1_495); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("unix-time", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := store.LookupBlockByUnixTimeForPrefix(ctx, key, 1_495); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func describeBlock(block ton.BlockIDExt, ok bool) string {

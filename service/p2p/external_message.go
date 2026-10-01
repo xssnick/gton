@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/internal/extmsg"
-	"github.com/xssnick/gton/service/externalmsg"
 	"github.com/xssnick/tonutils-go/address"
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
@@ -87,6 +86,30 @@ func (n *Node) sendExternalMessage(ctx context.Context, data []byte, addrKey ext
 		Message:  msg,
 	}
 
+	// The address limit and the broadcast capacity are taken before admission:
+	// admission may put the message into this node's pool, and a refusal after
+	// that tells the client the message failed while it can still be included.
+	if err = n.addExternalMessageAddressLimit(addrKey, now); err != nil {
+		return err
+	}
+
+	costBytes := externalBroadcastCostBytes(pending, len(payload))
+	sendAt, err := n.externalBroadcastPacer.Reserve(costBytes)
+	if err != nil {
+		n.externalMessageLimiter.Remove(addrKey, now)
+		return err
+	}
+
+	if err = n.admitAndEnqueueExternalMessage(ctx, ev, checked, sendAt, pending, payload); err != nil {
+		n.externalBroadcastPacer.Cancel(sendAt, costBytes)
+		n.externalMessageLimiter.Remove(addrKey, now)
+		return err
+	}
+	return nil
+}
+
+func (n *Node) admitAndEnqueueExternalMessage(ctx context.Context, ev ExternalMessageEvent, checked bool, sendAt time.Time, targets []externalMessageTarget, payload []byte) error {
+	var err error
 	if checked {
 		err = n.acceptCheckedExternalMessage(ctx, ev)
 	} else {
@@ -96,11 +119,10 @@ func (n *Node) sendExternalMessage(ctx context.Context, data []byte, addrKey ext
 		return err
 	}
 
-	costBytes := externalBroadcastCostBytes(pending, len(payload))
-	if err = n.externalBroadcastPacer.Wait(ctx, costBytes); err != nil {
+	if err = n.externalBroadcastPacer.Wait(ctx, sendAt); err != nil {
 		return err
 	}
-	return n.enqueueExternalMessageTargets(addrKey, pending, payload, time.Now())
+	return n.enqueueExternalMessageTargets(targets, payload, time.Now())
 }
 
 func (n *Node) acceptExternalMessage(ctx context.Context, event ExternalMessageEvent) error {
@@ -126,11 +148,7 @@ type externalMessageTarget struct {
 	hash string
 }
 
-func (n *Node) enqueueExternalMessageTargets(addrKey extmsg.AddressKey, targets []externalMessageTarget, payload []byte, now time.Time) error {
-	if err := n.addExternalMessageAddressLimit(addrKey, now); err != nil {
-		return err
-	}
-
+func (n *Node) enqueueExternalMessageTargets(targets []externalMessageTarget, payload []byte, now time.Time) error {
 	queued := 0
 	for _, target := range targets {
 		req := rebroadcastRequest{
@@ -146,7 +164,6 @@ func (n *Node) enqueueExternalMessageTargets(addrKey extmsg.AddressKey, targets 
 		queued++
 	}
 	if queued == 0 {
-		n.externalMessageLimiter.Remove(addrKey, now)
 		return errors.New("local external message rebroadcast queues are full")
 	}
 	return nil
@@ -239,14 +256,14 @@ type parsedExternalMessage struct {
 }
 
 func parseExternalMessageData(data []byte) (parsedExternalMessage, error) {
-	root, message, err := externalmsg.ParseMessage(data)
+	root, message, err := extmsg.ParseMessage(data)
 	if err != nil {
 		return parsedExternalMessage{}, err
 	}
 	return parsedExternalMessage{
 		root:    root,
 		message: message,
-		address: externalmsg.AddressKey(message.DstAddr),
+		address: extmsg.AddressKeyFor(message.DstAddr),
 	}, nil
 }
 
@@ -257,7 +274,7 @@ func checkedExternalMessageAddressKey(addr *address.Address) (extmsg.AddressKey,
 	if addr.Type() != address.StdAddress || addr.BitsLen() != 256 {
 		return extmsg.AddressKey{}, errors.New("external message destination address is not a std 256-bit address")
 	}
-	return externalmsg.AddressKey(addr), nil
+	return extmsg.AddressKeyFor(addr), nil
 }
 
 func (n *Node) addExternalMessageAddressLimit(key extmsg.AddressKey, now time.Time) error {

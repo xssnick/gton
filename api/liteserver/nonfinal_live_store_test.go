@@ -334,16 +334,16 @@ func TestLiveStoreNonfinalUsesStateUpdateLazyOverlay(t *testing.T) {
 		},
 	})
 
-	usageTree := cell.NewCellUsageTree()
-	usageBaseState := baseState.WithTrace(usageTree.RootTrace())
+	readSet := cell.NewReadSet(baseState)
+	tracedBaseState := readSet.Root()
 	nextStateBlock := ton.BlockIDExt{Workchain: 0, Shard: masterchainShard, SeqNo: 11}
 	nextState, wantAccount := testShardStateWithAccount(t, nextStateBlock, accountID)
-	nextState = testNonfinalStateWithTracedRootRefs(t, nextState, usageBaseState)
-	update, err := usageTree.CreateMerkleUpdate(usageBaseState, nextState)
+	nextState = testNonfinalStateWithTracedRootRefs(t, nextState, tracedBaseState)
+	update, err := readSet.CreateMerkleUpdate(nextState)
 	if err != nil {
 		t.Fatalf("create merkle update: %v", err)
 	}
-	pendingBlock, pendingRoot := testNonfinalBlockForStateUpdate(t, 0, masterchainShard, 11, baseBlock, update)
+	pendingBlock, pendingRoot := testNonfinalBlockForStateUpdate(t, 11, baseBlock, update)
 	pending := storage.LiveBlockArtifacts{
 		Block:     pendingBlock,
 		Root:      pendingRoot,
@@ -373,17 +373,16 @@ func TestLiveStoreNonfinalRejectsStateUpdateFromDifferentPreviousRoot(t *testing
 
 	wrongBaseState := cell.BeginCell().MustStoreUInt(0x90, 8).EndCell()
 	nextState := cell.BeginCell().MustStoreUInt(0x91, 8).EndCell()
-	usageTree := cell.NewCellUsageTree()
-	usageWrongBase := wrongBaseState.WithTrace(usageTree.RootTrace())
-	if _, err := usageWrongBase.BeginParse(); err != nil {
+	readSet := cell.NewReadSet(wrongBaseState)
+	if _, err := readSet.Root().BeginParse(); err != nil {
 		t.Fatalf("trace wrong base state: %v", err)
 	}
-	update, err := usageTree.CreateMerkleUpdate(usageWrongBase, nextState)
+	update, err := readSet.CreateMerkleUpdate(nextState)
 	if err != nil {
 		t.Fatalf("create merkle update: %v", err)
 	}
 
-	pendingBlock, pendingRoot := testNonfinalBlockForStateUpdate(t, 0, masterchainShard, 11, base.Block, update)
+	pendingBlock, pendingRoot := testNonfinalBlockForStateUpdate(t, 11, base.Block, update)
 	err = live.PublishNonfinalBlockArtifacts(storage.LiveBlockArtifacts{
 		Block:     pendingBlock,
 		Root:      pendingRoot,
@@ -420,7 +419,7 @@ func TestLiveStoreNonfinalSignedValidatesExtractedStateUpdate(t *testing.T) {
 		t.Fatal("invalid update fixture passed validation")
 	}
 
-	pendingBlock, pendingRoot := testNonfinalBlockForStateUpdate(t, 0, masterchainShard, 11, base.Block, update)
+	pendingBlock, pendingRoot := testNonfinalBlockForStateUpdate(t, 11, base.Block, update)
 	err = live.PublishNonfinalBlockArtifacts(storage.LiveBlockArtifacts{
 		Block:            pendingBlock,
 		Root:             pendingRoot,
@@ -455,7 +454,7 @@ func TestLiveStoreNonfinalChecksPreviousStateBeforePreparingRecords(t *testing.T
 		t.Fatalf("create merkle update: %v", err)
 	}
 
-	pendingBlock, pendingRoot := testNonfinalBlockForStateUpdate(t, 0, masterchainShard, 11, base.Block, update)
+	pendingBlock, pendingRoot := testNonfinalBlockForStateUpdate(t, 11, base.Block, update)
 	err = live.PublishNonfinalBlockArtifacts(storage.LiveBlockArtifacts{
 		Block:            pendingBlock,
 		Root:             pendingRoot,
@@ -481,18 +480,17 @@ func TestLiveStoreNonfinalWaitsBeforePreparingStateUpdate(t *testing.T) {
 	parentState := cell.BeginCell().MustStoreUInt(0x93, 8).EndCell()
 	parent := testNonfinalArtifact(t, 0, masterchainShard, 11, parentState, base.Block)
 
-	usageTree := cell.NewCellUsageTree()
-	usageParentState := parentState.WithTrace(usageTree.RootTrace())
-	if _, err := usageParentState.BeginParse(); err != nil {
+	readSet := cell.NewReadSet(parentState)
+	if _, err := readSet.Root().BeginParse(); err != nil {
 		t.Fatalf("trace parent state: %v", err)
 	}
 	childState := cell.BeginCell().MustStoreUInt(0x94, 8).EndCell()
-	update, err := usageTree.CreateMerkleUpdate(usageParentState, childState)
+	update, err := readSet.CreateMerkleUpdate(childState)
 	if err != nil {
 		t.Fatalf("create merkle update: %v", err)
 	}
 
-	childBlock, childRoot := testNonfinalBlockForStateUpdate(t, 0, masterchainShard, 12, parent.Block, update)
+	childBlock, childRoot := testNonfinalBlockForStateUpdate(t, 12, parent.Block, update)
 	child := storage.LiveBlockArtifacts{
 		Block:     childBlock,
 		Root:      childRoot,
@@ -560,7 +558,7 @@ func TestLiveStoreNonfinalValidatesWaitingCandidateOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create child state update: %v", err)
 	}
-	childBlock, childRoot := testNonfinalBlockForStateUpdate(t, 0, masterchainShard, 12, parent.Block, update)
+	childBlock, childRoot := testNonfinalBlockForStateUpdate(t, 12, parent.Block, update)
 	child := storage.LiveBlockArtifacts{
 		Block:            childBlock,
 		Root:             childRoot,
@@ -906,8 +904,16 @@ func testNonfinalArtifact(t *testing.T, workchain int32, shard int64, seqno uint
 	}
 }
 
-func testNonfinalBlockForStateUpdate(t *testing.T, workchain int32, shard int64, seqno uint32, prev ton.BlockIDExt, update *cell.Cell) (ton.BlockIDExt, *cell.Cell) {
+func testNonfinalBlockForStateUpdate(
+	t *testing.T,
+	seqno uint32,
+	prev ton.BlockIDExt,
+	update *cell.Cell,
+) (ton.BlockIDExt, *cell.Cell) {
 	t.Helper()
+
+	const workchain = int32(0)
+	shard := int64(masterchainShard)
 
 	var header tlb.BlockHeader
 	header.Version = 1

@@ -10,7 +10,7 @@ type liveBlockPublishOptions struct {
 	availabilityOnly bool
 }
 
-func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *storage.BlockState, options liveBlockPublishOptions) {
+func (s *SyncCoordinator) publishLiveBlockArtifacts(downloaded PreparedBlock, state *storage.BlockState, options liveBlockPublishOptions) {
 	blockData := downloaded.BlockBOC
 
 	var proofs []storage.LiveBlockProofArtifact
@@ -63,7 +63,56 @@ func (s *Service) publishLiveBlockArtifacts(downloaded PreparedBlock, state *sto
 	}
 }
 
-func (s *Service) publishLiveCurrentBlockMarkers(current *storage.CurrentState) {
+// publishInternalNonfinalShardBlock gives locally accepted shard blocks the
+// same live-state visibility as signed blocks received from P2P. The live
+// store consumes the already extracted state update: it verifies that the
+// update applies to the resident predecessor and retains only the destination
+// cells, instead of walking or serializing the complete resulting state.
+func (s *SyncCoordinator) publishInternalNonfinalShardBlock(block VerifiedBlock) {
+	// Recovery can accept a shard block without retaining its full state. Its
+	// proof must still be readable by the next shard-top description, otherwise
+	// registration waits for a proof that ordinary apply only publishes AFTER
+	// registration. These artifacts are bounded independently of a future flush.
+	if s.liveBlockCache != nil {
+		var proofs []storage.LiveBlockProofArtifact
+		if len(block.ProofBOC) > 0 {
+			for _, kind := range storage.StoredProofKindsForServedBlock(block.ID, block.IsLink, block.Meta.Has(storage.BlockMetaIsKeyBlock)) {
+				proofs = append(proofs, storage.LiveBlockProofArtifact{Kind: kind, Data: block.ProofBOC})
+			}
+		}
+		if err := s.liveBlockCache.PublishLiveBlockArtifacts(storage.LiveBlockCacheArtifacts{
+			Block:     block.ID,
+			BlockData: block.BlockBOC,
+			Meta:      liveBlockArtifactMeta(block.ID, block.Meta, block.BlockBOC, proofs),
+			Proofs:    proofs,
+			Transient: true,
+		}); err != nil {
+			s.log.Debug().Err(err).
+				Str("block", storage.FormatBlockRef(block.ID)).
+				Msg("skip internal shard block artifacts")
+		}
+	}
+
+	if s.liveState == nil || !s.liveState.NonfinalBlockCacheEnabled() {
+		return
+	}
+
+	err := s.liveState.PublishNonfinalBlockArtifacts(storage.LiveBlockArtifacts{
+		Block:       block.ID,
+		Root:        block.BlockRoot,
+		BlockData:   block.BlockBOC,
+		Meta:        block.Meta,
+		StateUpdate: block.StateUpdate,
+	}, storage.LiveBlockNonfinalSigned)
+	if err != nil {
+		s.log.Debug().
+			Err(err).
+			Str("block", storage.FormatBlockRef(block.ID)).
+			Msg("skip internal non-final live block cache update")
+	}
+}
+
+func (s *SyncCoordinator) publishLiveCurrentBlockMarkers(current *storage.CurrentState) {
 	if s.liveState == nil {
 		return
 	}

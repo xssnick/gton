@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/xssnick/gton/service/externalmsg"
-	"github.com/xssnick/gton/service/hooks"
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/ton"
@@ -26,8 +25,8 @@ const (
 
 type Options struct {
 	Logger         *zerolog.Logger
-	Store          hooks.Store
-	Network        hooks.Network
+	Store          Store
+	Network        Network
 	TVM            *tvm.TVM
 	ListenAddr     string
 	RequestTimeout time.Duration
@@ -37,7 +36,7 @@ type Options struct {
 
 type Server struct {
 	log            zerolog.Logger
-	store          hooks.Store
+	store          Store
 	messageSender  *externalmsg.Sender
 	tvm            *tvm.TVM
 	listenAddr     string
@@ -49,6 +48,7 @@ type Server struct {
 
 	server   *http.Server
 	listener net.Listener
+	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 }
 
@@ -127,10 +127,13 @@ func (s *Server) Start(ctx context.Context) error {
 		ReadTimeout:       s.requestTimeout,
 	}
 
+	runCtx, cancel := context.WithCancel(ctx)
+	s.cancel = cancel
+
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		<-ctx.Done()
+		<-runCtx.Done()
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -142,6 +145,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer cancel()
 		s.log.Info().Str("listen_addr", s.listenAddr).Msg("started http api server")
 		if err := s.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.log.Error().Err(err).Str("listen_addr", s.listenAddr).Msg("http api server stopped")
@@ -152,10 +156,16 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) Close(ctx context.Context) error {
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.server == nil {
 		return nil
 	}
-	return s.server.Shutdown(ctx)
+	if err := s.server.Shutdown(ctx); err != nil {
+		return errors.Join(err, s.server.Close())
+	}
+	return nil
 }
 
 func (s *Server) Wait() {

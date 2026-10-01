@@ -1174,12 +1174,14 @@ func (v *replayValidator) blockContext(master ton.BlockIDExt, masterState *cell.
 	}
 
 	blockLT := block.Parsed.BlockInfo.StartLt
+	configAddress := [32]byte(extra.ConfigParams.ConfigAddr)
 	blockCtx, err := epoch.prepared.NewBlockContext(tvm.BlockOptions{
-		Now:        block.Parsed.BlockInfo.GenUtime,
-		BlockLT:    int64(blockLT),
-		RandSeed:   block.Parsed.Extra.RandSeed,
-		PrevBlocks: prevBlocks,
-		Libraries:  libraries,
+		Now:           block.Parsed.BlockInfo.GenUtime,
+		BlockLT:       int64(blockLT),
+		ConfigAddress: &configAddress,
+		RandSeed:      block.Parsed.Extra.RandSeed,
+		PrevBlocks:    prevBlocks,
+		Libraries:     libraries,
 	})
 	if err != nil {
 		return nil, err

@@ -1,89 +1,114 @@
 package service
 
 import (
+	"sync"
+	"sync/atomic"
+
 	"github.com/xssnick/gton/service/p2p"
 	"github.com/xssnick/gton/service/storage"
+
+	"github.com/rs/zerolog"
 )
 
-var _ p2p.BroadcastAdmission = (*Service)(nil)
+type BroadcastAdmission struct {
+	log                 zerolog.Logger
+	liveWindow          uint32
+	backpressureWindows uint32
 
-func (s *Service) CanAcceptBroadcast(_ p2p.BroadcastAdmissionRequest) bool {
-	return !s.broadcastAdmissionClosedAtomic.Load()
+	mu                 sync.Mutex
+	initialized        bool
+	closed             bool
+	closedAtomic       atomic.Bool
+	liveMasterSeqno    uint32
+	flushedMasterSeqno uint32
 }
 
-func (s *Service) observeBroadcastLiveCurrentState(current *storage.CurrentState) {
-	s.observeBroadcastCurrentState(current, false)
+func NewBroadcastAdmission(log zerolog.Logger, liveWindow uint32, backpressureWindows uint32) *BroadcastAdmission {
+	return &BroadcastAdmission{
+		log:                 log,
+		liveWindow:          liveWindow,
+		backpressureWindows: backpressureWindows,
+	}
 }
 
-func (s *Service) observeBroadcastFlushedCurrentState(current *storage.CurrentState) {
-	s.observeBroadcastCurrentState(current, true)
+var _ p2p.BroadcastAdmission = (*BroadcastAdmission)(nil)
+
+func (a *BroadcastAdmission) CanAcceptBroadcast(_ p2p.BroadcastAdmissionRequest) bool {
+	return !a.closedAtomic.Load()
 }
 
-func (s *Service) observeBroadcastCurrentState(current *storage.CurrentState, flushed bool) {
-	s.broadcastAdmissionMu.Lock()
-	defer s.broadcastAdmissionMu.Unlock()
+func (a *BroadcastAdmission) ObserveLiveCurrentState(current *storage.CurrentState) {
+	a.observeCurrentState(current, false)
+}
+
+func (a *BroadcastAdmission) ObserveFlushedCurrentState(current *storage.CurrentState) {
+	a.observeCurrentState(current, true)
+}
+
+func (a *BroadcastAdmission) observeCurrentState(current *storage.CurrentState, flushed bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
 	seqno := current.Masterchain.Block.SeqNo
-	if !s.broadcastAdmissionInitialized {
-		s.broadcastLiveMasterSeqno = seqno
-		s.broadcastFlushedMasterSeqno = seqno
-		s.broadcastAdmissionInitialized = true
-	} else if seqno > s.broadcastLiveMasterSeqno {
-		s.broadcastLiveMasterSeqno = seqno
+	if !a.initialized {
+		a.liveMasterSeqno = seqno
+		a.flushedMasterSeqno = seqno
+		a.initialized = true
+	} else if seqno > a.liveMasterSeqno {
+		a.liveMasterSeqno = seqno
 	}
-	if flushed && seqno > s.broadcastFlushedMasterSeqno {
-		s.broadcastFlushedMasterSeqno = seqno
-		if s.broadcastFlushedMasterSeqno > s.broadcastLiveMasterSeqno {
-			s.broadcastLiveMasterSeqno = s.broadcastFlushedMasterSeqno
+	if flushed && seqno > a.flushedMasterSeqno {
+		a.flushedMasterSeqno = seqno
+		if a.flushedMasterSeqno > a.liveMasterSeqno {
+			a.liveMasterSeqno = a.flushedMasterSeqno
 		}
 	}
 
-	s.updateBroadcastAdmissionLocked()
+	a.updateLocked()
 }
 
-func (s *Service) updateBroadcastAdmissionLocked() {
-	lag := s.broadcastLiveFlushLagLocked()
-	closeLag := s.broadcastAdmissionCloseLag()
+func (a *BroadcastAdmission) updateLocked() {
+	lag := a.liveFlushLagLocked()
+	closeLag := a.closeLag()
 	openLag := closeLag / 2
-	wasClosed := s.broadcastAdmissionClosed
+	wasClosed := a.closed
 
 	if wasClosed {
 		if lag <= openLag {
-			s.broadcastAdmissionClosed = false
+			a.closed = false
 		}
 	} else if lag >= closeLag {
-		s.broadcastAdmissionClosed = true
+		a.closed = true
 	}
-	if wasClosed == s.broadcastAdmissionClosed {
+	if wasClosed == a.closed {
 		return
 	}
-	s.broadcastAdmissionClosedAtomic.Store(s.broadcastAdmissionClosed)
+	a.closedAtomic.Store(a.closed)
 
-	event := s.log.Info()
-	if s.broadcastAdmissionClosed {
-		event = s.log.Warn()
+	event := a.log.Info()
+	if a.closed {
+		event = a.log.Warn()
 	}
 	event.
-		Bool("closed", s.broadcastAdmissionClosed).
-		Uint32("live_master_seqno", s.broadcastLiveMasterSeqno).
-		Uint32("flushed_master_seqno", s.broadcastFlushedMasterSeqno).
+		Bool("closed", a.closed).
+		Uint32("live_master_seqno", a.liveMasterSeqno).
+		Uint32("flushed_master_seqno", a.flushedMasterSeqno).
 		Uint32("lag", lag).
 		Uint32("open_lag", openLag).
 		Uint32("close_lag", closeLag).
 		Msg("updated broadcast admission circuit breaker")
 }
 
-func (s *Service) broadcastLiveFlushLagLocked() uint32 {
-	if s.broadcastLiveMasterSeqno <= s.broadcastFlushedMasterSeqno {
+func (a *BroadcastAdmission) liveFlushLagLocked() uint32 {
+	if a.liveMasterSeqno <= a.flushedMasterSeqno {
 		return 0
 	}
-	return s.broadcastLiveMasterSeqno - s.broadcastFlushedMasterSeqno
+	return a.liveMasterSeqno - a.flushedMasterSeqno
 }
 
-func (s *Service) broadcastAdmissionCloseLag() uint32 {
-	liveWindow := s.nextBlockCheckpointBlocks
-	closeLag := checkpointBackpressureBlocks(liveWindow, 2)
-	hardLag := checkpointBackpressureBlocks(liveWindow, s.syncBackpressureWindows)
+func (a *BroadcastAdmission) closeLag() uint32 {
+	closeLag := checkpointBackpressureBlocks(a.liveWindow, 2)
+	hardLag := checkpointBackpressureBlocks(a.liveWindow, a.backpressureWindows)
 	if closeLag > hardLag {
 		return hardLag
 	}

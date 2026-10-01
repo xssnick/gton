@@ -16,6 +16,7 @@ import (
 
 	"github.com/xssnick/tonutils-go/adnl"
 	adnladdr "github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	adnlquic "github.com/xssnick/tonutils-go/adnl/quic"
@@ -39,6 +40,42 @@ type blockingOutboundRouteDHT struct {
 	release   chan struct{}
 	startOnce sync.Once
 	calls     atomic.Int32
+}
+
+type publishingOutboundRouteDHT struct {
+	dhtBackend
+
+	addresses *adnladdr.List
+	pub       ed25519.PublicKey
+	started   chan struct{}
+	once      sync.Once
+	ready     atomic.Bool
+	calls     atomic.Int32
+}
+
+func TestQUICMessageDialStopsWithNode(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	path := quicPeerPath{node: &Node{runCtx: ctx}}
+	if _, err := path.dialForMessage(t.Context()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("dial on stopped node = %v, want canceled", err)
+	}
+}
+
+func (d *publishingOutboundRouteDHT) FindAddresses(
+	context.Context,
+	[]byte,
+) (*adnladdr.List, ed25519.PublicKey, error) {
+	d.calls.Add(1)
+	// Publish the call only after choosing its result; otherwise the test can
+	// make the first lookup succeed before it has returned the missing value.
+	ready := d.ready.Load()
+	d.once.Do(func() { close(d.started) })
+	if !ready {
+		return nil, nil, dht.ErrDHTValueIsNotFound
+	}
+
+	return d.addresses, d.pub, nil
 }
 
 func (d *blockingOutboundRouteDHT) FindAddresses(
@@ -89,7 +126,7 @@ func TestStaleQUICRouteRefreshesTheSignedAddressList(t *testing.T) {
 	}
 	node := newTestNode(t)
 	node.dht = dht
-	route := newPeerRoute("127.0.0.1:25001")
+	route := newTestPeerRoute("127.0.0.1:25001")
 
 	addr, err := resolveQUICRoute(
 		context.Background(),
@@ -105,7 +142,7 @@ func TestStaleQUICRouteRefreshesTheSignedAddressList(t *testing.T) {
 		t.Fatalf("current route = %q with %d DHT lookups", addr, dht.calls.Load())
 	}
 
-	route.markQUICAddrStale()
+	route.MarkQUICAddressStale()
 	addr, err = resolveQUICRoute(
 		context.Background(),
 		node,
@@ -122,11 +159,11 @@ func TestStaleQUICRouteRefreshesTheSignedAddressList(t *testing.T) {
 	if got := dht.calls.Load(); got != 1 {
 		t.Fatalf("stale route DHT lookups = %d, want 1", got)
 	}
-	if route.quicAddrStale() {
+	if route.QUICAddressStale() {
 		t.Fatal("validated DHT refresh left the QUIC route stale")
 	}
 
-	route.markQUICAddrStale()
+	route.MarkQUICAddressStale()
 	addr, err = resolveQUICRoute(
 		context.Background(),
 		node,
@@ -150,7 +187,7 @@ func TestStaleQUICRouteRefreshesTheSignedAddressList(t *testing.T) {
 	node.peerAddresses.cache[remoteID] = entry
 	node.peerAddresses.mx.Unlock()
 
-	route.markQUICAddrStale()
+	route.MarkQUICAddressStale()
 	if _, err = resolveQUICRoute(
 		context.Background(),
 		node,
@@ -162,6 +199,59 @@ func TestStaleQUICRouteRefreshesTheSignedAddressList(t *testing.T) {
 	}
 	if got := dht.calls.Load(); got != 2 {
 		t.Fatalf("old stale route DHT lookups = %d, want 2", got)
+	}
+}
+
+func TestQUICRouteWaitsForPeerAddressPublication(t *testing.T) {
+	remotePub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate remote key: %v", err)
+	}
+	remoteID := peerIDForQUICOutboundTest(t, remotePub)
+	backend := &publishingOutboundRouteDHT{
+		addresses: &adnladdr.List{
+			Addresses: []adnladdr.Address{adnladdr.QUIC{
+				IP:   net.IPv4(127, 0, 0, 1),
+				Port: 25003,
+			}},
+			ExpireAt: int32(time.Now().Add(time.Hour).Unix()),
+		},
+		pub:     remotePub,
+		started: make(chan struct{}),
+	}
+	node := newTestNode(t)
+	node.dht = backend
+	route := newTestPeerRoute("")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	result := make(chan struct {
+		address string
+		err     error
+	}, 1)
+	go func() {
+		address, resolveErr := resolveQUICRoute(ctx, node, remoteID, remotePub, route)
+		result <- struct {
+			address string
+			err     error
+		}{address: address, err: resolveErr}
+	}()
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatal("initial DHT lookup did not start")
+	}
+	backend.ready.Store(true)
+
+	got := <-result
+	if got.err != nil {
+		t.Fatalf("resolve route after publication: %v", got.err)
+	}
+	if got.address != "127.0.0.1:25003" {
+		t.Fatalf("resolved QUIC route = %q", got.address)
+	}
+	if backend.calls.Load() < 2 {
+		t.Fatalf("DHT address lookups = %d, want at least 2", backend.calls.Load())
 	}
 }
 
@@ -204,11 +294,11 @@ func TestDHTAddressLookupSuppliesBothPeerRoutes(t *testing.T) {
 				return spec
 			},
 			connect: func(sub *overlaySubscription) (bool, error) {
-				node, nodeErr := overlay.NewNode(sub.spec.FullID, remoteKey)
+				node, nodeErr := newTestOverlayNode(sub.spec.FullID, remoteKey)
 				if nodeErr != nil {
 					return false, nodeErr
 				}
-				return sub.connectOverlayNodeV1(context.Background(), *node)
+				return sub.connectOverlayNode(context.Background(), *node)
 			},
 		},
 		{
@@ -265,8 +355,8 @@ func TestDHTAddressLookupSuppliesBothPeerRoutes(t *testing.T) {
 			if peer.addr != "127.0.0.1:24001" {
 				t.Fatalf("ADNL route = %q", peer.addr)
 			}
-			if peer.route.quicAddr() != "127.0.0.1:25001" {
-				t.Fatalf("QUIC route = %q", peer.route.quicAddr())
+			if peer.route.QUICAddress() != "127.0.0.1:25001" {
+				t.Fatalf("QUIC route = %q", peer.route.QUICAddress())
 			}
 		})
 	}
@@ -337,8 +427,8 @@ func TestFixedQUICOverlayDiscoversRouteForAttachedInboundPeerOnce(t *testing.T) 
 	if peer.route != pooled.route {
 		t.Fatal("attached peer does not share its pooled route")
 	}
-	if peer.route.quicAddr() != "" {
-		t.Fatalf("inbound peer unexpectedly derived QUIC route %q", peer.route.quicAddr())
+	if peer.route.QUICAddress() != "" {
+		t.Fatalf("inbound peer unexpectedly derived QUIC route %q", peer.route.QUICAddress())
 	}
 
 	sub.startSeedFromFixedNodes(context.Background())
@@ -357,7 +447,7 @@ func TestFixedQUICOverlayDiscoversRouteForAttachedInboundPeerOnce(t *testing.T) 
 	if peer.addr != inbound.remoteAddr {
 		t.Fatalf("attached ADNL route changed to %q, want inbound route %q", peer.addr, inbound.remoteAddr)
 	}
-	if got := peer.route.quicAddr(); got != "127.0.0.1:25011" {
+	if got := peer.route.QUICAddress(); got != "127.0.0.1:25011" {
 		t.Fatalf("discovered QUIC route = %q, want DHT route", got)
 	}
 
@@ -451,7 +541,7 @@ func TestResolveQUICRouteUsesCachedAddressWithoutDHT(t *testing.T) {
 		node:  &Node{dht: dht},
 		id:    remoteID,
 		pub:   remotePub,
-		route: newPeerRoute("127.0.0.1:25011"),
+		route: newTestPeerRoute("127.0.0.1:25011"),
 	}
 
 	addr, err := resolveQUICRoute(
@@ -497,7 +587,7 @@ func TestResolveQUICRouteRejectsDifferentPeerIdentity(t *testing.T) {
 		node:  &Node{dht: dht},
 		id:    remoteID,
 		pub:   remotePub,
-		route: newPeerRoute(""),
+		route: newTestPeerRoute(""),
 	}
 
 	if _, err = resolveQUICRoute(
@@ -509,7 +599,7 @@ func TestResolveQUICRouteRejectsDifferentPeerIdentity(t *testing.T) {
 	); err == nil {
 		t.Fatal("resolution accepted a different peer identity")
 	}
-	if got := peer.route.quicAddr(); got != "" {
+	if got := peer.route.QUICAddress(); got != "" {
 		t.Fatalf("failed resolution stored QUIC route %q", got)
 	}
 }
@@ -602,11 +692,11 @@ func TestMalformedQUICRouteOnlyRejectsCustomQUICOverlay(t *testing.T) {
 				return spec
 			},
 			connect: func(sub *overlaySubscription) (bool, error) {
-				node, nodeErr := overlay.NewNode(sub.spec.FullID, remoteKey)
+				node, nodeErr := newTestOverlayNode(sub.spec.FullID, remoteKey)
 				if nodeErr != nil {
 					return false, nodeErr
 				}
-				return sub.connectOverlayNodeV1(context.Background(), *node)
+				return sub.connectOverlayNode(context.Background(), *node)
 			},
 		},
 		{
@@ -687,8 +777,8 @@ func TestMalformedQUICRouteOnlyRejectsCustomQUICOverlay(t *testing.T) {
 			if peer.addr != "127.0.0.1:24003" {
 				t.Fatalf("ADNL route = %q", peer.addr)
 			}
-			if peer.route.quicAddr() != "" {
-				t.Fatalf("malformed optional QUIC route was retained as %q", peer.route.quicAddr())
+			if peer.route.QUICAddress() != "" {
+				t.Fatalf("malformed optional QUIC route was retained as %q", peer.route.QUICAddress())
 			}
 		})
 	}
@@ -759,7 +849,7 @@ func TestQUICOutboundOperationsReuseGatewayPathAndFrameOverlay(t *testing.T) {
 	peer := &overlayPeer{
 		node:        node,
 		id:          serverID,
-		route:       newPeerRoute(serverAddr),
+		route:       newTestPeerRoute(serverAddr),
 		pub:         server.PublicKey(),
 		overlayID:   overlayID[:],
 		fixedMember: true,
@@ -814,16 +904,13 @@ func TestQUICOutboundOperationsReuseGatewayPathAndFrameOverlay(t *testing.T) {
 		t.Fatalf("raw answer = %T, want overlay.Pong value", rawResult)
 	}
 
-	peerSet, failed := sub.resolveTwoStepPeerSet(ctx, PeerID{})
-	if len(failed) != 0 {
-		t.Fatalf("resolve QUIC two-step peers: %+v", failed)
-	}
+	peerSet := sub.resolveTwoStepPeerSet(PeerID{})
 	if len(peerSet) != 1 {
 		t.Fatalf("resolved QUIC two-step peers = %d, want 1", len(peerSet))
 	}
 	broadcastPeer, ok := peerSet[0].(quicRouteBroadcastPeer)
 	if !ok {
-		t.Fatalf("resolved two-step peer = %T, want concrete QUIC peer", peerSet[0])
+		t.Fatalf("resolved two-step peer = %T, want route-bound QUIC peer", peerSet[0])
 	}
 	if !bytes.Equal(broadcastPeer.ID(), serverID[:]) {
 		t.Fatalf("broadcast peer id = %x, want %x", broadcastPeer.ID(), serverID)
@@ -838,6 +925,22 @@ func TestQUICOutboundOperationsReuseGatewayPathAndFrameOverlay(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("QUIC broadcast message was not received")
+	}
+
+	preparedPing, err := tl.Serialize(overlay.Ping{}, true)
+	if err != nil {
+		t.Fatalf("prepare QUIC broadcast message: %v", err)
+	}
+	if err = broadcastPeer.SendPreparedCustomMessage(ctx, preparedPing); err != nil {
+		t.Fatalf("send prepared QUIC broadcast message: %v", err)
+	}
+	select {
+	case messageErr := <-messages:
+		if messageErr != nil {
+			t.Fatalf("parse prepared QUIC broadcast message: %v", messageErr)
+		}
+	case <-ctx.Done():
+		t.Fatal("prepared QUIC broadcast message was not received")
 	}
 
 	if err = (quicRouteBroadcastPeer{
@@ -910,7 +1013,7 @@ func TestOverlayPeerDialQUICDoesNotReuseInboundOnlyPath(t *testing.T) {
 		node:  node,
 		id:    remoteID,
 		pub:   remote.PublicKey(),
-		route: newPeerRoute(remoteAddr),
+		route: newTestPeerRoute(remoteAddr),
 	}
 
 	outbound, err := peer.dialQUIC(ctx)
@@ -975,7 +1078,7 @@ func TestOverlayPeerDialQUICRecoversChangedEndpointThroughDHT(t *testing.T) {
 		pub: remote.PublicKey(),
 	}
 	node.dht = dht
-	route := newPeerRoute(deadAddr)
+	route := newTestPeerRouteWithRetry(deadAddr, time.Millisecond, time.Millisecond)
 	peer := &overlayPeer{
 		node:  node,
 		id:    remoteID,
@@ -989,17 +1092,23 @@ func TestOverlayPeerDialQUICRecoversChangedEndpointThroughDHT(t *testing.T) {
 	if err == nil {
 		t.Fatal("dial to dead QUIC endpoint unexpectedly succeeded")
 	}
-	if !route.quicAddrStale() {
+	if !route.QUICAddressStale() {
 		t.Fatal("failed post-resolution QUIC dial did not mark the route stale")
 	}
-	if route.quicReady(time.Now()) {
+	if route.QUICReady(time.Now()) {
 		t.Fatal("failed post-resolution QUIC dial did not enter cooldown")
 	}
 	if got := dht.calls.Load(); got != 0 {
 		t.Fatalf("DHT lookups before stale recovery = %d, want 0", got)
 	}
 
-	route.quicRetryState.Store(time.Now().Add(-time.Second).UnixNano())
+	retryDeadline := time.Now().Add(time.Second)
+	for !route.QUICDialPermitted(time.Now()) {
+		if time.Now().After(retryDeadline) {
+			t.Fatal("quic route did not leave its retry window")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), 5*time.Second)
 	outbound, err := peer.dialQUIC(recoveryCtx)
 	cancelRecovery()
@@ -1012,20 +1121,14 @@ func TestOverlayPeerDialQUICRecoversChangedEndpointThroughDHT(t *testing.T) {
 	if got := dht.calls.Load(); got != 1 {
 		t.Fatalf("DHT lookups during stale recovery = %d, want 1", got)
 	}
-	if got := route.quicAddr(); got != remoteAddr {
+	if got := route.QUICAddress(); got != remoteAddr {
 		t.Fatalf("recovered QUIC route = %q, want %q", got, remoteAddr)
 	}
-	if route.quicAddrStale() {
+	if route.QUICAddressStale() {
 		t.Fatal("successful changed-endpoint dial left route stale")
 	}
-	if got := route.quicRetryState.Load(); got != 0 {
-		t.Fatalf("retry state after changed-endpoint recovery = %d, want 0", got)
-	}
-	route.quicRetryMx.Lock()
-	failures := route.quicDialFailures
-	route.quicRetryMx.Unlock()
-	if failures != 0 {
-		t.Fatalf("failures after changed-endpoint recovery = %d, want 0", failures)
+	if !route.QUICDialPermitted(time.Now()) {
+		t.Fatal("successful changed-endpoint dial did not reset the retry gate")
 	}
 }
 
@@ -1224,7 +1327,7 @@ func TestQUICOutboundOperationsRequireRoute(t *testing.T) {
 	peer := &overlayPeer{
 		node:  newTestNode(t),
 		pub:   peerPublicKey,
-		route: newPeerRoute(""),
+		route: newTestPeerRoute(""),
 	}
 
 	if _, err = (quicPeerQueryTransport{
@@ -1236,7 +1339,7 @@ func TestQUICOutboundOperationsRequireRoute(t *testing.T) {
 	typedPeer := &overlayPeer{
 		node:  peer.node,
 		pub:   peerPublicKey,
-		route: newPeerRoute(""),
+		route: newTestPeerRoute(""),
 	}
 	if err = (quicPeerQueryTransport{
 		peer:     typedPeer,
@@ -1270,7 +1373,7 @@ func TestCustomTwoStepQUICDoesNotFallbackWithoutRoute(t *testing.T) {
 		node:          node,
 		id:            peerID,
 		pub:           peerPublicKey,
-		route:         newPeerRoute(""),
+		route:         newTestPeerRoute(""),
 		overlayID:     overlayID[:],
 		fixedMember:   true,
 		overlay:       adnlOverlay,
@@ -1291,12 +1394,18 @@ func TestCustomTwoStepQUICDoesNotFallbackWithoutRoute(t *testing.T) {
 	})
 	t.Cleanup(sub.broadcastReceiver.Close)
 
-	peerSet, failed := sub.resolveTwoStepPeerSet(context.Background(), PeerID{})
-	if len(peerSet) != 0 {
-		t.Fatalf("resolved peers without QUIC route = %d, want 0", len(peerSet))
+	peerSet := sub.resolveTwoStepPeerSet(PeerID{})
+	if len(peerSet) != 1 {
+		t.Fatalf("deferred peers without QUIC route = %d, want 1", len(peerSet))
 	}
-	if len(failed) != 1 || !errors.Is(failed[0].Err, errQUICRouteMissing) {
-		t.Fatalf("QUIC route failures = %+v, want one missing-route error", failed)
+	sendPeer, ok := peerSet[0].(quicRouteBroadcastPeer)
+	if !ok {
+		t.Fatalf("deferred two-step peer = %T, want route-bound QUIC peer", peerSet[0])
+	}
+	// The send path never dials, so an unconnected peer is skipped rather than
+	// resolved inline; the route is brought up by the background dial instead.
+	if err = sendPeer.SendCustomMessage(context.Background(), overlay.Ping{}); !errors.Is(err, errQUICPeerOffline) {
+		t.Fatalf("deferred QUIC send error = %v, want offline peer", err)
 	}
 	if len(rldpTransport.sent) != 0 || len(base.sent) != 0 {
 		t.Fatal("missing QUIC route fell back to RLDP or ADNL")
@@ -1305,7 +1414,7 @@ func TestCustomTwoStepQUICDoesNotFallbackWithoutRoute(t *testing.T) {
 		t.Fatalf("receive relay peers without QUIC route = %d, want 0", len(relayPeers))
 	}
 
-	peer.route.setQUICAddr("127.0.0.1:25021")
+	peer.route.SetQUICAddress("127.0.0.1:25021")
 	relayPeers := (twoStepPeerSet{sub: sub}).Peers()
 	if len(relayPeers) != 1 {
 		t.Fatalf("receive relay peers with QUIC route = %d, want 1", len(relayPeers))
@@ -1353,7 +1462,7 @@ func peerIDForQUICOutboundTest(t *testing.T, pub ed25519.PublicKey) PeerID {
 	return id
 }
 
-func quicOutboundTestKey(t *testing.T) ed25519.PrivateKey {
+func quicOutboundTestKey(t testing.TB) ed25519.PrivateKey {
 	t.Helper()
 
 	_, key, err := ed25519.GenerateKey(rand.Reader)
@@ -1363,7 +1472,7 @@ func quicOutboundTestKey(t *testing.T) ed25519.PrivateKey {
 	return key
 }
 
-func startQUICOutboundTestGateway(t *testing.T, gateway *adnlquic.Gateway) string {
+func startQUICOutboundTestGateway(t testing.TB, gateway *adnlquic.Gateway) string {
 	t.Helper()
 
 	packetConn, err := net.ListenUDP("udp", &net.UDPAddr{

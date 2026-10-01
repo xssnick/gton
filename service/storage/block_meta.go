@@ -5,7 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
+
+	"github.com/xssnick/gton/service/shard"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -53,35 +56,29 @@ func ValidateBlockIDHashes(id ton.BlockIDExt) error {
 
 // ShardPrefixCandidates returns the shard IDs from the root shard to the
 // 60-bit account prefix represented by prefix.
-func ShardPrefixCandidates(workchain int32, prefix uint64) []int64 {
+func ShardPrefixCandidates(workchain int32, prefix uint64) ([]int64, error) {
 	if workchain == masterchainID {
-		return []int64{masterchainShard}
+		return []int64{masterchainShard}, nil
 	}
 
 	shards := make([]int64, 0, 61)
 	for length := uint32(0); length <= 60; length++ {
-		shards = append(shards, AccountShardPrefix(prefix, length))
+		shardID, err := shard.FromAccountPrefix(prefix, length)
+		if err != nil {
+			return nil, err
+		}
+		shards = append(shards, shardID)
 	}
-	return shards
-}
-
-// AccountShardPrefix returns the shard ID at depth along an account prefix.
-func AccountShardPrefix(prefix uint64, depth uint32) int64 {
-	if depth == 0 {
-		return masterchainShard
-	}
-
-	x := uint64(1) << (63 - depth)
-	return int64((prefix & ^(x - 1)) | x)
+	return shards, nil
 }
 
 // AccountShardCandidates returns the shard IDs along the account prefix path.
-func AccountShardCandidates(workchain int32, account []byte) []int64 {
+func AccountShardCandidates(workchain int32, account []byte) ([]int64, error) {
 	if workchain == masterchainID {
-		return []int64{masterchainShard}
+		return []int64{masterchainShard}, nil
 	}
 	if len(account) < 8 {
-		return nil
+		return nil, nil
 	}
 
 	return ShardPrefixCandidates(workchain, binary.BigEndian.Uint64(account[:8]))
@@ -425,7 +422,7 @@ func BuildBlockMetaFromParsedBlock(id ton.BlockIDExt, block *tlb.Block) (*BlockM
 		if err != nil {
 			return nil, fmt.Errorf("load block state update target: %w", err)
 		}
-		nextStateHash := nextState.HashKey(0)
+		nextStateHash := nextState.HashKeyAt(0)
 		meta.StateRootHash = nextStateHash[:]
 	}
 	if block.BlockInfo.NotMaster {
@@ -482,4 +479,25 @@ func blockRefToBlockIDExt(workchain int32, shard int64, ref tlb.ExtBlkRef) ton.B
 		RootHash:  bytes.Clone(ref.RootHash),
 		FileHash:  bytes.Clone(ref.FileHash),
 	}
+}
+
+// SameBlockIDs reports whether two block-id slices are equal element by
+// element. Block ids carry hash slices, so they are not comparable with ==.
+func SameBlockIDs(left, right []ton.BlockIDExt) bool {
+	return slices.EqualFunc(left, right, func(a, b ton.BlockIDExt) bool { return a.Equals(&b) })
+}
+
+// CloneBlockIDs returns an independent copy of a borrowed block-id slice,
+// including its hash bytes. Metadata handed to a callback may be reused after
+// the call, so anything retained past it has to own its storage.
+func CloneBlockIDs(blocks []ton.BlockIDExt) []ton.BlockIDExt {
+	if len(blocks) == 0 {
+		return nil
+	}
+	cloned := make([]ton.BlockIDExt, len(blocks))
+	for i := range blocks {
+		cloned[i] = *blocks[i].Copy()
+	}
+
+	return cloned
 }

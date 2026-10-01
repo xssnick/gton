@@ -46,13 +46,13 @@ func BenchmarkRememberMasterStateCacheEviction(b *testing.B) {
 
 	service := newMasterStateCacheTestService(b)
 	for i := 0; i < masterStateCacheLimit; i++ {
-		service.rememberMasterState(b.Context(), &states[i], nil, nil)
+		service.rememberMasterState(b.Context(), &states[i], nil)
 	}
 
 	index := masterStateCacheLimit
 	b.ReportAllocs()
 	for b.Loop() {
-		service.rememberMasterState(b.Context(), &states[index], nil, nil)
+		service.rememberMasterState(b.Context(), &states[index], nil)
 		index++
 		if index == len(states) {
 			index = 0
