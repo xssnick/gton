@@ -652,7 +652,8 @@ type broadcastTargetsSnapshot struct {
 }
 
 // broadcastTargetsSnapshot returns the deduplicated union of neighbour and
-// known peers: alive ones when any exist, everything known otherwise. The
+// known peers. Whole-roster overlays keep every known member; mesh overlays
+// prefer alive peers when any exist and use everything known otherwise. The
 // slices are cached and shared between callers and must not be modified.
 func (s *overlaySubscription) broadcastTargetsSnapshot() *broadcastTargetsSnapshot {
 	if s.chainBroadcastsPaused() {
@@ -713,7 +714,7 @@ func (s *overlaySubscription) buildBroadcastTargetsSnapshot() *broadcastTargetsS
 	}
 
 	peers, neighbourPrefix := all, allNeighbours
-	if len(alive) > 0 {
+	if len(alive) > 0 && !s.spec.floodsWholeRoster() {
 		peers, neighbourPrefix = alive, aliveNeighbours
 	}
 

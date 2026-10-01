@@ -60,6 +60,7 @@ func (a *ExternalMessageAdmission) AcceptExternalMessage(ctx context.Context, ev
 func (a *ExternalMessageAdmission) AcceptCheckedExternalMessage(ctx context.Context, event p2p.ExternalMessageEvent) error {
 	return runExternalMessageGate(ctx, a.gate, ExternalMessageEvent{
 		IsLocal:        event.IsLocal,
+		Priority:       event.Priority,
 		SerializedSize: len(event.Body),
 		MessageRoot:    event.Root,
 		MessageParsed:  event.Message,
@@ -78,6 +79,7 @@ func acceptExternalMessage(ctx context.Context, event p2p.ExternalMessageEvent, 
 
 	return runExternalMessageGate(ctx, gate, ExternalMessageEvent{
 		IsLocal:        event.IsLocal,
+		Priority:       event.Priority,
 		SerializedSize: len(event.Body),
 		MessageRoot:    result.Root,
 		MessageParsed:  result.Message,

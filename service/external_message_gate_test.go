@@ -79,10 +79,11 @@ func TestExternalMessageAdmissionChecksParsedMessageWithoutCopies(t *testing.T) 
 	ctx := t.Context()
 
 	err := admission.AcceptExternalMessage(ctx, p2p.ExternalMessageEvent{
-		IsLocal: true,
-		Body:    body,
-		Root:    inputRoot,
-		Message: inputMessage,
+		IsLocal:  true,
+		Priority: 11,
+		Body:     body,
+		Root:     inputRoot,
+		Message:  inputMessage,
 	})
 	if err != nil {
 		t.Fatalf("accept external message: %v", err)
@@ -102,7 +103,7 @@ func TestExternalMessageAdmissionChecksParsedMessageWithoutCopies(t *testing.T) 
 	if gate.calls != 1 || gate.ctx != ctx {
 		t.Fatalf("gate calls/context: calls=%d same_context=%t, want 1 and true", gate.calls, gate.ctx == ctx)
 	}
-	if !gate.event.IsLocal || gate.event.SerializedSize != len(body) ||
+	if !gate.event.IsLocal || gate.event.Priority != 11 || gate.event.SerializedSize != len(body) ||
 		gate.event.MessageRoot != checkedRoot || gate.event.MessageParsed != checkedMessage {
 		t.Fatal("gate did not receive the checker result unchanged")
 	}
@@ -123,7 +124,7 @@ func TestExternalMessageAdmissionChecksBOCWithoutCopy(t *testing.T) {
 	gate := &externalMessageGateStub{}
 	admission := NewExternalMessageAdmission(zerolog.Nop(), checker, gate)
 
-	if err := admission.AcceptExternalMessage(t.Context(), p2p.ExternalMessageEvent{Body: body}); err != nil {
+	if err := admission.AcceptExternalMessage(t.Context(), p2p.ExternalMessageEvent{Body: body, Priority: 17}); err != nil {
 		t.Fatalf("accept external message BOC: %v", err)
 	}
 	if checker.checkCalls != 0 || checker.checkBOCCalls != 1 {
@@ -132,7 +133,7 @@ func TestExternalMessageAdmissionChecksBOCWithoutCopy(t *testing.T) {
 	if len(checker.body) != len(body) || &checker.body[0] != &body[0] {
 		t.Fatal("checker received a copied body")
 	}
-	if gate.event.SerializedSize != len(body) ||
+	if gate.event.IsLocal || gate.event.Priority != 17 || gate.event.SerializedSize != len(body) ||
 		gate.event.MessageRoot != checkedRoot || gate.event.MessageParsed != checkedMessage {
 		t.Fatal("gate did not receive the parsed BOC result unchanged")
 	}
@@ -150,10 +151,11 @@ func TestExternalMessageAdmissionAcceptsCheckedMessageWithoutChecker(t *testing.
 
 	body := []byte{7, 8, 9}
 	err := admission.AcceptCheckedExternalMessage(ctx, p2p.ExternalMessageEvent{
-		IsLocal: true,
-		Body:    body,
-		Root:    root,
-		Message: message,
+		IsLocal:  true,
+		Priority: 13,
+		Body:     body,
+		Root:     root,
+		Message:  message,
 	})
 	if err != nil {
 		t.Fatalf("accept checked external message: %v", err)
@@ -164,7 +166,7 @@ func TestExternalMessageAdmissionAcceptsCheckedMessageWithoutChecker(t *testing.
 	if gate.calls != 1 || gate.ctx != ctx {
 		t.Fatalf("gate calls/context: calls=%d same_context=%t, want 1 and true", gate.calls, gate.ctx == ctx)
 	}
-	if !gate.event.IsLocal || gate.event.SerializedSize != len(body) ||
+	if !gate.event.IsLocal || gate.event.Priority != 13 || gate.event.SerializedSize != len(body) ||
 		gate.event.MessageRoot != root || gate.event.MessageParsed != message {
 		t.Fatal("gate received different checked message pointers")
 	}

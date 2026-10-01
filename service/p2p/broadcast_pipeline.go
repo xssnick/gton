@@ -311,6 +311,10 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 		if !s.allowCustomBroadcastSource(kind, sourcePeerID, customBroadcastRoleMessage) {
 			return ignoredBroadcastResult(), nil
 		}
+		priority := 0
+		if s.spec.authorizesBroadcastSenders() {
+			priority = s.spec.MsgSenders[sourcePeerID]
+		}
 		if len(data.Message.Data) == 0 {
 			s.node.chainNode().noteBroadcastDrop(s.spec.Name, kind, "invalid_payload")
 			return ignoredBroadcastResult(), nil
@@ -341,9 +345,10 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 			return ignoredBroadcastResult(), nil
 		}
 		if err = s.node.chainNode().acceptExternalMessage(s.node.chainNode().runCtx, ExternalMessageEvent{
-			Body:    data.Message.Data,
-			Root:    parsed.root,
-			Message: parsed.message,
+			Priority: priority,
+			Body:     data.Message.Data,
+			Root:     parsed.root,
+			Message:  parsed.message,
 		}); err != nil {
 			s.node.chainNode().externalMessageLimiter.Remove(addrKey, now)
 			s.node.chainNode().noteBroadcastDrop(s.spec.Name, kind, "external_message_rejected")

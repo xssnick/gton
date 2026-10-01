@@ -49,6 +49,7 @@ type BlockAppliedEvent struct {
 
 type ExternalMessageEvent struct {
 	IsLocal        bool
+	Priority       int
 	SerializedSize int
 	MessageRoot    *cell.Cell
 	MessageParsed  *tlb.ExternalMessage

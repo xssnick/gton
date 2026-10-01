@@ -117,6 +117,7 @@ func (h *extensionHandlers) AcceptExternalMessage(ctx context.Context, event ser
 
 	return h.extension.OnExternalMessage(ctx, hooks.ExternalMessageEvent{
 		IsLocal:        event.IsLocal,
+		Priority:       event.Priority,
 		SerializedSize: event.SerializedSize,
 		MessageRoot:    event.MessageRoot,
 		MessageParsed:  event.MessageParsed,
