@@ -45,7 +45,7 @@ require (
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/rogpeppe/go-internal v1.12.0 // indirect
-	github.com/xssnick/quic-go-ton v0.0.0-20260707110703-14f3237f97b9 // indirect
+	github.com/xssnick/quic-go-ton v0.0.0-20261001181112-f2ad8f940a32 // indirect
 	golang.org/x/exp v0.0.0-20260508232706-74f9aab9d74a // indirect
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
