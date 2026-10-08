@@ -63,6 +63,7 @@ func TestParseNodeFlagsRejectsInvalidStatus(t *testing.T) {
 		{name: "flags after command", args: []string{"status", "--config", "other.json"}},
 		{name: "version conflict", args: []string{"--version", "status"}},
 		{name: "public key conflict", args: []string{"--ls-pubkey", "status"}},
+		{name: "liteserver config conflict", args: []string{"--print-ls-config", "status"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

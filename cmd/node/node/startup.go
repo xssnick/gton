@@ -48,6 +48,7 @@ const liteserverSendQueueSize = 2048
 type cliCommands struct {
 	version                bool
 	lsPubkey               bool
+	printLSConfig          bool
 	adnlID                 bool
 	consensusADNLID        bool
 	validatorControlPubkey bool
@@ -90,8 +91,8 @@ func Run(extensions ...hooks.ExtensionFactory) {
 	cfg, created, err := loadNodeConfig(
 		context.Background(),
 		startOpts.ConfigFile,
-		commands.lsPubkey || commands.adnlID || commands.consensusADNLID || commands.validatorControlPubkey ||
-			commands.dhtDescriptor || commands.statusMode != "",
+		commands.lsPubkey || commands.printLSConfig || commands.adnlID || commands.consensusADNLID ||
+			commands.validatorControlPubkey || commands.dhtDescriptor || commands.statusMode != "",
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -108,6 +109,13 @@ func Run(extensions ...hooks.ExtensionFactory) {
 
 	if commands.statusMode != "" {
 		if err = writeRemoteStatus(context.Background(), os.Stdout, cfg.Metrics, commands.statusMode); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if commands.printLSConfig {
+		if err = writeLiteServerConfig(os.Stdout, cfg, startOpts.ConfigFile); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
@@ -523,6 +531,7 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 	dataDirFlag := flags.String("data-dir", "", "override storage.dir from node config")
 	globalConfigFileFlag := flags.String("global-config-file", "", "override ton.global_config_path from node config")
 	lsPubkeyFlag := flags.Bool("ls-pubkey", false, "print liteserver public key in base64 and exit")
+	printLSConfigFlag := flags.Bool("print-ls-config", false, "print this liteserver's global config entry as JSON and exit")
 	adnlIDFlag := flags.Bool("adnl-id", false, "print ADNL id derived from adnl.key in base64 and exit")
 	consensusADNLIDFlag := flags.Bool("consensus-adnl-id", false, "print the validator/collator ADNL id in base64 and exit")
 	validatorControlPubkeyFlag := flags.Bool(
@@ -558,14 +567,15 @@ func parseNodeFlags(args []string, stderr io.Writer) (startupOptions, cliCommand
 	commands := cliCommands{
 		version:                *versionFlag,
 		lsPubkey:               *lsPubkeyFlag,
+		printLSConfig:          *printLSConfigFlag,
 		adnlID:                 *adnlIDFlag,
 		consensusADNLID:        *consensusADNLIDFlag,
 		validatorControlPubkey: *validatorControlPubkeyFlag,
 		dhtDescriptor:          *dhtDescriptorFlag,
 		skipConfigCheck:        *skipConfigCheckFlag,
 	}
-	infoCommand := commands.version || commands.lsPubkey || commands.adnlID || commands.consensusADNLID ||
-		commands.validatorControlPubkey || commands.dhtDescriptor
+	infoCommand := commands.version || commands.lsPubkey || commands.printLSConfig || commands.adnlID ||
+		commands.consensusADNLID || commands.validatorControlPubkey || commands.dhtDescriptor
 	if positional := flags.Args(); len(positional) != 0 {
 		if positional[0] != "status" {
 			return startupOptions{}, cliCommands{}, fmt.Errorf("unknown command %q", positional[0])
@@ -748,6 +758,50 @@ func writeLiteServerPublicKey(out io.Writer, cfg nodeconfig.Config, path string)
 	litePriv := ed25519.NewKeyFromSeed(liteSeed)
 	if _, err := fmt.Fprintln(out, base64.StdEncoding.EncodeToString(litePriv.Public().(ed25519.PublicKey))); err != nil {
 		return fmt.Errorf("write liteserver public key: %w", err)
+	}
+	return nil
+}
+
+func writeLiteServerConfig(out io.Writer, cfg nodeconfig.Config, path string) error {
+	seed := cfg.Lite.Key
+	if len(seed) == 0 {
+		return fmt.Errorf("liteserver key is missing in %s", path)
+	}
+	if len(seed) != ed25519.SeedSize {
+		return fmt.Errorf("invalid liteserver key size: expected %d bytes, got %d", ed25519.SeedSize, len(seed))
+	}
+
+	externalHost, _, err := net.SplitHostPort(strings.TrimSpace(cfg.ADNL.ExternalAddr))
+	if err != nil {
+		return fmt.Errorf("parse adnl.external_addr: %w", err)
+	}
+	externalIP := net.ParseIP(externalHost).To4()
+	if externalIP == nil || externalIP.IsUnspecified() {
+		return fmt.Errorf("adnl.external_addr must contain a non-zero IPv4 address")
+	}
+
+	_, portText, err := net.SplitHostPort(strings.TrimSpace(cfg.Lite.ListenAddr))
+	if err != nil {
+		return fmt.Errorf("parse liteserver.listen_addr: %w", err)
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil || port == 0 {
+		return fmt.Errorf("liteserver.listen_addr must contain a port between 1 and 65535")
+	}
+
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	descriptor := liteclient.LiteserverConfig{
+		IP:   int64(int32(binary.BigEndian.Uint32(externalIP))),
+		Port: int(port),
+		ID: liteclient.ServerID{
+			Type: "pub.ed25519",
+			Key:  base64.StdEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey)),
+		},
+	}
+	encoder := json.NewEncoder(out)
+	encoder.SetIndent("", "  ")
+	if err = encoder.Encode(descriptor); err != nil {
+		return fmt.Errorf("write liteserver config: %w", err)
 	}
 	return nil
 }

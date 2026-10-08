@@ -74,6 +74,7 @@ Supported flags:
 | `--data-dir <path>` | Override `storage.dir` from the node config. |
 | `--global-config-file <path>` | Override `ton.global_config_path` from the node config. |
 | `--ls-pubkey` | Print the liteserver public key (base64) and exit. |
+| `--print-ls-config` | Print this liteserver's global config entry as formatted JSON and exit. |
 | `--adnl-id` | Print the ADNL id derived from `adnl.key` (base64) and exit. |
 | `--consensus-adnl-id` | Print the ADNL id used by the validator and collator (base64) and exit. |
 | `--validator-control-pubkey` | Print the boxed validator-control server public key in base64 and exit. |
@@ -92,6 +93,18 @@ Supported flags:
 | `--skip-cfg-check` | Continue startup after creating missing config file without manually reviewing it first. |
 | `--archive-checkpoint-period <duration>` | Maximum current-state checkpoint interval during archive catch-up. Defaults to `2m`. |
 | `--archive-prefetch-windows <n>` | Archive import window prefetch depth. Defaults to `2`. |
+
+To export one entry for the global config's `liteservers` array:
+
+```bash
+./gton-node --config config.json --print-ls-config
+```
+
+The command uses the IPv4 host from `adnl.external_addr`, the port from
+`liteserver.listen_addr`, and the public key derived from `liteserver.key`.
+It prints only the formatted JSON object and exits without starting the node
+or modifying the config. The config must already exist and contain these
+fields; IPv4 is encoded as a signed 32-bit integer.
 
 ## Creating a Test Network Genesis
 
