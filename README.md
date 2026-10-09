@@ -2,7 +2,7 @@
 
 <img align="right" width="512px" src="https://github.com/user-attachments/assets/b7ec1bc3-6cb0-4e93-bcf0-6c019e295147">
 
-`gton` is a Go implementation of a TON full node with a liteserver API. Its validator subsystem is under development and does not yet provide a complete production validation pipeline. The node is designed to be an efficient API access point for services, backends of projects, indexers, wallets, and other infrastructure that needs fast synchronization and stable data serving under heavy load.
+`gton` is a Go implementation of a TON full node with a liteserver API. The node is designed to be an efficient API access point for services, backends of projects, indexers, wallets, and other infrastructure that needs fast synchronization and stable data serving under heavy load.
 
 The project focuses on:
 
