@@ -107,6 +107,7 @@ func (s *StateLifecycle) runCellGenerationMigration(ctx context.Context, origin 
 		}
 	}
 
+migrate:
 	for {
 		target, err := store.CurrentState(ctx)
 		if err != nil {
@@ -137,6 +138,18 @@ func (s *StateLifecycle) runCellGenerationMigration(ctx context.Context, origin 
 				Int64("compactions_in_progress", metrics.CompactionsInProgress).
 				Int64("compaction_in_progress_bytes", metrics.CompactionInProgressSize).
 				Msg("waiting for cell generation compaction before switch")
+			if err = waitRetry(ctx, stateSerializationRetryDelay); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err = s.checkCellGenerationHistory(candidate.current, origin); err != nil {
+			if !errors.Is(err, errCellGenerationHistoryReferenced) {
+				return err
+			}
+			s.log.Info().Err(err).Uint64("cell_generation", candidate.generation).
+				Msg("waiting for referenced masterchain history before cell generation switch")
 			if err = waitRetry(ctx, stateSerializationRetryDelay); err != nil {
 				return err
 			}
@@ -181,6 +194,17 @@ func (s *StateLifecycle) runCellGenerationMigration(ctx context.Context, origin 
 
 			if err = s.catchUpAndFlushCellGenerationCandidate(ctx, store, candidate, latest); err != nil {
 				return err
+			}
+			if err = s.checkCellGenerationHistory(candidate.current, origin); err != nil {
+				if !errors.Is(err, errCellGenerationHistoryReferenced) {
+					return err
+				}
+				// The newer canonical snapshot is authoritative even if its
+				// retention floor moved back. Resume normal block application
+				// before waiting for that reference to retire.
+				s.clearCellGenerationSwitchRequest()
+				switchRequested = false
+				continue migrate
 			}
 			if err = s.prepareCellGenerationSwitchCandidate(ctx, store, candidate, origin); err != nil {
 				return err

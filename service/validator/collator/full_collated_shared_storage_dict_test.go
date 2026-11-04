@@ -3,6 +3,7 @@ package collator
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -38,6 +39,12 @@ import (
 // and the mainnet fixture has no two accounts sharing a dictionary, so nothing
 // else in the suite can reach this shape.
 func TestFullCollatedSharedStorageDictProvesEveryAccount(t *testing.T) {
+	for _, version := range []uint32{15, 16} {
+		t.Run(fmt.Sprintf("GV%d", version), func(t *testing.T) { testFullCollatedSharedStorageDict(t, version) })
+	}
+}
+
+func testFullCollatedSharedStorageDict(t *testing.T, version uint32) {
 	// The two accounts run identical code over identical data, so their initial
 	// storage-stat dictionaries — and therefore their dictionary hashes — are
 	// the same. The ballast under the code carries the state over the
@@ -70,6 +77,7 @@ func TestFullCollatedSharedStorageDictProvesEveryAccount(t *testing.T) {
 	// collated data degenerates to a marker carrying no proofs at all — every
 	// assertion below would then hold vacuously.
 	req.Masterchain.Config.capabilities |= capFullCollatedData
+	req.Masterchain.Config.globalVersion = version
 	attachFullCollatedTestNeighbors(t, &req)
 
 	// Now the two accounts diverge. Each stores a reference to a DIFFERENT cell
@@ -250,34 +258,28 @@ func assertSharedStorageDict(tb testing.TB, req ShardRequest, addrs ...*address.
 func collatedAccountStorageProofs(tb testing.TB, candidate *Candidate) map[cell.Hash]*cell.Cell {
 	tb.Helper()
 
-	roots, err := cell.FromBOCMultiRoot(candidate.CollatedData)
+	roots, err := cell.FromBOCMultiRootWithOptions(candidate.CollatedData, cell.BOCParseOptions{AllowNonZeroLevelRoot: true})
 	if err != nil {
 		tb.Fatalf("parse collated data: %v", err)
 	}
-	proofs := map[cell.Hash]*cell.Cell{}
+	var genUtime uint32
 	for _, root := range roots {
+		if root.Level() != 0 || root.IsSpecial() {
+			continue
+		}
 		loader := root.MustBeginParse()
-		if loader.BitsLeft() < 32 {
+		if loader.BitsLeft() < 128 || loader.MustLoadUInt(32) != consensusExtraDataTag {
 			continue
 		}
-		tag, tagErr := loader.LoadUInt(32)
-		if tagErr != nil || tag != accountStorageDictProofTag {
-			continue
-		}
-		proof, refErr := loader.LoadRefCell()
-		if refErr != nil {
-			tb.Fatalf("load account storage proof: %v", refErr)
-		}
-		virtual, unwrapErr := unwrapCollatedProof(proof)
-		if unwrapErr != nil {
-			tb.Fatalf("unwrap account storage proof: %v", unwrapErr)
-		}
-		// Level zero explicitly: the proof body carries pruned branches, so its
-		// top level is not the one the proven dictionary is addressed by.
-		proofs[virtual.HashKey(0)] = virtual
+		loader.MustLoadUInt(32)
+		genUtime = uint32(loader.MustLoadUInt(64) / 1000)
+		break
 	}
-
-	return proofs
+	verified, err := verifyCollatedRoots(roots, genUtime)
+	if err != nil {
+		tb.Fatalf("verify collated roots: %v", err)
+	}
+	return verified.accountStorage
 }
 
 // sharedStorageDictContract builds a contract that replaces its data with the

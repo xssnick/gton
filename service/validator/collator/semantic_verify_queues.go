@@ -128,10 +128,11 @@ type semanticQueueValidation struct {
 	replay *semanticReplay
 	target msgpool.ShardIdent
 
-	old       tlb.OutMsgQueueInfo
-	candidate *tlb.OutMsgQueueInfo
-	dispatch  *tlb.DispatchQueueAugDict
-	queueSize uint64
+	old                     tlb.OutMsgQueueInfo
+	candidate               *tlb.OutMsgQueueInfo
+	dispatch                *tlb.DispatchQueueAugDict
+	queueSize               uint64
+	changedDispatchAccounts [][32]byte
 
 	shardEndLT *shardEndLTResolver
 
@@ -210,7 +211,7 @@ func (v *semanticQueueValidation) precheckOutQueueUpdate() error {
 			return fmt.Errorf("%w: open outbound queue message body: %v", ErrInvalidInput, err)
 		}
 		return v.verifyOutQueueChange(key, &entry, view.HasNew)
-	})
+	}, cell.DictDiffCheckNewCanonicalLabels)
 	if err != nil {
 		if errors.Is(err, ErrInvalidInput) {
 			return err
@@ -229,6 +230,10 @@ func (v *semanticQueueValidation) precheckDispatchQueueUpdate() error {
 		return fmt.Errorf("%w: decode candidate dispatch queue: %v", ErrInvalidInput, err)
 	}
 	err = v.dispatch.ScanDiffRaw(candidate.AugmentedDictionary, true, func(view cell.AugDictDiffRawView) error {
+		if view.KeyBits != 256 || len(view.Key) != 32 {
+			return fmt.Errorf("%w: dispatch account key is malformed", ErrInvalidInput)
+		}
+		v.changedDispatchAccounts = append(v.changedDispatchAccounts, [32]byte(view.Key))
 		if view.HasOld {
 			oldAccount, parseErr := dispatchDiffAccount(view.OldValueExtra)
 			if parseErr != nil {
@@ -471,6 +476,16 @@ func (v *semanticQueueValidation) verifyQueueRoots() error {
 		return fmt.Errorf("%w: candidate outbound queue size differs from semantic delta", ErrInvalidInput)
 	}
 
+	config := v.replay.transition.Config
+	if config.globalVersion >= 16 && v.candidate.Extra != nil && v.candidate.Extra.OutQueueSize != nil {
+		hardLimit := config.outQueueHardLimit
+		if v.old.Extra != nil && v.old.Extra.OutQueueSize != nil {
+			hardLimit = max(hardLimit, *v.old.Extra.OutQueueSize)
+		}
+		if v.queueSize > hardLimit {
+			return fmt.Errorf("%w: outbound queue size %d exceeds hard limit %d", ErrInvalidInput, v.queueSize, hardLimit)
+		}
+	}
 	return nil
 }
 

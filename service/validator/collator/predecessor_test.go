@@ -209,11 +209,14 @@ func TestPreparePredecessorTracesDispatchQueueRootValidation(t *testing.T) {
 
 func TestAfterSplitFullCollatedProofCarriesChangedAccount(t *testing.T) {
 	for _, test := range []struct {
-		name  string
-		right bool
+		name    string
+		right   bool
+		version uint32
 	}{
-		{name: "left"},
-		{name: "right", right: true},
+		{name: "left GV15", version: 15},
+		{name: "right GV15", right: true, version: 15},
+		{name: "left GV16", version: 16},
+		{name: "right GV16", right: true, version: 16},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			parentRequest := emptyCandidateRequest(t)
@@ -257,6 +260,7 @@ func TestAfterSplitFullCollatedProofCarriesChangedAccount(t *testing.T) {
 			childRequest.Header.GenUtime++
 			childRequest.Header.GenUtimeMS = uint64(childRequest.Header.GenUtime) * 1_000
 			childRequest.Masterchain.Config.capabilities |= capFullCollatedData
+			childRequest.Masterchain.Config.globalVersion = test.version
 			childRequest.Masterchain.Groups.Active = []groups.Session{{
 				Shard:            childRequest.Shard,
 				CatchainSeqno:    parentSession.CatchainSeqno,
@@ -302,18 +306,12 @@ func TestAfterSplitFullCollatedProofCarriesChangedAccount(t *testing.T) {
 				t.Fatal("child state update does not produce the candidate state")
 			}
 
-			roots, err := cell.FromBOCMultiRoot(candidate.CollatedData)
+			verified, err := verifyCollatedData(candidate, nil, childRequest.Header.GenUtime)
 			if err != nil {
 				t.Fatalf("decode child collated data: %v", err)
 			}
-			var provenParent *cell.Cell
-			for _, root := range roots {
-				virtual, proofErr := cell.UnwrapProof(root, parent.State.Hash())
-				if proofErr == nil {
-					provenParent = virtual
-					break
-				}
-			}
+			provenParent := verified.virtualRoots[parent.State.HashKey()]
+
 			if provenParent == nil {
 				t.Fatal("collated data carries no parent state proof")
 			}

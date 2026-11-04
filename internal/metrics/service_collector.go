@@ -163,7 +163,7 @@ func newServiceCollector(metrics *Metrics, namespace string) prometheus.Collecto
 		),
 		p2pBroadcastDrops: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "p2p", "broadcast_dropped_total"),
-			"Total inbound P2P broadcasts dropped before acceptance by type and reason.",
+			"Total inbound P2P broadcasts dropped before acceptance by type and reason; local_send_* reasons count recipients this node's own broadcasts did not reach.",
 			[]string{"overlay", "kind", "reason"},
 			nil,
 		),

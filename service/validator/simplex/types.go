@@ -258,6 +258,8 @@ type Params struct {
 	MinBlockInterval           time.Duration
 	NoEmptyBlocksOnErrTimeout  time.Duration
 	CertificateGossipNeighbors uint32
+	CollatorMaxFutureWindow    uint32
+	CollatorMaxSyncDelay       time.Duration
 }
 
 // Validate rejects parameter sets the engine cannot run with. The protocol
@@ -310,6 +312,8 @@ func DefaultParams() Params {
 		MinBlockInterval:           0,
 		NoEmptyBlocksOnErrTimeout:  15 * time.Second,
 		CertificateGossipNeighbors: 20,
+		CollatorMaxFutureWindow:    4,
+		CollatorMaxSyncDelay:       10 * time.Second,
 	}
 }
 
@@ -461,10 +465,10 @@ func totalValidatorWeight(validators []Validator) (uint64, error) {
 		if validators[i].Weight == 0 {
 			return 0, fmt.Errorf("simplex: validator %d has zero weight", i)
 		}
-		total += validators[i].Weight
-		if total > maxTotalWeight {
+		if validators[i].Weight > maxTotalWeight-total {
 			return 0, fmt.Errorf("simplex: total validator weight exceeds 2^61")
 		}
+		total += validators[i].Weight
 	}
 
 	return total, nil

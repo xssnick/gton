@@ -12,6 +12,7 @@ import (
 	tonnodeapi "github.com/xssnick/tonutils-go/adnl/node"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -67,6 +68,22 @@ func (n *Node) sendExternalMessage(ctx context.Context, data []byte, addrKey ext
 		return err
 	}
 
+	ev := ExternalMessageEvent{
+		IsLocal:  isLocal,
+		Priority: 0,
+		Body:     data,
+		Root:     root,
+		Message:  msg,
+	}
+	if len(targets) == 0 {
+		// A configured validator/collator may be between FastSync memberships.
+		// Public isolation must not prevent local pool admission in that gap.
+		if checked {
+			return n.acceptCheckedExternalMessage(ctx, ev)
+		}
+		return n.acceptExternalMessage(ctx, ev)
+	}
+
 	pending := make([]externalMessageTarget, 0, len(targets))
 	for _, target := range targets {
 		if !n.allowDuplicateExternals && n.externalMessageSeen(target.hash, now) {
@@ -76,14 +93,6 @@ func (n *Node) sendExternalMessage(ctx context.Context, data []byte, addrKey ext
 	}
 	if len(pending) == 0 {
 		return nil
-	}
-
-	ev := ExternalMessageEvent{
-		IsLocal:  isLocal,
-		Priority: 0,
-		Body:     data,
-		Root:     root,
-		Message:  msg,
 	}
 
 	// The address limit and the broadcast capacity are taken before admission:
@@ -185,10 +194,28 @@ func externalBroadcastCostBytes(targets []externalMessageTarget, payloadLen int)
 
 func (n *Node) externalMessageTargets(addrKey extmsg.AddressKey, data []byte) ([]externalMessageTarget, error) {
 	customTargets, skipPublic := n.customExternalMessageTargets(addrKey, data)
-	targets := make([]externalMessageTarget, 0, len(customTargets)+1)
+	fastSync, err := n.fastSyncSubscriptionForBlock(ton.BlockIDExt{
+		Workchain: addrKey.Workchain,
+		Shard:     externalMessageLeafShard(addrKey),
+	})
+	if err != nil {
+		return nil, err
+	}
+	hasFastSync := fastSync != nil && fastSync.isActive()
+	capacity := len(customTargets) + 1
+	if hasFastSync {
+		capacity++
+	}
+	targets := make([]externalMessageTarget, 0, capacity)
 	targets = append(targets, customTargets...)
+	if hasFastSync {
+		targets = append(targets, externalMessageTarget{
+			sub:  fastSync,
+			hash: externalMessageFingerprint(fastSync.spec.ShortID, data),
+		})
+	}
 
-	if !skipPublic {
+	if !skipPublic && !n.disablePublicExternalMessages {
 		sub, err := n.subscriptionForWorkchain(addrKey.Workchain)
 		if err != nil {
 			return nil, err

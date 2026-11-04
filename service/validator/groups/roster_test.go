@@ -4,18 +4,10 @@ import (
 	"encoding/binary"
 	"math"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
-
-type testTentativeValidatorSetCase struct {
-	name      string
-	input     TentativeValidatorSetInput
-	wantKey   byte
-	wantError string
-}
 
 func TestValidatorSetPRNGGolden(t *testing.T) {
 	want := []uint64{
@@ -147,67 +139,6 @@ func TestFenwickShardRosterMatchesHoleSelection(t *testing.T) {
 	}
 }
 
-func TestSelectTentativeValidatorSetBoundary(t *testing.T) {
-	current := testSingleValidatorSet(1, 100)
-	next := testSingleValidatorSet(2, 400)
-
-	tests := []testTentativeValidatorSetCase{
-		{
-			name: "next starts after boundary",
-			input: TentativeValidatorSetInput{
-				Current: current, Next: &next, GenUTime: 199, CatchainLifetime: 200,
-			},
-			wantKey: 1,
-		},
-		{
-			name: "equality selects next",
-			input: TentativeValidatorSetInput{
-				Current: current, Next: &next, GenUTime: 200, CatchainLifetime: 200,
-			},
-			wantKey: 2,
-		},
-		{
-			name: "absent next ignores zero lifetime",
-			input: TentativeValidatorSetInput{
-				Current: current,
-			},
-			wantKey: 1,
-		},
-		{
-			name: "zero lifetime",
-			input: TentativeValidatorSetInput{
-				Current: current, Next: &next,
-			},
-			wantError: "lifetime must be positive",
-		},
-		{
-			name: "uint32 boundary overflow",
-			input: TentativeValidatorSetInput{
-				Current: current, Next: &next, GenUTime: math.MaxUint32, CatchainLifetime: 200,
-			},
-			wantError: "overflows uint32",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			selected, err := SelectTentativeValidatorSet(test.input)
-			if test.wantError != "" {
-				if err == nil || !strings.Contains(err.Error(), test.wantError) {
-					t.Fatalf("SelectTentativeValidatorSet error = %v, want %q", err, test.wantError)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("SelectTentativeValidatorSet: %v", err)
-			}
-			if got := selected.Validators[0].PublicKey[0]; got != test.wantKey {
-				t.Fatalf("selected key prefix = %d, want %d", got, test.wantKey)
-			}
-		})
-	}
-}
-
 func TestValidatorSetHashGolden(t *testing.T) {
 	validators := []Validator{
 		{PublicKey: groupTestBytes(1), ADNL: groupTestBytes(101), Weight: 10},
@@ -300,19 +231,6 @@ func testRosterValidatorSet() ValidatorSet {
 	}
 
 	return ValidatorSet{Main: 4, TotalWeight: totalWeight, Validators: validators, cumulativeWeights: cumulativeWeights}
-}
-
-func testSingleValidatorSet(key byte, since uint32) ValidatorSet {
-	return ValidatorSet{
-		Since:       since,
-		Main:        1,
-		TotalWeight: 1,
-		Validators: []Validator{{
-			PublicKey:     groupTestBytes(key),
-			PublicKeyHash: groupTestBytes(key + 40),
-			Weight:        1,
-		}},
-	}
 }
 
 func assertRosterKeys(t *testing.T, roster []Validator, want []byte) {

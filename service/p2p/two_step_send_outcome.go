@@ -20,22 +20,42 @@ type TwoStepSendFault uint8
 
 const (
 	// TwoStepSendFaultOffline: no live outbound connection when the part was
-	// due. A background dial has been asked for; the part is dropped.
+	// due - a relay found none, or an own broadcast skipped the wait on a
+	// failing route. A dial has been asked for or is in flight; the part is
+	// dropped.
 	TwoStepSendFaultOffline TwoStepSendFault = iota
 	// TwoStepSendFaultDialDeferred: the peer's route is inside its retry
-	// window, so no dial was attempted at all.
+	// window, so no dial was attempted at all - for an own broadcast, a dial
+	// failed between its failing-route check and its wait.
 	TwoStepSendFaultDialDeferred
 	// TwoStepSendFaultWriteDeadline: the transport's own write deadline fired.
 	TwoStepSendFaultWriteDeadline
-	// TwoStepSendFaultContextDeadline: the caller's budget expired.
+	// TwoStepSendFaultContextDeadline: the caller's budget expired, including
+	// an own broadcast that waited for the shared dial until its budget ran
+	// out.
 	TwoStepSendFaultContextDeadline
 	// TwoStepSendFaultCanceled: the fan-out was cancelled - node shutdown or a
-	// retired session.
+	// retired session - also while an own broadcast waited for a dial.
 	TwoStepSendFaultCanceled
 	// TwoStepSendFaultOther: an error the peer is answerable for.
 	TwoStepSendFaultOther
 	TwoStepSendFaultCount
 )
+
+// localSendDropReasons are the p2p_broadcast_dropped_total reasons of a
+// recipient this node's own broadcast did not reach, one per fault class. The
+// local_send_ prefix keeps them apart from the inbound drop reasons of the same
+// family. A wait for the shared dial that did not end in a connection is
+// classified by why it ended, so local_send_peer_offline is an instant skip and
+// local_send_context_deadline a wait that held its queue for the whole budget.
+var localSendDropReasons = [TwoStepSendFaultCount]string{
+	TwoStepSendFaultOffline:         "local_send_peer_offline",
+	TwoStepSendFaultDialDeferred:    "local_send_dial_deferred",
+	TwoStepSendFaultWriteDeadline:   "local_send_write_deadline",
+	TwoStepSendFaultContextDeadline: "local_send_context_deadline",
+	TwoStepSendFaultCanceled:        "local_send_canceled",
+	TwoStepSendFaultOther:           "local_send_error",
+}
 
 // TwoStepSendOutcome reports one fan-out by recipient. Attempted counts the
 // recipients the broadcast was addressed to, Sent the ones that took their
@@ -98,19 +118,22 @@ func (s *overlaySubscription) twoStepSendOutcome(
 }
 
 func classifyTwoStepSendFault(err error) TwoStepSendFault {
+	// An own broadcast's dial wait wraps why it ended in errQUICPeerOffline
+	// (quicLocalBroadcastPeer.connection), so the cause is checked first: it
+	// is the more precise class and still not one the peer is answerable for.
 	switch {
 	case err == nil:
 		return TwoStepSendFaultOther
-	case errors.Is(err, errQUICPeerOffline),
-		errors.Is(err, errQUICRouteMissing),
-		errors.Is(err, errAuthenticatedQUICPeerNotFound):
-		return TwoStepSendFaultOffline
 	case errors.Is(err, errQUICDialDeferred):
 		return TwoStepSendFaultDialDeferred
 	case errors.Is(err, context.Canceled):
 		return TwoStepSendFaultCanceled
 	case errors.Is(err, context.DeadlineExceeded):
 		return TwoStepSendFaultContextDeadline
+	case errors.Is(err, errQUICPeerOffline),
+		errors.Is(err, errQUICRouteMissing),
+		errors.Is(err, errAuthenticatedQUICPeerNotFound):
+		return TwoStepSendFaultOffline
 	}
 
 	// A stream deadline surfaces as a net.Error timeout rather than a context

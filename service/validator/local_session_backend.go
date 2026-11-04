@@ -156,6 +156,8 @@ type LocalSessionBackend struct {
 	collatorDeferred atomic.Bool
 
 	controlMu         sync.Mutex
+	deliveries        map[uint32]*delegationDelivery
+	deliveryWorkers   sync.WaitGroup
 	validationChanged chan struct{}
 	// collatorReady is closed once deferred producer recovery resolves. Waiters
 	// then recheck whether it resolved as ready, terminally unavailable, or
@@ -402,6 +404,7 @@ func (b *LocalSessionBackend) ObserveConsensusProgress(
 	if b.closed.Load() {
 		return ErrLocalSessionBackendClosed
 	}
+	b.cancelStartedDelegationsLocked(progress.Window.StartSlot)
 	if b.progress == nil {
 		applyConsensusWindow(&b.update, progress.Window, progress.StartAt)
 		b.publishValidationView()
@@ -1121,6 +1124,7 @@ func (b *LocalSessionBackend) HandleLeaderWindow(ctx context.Context, window Lea
 		}
 	}
 	defer b.controlMu.Unlock()
+	b.cancelStartedDelegationsLocked(window.Window.StartSlot)
 	if b.collatorUnavailable.Load() {
 		return nil
 	}
@@ -1236,29 +1240,29 @@ func (b *LocalSessionBackend) authorizeDelegatedWindow(ctx context.Context, next
 		return nil
 	}
 
-	authorization, err := b.delegationAuthorization(ctx, nextStart)
-	if err != nil {
-		return err
-	}
-	deliveryCtx, cancel := context.WithTimeout(ctx, delegationDeliveryTimeout)
-	err = b.collator.CommitDelegation(deliveryCtx, collator.WindowRequest{
-		SessionID:  b.config.SessionID,
-		SourceADNL: b.config.Identity.ADNLID,
-		PleaseCollate: simplex.ConsensusPleaseCollate{
-			WindowStartSlot: int32(nextStart),
-			Signature:       authorization.Signature,
-		},
-	})
+	nextAttempt := time.Now().Add(delegationDeliveryTimeout)
+	prepareCtx, cancel := context.WithDeadline(ctx, nextAttempt)
+	authorization, err := b.delegationAuthorization(prepareCtx, nextStart)
 	cancel()
-	if err != nil && !errors.Is(err, collator.ErrAlreadyDelegated) {
+	if err != nil {
+		if !errors.Is(err, errDelegationPreparationUnavailable) {
+			return err
+		}
+		b.retryDelegationPreparationLocked(ctx, nextStart, nextAttempt)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		b.log.Debug().
-			Err(err).
-			Hex("session", b.config.SessionID[:]).
-			Uint32("window", nextStart).
-			Msg("durable delegation delivery was inconclusive")
+		b.log.Debug().Err(err).Uint32("window", nextStart).Msg("delegation preparation will retry")
+		return nil
+	}
+	nextAttempt = time.Now().Add(delegationDeliveryTimeout)
+	err = b.commitDelegation(ctx, authorization)
+	if err != nil && !errors.Is(err, collator.ErrAlreadyDelegated) {
+		b.retryDelegationLocked(ctx, authorization, nextAttempt)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		b.log.Debug().Err(err).Uint32("window", nextStart).Msg("durable delegation delivery will retry")
 	}
 
 	return nil
@@ -1291,7 +1295,8 @@ func (b *LocalSessionBackend) delegationAuthorization(
 	})
 	if err != nil && !errors.Is(err, collator.ErrAlreadyDelegated) {
 		return DelegationAuthorization{}, fmt.Errorf(
-			"validator local backend: probe upcoming leader window %d: %w",
+			"validator local backend: %w for window %d: %w",
+			errDelegationPreparationUnavailable,
 			start,
 			err,
 		)
@@ -1408,12 +1413,9 @@ func (b *LocalSessionBackend) Close() error {
 	b.controlMu.Lock()
 	if b.closed.Load() {
 		b.controlMu.Unlock()
-
+		b.deliveryWorkers.Wait()
 		return nil
 	}
-	// Teardown is synchronous here, so there is no intermediate draining state:
-	// every observer either sees an open backend or a fully closed one. Unlike
-	// collator.RemoteCollator, this backend has nothing in flight to wait for.
 	b.validation.Store(nil)
 	b.signalValidationChanged()
 	b.clearWindowRoute(0)
@@ -1422,13 +1424,16 @@ func (b *LocalSessionBackend) Close() error {
 		b.releaseRoute = nil
 	}
 	b.closed.Store(true)
+	for _, delivery := range b.deliveries {
+		delivery.cancel()
+	}
 	b.pendingWindow = nil
 	b.appliedWindow = nil
 	b.handledWindow = nil
 	b.recheckWindow = nil
 	b.signalCollatorReady()
 	b.controlMu.Unlock()
-
+	b.deliveryWorkers.Wait()
 	return nil
 }
 
@@ -1886,6 +1891,8 @@ func localCollatorUpdate(sessionID [32]byte, state SessionState) collator.Sessio
 	update := collator.SessionUpdate{
 		SessionID:                 sessionID,
 		TargetRate:                state.Params.TargetRate,
+		CollatorMaxFutureWindow:   state.Params.CollatorMaxFutureWindow,
+		CollatorMaxSyncDelay:      state.Params.CollatorMaxSyncDelay,
 		NoEmptyBlocksOnErrTimeout: state.Params.NoEmptyBlocksOnErrTimeout,
 		MasterchainBlock:          *state.MasterchainBlock.Copy(),
 		Registered:                append([]groups.ShardDescription(nil), state.Registered...),

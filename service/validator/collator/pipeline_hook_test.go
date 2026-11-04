@@ -3,6 +3,7 @@ package collator
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -432,7 +433,10 @@ func TestRuntimePipelinedFutureSurvivesAnEmittedEmptySlot(t *testing.T) {
 			}
 		}
 
-		return runtimeBuiltCandidate(request), nil
+		candidate := runtimeBuiltCandidate(request)
+		candidate.processedExternals = append(slices.Clone(request.excludeExternals), [32]byte{byte(request.Slot + 1)})
+
+		return candidate, nil
 	}
 
 	emitted := make(chan CandidateArtifact, 8)
@@ -453,6 +457,13 @@ func TestRuntimePipelinedFutureSurvivesAnEmittedEmptySlot(t *testing.T) {
 		artifact := runtimeAwaitArtifact(t, emitted)
 		if artifact.Candidate.Empty {
 			empties++
+		}
+		want := [][32]byte{{1}}
+		if slot == 2 {
+			want = append(want, [32]byte{2})
+		}
+		if !slices.Equal(artifact.processedExternals, want) {
+			t.Fatalf("slot %d processed hashes = %x, want %x", slot, artifact.processedExternals, want)
 		}
 	}
 	if empties != 1 {

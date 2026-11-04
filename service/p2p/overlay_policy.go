@@ -84,6 +84,26 @@ func (spec *overlaySpec) membersArePermanent() bool {
 		spec.Kind == overlayKindPrivate
 }
 
+// inboundQUICReopensFailingRoute reports whether a new QUIC connection a
+// roster member opens to us reopens that member's failing route and redials at
+// once (authenticatedQUICPeer.reopenFailingRoute) rather than leaving this
+// node's own traffic to it dropped until the retry gate expires. Custom fixed
+// and private overlays need the direct path: a custom overlay is often just a
+// message sender and a block sender, and a private overlay sends its consensus
+// messages point to point (dialForMessage, which a gated route refuses).
+//
+// FastSync is left out on purpose. Its roster is not permanent - it follows
+// member certificates and the validator sets, so a failing route there may
+// belong to a member that is leaving anyway - and its own sends do not hinge on
+// one member: the overlay spans a whole validator set whose members relay
+// what they receive (FEC and simple relay, two-step, Plumtree), so a member
+// this node cannot reach still gets the broadcast from the others. A reopen
+// per member and failing streak across a roster that size would also buy
+// many more handshakes.
+func (spec *overlaySpec) inboundQUICReopensFailingRoute() bool {
+	return spec.UseQUIC && spec.membersArePermanent()
+}
+
 // peersStartPending reports whether a freshly attached peer is untrusted until
 // warmup proves it answers. A configured roster member is a member from the
 // start — there is nothing to prove and no alternative peer to prefer.
@@ -266,9 +286,8 @@ func (spec *overlaySpec) nextQueryProbeDelay() time.Duration {
 // broadcast
 // ---------------------------------------------------------------------------
 
-// restrictsBroadcastKinds admits only the block family, dropping externals and
-// IHR before any type switch runs. A FastSync overlay exists to move blocks
-// between validators; anything else on it is either a bug or an attack.
+// restrictsBroadcastKinds limits FastSync to block traffic and admitted external
+// messages before the application type switch runs.
 func (spec *overlaySpec) restrictsBroadcastKinds() bool {
 	return spec.Kind == overlayKindFastSync
 }
@@ -277,6 +296,12 @@ func (spec *overlaySpec) restrictsBroadcastKinds() bool {
 // relay, which happens because we are also a listed sender on this overlay.
 func (spec *overlaySpec) dropsSelfSourcedBroadcasts() bool {
 	return spec.Kind == overlayKindCustomFixed
+}
+
+// relaysOwnExternalMessages allows the first reflected external copy through
+// native relay without admitting a locally originated message to the pool again.
+func (spec *overlaySpec) relaysOwnExternalMessages() bool {
+	return spec.Kind == overlayKindFastSync
 }
 
 // dropsIHRBroadcasts reports that tonNode.ihrMessageBroadcast has no place on
@@ -306,7 +331,7 @@ func (spec *overlaySpec) relaysFECBroadcasts() bool {
 }
 
 // relaysSimpleBroadcasts reports that the transport forwards the original
-// simple broadcast envelope after application acceptance. Public overlays use
+// simple broadcast envelope after application acceptance. Gossip overlays use
 // this path to preserve the source, signature, and broadcast id exactly as the
 // C++ overlay does. The application layer must not additionally rebuild and
 // enqueue the payload, or the new local source turns it into another broadcast.
@@ -314,7 +339,7 @@ func (spec *overlaySpec) relaysSimpleBroadcasts() bool {
 	if spec.Kind == overlayKindPrivate {
 		return spec.PrivateAllowLegacyBroadcasts
 	}
-	return spec.Kind == overlayKindPublicShard
+	return spec.Kind == overlayKindPublicShard || spec.Kind == overlayKindFastSync
 }
 
 // usesPlumtree reports whether a Plumtree runtime is built for this overlay.
@@ -356,7 +381,7 @@ func (spec *overlaySpec) alwaysTwoStepFEC() bool {
 
 // twoStepFECUnlessPlanOptsOut reports that FEC goes two-step unless the plan
 // stamped overlay.BroadcastFlagNoTwoStep, which planFastSyncRebroadcast does
-// for shard descriptions.
+// for shard descriptions and external messages.
 func (spec *overlaySpec) twoStepFECUnlessPlanOptsOut() bool {
 	return spec.Kind == overlayKindFastSync
 }
@@ -388,29 +413,14 @@ func (spec *overlaySpec) servesPublicIngress() bool {
 	return spec.Kind == overlayKindPublicShard
 }
 
-// unauthorizedBroadcastLimit caps broadcasts from senders outside the overlay's
-// authorized keys. A FastSync overlay only ever carries traffic from its
-// validator roster, so nothing outside it is acceptable at any size: the
-// reference node builds this overlay with OverlayPrivacyRules{0, 0, keys}
-// (full-node-fast-sync-overlays.cpp), where a non-zero size from an
-// unauthorized sender is Forbidden outright. Without the cap a certified
-// non-validator member could push a full-size FEC broadcast that only the block
-// signature check would eventually reject.
-//
-// Keeps the overlayKind parameter: TestUnauthorizedBroadcastLimitIsZeroOnlyForFastSync
-// drives it as a table over all three kinds.
-func unauthorizedBroadcastLimit(kind overlayKind) uint32 {
-	if kind == overlayKindFastSync {
-		return 0
-	}
-	return maxOverlayPayloadSize
-}
-
+// unauthorizedBroadcastLimit permits bounded broadcasts which still require
+// application admission. FastSync membership is authenticated at transport
+// ingress; only external messages may pass its untrusted-source check.
 func (spec *overlaySpec) unauthorizedBroadcastLimit() uint32 {
 	if spec.Kind == overlayKindPrivate {
 		return spec.PrivateUnauthenticatedBroadcast
 	}
-	return unauthorizedBroadcastLimit(spec.Kind)
+	return maxOverlayPayloadSize
 }
 
 // ---------------------------------------------------------------------------

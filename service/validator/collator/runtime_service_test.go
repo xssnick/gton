@@ -273,6 +273,7 @@ func runtimeHandOffSuccessor(
 			StartLT:     uint64(request.Slot) * 1000,
 		},
 		Policy:          policy,
+		Exclude:         candidate.processedExternals,
 		predecessorSlot: request.Slot,
 		handoffAt:       time.Now(),
 		// What LocalAcquisition puts on its port, from the same two instants.
@@ -773,6 +774,7 @@ func newRuntimeFixtureWithMode(
 	keys := newRuntimeTestKeys(t)
 	source := sha256.Sum256([]byte("validator-adnl"))
 	service, err := NewService(ServiceOptions{
+		SyncLag:           func() (time.Duration, error) { return 0, nil },
 		ProductionMode:    mode,
 		Storage:           storage,
 		Pipeline:          pipeline,
@@ -811,6 +813,7 @@ func newUnstartedRuntimeService(
 		emit = func(context.Context, CandidateArtifact) error { return nil }
 	}
 	service, err := NewService(ServiceOptions{
+		SyncLag:           func() (time.Duration, error) { return 0, nil },
 		ProductionMode:    ProductionModeDelegated,
 		Storage:           storage,
 		Pipeline:          pipeline,
@@ -856,6 +859,8 @@ func (f *runtimeFixture) session(seed byte, slots uint32, current uint32, startA
 	update := SessionUpdate{
 		SessionID:                 id,
 		TargetRate:                100 * time.Millisecond,
+		CollatorMaxFutureWindow:   4,
+		CollatorMaxSyncDelay:      10 * time.Second,
 		NoEmptyBlocksOnErrTimeout: 15 * time.Second,
 		MasterchainBlock:          master,
 		HasCurrentWindow:          true,
@@ -1300,6 +1305,7 @@ func TestRuntimeRestartDoesNotRebuildSelfCandidateMarker(t *testing.T) {
 	secondPipeline := &runtimeTestPipeline{}
 	secondEmitted := make(chan CandidateArtifact, 1)
 	second, err := NewService(ServiceOptions{
+		SyncLag:           func() (time.Duration, error) { return 0, nil },
 		ProductionMode:    ProductionModeSelf,
 		Storage:           storage,
 		Pipeline:          secondPipeline,
@@ -1430,6 +1436,7 @@ func TestRuntimeStartDefersRecoveredSessionUntilMessageTopologyIsReady(t *testin
 
 	keys := newRuntimeTestKeys(t)
 	service, err := NewService(ServiceOptions{
+		SyncLag:            func() (time.Duration, error) { return 0, nil },
 		ProductionMode:     ProductionModeDelegated,
 		Storage:            storage,
 		Pipeline:           acquisition,
@@ -1975,7 +1982,6 @@ func (f *runtimeFixture) prepare(t *testing.T, session Session, update SessionUp
 		}
 		managed.mu.Lock()
 		managed.progressReady = true
-		managed.progressApplied = true
 		managed.mu.Unlock()
 	}
 }
@@ -1991,7 +1997,6 @@ func (f *runtimeFixture) forceProgressReady(t *testing.T, sessionID [32]byte) {
 	}
 	managed.mu.Lock()
 	managed.progressReady = true
-	managed.progressApplied = true
 	managed.mu.Unlock()
 }
 
@@ -2089,11 +2094,11 @@ func TestRuntimeProbeAndCommitValidation(t *testing.T) {
 	conflict := request
 	conflict.PleaseCollate.Signature = append([]byte(nil), request.PleaseCollate.Signature...)
 	conflict.PleaseCollate.Signature[0] ^= 0xff
-	if err = fixture.service.CommitDelegation(context.Background(), conflict); !errors.Is(err, ErrWindowConflict) {
-		t.Fatalf("conflicting duplicate delegation error = %v, want ErrWindowConflict", err)
+	if err = fixture.service.CommitDelegation(context.Background(), conflict); err != nil {
+		t.Fatalf("duplicate committed window error = %v", err)
 	}
 	probe.StartSlot = 2
-	if err = fixture.service.Probe(context.Background(), probe); !errors.Is(err, ErrAlreadyDelegated) {
+	if err = fixture.service.Probe(context.Background(), probe); err != nil {
 		t.Fatalf("probe after final delegation error = %v", err)
 	}
 }
@@ -2148,18 +2153,18 @@ func TestRuntimeDelegationHorizonMatchesReference(t *testing.T) {
 	probe := WindowPreparation{
 		SessionID:  session.ID,
 		SourceADNL: fixture.sourceADNL,
-		StartSlot:  19 * session.SlotsPerLeaderWindow,
+		StartSlot:  3 * session.SlotsPerLeaderWindow,
 	}
 	if err := fixture.service.Probe(context.Background(), probe); err != nil {
-		t.Fatalf("window at distance 19 rejected: %v", err)
+		t.Fatalf("window at distance 3 rejected: %v", err)
 	}
-	probe.StartSlot = 20 * session.SlotsPerLeaderWindow
+	probe.StartSlot = 4 * session.SlotsPerLeaderWindow
 	if err := fixture.service.Probe(context.Background(), probe); !errors.Is(err, ErrWindowTooFar) {
-		t.Fatalf("window at distance 20 error = %v, want ErrWindowTooFar", err)
+		t.Fatalf("window at distance 4 error = %v, want ErrWindowTooFar", err)
 	}
 }
 
-func TestRuntimeDelegationRequiresFreshConsensusProgress(t *testing.T) {
+func TestRuntimeDelegationPreparesBeforeConsensusStarts(t *testing.T) {
 	emitted := make(chan CandidateArtifact, 1)
 	pipeline := &runtimeTestPipeline{}
 	fixture := newRuntimeFixture(t, 1, 1, pipeline, nil, func(_ context.Context, artifact CandidateArtifact) error {
@@ -2173,12 +2178,12 @@ func TestRuntimeDelegationRequiresFreshConsensusProgress(t *testing.T) {
 	fixture.prepare(t, session, update)
 
 	probe := WindowPreparation{SessionID: session.ID, SourceADNL: fixture.sourceADNL}
-	if err := fixture.service.Probe(context.Background(), probe); !errors.Is(err, ErrAcquisitionNotReady) {
-		t.Fatalf("probe before fresh progress = %v, want ErrAcquisitionNotReady", err)
+	if err := fixture.service.Probe(context.Background(), probe); err != nil {
+		t.Fatalf("probe before first window = %v", err)
 	}
 	request := fixture.request(t, session, 0)
-	if err := fixture.service.CommitDelegation(context.Background(), request); !errors.Is(err, ErrAcquisitionNotReady) {
-		t.Fatalf("commit before fresh progress = %v, want ErrAcquisitionNotReady", err)
+	if err := fixture.service.CommitDelegation(context.Background(), request); err != nil {
+		t.Fatalf("commit before first window = %v", err)
 	}
 	managed, err := fixture.service.runningSession(session.ID)
 	if err != nil {
@@ -2187,8 +2192,8 @@ func TestRuntimeDelegationRequiresFreshConsensusProgress(t *testing.T) {
 	managed.mu.Lock()
 	_, authorized := managed.authorizations[request.ID()]
 	managed.mu.Unlock()
-	if authorized {
-		t.Fatal("rejected delegation was retained in receiver memory")
+	if !authorized {
+		t.Fatal("accepted future delegation was not retained")
 	}
 	if pipeline.buildCount() != 0 {
 		t.Fatalf("builds before fresh progress = %d, want 0", pipeline.buildCount())
@@ -2212,7 +2217,7 @@ func TestRuntimeDelegationRequiresFreshConsensusProgress(t *testing.T) {
 	if err := fixture.service.CommitDelegation(context.Background(), request); err != nil {
 		t.Fatalf("idempotent commit after fresh progress: %v", err)
 	}
-	if err := fixture.service.Probe(context.Background(), probe); !errors.Is(err, ErrAlreadyDelegated) {
+	if err := fixture.service.Probe(context.Background(), probe); err != nil {
 		t.Fatalf("probe after final delegation error = %v, want ErrAlreadyDelegated", err)
 	}
 	artifact := runtimeAwaitArtifact(t, emitted)
@@ -2249,6 +2254,7 @@ func TestRuntimeDefersStaleActivationUntilRecoveredSessionAdvances(t *testing.T)
 		},
 	}
 	second, err := NewService(ServiceOptions{
+		SyncLag:           func() (time.Duration, error) { return 0, nil },
 		ProductionMode:    ProductionModeDelegated,
 		Storage:           storage,
 		Pipeline:          pipeline,
@@ -2797,6 +2803,7 @@ func TestRuntimePendingCandidateEndsWindowInsteadOfRebuilding(t *testing.T) {
 	recovered := make(chan CandidateArtifact, 1)
 	secondPipeline := &runtimeTestPipeline{}
 	secondService, err := NewService(ServiceOptions{
+		SyncLag:           func() (time.Duration, error) { return 0, nil },
 		ProductionMode:    ProductionModeDelegated,
 		Storage:           storage,
 		Pipeline:          secondPipeline,
@@ -2841,6 +2848,9 @@ func TestRuntimePendingCandidateEndsWindowInsteadOfRebuilding(t *testing.T) {
 	}
 	if secondPipeline.buildCount() != 0 {
 		t.Fatalf("successor built %d candidates without a delegation resend", secondPipeline.buildCount())
+	}
+	if err = secondService.UpdateSession(context.Background(), update); err != nil {
+		t.Fatal(err)
 	}
 	if err = secondService.CommitDelegation(
 		context.Background(),
@@ -2897,18 +2907,24 @@ func TestRuntimeRestartRequiresFreshProgressBeforeNextDelegation(t *testing.T) {
 	first.close(t)
 
 	emitted := make(chan CandidateArtifact, 1)
+	emissionStarted := make(chan uint32, session.SlotsPerLeaderWindow)
 	secondPipeline := &runtimeTestPipeline{}
 	second, err := NewService(ServiceOptions{
+		SyncLag:           func() (time.Duration, error) { return 0, nil },
 		ProductionMode:    ProductionModeDelegated,
 		Storage:           storage,
 		Pipeline:          secondPipeline,
 		Keys:              first.keys,
 		CollatorKeyID:     first.keys.id,
 		AllowedValidators: map[[32]byte]struct{}{first.sourceADNL: {}},
-		Emit: func(_ context.Context, artifact CandidateArtifact) error {
-			emitted <- artifact
-
-			return nil
+		Emit: func(ctx context.Context, artifact CandidateArtifact) error {
+			emissionStarted <- artifact.Candidate.ID.Slot
+			select {
+			case emitted <- artifact:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		},
 	})
 	if err != nil {
@@ -2951,6 +2967,9 @@ func TestRuntimeRestartRequiresFreshProgressBeforeNextDelegation(t *testing.T) {
 	); !errors.Is(err, ErrAcquisitionNotReady) {
 		t.Fatalf("recovered commit before fresh progress = %v, want ErrAcquisitionNotReady", err)
 	}
+	if err = second.UpdateSession(context.Background(), previous); err != nil {
+		t.Fatal(err)
+	}
 	next := previous
 	next.HasCurrentWindow = true
 	next.CurrentWindowStart = 4
@@ -2975,6 +2994,19 @@ func TestRuntimeRestartRequiresFreshProgressBeforeNextDelegation(t *testing.T) {
 	if artifact.WindowID != (WindowID{SessionID: session.ID, StartSlot: 4}) ||
 		artifact.Candidate.ID.Slot != 4 {
 		t.Fatalf("fresh next-window candidate after receiver restart = %+v", artifact)
+	}
+
+	// One artifact was consumed above. The second fills the buffer and the
+	// third must wait until shutdown cancels its delivery context.
+	for slot := uint32(4); slot < 7; slot++ {
+		select {
+		case started := <-emissionStarted:
+			if started != slot {
+				t.Fatalf("emission slot = %d, want %d", started, slot)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("producer did not reach the full emission channel")
+		}
 	}
 }
 
@@ -3594,7 +3626,6 @@ func TestRuntimeMasterchainWaitsWithEmptyCandidatesUntilConsensusFinalization(t 
 	}
 	managed.mu.Lock()
 	managed.progressReady = true
-	managed.progressApplied = true
 	managed.mu.Unlock()
 
 	if err = fixture.service.CommitDelegation(
@@ -3674,7 +3705,6 @@ func TestRuntimeConsensusFinalizationAllowsNextMasterchainBlock(t *testing.T) {
 	}
 	managed.mu.Lock()
 	managed.progressReady = true
-	managed.progressApplied = true
 	managed.mu.Unlock()
 	if err = service.CommitDelegation(context.Background(), fixture.request(t, session, 0)); err != nil {
 		t.Fatal(err)
@@ -4376,7 +4406,6 @@ func TestRuntimeOrdinaryUpdateCannotAdvanceSelectedConsensusBase(t *testing.T) {
 	}
 	managed.mu.Lock()
 	managed.progressReady = true
-	managed.progressApplied = true
 	managed.mu.Unlock()
 
 	next := cloneSessionUpdate(update)
@@ -6610,10 +6639,9 @@ func TestRuntimeAdmitsDelegationBehindAPendingSessionWrite(t *testing.T) {
 	}
 
 	// The condition the gate exists for is untouched: a session serving a
-	// descriptor recovered from storage, which has never materialized consensus
-	// progress, still refuses.
+	// descriptor recovered from storage without refreshed admission config still refuses.
 	managed.mu.Lock()
-	managed.progressApplied = false
+	managed.admissionReady = false
 	managed.progressReady = true
 	managed.sessionWritePending = false
 	managed.mu.Unlock()
@@ -6621,4 +6649,10 @@ func TestRuntimeAdmitsDelegationBehindAPendingSessionWrite(t *testing.T) {
 	if !errors.Is(err, ErrAcquisitionNotReady) {
 		t.Fatalf("delegation before any consensus progress = %v, want ErrAcquisitionNotReady", err)
 	}
+}
+
+func sameDelegationAuthorization(left, right delegatedAuthorization) bool {
+	return left.ID == right.ID && left.Leader == right.Leader &&
+		left.SourceADNL == right.SourceADNL && left.CollatorKeyID == right.CollatorKeyID &&
+		bytes.Equal(left.DelegationSignature, right.DelegationSignature)
 }

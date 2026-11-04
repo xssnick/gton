@@ -230,7 +230,7 @@ func verifyPreparedShardCandidate(
 	if err = verifyBlockLTDelta(config, header, false); err != nil {
 		return err
 	}
-	if err = verifyShardLoadHistory(&topology, &firstState, verified); err != nil {
+	if err = verifyShardLoadHistory(config, &topology, &firstState, verified); err != nil {
 		return err
 	}
 	if err = verifyShardMasterchainBindings(req, &topology, &firstState, secondState, verified); err != nil {
@@ -417,6 +417,7 @@ func loadCandidateValueFlowAugmentations(
 }
 
 func verifyShardLoadHistory(
+	config *Config,
 	topology *shardTopology,
 	previous *tlb.ShardStateUnsplit,
 	candidate *verifiedCandidate,
@@ -433,6 +434,7 @@ func verifyShardLoadHistory(
 		&candidate.stats,
 		&candidate.block.BlockInfo,
 		topology.kind != topologyLinear,
+		queueAllowsMerge(config, &candidate.queue),
 	)
 }
 
@@ -642,6 +644,15 @@ func verifyPreparedMasterCandidate(
 	if err = verifyMasterExtras(verified, &masterState); err != nil {
 		return err
 	}
+	if config.globalVersion >= 17 {
+		if req.GlobalBalance == nil {
+			return fmt.Errorf("%w: GV17 requires a global balance calculator", ErrInvalidInput)
+		}
+		masterState.previousGlobalBalance, err = req.GlobalBalance.CalculateGlobalBalance(ctx, previous, config.globalVersion)
+		if err != nil {
+			return fmt.Errorf("calculate previous global balance: %w", err)
+		}
+	}
 	if err = verifyMasterValueFlow(config, verified, &masterState); err != nil {
 		return err
 	}
@@ -650,6 +661,7 @@ func verifyPreparedMasterCandidate(
 		&verified.stats,
 		header,
 		false,
+		queueAllowsMerge(config, &verified.queue),
 	); err != nil {
 		return err
 	}
@@ -696,6 +708,30 @@ func verifyPreparedMasterCandidate(
 		},
 	}); err != nil {
 		return fmt.Errorf("verify candidate semantic transition: %w", err)
+	}
+	if config.globalVersion >= 17 {
+		next, err := req.GlobalBalance.CalculateGlobalBalance(ctx, PreviousBlock{
+			ID: candidate.ID, Block: prepared.root, State: candidate.State,
+		}, config.globalVersion)
+		if err != nil {
+			return fmt.Errorf("calculate candidate global balance: %w", err)
+		}
+		if next.Cmp(masterState.nextExtra.GlobalBalance.Coins.NanoRef()) != 0 {
+			return fmt.Errorf("%w: stored global balance differs from actual balance", ErrInvalidInput)
+		}
+		oldRegistry, err := ParseShardRegistry(masterState.previousExtra.ShardHashes)
+		if err != nil {
+			return err
+		}
+		created, err := globalBalanceCreated(config, oldRegistry, registry)
+		if err != nil {
+			return err
+		}
+		created.Add(created, masterState.previousGlobalBalance)
+		created.Sub(created, verified.flow.Burned.Coins.NanoRef())
+		if next.Cmp(created) != 0 {
+			return fmt.Errorf("%w: actual global balance violates creation and burning invariant", ErrInvalidInput)
+		}
 	}
 
 	return nil
@@ -1142,6 +1178,7 @@ func verifyLoadHistory(
 	next *tlb.ShardStateStats,
 	header *tlb.BlockHeader,
 	topologyChanged bool,
+	allowMerge bool,
 ) error {
 	if next.OverloadHistory&next.UnderloadHistory&1 != 0 {
 		return fmt.Errorf("%w: block is both overloaded and underloaded", ErrInvalidInput)
@@ -1156,7 +1193,7 @@ func verifyLoadHistory(
 	}
 
 	wantSplit := historyWeight(next.OverloadHistory) >= 0
-	wantMerge := !wantSplit && historyWeight(next.UnderloadHistory) >= 0
+	wantMerge := allowMerge && !wantSplit && historyWeight(next.UnderloadHistory) >= 0
 	if header.WantSplit != wantSplit || header.WantMerge != wantMerge {
 		return fmt.Errorf("%w: block split/merge wishes disagree with load history", ErrInvalidInput)
 	}
@@ -1210,6 +1247,16 @@ func verifyMasterValueFlow(
 	globalBalance, err = globalBalance.Add(expected.importedCreated)
 	if err != nil {
 		return fmt.Errorf("%w: add expected imported creation balance: %v", ErrInvalidInput, err)
+	}
+	if config.globalVersion >= 17 {
+		if state.previousGlobalBalance == nil {
+			return fmt.Errorf("%w: previous actual global balance is absent", ErrInvalidInput)
+		}
+		globalBalance.Coins, err = nextGlobalBalanceGrams(state.previousGlobalBalance,
+			flow.Created.Coins, expected.importedCreated.Coins, flow.Burned.Coins)
+		if err != nil {
+			return err
+		}
 	}
 	if !state.nextExtra.GlobalBalance.Equals(globalBalance) {
 		return fmt.Errorf("%w: resulting global balance disagrees with value flow", ErrInvalidInput)
@@ -1362,7 +1409,8 @@ func verifyCollatedData(
 		// Candidate retains CollatedData until verification finishes, so the
 		// parsed roots can safely borrow its immutable payload.
 		roots, err = cell.FromBOCMultiRootWithOptions(candidate.CollatedData, cell.BOCParseOptions{
-			NoCopyPayload: true,
+			NoCopyPayload:         true,
+			AllowNonZeroLevelRoot: true,
 		})
 		if err != nil {
 			return verifiedCollatedData{}, fmt.Errorf("%w: decode candidate collated data: %v", ErrInvalidInput, err)

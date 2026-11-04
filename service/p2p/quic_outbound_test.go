@@ -1347,9 +1347,10 @@ func TestQUICOutboundOperationsRequireRoute(t *testing.T) {
 	}).Query(context.Background(), 1024, overlay.Ping{}, &overlay.Pong{}); !errors.Is(err, errQUICRouteMissing) {
 		t.Fatalf("typed query error = %v, want missing route", err)
 	}
-	// Broadcast sends never dial inline: without a live outbound connection
-	// the part is dropped and errQUICPeerOffline is returned so the caller can
-	// stop early and count the drop, while a background dial is kicked off.
+	// Relay broadcast sends never dial inline: without a live outbound
+	// connection the part is dropped and errQUICPeerOffline is returned so the
+	// caller can stop early and count the drop, while a background dial is
+	// kicked off.
 	if err = (quicRouteBroadcastPeer{
 		peer:     peer,
 		envelope: envelope,
@@ -1402,8 +1403,9 @@ func TestCustomTwoStepQUICDoesNotFallbackWithoutRoute(t *testing.T) {
 	if !ok {
 		t.Fatalf("deferred two-step peer = %T, want route-bound QUIC peer", peerSet[0])
 	}
-	// The send path never dials, so an unconnected peer is skipped rather than
-	// resolved inline; the route is brought up by the background dial instead.
+	// The relay send path never dials, so an unconnected peer is skipped rather
+	// than resolved inline; the route is brought up by the background dial
+	// instead.
 	if err = sendPeer.SendCustomMessage(context.Background(), overlay.Ping{}); !errors.Is(err, errQUICPeerOffline) {
 		t.Fatalf("deferred QUIC send error = %v, want offline peer", err)
 	}

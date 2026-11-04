@@ -335,6 +335,7 @@ func (a *LocalAcquisition) AcquireMaster(ctx context.Context, request BuildReque
 	}
 	a.collectCurrentInternals(&hints, messages.cut)
 	result := MasterRequest{
+		GlobalBalance:       localGlobalBalanceCalculator{acquisition: a, mode: acquisitionReadImmediate, baseline: chain.previous[0]},
 		Previous:            chain.previous[0],
 		Config:              master.context.Config,
 		Groups:              master.context.Groups,
@@ -1649,6 +1650,7 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 
 			return nil, err
 		}
+		input.processedExternals = request.excludeExternals
 		a.observeCollationStage(chain, CollationStageAcquireInputs, time.Since(assembly))
 		// From assembly, the instant this build started, and not from a reading
 		// taken now. C++ sets queue_cleanup_timeout_ in the Collator constructor
@@ -1711,6 +1713,7 @@ func (a *LocalAcquisition) BuildCandidate(ctx context.Context, request BuildRequ
 
 		return nil, err
 	}
+	input.processedExternals = request.excludeExternals
 	a.observeCollationStage(chain, CollationStageAcquireInputs, time.Since(assembly))
 	// The budget is derived here rather than inside the collation so that the
 	// deterministic entry points — BuildShard, restore, every test — keep a zero

@@ -14,8 +14,20 @@ import (
 )
 
 func (s *SyncCoordinator) ensureCurrentState(ctx context.Context) error {
+	if s.syncUntilFrozen() {
+		return nil
+	}
+
 	s.state.lockCurrentStateTransition()
 	current, err := s.storage.CurrentState(ctx)
+	if err == nil {
+		master, loadErr := s.loadBlockStateForApply(ctx, current.Masterchain)
+		if loadErr != nil {
+			s.state.unlockCurrentStateTransition()
+			return fmt.Errorf("load current masterchain state for status: %w", loadErr)
+		}
+		current.Masterchain = *master
+	}
 	s.state.unlockCurrentStateTransition()
 
 	if err == nil {
@@ -24,6 +36,7 @@ func (s *SyncCoordinator) ensureCurrentState(ctx context.Context) error {
 			Uint32("shard_client_seqno", current.ShardClientSeqno).
 			Int("shards", len(current.Shards)).
 			Msg("loaded current state from storage")
+		s.publishCommittedCurrentState(current)
 		return s.catchUpCurrentState(ctx)
 	}
 	if !errors.Is(err, storage.ErrNotFound) {

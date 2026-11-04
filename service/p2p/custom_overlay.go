@@ -253,9 +253,18 @@ func (s *overlaySubscription) sendTwoStepRebroadcast(ctx context.Context, req re
 
 	// The queue worker is already off every producer's path, so its own budget
 	// is the only bound the fan-out needs; a second per-peer deadline only
-	// truncated deliveries that were still making progress.
+	// truncated deliveries that were still making progress. It also bounds how
+	// long an own broadcast waits for a cold member's dial, and since tonutils
+	// returns only when every recipient is done, that wait holds the whole
+	// queue of this custom or FastSync overlay - hence quicLocalBroadcastPeer
+	// does not wait on a route whose last dial failed.
 	sendCtx, cancel := context.WithTimeout(ctx, peerRebroadcastTimeout)
 	defer cancel()
+
+	peers := s.resolveTwoStepPeerSet(req.sourcePeerID)
+	if req.local {
+		peers = localTwoStepPeerSet(peers)
+	}
 
 	res, err := overlay.SendBroadcastTwoStep(sendCtx, overlay.BroadcastTwoStepSendRequest{
 		Key:         s.node.privKey,
@@ -263,9 +272,14 @@ func (s *overlaySubscription) sendTwoStepRebroadcast(ctx context.Context, req re
 		LocalADNLID: s.node.localID.Bytes(),
 		Payload:     req.payload,
 		Flags:       plan.flags,
-		PeerSet:     s.resolveTwoStepPeerSet(req.sourcePeerID),
+		PeerSet:     peers,
 	})
 	outcome := s.twoStepSendOutcome(res)
+	if req.local {
+		for _, failed := range res.Failed {
+			s.noteLocalSendFailure(req.kind, failed.PeerID, failed.Err)
+		}
+	}
 
 	if err != nil && outcome.Sent == 0 {
 		s.log.Debug().

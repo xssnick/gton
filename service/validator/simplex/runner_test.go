@@ -241,7 +241,7 @@ func TestRunnerPrioritizesCandidateWorkOverDirectMessageBacklog(t *testing.T) {
 	}
 	runner.postPriority(func() { order = append(order, "candidate") })
 
-	batch, stopped, more := runner.takeBatch()
+	batch, _, stopped, more := runner.takeBatch()
 	if stopped || more {
 		t.Fatalf("take batch state stopped=%t more=%t", stopped, more)
 	}
@@ -260,7 +260,7 @@ func TestRunnerOrdinaryBatchesKeepOrderWhilePosting(t *testing.T) {
 		runner.post(func() { order = append(order, i) })
 	}
 
-	batch, stopped, more := runner.takeBatch()
+	batch, _, stopped, more := runner.takeBatch()
 	if stopped || !more || len(batch) != runnerBatchSize {
 		t.Fatalf("first batch len=%d stopped=%t more=%t", len(batch), stopped, more)
 	}
@@ -270,7 +270,7 @@ func TestRunnerOrdinaryBatchesKeepOrderWhilePosting(t *testing.T) {
 		work()
 	}
 
-	batch, stopped, more = runner.takeBatch()
+	batch, _, stopped, more = runner.takeBatch()
 	if stopped || more || len(batch) != 4 {
 		t.Fatalf("second batch len=%d stopped=%t more=%t", len(batch), stopped, more)
 	}
@@ -295,7 +295,7 @@ func BenchmarkRunnerOrdinaryTakeBatch(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				runner.queue = queued
-				batch, _, _ := runner.takeBatch()
+				batch, _, _, _ := runner.takeBatch()
 				if len(batch) != count {
 					b.Fatal("incomplete batch")
 				}

@@ -99,6 +99,9 @@ func validateSessionUpdate(session Session, update SessionUpdate) error {
 	if update.TargetRate <= 0 {
 		return errors.New("collator runtime: target rate must be positive")
 	}
+	if update.CollatorMaxSyncDelay < 0 {
+		return errors.New("collator runtime: maximum sync delay must not be negative")
+	}
 	if update.NoEmptyBlocksOnErrTimeout < 0 {
 		return errors.New("collator runtime: no-empty-blocks timeout must not be negative")
 	}
@@ -187,8 +190,8 @@ func equalBlockIDs(left, right []ton.BlockIDExt) bool {
 	return slices.EqualFunc(left, right, sameBlockID)
 }
 
-// Equal reports whether two updates carry the same chain state and window. It
-// gates ErrSessionConflict, so it compares every field a session is pinned by.
+// Equal compares the persisted chain state and window. Delegation admission
+// limits are refreshed independently from authenticated config.
 func (a SessionUpdate) Equal(other SessionUpdate) bool {
 	b := other
 	if !sameSessionChainUpdate(a, b) ||

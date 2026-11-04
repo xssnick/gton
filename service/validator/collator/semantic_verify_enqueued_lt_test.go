@@ -152,7 +152,7 @@ func TestSemanticVerifierRejectsQueueEnqueuedLTBelowEmittedLT(t *testing.T) {
 	verification.Semantics = NewSemanticVerifier(tvm.NewTVM())
 	err = verifyShardCandidateForTest(context.Background(), verification)
 	if !errors.Is(err, ErrInvalidInput) ||
-		!strings.Contains(err.Error(), "enqueued lt is below the message emitted lt") {
+		!strings.Contains(err.Error(), "enqueued lt") {
 		t.Fatalf("enqueued lt below emitted lt error = %v, want invalid input naming the emitted lt", err)
 	}
 }

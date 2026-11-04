@@ -40,9 +40,6 @@ const (
 	// service lifetime, so an RPC deadline cannot poison the deterministic
 	// session ID while shutdown still cancels it promptly.
 	prepareRollbackTimeout = 10 * time.Second
-	// The protocol's fixed maximum future window. This is a delegated-collation
-	// admission bound, not a configurable validator desync limit.
-	delegationWindowHorizon = uint32(20)
 	// retiredTombstoneLimit bounds the retirement fence. Session IDs are
 	// deterministic per validator-group generation, so a retired ID is
 	// essentially never admitted again and the fence would otherwise grow one
@@ -72,6 +69,8 @@ type ServiceOptions struct {
 	// standalone operator who explicitly disables the extra allowlist.
 	AllowAllValidators bool
 	Emit               EmitCandidate
+	// SyncLag reports the largest applied-chain timestamp lag.
+	SyncLag func() (time.Duration, error)
 }
 
 type serviceState uint8
@@ -147,15 +146,13 @@ type managedCollatorSession struct {
 	pipelineReady   bool
 	activationReady bool
 	progressReady   bool
-	// progressApplied records that consensus progress has been materialized for
-	// this session at least once. It answers a different question from
-	// progressReady, which is "production may run against the current record"
-	// and is therefore disarmed by every pending session write and by every
-	// adoption in flight. A delegation admission only needs to know that this
-	// collator is not still serving a descriptor recovered from storage, so it
-	// reads this flag instead and is not refused for the microseconds a routine
-	// masterchain refresh spends in the WAL.
-	progressApplied bool
+	// Admission policy is ephemeral and unavailable on recovery until the
+	// authenticated group projection refreshes it. Prepared windows retain
+	// their admission if sync status or policy changes before commit.
+	admissionReady        bool
+	admissionFutureWindow uint32
+	admissionMaxSyncDelay time.Duration
+	preparedDelegations   map[WindowID]struct{}
 	// sessionWritePending records that the pipeline accepted managed.record,
 	// but storage has not confirmed that exact revision yet. The in-memory
 	// record is authoritative from that point: callers advance their mirror.
@@ -299,12 +296,6 @@ func delegatedProductionWindow(window delegatedAuthorization) productionWindow {
 		Authority:           CandidateAuthorityDelegated,
 		DelegationSignature: append([]byte(nil), window.DelegationSignature...),
 	}
-}
-
-func sameDelegationAuthorization(left, right delegatedAuthorization) bool {
-	return left.ID == right.ID && left.Leader == right.Leader &&
-		left.SourceADNL == right.SourceADNL && left.CollatorKeyID == right.CollatorKeyID &&
-		bytes.Equal(left.DelegationSignature, right.DelegationSignature)
 }
 
 func selfProductionWindow(session Session, request SelfWindowRequest) productionWindow {
@@ -456,6 +447,9 @@ func (f *candidateBuildFuture) viable(now time.Time) bool {
 func NewService(opts ServiceOptions) (*Service, error) {
 	if opts.ProductionMode != ProductionModeSelf && opts.ProductionMode != ProductionModeDelegated {
 		return nil, errors.New("collator runtime: production mode is invalid")
+	}
+	if opts.ProductionMode == ProductionModeDelegated && opts.SyncLag == nil {
+		return nil, errors.New("collator runtime: sync lag source is required for delegated production")
 	}
 	if opts.Storage == nil {
 		return nil, errors.New("collator runtime: storage is required")
@@ -934,7 +928,7 @@ func (s *Service) startProductionWait() {
 }
 
 // PrepareSession makes one shard session durable and ready for delegation.
-func (s *Service) PrepareSession(ctx context.Context, session Session, update SessionUpdate) error {
+func (s *Service) PrepareSession(ctx context.Context, session Session, update SessionUpdate) (resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -954,6 +948,11 @@ func (s *Service) PrepareSession(ctx context.Context, session Session, update Se
 		}
 	}
 	defer managed.controlMu.Unlock()
+	defer func() {
+		if resultErr == nil {
+			managed.refreshAdmission(update)
+		}
+	}()
 	created, err = s.recheckPreparedSession(record.Session.ID, managed, created)
 	if err != nil {
 		return err
@@ -1269,6 +1268,11 @@ func (s *Service) UpdateSession(ctx context.Context, update SessionUpdate) (resu
 		return err
 	}
 	defer managed.controlMu.Unlock()
+	defer func() {
+		if resultErr == nil || errors.Is(resultErr, ErrSessionUpdateDeferred) {
+			managed.refreshAdmission(update)
+		}
+	}()
 
 	managed.mu.Lock()
 	current := cloneSessionRecord(managed.record)
@@ -1790,14 +1794,12 @@ func (s *Service) ApplyConsensusProgress(
 		// view and must not wait for the asynchronous storage callback.
 		managed.mu.Lock()
 		managed.progressReady = true
-		managed.progressApplied = true
 		managed.mu.Unlock()
 	} else {
 		s.releaseSessionWriteReservation(managed)
 		managed.mu.Lock()
 		managed.record = current
 		managed.progressReady = true
-		managed.progressApplied = true
 		managed.updating = false
 		managed.mu.Unlock()
 	}
@@ -2011,62 +2013,26 @@ func (s *Service) releaseRetiredLocked(id [32]byte) {
 	s.retiredOrder = slices.DeleteFunc(s.retiredOrder, func(fenced [32]byte) bool { return fenced == id })
 }
 
-// Probe validates an upcoming delegation without reserving memory or durable
-// state, matching consensus.pleaseCollatePrepare.
+// Probe remembers accepted preparation until the window has passed.
 func (s *Service) Probe(ctx context.Context, preparation WindowPreparation) error {
 	if s.opts.ProductionMode != ProductionModeDelegated {
 		return ErrUnsupported
-	}
-	if err := ctx.Err(); err != nil {
-		return err
 	}
 	managed, err := s.beginSessionOp(ctx, preparation.SessionID)
 	if err != nil {
 		return err
 	}
 	defer managed.controlMu.Unlock()
-	id := WindowID{SessionID: preparation.SessionID, StartSlot: preparation.StartSlot}
 	managed.mu.Lock()
-	if managed.retiring {
-		managed.mu.Unlock()
-		return ErrSessionRetired
-	}
-	if managed.unavailable {
-		managed.mu.Unlock()
-		return ErrSessionUnavailable
-	}
-	_, err = s.validateWindowSource(managed.record, preparation.SourceADNL, preparation.StartSlot)
-	if err != nil {
-		managed.mu.Unlock()
-		return err
-	}
-	if _, exists := managed.authorizations[id]; exists {
-		managed.mu.Unlock()
-		return ErrAlreadyDelegated
-	}
-	if _, exists := managed.productions[id]; exists {
-		managed.mu.Unlock()
-		return ErrAlreadyDelegated
-	}
-	if !managed.progressApplied {
-		managed.mu.Unlock()
-
-		return fmt.Errorf("%w: fresh consensus progress is not ready", ErrAcquisitionNotReady)
-	}
-	managed.mu.Unlock()
-
-	return nil
+	defer managed.mu.Unlock()
+	_, err = s.prepareDelegationLocked(managed, preparation.SourceADNL, preparation.StartSlot)
+	return err
 }
 
-// CommitDelegation accepts one final leader authorization in receiver memory
-// and starts current-window production. Candidate markers, not delegations,
-// are the persisted anti-equivocation boundary.
+// CommitDelegation accepts final authorization for a prepared or newly admitted window.
 func (s *Service) CommitDelegation(ctx context.Context, request WindowRequest) error {
 	if s.opts.ProductionMode != ProductionModeDelegated {
 		return ErrUnsupported
-	}
-	if err := ctx.Err(); err != nil {
-		return err
 	}
 	managed, err := s.beginSessionOp(ctx, request.SessionID)
 	if err != nil {
@@ -2075,68 +2041,82 @@ func (s *Service) CommitDelegation(ctx context.Context, request WindowRequest) e
 	defer managed.controlMu.Unlock()
 	id := request.ID()
 	managed.mu.Lock()
-	if managed.retiring {
-		managed.mu.Unlock()
-		return ErrSessionRetired
-	}
-	if managed.unavailable {
-		managed.mu.Unlock()
-		return ErrSessionUnavailable
-	}
-	leader, err := s.validateWindowSource(
-		managed.record,
-		request.SourceADNL,
-		id.StartSlot,
-	)
+	defer managed.mu.Unlock()
+	leader, err := s.prepareDelegationLocked(managed, request.SourceADNL, id.StartSlot)
 	if err != nil {
-		managed.mu.Unlock()
 		return err
 	}
+	if _, exists := managed.authorizations[id]; exists {
+		return nil
+	}
+	if !simplex.VerifyDelegationSignature(
+		ed25519.PublicKey(managed.record.Session.Validators[leader].PublicKey[:]),
+		request.SessionID, id.StartSlot, s.opts.CollatorKeyID, request.PleaseCollate.Signature,
+	) {
+		return errors.New("collator runtime: delegation signature is invalid")
+	}
 	window := delegatedAuthorization{
-		ID:                  id,
-		Leader:              leader,
-		SourceADNL:          request.SourceADNL,
+		ID: id, Leader: leader, SourceADNL: request.SourceADNL,
 		CollatorKeyID:       s.opts.CollatorKeyID,
 		DelegationSignature: append([]byte(nil), request.PleaseCollate.Signature...),
 		State:               delegatedAuthorizationPending,
 	}
-	if existing, exists := managed.authorizations[id]; exists {
-		managed.mu.Unlock()
-		if sameDelegationAuthorization(existing, window) {
-			return nil
-		}
-
-		return ErrWindowConflict
-	}
-	if _, exists := managed.productions[id]; exists {
-		managed.mu.Unlock()
-
-		return ErrWindowConflict
-	}
-	if !managed.progressApplied {
-		managed.mu.Unlock()
-
-		return fmt.Errorf("%w: fresh consensus progress is not ready", ErrAcquisitionNotReady)
-	}
-	if !simplex.VerifyDelegationSignature(
-		ed25519.PublicKey(managed.record.Session.Validators[leader].PublicKey[:]),
-		request.SessionID,
-		id.StartSlot,
-		s.opts.CollatorKeyID,
-		request.PleaseCollate.Signature,
-	) {
-		managed.mu.Unlock()
-
-		return errors.New("collator runtime: delegation signature is invalid")
-	}
-
 	managed.authorizations[id] = window
 	if managed.productionEligibleLocked(id.StartSlot) {
 		_ = s.launchProductionLocked(managed, delegatedProductionWindow(window))
 	}
-	managed.mu.Unlock()
-
 	return nil
+}
+
+func (m *managedCollatorSession) refreshAdmission(update SessionUpdate) {
+	m.mu.Lock()
+	m.admissionReady = true
+	m.record.Update.CollatorMaxFutureWindow = update.CollatorMaxFutureWindow
+	m.record.Update.CollatorMaxSyncDelay = update.CollatorMaxSyncDelay
+	m.admissionFutureWindow = update.CollatorMaxFutureWindow
+	m.admissionMaxSyncDelay = update.CollatorMaxSyncDelay
+	m.mu.Unlock()
+}
+
+// prepareDelegationLocked always authenticates source and age, and applies
+// operator/config admission policy only once per window.
+func (s *Service) prepareDelegationLocked(m *managedCollatorSession, source [32]byte, start uint32) (uint32, error) {
+	if m.retiring {
+		return 0, ErrSessionRetired
+	}
+	if m.unavailable {
+		return 0, ErrSessionUnavailable
+	}
+	leader, err := s.validateWindowSource(m.record, source, start)
+	if err != nil {
+		return 0, err
+	}
+	id := WindowID{SessionID: m.record.Session.ID, StartSlot: start}
+	if _, exists := m.preparedDelegations[id]; exists {
+		return leader, nil
+	}
+	if !m.admissionReady {
+		return 0, fmt.Errorf("%w: fresh delegation admission config is not ready", ErrAcquisitionNotReady)
+	}
+	if _, allowed := s.allowed[source]; !s.allowAll && !allowed {
+		return 0, ErrUnauthorized
+	}
+	baseline := uint32(0)
+	if m.record.Update.HasCurrentWindow {
+		baseline = m.record.Update.CurrentWindowStart
+	}
+	if (start-baseline)/m.record.Session.SlotsPerLeaderWindow >= m.admissionFutureWindow {
+		return 0, ErrWindowTooFar
+	}
+	lag, err := s.opts.SyncLag()
+	if err != nil {
+		return 0, fmt.Errorf("%w: read sync lag: %w", ErrAcquisitionNotReady, err)
+	}
+	if lag > m.admissionMaxSyncDelay {
+		return 0, fmt.Errorf("%w: sync lag %s exceeds %s", ErrAcquisitionNotReady, lag, m.admissionMaxSyncDelay)
+	}
+	m.preparedDelegations[id] = struct{}{}
+	return leader, nil
 }
 
 // ActivateSelfWindow opens one local-validator production window in memory.
@@ -2640,17 +2620,18 @@ func (s *Service) removePreparedSession(id [32]byte, managed *managedCollatorSes
 
 func newManagedCollatorSession(record SessionRecord, ready bool) *managedCollatorSession {
 	managed := &managedCollatorSession{
-		controlMu:          newCtxMutex(),
-		productionMu:       newCtxMutex(),
-		sessionWriteMu:     newCtxMutex(),
-		record:             cloneSessionRecord(record),
-		ready:              ready,
-		pipelineReady:      ready,
-		authorizations:     make(map[WindowID]delegatedAuthorization),
-		selfWindows:        make(map[WindowID]SelfWindowRequest),
-		productions:        make(map[WindowID]*productionJob),
-		sessionWriteWake:   make(chan struct{}, 1),
-		deferredUpdateWake: make(chan struct{}, 1),
+		controlMu:           newCtxMutex(),
+		productionMu:        newCtxMutex(),
+		sessionWriteMu:      newCtxMutex(),
+		record:              cloneSessionRecord(record),
+		ready:               ready,
+		pipelineReady:       ready,
+		authorizations:      make(map[WindowID]delegatedAuthorization),
+		preparedDelegations: make(map[WindowID]struct{}),
+		selfWindows:         make(map[WindowID]SelfWindowRequest),
+		productions:         make(map[WindowID]*productionJob),
+		sessionWriteWake:    make(chan struct{}, 1),
+		deferredUpdateWake:  make(chan struct{}, 1),
 	}
 	if record.Activation != nil {
 		managed.observeSessionStart(*record.Activation, record.Update)
@@ -2738,15 +2719,8 @@ func (s *Service) validateWindowSource(record SessionRecord, source [32]byte, st
 			return 0, ErrStaleWindow
 		}
 	}
-	distance := (start - baseline) / session.SlotsPerLeaderWindow
-	if distance >= delegationWindowHorizon {
-		return 0, ErrWindowTooFar
-	}
 	leader := start / session.SlotsPerLeaderWindow % uint32(len(session.Validators))
 	if session.Validators[leader].ADNLID != source {
-		return 0, ErrUnauthorized
-	}
-	if _, allowed := s.allowed[source]; !s.allowAll && !allowed {
 		return 0, ErrUnauthorized
 	}
 	return leader, nil
@@ -2768,6 +2742,11 @@ func (s *Service) reconcileWindows(ctx context.Context, managed *managedCollator
 		if id.StartSlot < current || !now.Before(request.Deadline) {
 			delete(managed.selfWindows, id)
 			managed.forgetEmitted(id)
+		}
+	}
+	for id := range managed.preparedDelegations {
+		if id.StartSlot < current {
+			delete(managed.preparedDelegations, id)
 		}
 	}
 	for id := range managed.authorizations {
@@ -3620,7 +3599,6 @@ func (p *windowProducer) offerNextWindow(offer SuccessorOffer) PipelineHandoffOu
 		// The first slot of the next window; see firstSlotTransactions.
 		MaxTransactions: firstSlotTransactions,
 	}
-	request.excludeExternals = offer.Exclude
 	// Never idle on the estimated window opening: this bet starts from the
 	// predecessor's handoff and consumes what is already pooled. Its admission
 	// boundaries still stop at the predicted slot start, exactly like an
@@ -4029,6 +4007,7 @@ func (p *windowProducer) runSlot(slot uint32) error {
 
 			return emptyErr
 		}
+		artifact.processedExternals = request.excludeExternals
 		p.service.logCollatedCandidate(
 			request,
 			&artifact.Candidate,
@@ -4854,12 +4833,13 @@ func (s *Service) signArtifact(
 	candidate.Signature = signature
 
 	artifact := CandidateArtifact{
-		SessionID:    session.ID,
-		WindowID:     window.ID,
-		Candidate:    candidate,
-		BlockBOC:     built.BlockBOC,
-		CollatedData: built.CollatedData,
-		prepared:     built.prepared,
+		SessionID:          session.ID,
+		WindowID:           window.ID,
+		Candidate:          candidate,
+		BlockBOC:           built.BlockBOC,
+		CollatedData:       built.CollatedData,
+		processedExternals: built.processedExternals,
+		prepared:           built.prepared,
 		// Either the builder took both digests of these very buffers, or the
 		// block above just re-derived them and compared. Both are the same
 		// statement, and it is the one the leader's own validation of this
@@ -4951,6 +4931,7 @@ func clonePipelineCandidate(source *Candidate) *Candidate {
 		owned.StorageStats[hash] = stat
 	}
 	owned.Externals = append([]msgpool.ExternalFeedback(nil), source.Externals...)
+	owned.processedExternals = append([][32]byte(nil), source.processedExternals...)
 
 	return &owned
 }
@@ -5081,12 +5062,13 @@ func (s *Service) artifactFromRecord(
 	// again. Keeping it is also what makes rememberEmitted's retention of it pay
 	// for itself instead of holding a compressed payload nobody reads.
 	return CandidateArtifact{
-		SessionID:    session.ID,
-		WindowID:     window.ID,
-		Candidate:    candidate,
-		BlockBOC:     remembered.BlockBOC,
-		CollatedData: remembered.CollatedData,
-		prepared:     remembered.prepared,
+		SessionID:          session.ID,
+		WindowID:           window.ID,
+		Candidate:          candidate,
+		BlockBOC:           remembered.BlockBOC,
+		CollatedData:       remembered.CollatedData,
+		processedExternals: remembered.processedExternals,
+		prepared:           remembered.prepared,
 		// Established by the two hash checks above, which had to run here: they
 		// bind the payload this process still holds in memory to the digests the
 		// persisted marker recorded for the candidate this window already signed.
@@ -5275,6 +5257,9 @@ func slotBuildRequest(
 		CandidateAwaitDeadline: candidateAwaitDeadline(record, slot),
 		MaxTransactions:        maxTransactions,
 		PaceStartedAt:          buildStartTime(record, slot),
+	}
+	if previous != nil && previous.WindowID == window.ID {
+		request.excludeExternals = previous.processedExternals
 	}
 	// The schedule is the window's, computed from its start; when the window
 	// opened late the early slots' schedule is already in the past, and a build

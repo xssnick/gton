@@ -9,7 +9,7 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 )
 
-const overlayMemberDoNotReceiveBroadcasts = uint32(1)
+const overlayMemberDoNotReceivePlumtreeBroadcasts = uint32(1)
 
 // V1 and zero-flag V2 descriptors sign the same overlay.node.toSign payload.
 // Keep V2 internally so flags and their signed payload survive peer gossip.
@@ -69,7 +69,7 @@ func (s *overlaySubscription) handleGetRandomPeersV2(
 		Certificate: overlay.EmptyMemberCertificate{},
 	}
 	if s.chainBroadcastsPaused() {
-		self.Flags = overlayMemberDoNotReceiveBroadcasts
+		self.Flags = overlayMemberDoNotReceivePlumtreeBroadcasts
 	}
 	if err := self.Sign(s.node.privKey); err != nil {
 		return overlay.NodesV2{}, err

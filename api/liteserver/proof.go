@@ -451,7 +451,7 @@ func markValidatorSetConfigParam(dict *cell.Dictionary) error {
 		return err
 	}
 
-	return markConfigParamIfPresent(dict, int32(tlb.ConfigParamCurrentTempValidators))
+	return nil
 }
 
 func globalVersionFromConfigValue(value *cell.Slice) (tlb.GlobalVersion, error) {

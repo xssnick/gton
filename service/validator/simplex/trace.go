@@ -23,7 +23,7 @@ const (
 	schemeStatsCandidateBlock = "consensus.stats.block id:tonNode.blockIdExt = consensus.stats.CandidateBlock"
 	schemeStatsCandidateEmpty = "consensus.stats.empty = consensus.stats.CandidateBlock"
 
-	schemeStatsCandidateReceived = "consensus.stats.candidateReceived id:consensus.candidateId parent:consensus.CandidateParent block:consensus.stats.CandidateBlock is_collator:Bool = consensus.stats.Event"
+	schemeStatsCandidateReceived = "consensus.stats.candidateReceived id:consensus.candidateId parent:consensus.CandidateParent block:consensus.stats.CandidateBlock is_collator:Bool collator_node_id:int256 = consensus.stats.Event"
 
 	schemeStatsTimestampedEvent = "consensus.stats.timestampedEvent ts:double event:consensus.stats.Event = consensus.stats.TimestampedEvent"
 
@@ -53,10 +53,11 @@ type ConsensusStatsCandidateEmpty struct{}
 
 // ConsensusStatsCandidateReceived is consensus.stats.candidateReceived.
 type ConsensusStatsCandidateReceived struct {
-	ID         ton.ConsensusCandidateID `tl:"struct"`
-	Parent     any                      `tl:"struct boxed [consensus.candidateParent,consensus.candidateWithoutParents]"`
-	Block      any                      `tl:"struct boxed [consensus.stats.block,consensus.stats.empty]"`
-	IsCollator bool                     `tl:"bool"`
+	ID             ton.ConsensusCandidateID `tl:"struct"`
+	Parent         any                      `tl:"struct boxed [consensus.candidateParent,consensus.candidateWithoutParents]"`
+	Block          any                      `tl:"struct boxed [consensus.stats.block,consensus.stats.empty]"`
+	IsCollator     bool                     `tl:"bool"`
+	CollatorNodeID []byte                   `tl:"int256"`
 }
 
 // ConsensusSimplexStatsVoted is consensus.simplex.stats.voted.
@@ -169,6 +170,8 @@ type TraceCandidateReceived struct {
 	// reference reports as consensus.stats.empty.
 	Block      *ton.BlockIDExt
 	IsCollator bool
+	// CollatorNodeID identifies the delegated collator; zero means self-collation.
+	CollatorNodeID [32]byte
 }
 
 func (e TraceCandidateReceived) Serialize() []byte {
@@ -177,10 +180,11 @@ func (e TraceCandidateReceived) Serialize() []byte {
 		block = ConsensusStatsCandidateBlock{ID: *e.Block}
 	}
 	return mustSerialize(ConsensusStatsCandidateReceived{
-		ID:         tlCandidateID(e.ID),
-		Parent:     parentToTL(e.Parent),
-		Block:      block,
-		IsCollator: e.IsCollator,
+		ID:             tlCandidateID(e.ID),
+		Parent:         parentToTL(e.Parent),
+		Block:          block,
+		IsCollator:     e.IsCollator,
+		CollatorNodeID: e.CollatorNodeID[:],
 	})
 }
 
@@ -189,5 +193,5 @@ func (e TraceCandidateReceived) String() string {
 	if e.Block != nil {
 		block = fmt.Sprintf("(%d,%016x,%d)", e.Block.Workchain, uint64(e.Block.Shard), e.Block.SeqNo)
 	}
-	return fmt.Sprintf("CandidateReceived{id=%s, parent=%s, block_id=%s}", e.ID, e.Parent, block)
+	return fmt.Sprintf("CandidateReceived{id=%s, parent=%s, block_id=%s, collator_node=%x}", e.ID, e.Parent, block, e.CollatorNodeID)
 }

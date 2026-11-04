@@ -158,6 +158,20 @@ func (c *collation) buildMasterStateAndBlockParts() (blockParts, error) {
 	if err != nil {
 		return blockParts{}, fmt.Errorf("add imported shard creation balance: %w", err)
 	}
+	if c.config.globalVersion >= 17 {
+		if c.master.previousGlobalBalance == nil {
+			return blockParts{}, fmt.Errorf("%w: previous actual global balance is absent", ErrInvalidInput)
+		}
+		var valueFlow tlb.ValueFlow
+		if err = parseExact(&valueFlow, flow.root); err != nil {
+			return blockParts{}, err
+		}
+		globalBalance.Coins, err = nextGlobalBalanceGrams(c.master.previousGlobalBalance,
+			c.master.created.Coins, c.master.importedCreated.Coins, valueFlow.Burned.Coins)
+		if err != nil {
+			return blockParts{}, err
+		}
+	}
 	stateExtra := tlb.McStateExtra{
 		ShardHashes:   c.master.shardHashes,
 		ConfigParams:  c.master.configParams,

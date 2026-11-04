@@ -103,6 +103,8 @@ type CandidateArtifact struct {
 	Candidate    simplex.Candidate
 	BlockBOC     []byte
 	CollatedData []byte
+	// processedExternals carries immutable normalized hashes tried in this window.
+	processedExternals [][32]byte
 
 	prepared *simplex.PreparedCandidate
 
@@ -386,9 +388,8 @@ type BuildRequest struct {
 	// producer when it adopts the offer, against the predecessor it actually
 	// committed.
 	PreviousPending *SuccessorOffer
-	// excludeExternals are the external messages the pending predecessor
-	// consumed. Its consumption is reported to the pool at its commit, which has
-	// not happened yet, so without this the successor's stream offers them again.
+	// excludeExternals are all normalized hashes already attempted in this
+	// leader window. They survive pool deletion and same-process production retries.
 	excludeExternals [][32]byte
 	// onSuccessor is where a build hands its result the moment it stops
 	// recording, before it has serialized anything. The producer installs it on

@@ -44,7 +44,7 @@ func TestExternalImportFeeRejectionDoesNotAbortCandidate(t *testing.T) {
 				))
 
 				clock := &externalImportFeeClock{now: time.Unix(1_900_000_000, 0)}
-				pool := msgpool.New(msgpool.Config{Clock: clock, IncludedRetryDelay: time.Hour})
+				pool := msgpool.New(msgpool.Config{Clock: clock})
 				t.Cleanup(pool.Close)
 				var inputs []ExternalInput
 				// Revisit both accounts so the wave path also reuses a rejected lane.
@@ -132,36 +132,17 @@ func TestExternalImportFeeRejectionDoesNotAbortCandidate(t *testing.T) {
 				if next := pool.SelectForBlock(shard, 4); len(next) != 0 {
 					t.Fatal("processed externals were immediately selected again")
 				}
-				if stats := pool.Stats(); stats.RejectedDelayed != 2 {
+				if stats := pool.Stats(); stats.RejectedDeleted != 2 {
 					t.Fatalf("pool did not receive both import rejections: %+v", stats)
 				}
 
-				// Exercise the real retry generations: unpaid imports must eventually
-				// leave the pool even though their TTL has not expired.
-				for range msgpool.DefaultAccountRejectRetryLimit {
-					clock.now = clock.now.Add(msgpool.DefaultAccountRejectRetryDelay)
-					selected := pool.SelectForBlock(shard, 4)
-					if len(selected) != 2 {
-						t.Fatalf("retry selected %d messages, want 2 unpaid imports", len(selected))
-					}
-					req.Externals = nil
-					for _, snapshot := range selected {
-						input, err := NewExternalInput(snapshot)
-						if err != nil {
-							t.Fatal(err)
-						}
-						req.Externals = append(req.Externals, input)
-					}
-					retry, err := testBuilder().BuildShard(t.Context(), req)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if err = pool.Complete(retry.Externals); err != nil {
-						t.Fatal(err)
-					}
+				clock.now = clock.now.Add(msgpool.DefaultIncludedRetryDelay)
+				selected := pool.SelectForBlock(shard, 4)
+				if len(selected) != 2 {
+					t.Fatalf("after inclusion quarantine selected %d messages, want 2 funded imports", len(selected))
 				}
-				if stats := pool.Stats(); stats.RejectedExhausted != 2 || stats.Pooled != 2 {
-					t.Fatalf("unpaid imports survived their retry limit: %+v", stats)
+				if stats := pool.Stats(); stats.RejectedDeleted != 2 || stats.Pooled != 2 {
+					t.Fatalf("unpaid imports survived rejection: %+v", stats)
 				}
 			})
 		}

@@ -406,6 +406,9 @@ func effectiveDownloadedBlockRoot(id ton.BlockIDExt, isLink bool, root *cell.Cel
 	if root == nil {
 		return nil, fmt.Errorf("block %s has no parsed root", tnstore.FormatBlockRef(id))
 	}
+	if root.Level() != 0 {
+		return nil, fmt.Errorf("block %s root has non-zero level", tnstore.FormatBlockRef(id))
+	}
 	if !isLink || root.GetType() != cell.MerkleProofCellType {
 		return root, nil
 	}

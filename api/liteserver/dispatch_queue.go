@@ -391,12 +391,9 @@ func lookupNextDispatchQueueAccount(dispatchQueue *cell.AugmentedDictionary, add
 	if dispatchQueue == nil || dispatchQueue.IsEmpty() {
 		return nil, nil, cell.ErrNoSuchKeyInDict
 	}
-	key, value, err := dispatchQueue.LookupNearestKey(cell.BeginCell().MustStoreSlice(addr, 256).EndCell(), true, allowEq, false)
+	key, value, _, err := dispatchQueue.LookupNearestKeyExtra(cell.BeginCell().MustStoreSlice(addr, 256).EndCell(), true, allowEq, false)
 	if err != nil {
 		return nil, nil, err
-	}
-	if _, err = value.LoadUInt(64); err != nil {
-		return nil, nil, fmt.Errorf("load dispatch queue account extra: %w", err)
 	}
 	return key, value, nil
 }

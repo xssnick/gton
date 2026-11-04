@@ -110,13 +110,12 @@ func newRefillTwin() *refillTwin {
 
 	return &refillTwin{
 		pool: New(Config{
-			Clock:                   clock,
-			MempoolLimit:            1 << 30,
-			PerAddressLimit:         1 << 30,
-			MempoolBytesLimit:       1 << 40,
-			TTL:                     time.Minute,
-			IncludedRetryDelay:      3 * time.Second,
-			AccountRejectRetryDelay: time.Second,
+			Clock:              clock,
+			MempoolLimit:       1 << 30,
+			PerAddressLimit:    1 << 30,
+			MempoolBytesLimit:  1 << 40,
+			TTL:                time.Minute,
+			IncludedRetryDelay: 3 * time.Second,
 		}),
 		clock: clock,
 	}
@@ -132,7 +131,7 @@ type refillEquivalenceCoverage struct {
 // The refill must offer the same messages in the same order, reactivate the
 // same retries and reach the same dirty verdict as before, on pools that
 // exercise all of it: several priority levels, streams narrower than the pool
-// and of other workchains, exclusions by raw and normalized hash, retries that
+// and of other workchains, exclusions by normalized hash, retries that
 // fall due during the scan, expiry, and follow admission between refills.
 func TestExternalStreamRefillMatchesLegacy(t *testing.T) {
 	var coverage refillEquivalenceCoverage
@@ -176,7 +175,9 @@ func runRefillEquivalence(t *testing.T, rng *rand.Rand, coverage *refillEquivale
 		var exclude [][32]byte
 		for range rng.Intn(3) {
 			if len(hashes) > 0 {
-				exclude = append(exclude, hashes[rng.Intn(len(hashes))])
+				if entry := current.pool.byHash[hashes[rng.Intn(len(hashes))]]; entry != nil {
+					exclude = append(exclude, entry.msg.HashNorm)
+				}
 			}
 		}
 		for _, twin := range []*refillTwin{current, legacy} {
@@ -318,7 +319,7 @@ func requireSameRefillState(t *testing.T, step int, current, legacy *refillTwin)
 			t.Fatalf("step %d: message %x pooled only by the current refill", step, hash[:6])
 		}
 		if e.priority != other.priority || e.generation != other.generation ||
-			e.retryReason != other.retryReason || !e.retryAt.Equal(other.retryAt) || !e.deleteAt.Equal(other.deleteAt) {
+			!e.retryAt.Equal(other.retryAt) || !e.deleteAt.Equal(other.deleteAt) {
 			t.Fatalf("step %d: entry %x diverged: %+v against %+v", step, hash[:6], *e, *other)
 		}
 	}

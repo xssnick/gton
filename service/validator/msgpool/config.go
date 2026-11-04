@@ -45,13 +45,11 @@ import (
 )
 
 const (
-	DefaultMempoolLimit                   = 8192
-	DefaultMempoolBytesLimit              = 256 << 20
-	DefaultPerAddressLimit                = 256
-	DefaultTTL                            = 10 * time.Minute
-	DefaultIncludedRetryDelay             = 10 * time.Second
-	DefaultAccountRejectRetryDelay        = time.Second
-	DefaultAccountRejectRetryLimit uint32 = 3
+	DefaultMempoolLimit       = 8192
+	DefaultMempoolBytesLimit  = 256 << 20
+	DefaultPerAddressLimit    = 256
+	DefaultTTL                = 10 * time.Minute
+	DefaultIncludedRetryDelay = 10 * time.Second
 )
 
 // Config assembles a Pool.
@@ -73,13 +71,6 @@ type Config struct {
 	// stays unavailable while that candidate either reaches the applied chain
 	// or loses. Zero uses ten seconds.
 	IncludedRetryDelay time.Duration
-	// AccountRejectRetryDelay is how long an account-rejected external stays
-	// unavailable before the pool offers it to a collator again. Zero uses one
-	// second.
-	AccountRejectRetryDelay time.Duration
-	// AccountRejectRetryLimit bounds delayed retries during one pool lifetime.
-	// Zero uses three retries after the initial attempt.
-	AccountRejectRetryLimit uint32
 
 	// Clock is optional; nil means the system clock.
 	Clock Clock
@@ -102,12 +93,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.IncludedRetryDelay <= 0 {
 		c.IncludedRetryDelay = DefaultIncludedRetryDelay
-	}
-	if c.AccountRejectRetryDelay == 0 {
-		c.AccountRejectRetryDelay = DefaultAccountRejectRetryDelay
-	}
-	if c.AccountRejectRetryLimit == 0 {
-		c.AccountRejectRetryLimit = DefaultAccountRejectRetryLimit
 	}
 	if c.Clock == nil {
 		c.Clock = SystemClock{}
@@ -155,10 +140,7 @@ type Stats struct {
 	InvalidDeleted      uint64
 	IncludedQuarantined uint64
 	IncludedReleased    uint64
-	RejectedDelayed     uint64
-	RejectedRetried     uint64
-	RejectedExhausted   uint64
-	RejectedPressure    uint64
+	RejectedDeleted     uint64
 	StaleFeedback       uint64
 
 	AppliedRequested uint64

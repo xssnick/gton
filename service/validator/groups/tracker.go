@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -14,8 +13,6 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
-
-const futureShardHorizon = 60 * time.Second
 
 var (
 	ErrNoSnapshot                  = errors.New("validator groups snapshot is not initialized")
@@ -50,8 +47,7 @@ type TrackerOptions struct {
 	InitialCollators []CollatorRegistryEntry
 }
 
-// ApplyInput identifies one applied masterchain state and the wall-clock point
-// at which the 60-second future split/merge horizon is evaluated.
+// ApplyInput identifies one applied masterchain state and its observation time.
 type ApplyInput struct {
 	Block ton.BlockIDExt
 	Root  *cell.Cell
@@ -74,6 +70,7 @@ type Session struct {
 	Registered     []ShardDescription
 	MinMasterchain ton.BlockIDExt
 	FinalizedBlock *ton.BlockIDExt
+	ExpectedStart  time.Time
 }
 
 // Snapshot is the immutable group view derived from one masterchain state.
@@ -354,7 +351,7 @@ func (t *Tracker) project(previous *Snapshot, input ApplyInput) (ApplyResult, er
 		// validator-group.cpp: rotated_all_shards clears future groups and
 		// returns before deriving the next generation.
 		if !state.RotatedAllShards {
-			future, err = t.buildFutureSessions(state, config, input.AsOf, rotationID)
+			future, err = t.buildFutureSessions(state, config, rotationID)
 			if err != nil {
 				return ApplyResult{}, err
 			}
@@ -518,12 +515,6 @@ type activeSessionKey struct {
 // shard plus catchain seqno by the lookup key pins every input. Recomputing
 // them is measurably the most expensive part of every applied masterchain
 // state, and reconcileSnapshot discards the fresh rosters again anyway.
-//
-// Deliberately not used for tentative sessions: SelectTentativeValidatorSet
-// swaps the current set for the next one on gen_utime crossing a lifetime
-// boundary while the configuration is byte-identical, so these gates would
-// serve a stale session id there. See
-// TestTrackerFutureSessionsFollowTentativeSetBoundary.
 func reusableActiveSessions(
 	previous *Snapshot,
 	config *Config,
@@ -543,54 +534,22 @@ func reusableActiveSessions(
 	return index
 }
 
-func (t *Tracker) buildFutureSessions(state *State, config *Config, asOf time.Time, rotationID uint32) ([]Session, error) {
-	shards, err := state.FutureShards(asOf, futureShardHorizon)
+func (t *Tracker) buildFutureSessions(state *State, config *Config, rotationID uint32) ([]Session, error) {
+	shards, err := state.FutureShards(config.Catchain)
 	if err != nil {
 		return nil, fmt.Errorf("resolve future group topology: %w", err)
 	}
-
-	masterchainSet, err := SelectTentativeValidatorSet(TentativeValidatorSetInput{
-		Current:          config.ActiveValidators,
-		Next:             config.NextValidators,
-		GenUTime:         state.GenUTime,
-		CatchainLifetime: config.Catchain.MasterchainLifetime,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("select future masterchain validator set: %w", err)
-	}
-	shardSet, err := SelectTentativeValidatorSet(TentativeValidatorSetInput{
-		Current:          config.ActiveValidators,
-		Next:             config.NextValidators,
-		GenUTime:         state.GenUTime,
-		CatchainLifetime: config.Catchain.ShardLifetime,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("select future shard validator set: %w", err)
-	}
-
 	sessions := make([]Session, 0, len(shards))
-	for _, shard := range shards {
-		catchainSeqno, err := state.CatchainSeqnoFor(shard)
+	for _, future := range shards {
+		// Explicit catchain selection uses the current validator set in C++.
+		session, err := t.buildSession(config, config.ActiveValidators, future.Shard, future.CatchainSeqno, state.LastKeyBlockSeqno, rotationID)
 		if err != nil {
-			return nil, fmt.Errorf("resolve catchain seqno for future shard %+v: %w", shard, err)
+			return nil, fmt.Errorf("build future session for shard %+v: %w", future.Shard, err)
 		}
-		if catchainSeqno == math.MaxUint32 {
-			return nil, fmt.Errorf("future catchain seqno overflows for shard %+v", shard)
-		}
-
-		validatorSet := shardSet
-		if shard.IsMasterchain() {
-			validatorSet = masterchainSet
-		}
-
-		session, err := t.buildSession(config, validatorSet, shard, catchainSeqno+1, state.LastKeyBlockSeqno, rotationID)
-		if err != nil {
-			return nil, fmt.Errorf("build future session for shard %+v: %w", shard, err)
-		}
-		session.FinalizedBlock = exactFinalizedBlock(state, shard)
+		session.FinalizedBlock = exactFinalizedBlock(state, future.Shard)
+		session.ExpectedStart = future.ExpectedStart
 		sessions = append(sessions, session)
 	}
-
 	sortSessions(sessions)
 	return sessions, nil
 }
@@ -816,6 +775,7 @@ func preserveActiveSession(next, previous *Session) {
 
 func preserveFutureSession(next, previous *Session) {
 	next.Validators = previous.Validators
+	next.ExpectedStart = previous.ExpectedStart
 }
 
 func sortSessions(sessions []Session) {

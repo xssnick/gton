@@ -90,7 +90,7 @@ func (w *lazyCandidateWire) materialize() ([]byte, [32]byte, error) {
 				w.err = fmt.Errorf("validator runtime: restore candidate block roots: %w", err)
 				return
 			}
-			collated, err := cell.FromBOCMultiRootWithOptions(w.collatedData, cell.BOCParseOptions{NoCopyPayload: true})
+			collated, err := cell.FromBOCMultiRootWithOptions(w.collatedData, cell.BOCParseOptions{NoCopyPayload: true, AllowNonZeroLevelRoot: true})
 			if err != nil {
 				w.err = fmt.Errorf("validator runtime: restore candidate collated roots: %w", err)
 				return

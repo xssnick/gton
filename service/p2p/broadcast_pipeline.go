@@ -205,20 +205,16 @@ func (s *overlaySubscription) handleOverlayBroadcastPayload(peer *overlayPeer, m
 
 func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg any, payload *broadcastPayload, delivery Delivery, trusted bool, sourcePeerID PeerID) (broadcastResult, error) {
 	if s.spec.restrictsBroadcastKinds() {
-		// We publish DoNotReceiveBroadcasts in our member flags when this
-		// overlay is send-only for us (a validator under plumtree), and drop
-		// what a peer sends anyway. Upstream gates the same six kinds inside
-		// OverlayImpl::process_broadcast — but not the two-step pair, which it
-		// processes regardless, so neither do we. Note this only suppresses
-		// application processing: the transport has already decoded and
-		// relayed by the time classify runs, so it does not save that work.
-		if delivery != DeliveryTwoStep &&
-			s.fastSync != nil && s.fastSync.declinesBroadcasts() {
-			s.node.chainNode().noteBroadcastDrop(
-				s.spec.Name,
-				broadcastKindLabel(msg),
-				"fast_sync_broadcasts_declined",
-			)
+		if delivery == DeliveryPlumtree &&
+			s.fastSync != nil && s.fastSync.declinesPlumtreeBroadcasts() {
+			s.node.chainNode().noteBroadcastDrop(s.spec.Name, broadcastKindLabel(msg), "fast_sync_plumtree_declined")
+			return ignoredBroadcastResult(), nil
+		}
+		// Non-validator broadcast sources require application admission. The
+		// reference FastSync check_broadcast accepts only external messages;
+		// a valid member certificate alone does not authorize block traffic.
+		if _, external := msg.(tonnodeapi.NewExternalMessageBroadcast); !trusted && !external {
+			s.node.chainNode().noteBroadcastDrop(s.spec.Name, broadcastKindLabel(msg), "unauthorized_fast_sync_broadcast")
 			return ignoredBroadcastResult(), nil
 		}
 		if !fastSyncBroadcastSupported(msg) {
@@ -331,6 +327,11 @@ func (s *overlaySubscription) classifyBroadcastPayload(peer *overlayPeer, msg an
 			return ignoredBroadcastResult(), nil
 		}
 		if s.node.chainNode().myExternalMessages.Seen(hash, now) {
+			if s.spec.relaysOwnExternalMessages() {
+				// The first reflected copy remains eligible for native relay;
+				// local origination already admitted it to the pool.
+				return acceptedBroadcastResult(acceptedBroadcast{}), nil
+			}
 			s.node.chainNode().noteBroadcastDrop(s.spec.Name, kind, "seen")
 			return ignoredBroadcastResult(), nil
 		}
@@ -1497,6 +1498,7 @@ func fastSyncBroadcastSupported(msg any) bool {
 		tonnodeapi.BlockBroadcastCompressed,
 		tonnodeapi.BlockBroadcastCompressedV2,
 		tonnodeapi.NewShardBlockBroadcast,
+		tonnodeapi.NewExternalMessageBroadcast,
 		tonnodeapi.NewBlockCandidateBroadcast,
 		tonnodeapi.NewBlockCandidateBroadcastCompressed,
 		tonnodeapi.NewBlockCandidateBroadcastCompressedV2,

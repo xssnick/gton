@@ -136,7 +136,7 @@ func TestProofSizeEstimateParticipatesInAdmission(t *testing.T) {
 		ltDelta:      loose,
 		collatedData: limitThresholds{1, 2, 3, 4},
 	}, 1, cell.NewReadSet(nil), 0, 0)
-	c := collation{limits: status, fullCollated: true, collatedProofEstimate: estimator}
+	c := collation{config: &Config{}, limits: status, fullCollated: true, collatedProofEstimate: estimator}
 	c.updateCollatedEstimate()
 	if status.collatedData != estimator.size() {
 		t.Fatalf("admission estimate = %d, want %d", status.collatedData, estimator.size())

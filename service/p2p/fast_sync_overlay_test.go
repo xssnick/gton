@@ -75,7 +75,7 @@ func TestSetFastSyncOverlaysReconcilesValidatorShards(t *testing.T) {
 			)
 		}
 		if sub.fastSync == nil || !sub.fastSync.spec.localValidator ||
-			sub.fastSync.spec.receiveBroadcasts {
+			sub.fastSync.spec.receivePlumtreeBroadcasts {
 			t.Fatalf("%s FastSync local policy = %+v", name, sub.fastSync)
 		}
 		if sub.plumtree == nil {

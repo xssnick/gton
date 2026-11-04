@@ -3,6 +3,7 @@ package collator
 import (
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"math/big"
 	"testing"
 
@@ -16,6 +17,11 @@ import (
 )
 
 func TestAfterMergeFullCollatedProofCarriesChangedAccount(t *testing.T) {
+	for _, version := range []uint32{15, 16} {
+		t.Run(fmt.Sprintf("GV%d", version), func(t *testing.T) { testAfterMergeFullCollatedProof(t, version) })
+	}
+}
+func testAfterMergeFullCollatedProof(t *testing.T, version uint32) {
 	fixture := newMergePredecessorFixture(t)
 	req := fixture.req
 	bindSyntheticPredecessorBlock(t, &req.Previous)
@@ -26,6 +32,7 @@ func TestAfterMergeFullCollatedProofCarriesChangedAccount(t *testing.T) {
 	session.Registered[0].Block = *req.Previous.ID.Copy()
 	session.Registered[1].Block = *req.Previous2.ID.Copy()
 	req.Masterchain.Config.capabilities |= capFullCollatedData
+	req.Masterchain.Config.globalVersion = version
 
 	leftNeighbor := fullCollatedTestNeighbor(t, req.Previous)
 	rightNeighbor := fullCollatedTestNeighbor(t, *req.Previous2)

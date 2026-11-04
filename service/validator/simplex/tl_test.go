@@ -37,7 +37,7 @@ func TestConstructorIDsGolden(t *testing.T) {
 		"stats.id":                0xc8aee82e,
 		"stats.block":             0x3af82fee,
 		"stats.empty":             0xc6599e1f,
-		"stats.candidateReceived": 0x257ba2cf,
+		"stats.candidateReceived": 0xdd4bc811,
 		"stats.timestampedEvent":  0x4d601011,
 		"simplex.stats.voted":     0x07725e97,
 		"simplex.stats.cert":      0x71a32c35,

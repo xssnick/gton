@@ -276,7 +276,7 @@ func TestShardTopValidatorContextSelectsTentativeRosterAtBoundary(t *testing.T) 
 	}
 }
 
-func TestShardTopValidatorContextPrefersTemporaryRosters(t *testing.T) {
+func TestShardTopValidatorContextIgnoresTemporaryRosters(t *testing.T) {
 	context := testShardTopValidatorContext(
 		t,
 		50,
@@ -295,13 +295,13 @@ func TestShardTopValidatorContextPrefersTemporaryRosters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	testShardTopRequireValidatorKey(t, current, 0x12)
+	testShardTopRequireValidatorKey(t, current, 0x11)
 
 	next, err := context.ValidatorsForCatchain(block, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
-	testShardTopRequireValidatorKey(t, next, 0x22)
+	testShardTopRequireValidatorKey(t, next, 0x21)
 }
 
 func TestShardTopValidatorContextAllowsEmptyShardRegistry(t *testing.T) {

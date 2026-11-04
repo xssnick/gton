@@ -21,9 +21,17 @@ import (
 // goroutine is ever in flight, and that the flag is always released.
 
 // countGoroutinesContaining counts live goroutines whose stack mentions substr.
+// The dump grows until it holds every goroutine: runtime.Stack silently
+// truncates to the buffer, and a full package run keeps a few thousand
+// goroutines alive, so a fixed buffer dropped the very goroutine being counted.
 func countGoroutinesContaining(substr string) int {
 	buf := make([]byte, 1<<20)
 	n := runtime.Stack(buf, true)
+	for n == len(buf) {
+		buf = make([]byte, 2*len(buf))
+		n = runtime.Stack(buf, true)
+	}
+
 	needle := []byte(substr)
 	count := 0
 	for _, g := range bytes.Split(buf[:n], []byte("\n\n")) {
@@ -80,7 +88,7 @@ func TestRequestBackgroundQUICDialSingleFlightPerRoute(t *testing.T) {
 	for range callers {
 		go func() {
 			defer launched.Done()
-			peer.requestBackgroundQUICDial()
+			peer.quicPath().requestBackgroundQUICDial()
 		}()
 	}
 	launched.Wait()
@@ -142,7 +150,7 @@ func TestRequestBackgroundQUICDialResetsClaimWhenRunAsyncRefuses(t *testing.T) {
 		route: newTestPeerRoute(""),
 	}
 
-	peer.requestBackgroundQUICDial()
+	peer.quicPath().requestBackgroundQUICDial()
 
 	if !peer.route.ClaimBackgroundQUICDial() {
 		t.Fatal("refused background dial left its claim held")

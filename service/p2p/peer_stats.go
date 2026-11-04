@@ -100,11 +100,11 @@ func (p *overlayPeer) mergeAnnouncement(node *overlay.NodeV2) {
 	}
 }
 
-func (p *overlayPeer) receivesBroadcasts() bool {
+func (p *overlayPeer) receivesPlumtreeBroadcasts() bool {
 	p.statsMx.Lock()
 	defer p.statsMx.Unlock()
 
-	return p.announced == nil || p.announced.Flags&overlayMemberDoNotReceiveBroadcasts == 0
+	return p.announced == nil || p.announced.Flags&overlayMemberDoNotReceivePlumtreeBroadcasts == 0
 }
 
 func (p *overlayPeer) statsSnapshot() peerStats {
@@ -721,22 +721,21 @@ func (s *overlaySubscription) buildBroadcastTargetsSnapshot() *broadcastTargetsS
 	receivers := make([]*overlayPeer, 0, len(peers))
 	broadcast := make([]overlay.BroadcastPeer, 0, len(peers))
 	plumtree := make([]PeerID, 0, len(peers))
-	// Kept in sync with the neighbour prefix as the fastSync filter drops peers.
+	// Ordinary gossip includes peers which decline only Plumtree delivery.
 	neighbourTargets := 0
 	for i, peer := range peers {
-		if s.fastSync == nil && !peer.receivesBroadcasts() {
-			continue
-		}
-		if s.fastSync != nil &&
-			!s.fastSync.peerReceivesBroadcasts(peer.id) {
-			continue
-		}
 		if i < neighbourPrefix {
 			neighbourTargets++
 		}
 		receivers = append(receivers, peer)
 		broadcast = append(broadcast, peer.broadcastPeer)
-		if peer.route.QUICReady(now) {
+		var receivesPlumtree bool
+		if s.fastSync != nil {
+			receivesPlumtree = s.fastSync.peerReceivesPlumtreeBroadcasts(peer.id)
+		} else {
+			receivesPlumtree = peer.receivesPlumtreeBroadcasts()
+		}
+		if receivesPlumtree && peer.route.QUICReady(now) {
 			plumtree = append(plumtree, peer.id)
 		}
 	}

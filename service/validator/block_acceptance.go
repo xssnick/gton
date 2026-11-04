@@ -839,10 +839,7 @@ func validateAcceptedKeyBlockConfig(block *tlb.Block) error {
 	}
 	optional := []acceptedValidatorSetLoader{
 		{name: "previous", load: config.GetPrevValidators},
-		{name: "previous temporary", load: config.GetPrevTempValidators},
-		{name: "current temporary", load: config.GetCurrentTempValidators},
 		{name: "next", load: config.GetNextValidators},
-		{name: "next temporary", load: config.GetNextTempValidators},
 	}
 	for _, item := range optional {
 		set, loadErr := item.load()

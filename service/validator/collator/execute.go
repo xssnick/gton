@@ -321,8 +321,17 @@ func (h *newMessageHeap) popMin() newMessage {
 	return top
 }
 
-func (c *collation) recordExternal(ref msgpool.ExternalRef, outcome msgpool.ExternalOutcome) {
-	c.externals = append(c.externals, msgpool.ExternalFeedback{Ref: ref, Outcome: outcome})
+func (c *collation) recordExternal(input ExternalInput, outcome msgpool.ExternalOutcome) {
+	c.externals = append(c.externals, msgpool.ExternalFeedback{Ref: input.Ref, Outcome: outcome})
+	if outcome != msgpool.ExternalSkippedLimit {
+		if c.processedExternalSet == nil {
+			c.processedExternalSet = make(map[[32]byte]struct{})
+		}
+		if _, seen := c.processedExternalSet[input.normalizedHash]; !seen {
+			c.processedExternalSet[input.normalizedHash] = struct{}{}
+			c.processedExternals = append(c.processedExternals, input.normalizedHash)
+		}
+	}
 	switch outcome {
 	case msgpool.ExternalIncluded:
 		c.stats.ExternalIncluded++
@@ -368,7 +377,7 @@ func (c *collation) processExternalBatch(
 	// batch that crosses the threshold mid-way.
 	if len(externals) != 0 && c.externalIntakeClosed() {
 		for _, skipped := range externals {
-			c.recordExternal(skipped.Ref, msgpool.ExternalSkippedLimit)
+			c.recordExternal(skipped, msgpool.ExternalSkippedLimit)
 		}
 		return externalBatchResult{consumed: len(externals)}, nil
 	}
@@ -381,19 +390,19 @@ func (c *collation) processExternalBatch(
 		c.updateCollatedEstimate()
 		if !c.limits.fits(LoadSoft) {
 			for _, skipped := range externals[i:] {
-				c.recordExternal(skipped.Ref, msgpool.ExternalSkippedLimit)
+				c.recordExternal(skipped, msgpool.ExternalSkippedLimit)
 			}
 			return externalBatchResult{stop: ExternalStopSoftLimit, consumed: i}, nil
 		}
 		if !deadline.IsZero() && !time.Now().Before(deadline) {
 			for _, skipped := range externals[i:] {
-				c.recordExternal(skipped.Ref, msgpool.ExternalSkippedLimit)
+				c.recordExternal(skipped, msgpool.ExternalSkippedLimit)
 			}
 			return externalBatchResult{stop: ExternalStopDeadline, consumed: i}, nil
 		}
 		if c.paceExpired() {
 			for _, skipped := range externals[i:] {
-				c.recordExternal(skipped.Ref, msgpool.ExternalSkippedLimit)
+				c.recordExternal(skipped, msgpool.ExternalSkippedLimit)
 			}
 
 			return externalBatchResult{stop: ExternalStopDeadline, consumed: i}, nil
@@ -402,38 +411,38 @@ func (c *collation) processExternalBatch(
 			return externalBatchResult{}, err
 		}
 
+		if c.externalIntakeClosed() {
+			c.recordExternal(external, msgpool.ExternalSkippedLimit)
+			continue
+		}
+		if _, duplicate := c.processedExternalSet[external.normalizedHash]; duplicate {
+			c.stats.ExternalSkippedDuplicate++
+			continue
+		}
 		prepared := external.message
 		root := prepared.Cell()
 		message := prepared.Message()
 		hash := root.HashKey()
 		if root.Level() != 0 {
-			c.recordExternal(external.Ref, msgpool.ExternalInvalid)
+			c.recordExternal(external, msgpool.ExternalInvalid)
 			continue
 		}
 		if message.MsgType != tlb.MsgTypeExternalIn {
-			c.recordExternal(external.Ref, msgpool.ExternalInvalid)
+			c.recordExternal(external, msgpool.ExternalInvalid)
 			continue
 		}
 		destination, err := accountPrefixFromAddress(message.AsExternalIn().DstAddr)
 		if err != nil {
-			c.recordExternal(external.Ref, msgpool.ExternalInvalid)
+			c.recordExternal(external, msgpool.ExternalInvalid)
 			continue
 		}
 		if !c.shard.ContainsPrefix(destination) {
-			c.recordExternal(external.Ref, msgpool.ExternalInvalid)
-			continue
-		}
-		// Checked after the message is known to be well-formed and ours, so a
-		// message that would never be executable is still purged from the pool
-		// rather than held behind the brake, and before the attempt counter,
-		// which measures executions this message does not get.
-		if c.externalIntakeClosed() {
-			c.recordExternal(external.Ref, msgpool.ExternalSkippedLimit)
+			c.recordExternal(external, msgpool.ExternalInvalid)
 			continue
 		}
 		if int(c.stats.ExternalAttempts) >= c.req.maxExternalAttempts {
 			for _, skipped := range externals[i:] {
-				c.recordExternal(skipped.Ref, msgpool.ExternalSkippedLimit)
+				c.recordExternal(skipped, msgpool.ExternalSkippedLimit)
 			}
 			return externalBatchResult{stop: ExternalStopAttemptLimit, consumed: i}, nil
 		}
@@ -446,7 +455,7 @@ func (c *collation) processExternalBatch(
 			return externalBatchResult{}, err
 		}
 		if !result.Accepted {
-			c.recordExternal(external.Ref, msgpool.ExternalNotAccepted)
+			c.recordExternal(external, msgpool.ExternalNotAccepted)
 			continue
 		}
 		c.prewarmGeneratedOutputs(result)
@@ -458,7 +467,7 @@ func (c *collation) processExternalBatch(
 			return externalBatchResult{}, err
 		}
 
-		c.recordExternal(external.Ref, msgpool.ExternalIncluded)
+		c.recordExternal(external, msgpool.ExternalIncluded)
 		if err = c.registerOutputs(result, lane, nil, true); err != nil {
 			return externalBatchResult{}, err
 		}

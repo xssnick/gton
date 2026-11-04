@@ -467,6 +467,11 @@ func prepareSessionRuntime(
 
 		return nil, errors.Join(updateErr, closeErr)
 	}
+	if loaded.FirstNonAnnouncedWindow == 0 {
+		if backend, ok := options.Backend.(firstDelegationBackend); ok {
+			backend.scheduleFirstDelegation(ctx)
+		}
+	}
 	return runtime, nil
 }
 

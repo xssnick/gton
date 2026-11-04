@@ -7,6 +7,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/xssnick/gton/service/storage"
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -58,14 +59,16 @@ func TestCellGenerationSwitchPublishesCurrentStateWithActiveLoader(t *testing.T)
 		current:    storage.CloneCurrentState(latest),
 	}
 	candidate.current.Masterchain.Cell = candidateMaster
+	candidate.current.Masterchain.Parsed = &tlb.ShardStateUnsplit{MinRefMCSeqno: 50}
 	candidateShardState := candidate.current.Shards[storage.ShardKeyFromBlock(shardBlock)]
 	candidateShardState.Cell = candidateShard
 	candidate.current.Shards[storage.ShardKeyFromBlock(shardBlock)] = candidateShardState
 
 	transitions := &captureCellGenerationSwitchTransitions{}
 	lifecycle := &StateLifecycle{
-		log:                   zerolog.Nop(),
-		checkpointTransitions: transitions,
+		log:                      zerolog.Nop(),
+		retainMasterchainHistory: true,
+		checkpointTransitions:    transitions,
 	}
 	oldGeneration, err := lifecycle.trySwitchCellGenerationCandidate(
 		context.Background(),

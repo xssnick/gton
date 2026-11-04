@@ -42,7 +42,6 @@ func prepareBarrierSession(
 	}
 	managed.mu.Lock()
 	managed.progressReady = true
-	managed.progressApplied = true
 	managed.mu.Unlock()
 
 	return managed

@@ -2,6 +2,7 @@ package msgpool
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -310,53 +311,38 @@ func TestCompleteRejectsUnknownOutcomeWithoutMutation(t *testing.T) {
 	requireEqual(t, env.pool.Stats().Pooled, 1, "invalid batch must not mutate the pool")
 }
 
-func TestAccountRejectedDelayedRetriedAndBounded(t *testing.T) {
-	env := newPoolEnv(t, func(c *Config) {
-		c.AccountRejectRetryDelay = 10 * time.Second
-		c.AccountRejectRetryLimit = 1
-	})
-	env.mustAdd(buildExtMsg(t, 0, testAddr(0x5b), bodyWithTag(1), msgOpts{}), 0)
-
-	first := env.pool.SelectForBlock(allShard, 1)[0]
-	if err := env.pool.Complete([]ExternalFeedback{{
-		Ref:     first.Reference(),
-		Outcome: ExternalNotAccepted,
-	}}); err != nil {
-		t.Fatal(err)
+func TestRejectedFeedbackErasesNormalizedVariants(t *testing.T) {
+	for _, outcome := range []ExternalOutcome{ExternalInvalid, ExternalNotAccepted} {
+		t.Run(fmt.Sprint(outcome), func(t *testing.T) {
+			env := newPoolEnv(t)
+			addr := testAddr(0x5b)
+			body := bodyWithTag(1)
+			first := env.mustAdd(buildExtMsg(t, 0, addr, body, msgOpts{importFee: 0}), 0)
+			second := env.mustAdd(buildExtMsg(t, 0, addr, body, msgOpts{importFee: 777}), 1)
+			other := env.mustAdd(buildExtMsg(t, 0, addr, bodyWithTag(2), msgOpts{}), 0)
+			requireEqual(t, first.HashNorm, second.HashNorm, "normalized variants")
+			var ref ExternalRef
+			for _, snapshot := range env.pool.SelectForBlock(allShard, 3) {
+				if snapshot.Hash == first.Hash {
+					ref = snapshot.Reference()
+				}
+			}
+			if err := env.pool.Complete([]ExternalFeedback{{Ref: ref, Outcome: outcome}}); err != nil {
+				t.Fatal(err)
+			}
+			ready := env.pool.SelectForBlock(allShard, 3)
+			requireEqual(t, len(ready), 1, "only unrelated message remains")
+			requireEqual(t, ready[0].Hash, other.Hash, "unrelated normalized hash remains")
+			stats := env.pool.Stats()
+			if outcome == ExternalInvalid {
+				requireEqual(t, stats.InvalidDeleted, uint64(2), "invalid variants deleted")
+			} else {
+				requireEqual(t, stats.RejectedDeleted, uint64(2), "rejected variants deleted")
+			}
+			env.clock.advance(DefaultIncludedRetryDelay)
+			requireEqual(t, len(env.pool.SelectForBlock(allShard, 3)), 1, "rejected variants never reactivate")
+		})
 	}
-	requireEqual(t, len(env.pool.SelectForBlock(allShard, 1)), 0, "rejected message delayed")
-	requireEqual(t, env.pool.Stats().RejectedDelayed, uint64(1), "delay counted")
-
-	env.clock.advance(10 * time.Second)
-	retry := env.pool.SelectForBlock(allShard, 1)
-	requireEqual(t, len(retry), 1, "message reactivated")
-	if retry[0].Reference().Generation == first.Reference().Generation {
-		t.Fatal("retry must use a new generation")
-	}
-
-	// A late permanent result from the earlier collation cannot delete the
-	// reactivated generation.
-	if err := env.pool.Complete([]ExternalFeedback{{
-		Ref:     first.Reference(),
-		Outcome: ExternalInvalid,
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	requireEqual(t, env.pool.Stats().Pooled, 1, "stale feedback ignored")
-	requireEqual(t, env.pool.Stats().StaleFeedback, uint64(1), "stale feedback counted")
-
-	// The configured retry generation was already consumed, so a second
-	// account rejection removes the message instead of looping forever.
-	if err := env.pool.Complete([]ExternalFeedback{{
-		Ref:     retry[0].Reference(),
-		Outcome: ExternalNotAccepted,
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	st := env.pool.Stats()
-	requireEqual(t, st.Pooled, 0, "retry budget exhausted")
-	requireEqual(t, st.RejectedRetried, uint64(1), "reactivation counted")
-	requireEqual(t, st.RejectedExhausted, uint64(1), "exhaustion counted")
 }
 
 func TestIncludedFeedbackQuarantinesBeforeRetry(t *testing.T) {
@@ -444,53 +430,36 @@ func TestSkippedFeedbackCannotHideConcurrentExecutionResult(t *testing.T) {
 	}
 }
 
-func TestIncludedFeedbackDoesNotResetAccountRejectBudget(t *testing.T) {
-	env := newPoolEnv(t, func(c *Config) {
-		c.AccountRejectRetryDelay = time.Second
-		c.AccountRejectRetryLimit = 1
-	})
-	env.mustAdd(buildExtMsg(t, 0, testAddr(0x5f), bodyWithTag(1), msgOpts{}), 0)
-
-	first := env.pool.SelectForBlock(allShard, 1)[0]
-	if err := env.pool.Complete([]ExternalFeedback{{Ref: first.Reference(), Outcome: ExternalNotAccepted}}); err != nil {
+func TestStaleRejectionCannotDeleteQuarantinedNormalizedVariants(t *testing.T) {
+	env := newPoolEnv(t)
+	first := env.mustAdd(buildExtMsg(t, 0, testAddr(0x5f), bodyWithTag(1), msgOpts{}), 0)
+	env.mustAdd(buildExtMsg(t, 0, testAddr(0x5f), bodyWithTag(1), msgOpts{importFee: 12}), 1)
+	var ref ExternalRef
+	for _, snapshot := range env.pool.SelectForBlock(allShard, 2) {
+		if snapshot.Hash == first.Hash {
+			ref = snapshot.Reference()
+		}
+	}
+	if err := env.pool.Complete([]ExternalFeedback{{Ref: ref, Outcome: ExternalIncluded}}); err != nil {
 		t.Fatal(err)
 	}
-	env.clock.advance(time.Second)
-	retry := env.pool.SelectForBlock(allShard, 1)[0]
-	if err := env.pool.Complete([]ExternalFeedback{{Ref: retry.Reference(), Outcome: ExternalIncluded}}); err != nil {
+	if err := env.pool.Complete([]ExternalFeedback{{Ref: ref, Outcome: ExternalNotAccepted}}); err != nil {
 		t.Fatal(err)
 	}
+	stats := env.pool.Stats()
+	requireEqual(t, stats.Pooled, 2, "stale rejection preserves quarantined variants")
+	requireEqual(t, stats.StaleFeedback, uint64(1), "stale generation counted")
 	env.clock.advance(DefaultIncludedRetryDelay)
-	afterIncluded := env.pool.SelectForBlock(allShard, 1)[0]
-	if err := env.pool.Complete([]ExternalFeedback{{Ref: afterIncluded.Reference(), Outcome: ExternalNotAccepted}}); err != nil {
+	ready := env.pool.SelectForBlock(allShard, 2)
+	requireEqual(t, len(ready), 2, "variants released")
+	if err := env.pool.Complete([]ExternalFeedback{{Ref: ready[0].Reference(), Outcome: ExternalNotAccepted}}); err != nil {
 		t.Fatal(err)
 	}
-	if stats := env.pool.Stats(); stats.Pooled != 0 || stats.RejectedExhausted != 1 {
-		t.Fatalf("included feedback reset the lifetime reject budget: %+v", stats)
-	}
-}
-
-func TestAccountRejectedMessageIsErasedUnderSlabPressure(t *testing.T) {
-	env := newPoolEnv(t, func(c *Config) {
-		c.MempoolLimit = 2
-		c.PerAddressLimit = 2
-	})
-	env.mustAdd(buildExtMsg(t, 0, testAddr(0x60), bodyWithTag(1), msgOpts{}), 0)
-	env.mustAdd(buildExtMsg(t, 0, testAddr(0x61), bodyWithTag(2), msgOpts{}), 0)
-	selected := env.pool.SelectForBlock(allShard, 1)[0]
-
-	if err := env.pool.Complete([]ExternalFeedback{{Ref: selected.Reference(), Outcome: ExternalNotAccepted}}); err != nil {
-		t.Fatal(err)
-	}
-	if stats := env.pool.Stats(); stats.Pooled != 1 || stats.RejectedPressure != 1 || stats.RejectedDelayed != 0 {
-		t.Fatalf("rejected message retained under slab pressure: %+v", stats)
-	}
+	requireEqual(t, env.pool.Stats().Pooled, 0, "current rejection removes all variants")
 }
 
 func TestConcurrentFeedbackConsumesGenerationOnce(t *testing.T) {
-	env := newPoolEnv(t, func(c *Config) {
-		c.AccountRejectRetryDelay = time.Minute
-	})
+	env := newPoolEnv(t)
 	env.mustAdd(buildExtMsg(t, 0, testAddr(0x5e), bodyWithTag(1), msgOpts{}), 0)
 	ref := env.pool.SelectForBlock(allShard, 1)[0].Reference()
 
@@ -511,9 +480,8 @@ func TestConcurrentFeedbackConsumesGenerationOnce(t *testing.T) {
 	wg.Wait()
 
 	st := env.pool.Stats()
-	requireEqual(t, st.RejectedDelayed, uint64(1), "one feedback consumes the generation")
-	requireEqual(t, st.StaleFeedback, uint64(workers-1), "remaining feedback is stale")
-	requireEqual(t, st.Pooled, 1, "message remains delayed")
+	requireEqual(t, st.RejectedDeleted, uint64(1), "concurrent feedback deletes exactly once")
+	requireEqual(t, st.Pooled, 0, "message is deleted")
 }
 
 func TestEraseAppliedByNormalizedHash(t *testing.T) {

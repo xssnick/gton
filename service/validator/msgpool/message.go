@@ -46,10 +46,10 @@ const (
 	// quarantined until an applied block proves inclusion or its retry delay
 	// elapses.
 	ExternalIncluded ExternalOutcome = iota + 1
-	// ExternalInvalid cannot be retried and is removed immediately.
+	// ExternalInvalid removes the message and all its normalized variants.
 	ExternalInvalid
-	// ExternalNotAccepted was rejected by the destination account. It is
-	// delayed and may be offered again in a later generation.
+	// ExternalNotAccepted was rejected by the destination account. The message
+	// and all its normalized variants are removed immediately.
 	ExternalNotAccepted
 	// ExternalSkippedLimit was not executed because the candidate hit a limit.
 	ExternalSkippedLimit

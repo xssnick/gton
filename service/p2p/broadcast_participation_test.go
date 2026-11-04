@@ -40,7 +40,7 @@ func TestChainBroadcastPauseKeepsQueriesAndMembershipActive(t *testing.T) {
 			t.Fatal(err)
 		}
 		local := response.(overlay.NodesV2).Nodes[0]
-		if (local.Flags&overlayMemberDoNotReceiveBroadcasts == 0) != enabled {
+		if (local.Flags&overlayMemberDoNotReceivePlumtreeBroadcasts == 0) != enabled {
 			t.Fatalf("enabled=%v: local flags=%d", enabled, local.Flags)
 		}
 		if err := local.CheckSignature(); err != nil {

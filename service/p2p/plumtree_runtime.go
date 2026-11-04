@@ -179,7 +179,14 @@ func (r *plumtreeRuntime) processMessage(
 	now := time.Now()
 	var result plumtreeMessageResult
 	var err error
-	switch binary.LittleEndian.Uint32(body[:4]) {
+	constructor := binary.LittleEndian.Uint32(body[:4])
+	if r.sub.fastSync != nil && r.sub.fastSync.declinesPlumtreeBroadcasts() {
+		switch constructor {
+		case broadcastPlumtreeSimpleConstructorID, broadcastPlumtreeFECConstructorID, broadcastPlumtreeIHaveConstructorID:
+			return result, nil
+		}
+	}
+	switch constructor {
 	case broadcastPlumtreeSimpleConstructorID:
 		var message BroadcastPlumtreeSimple
 		if err = plumtreeParsed(message.ParseNoCopy(body[4:])); err != nil {
@@ -925,11 +932,11 @@ func (s *overlaySubscription) PlumtreePeerReceivesBroadcasts(peer PeerID) bool {
 	row := s.peers[peer]
 	receives := !s.removed && !s.inactive && row != nil
 	if receives && s.fastSync == nil {
-		receives = row.receivesBroadcasts()
+		receives = row.receivesPlumtreeBroadcasts()
 	}
 	s.mx.Unlock()
 	if receives && s.fastSync != nil {
-		return s.fastSync.peerReceivesBroadcasts(peer)
+		return s.fastSync.peerReceivesPlumtreeBroadcasts(peer)
 	}
 	return receives
 }
@@ -944,7 +951,7 @@ func (s *overlaySubscription) PlumtreePeersReceiveBroadcasts(
 		row := s.peers[peer]
 		out[i] = alive && row != nil
 		if out[i] && s.fastSync == nil {
-			out[i] = row.receivesBroadcasts()
+			out[i] = row.receivesPlumtreeBroadcasts()
 		}
 	}
 	s.mx.Unlock()
@@ -954,7 +961,7 @@ func (s *overlaySubscription) PlumtreePeersReceiveBroadcasts(
 	}
 	for i, peer := range peers {
 		if out[i] {
-			out[i] = s.fastSync.peerReceivesBroadcasts(peer)
+			out[i] = s.fastSync.peerReceivesPlumtreeBroadcasts(peer)
 		}
 	}
 }

@@ -31,6 +31,10 @@ const (
 	// symbols divided by the multiplier, i.e. ~3ms.
 	fastSyncBroadcastSpeedMultiplier    = 3.33
 	minFastSyncBroadcastSpeedMultiplier = 1e-9
+	// localSendDropLogPeriod throttles the per-overlay log of own broadcasts
+	// that missed a recipient, like C++ kSlowLogPeriod
+	// (cppnode/ton/metrics/tl-traffic-bucket.h); the metric counts every miss.
+	localSendDropLogPeriod = 10 * time.Second
 )
 
 var quietRebroadcastIntervals = map[string]time.Duration{
@@ -145,7 +149,21 @@ func planRebroadcast(kind string, payloadLen int) rebroadcastPlan {
 	}
 }
 
+// broadcastFlagFixedNeighbours is bit 1 in the C++ overlay FEC protocol.
+// Our sender already pins its targets for all parts of a broadcast; the flag
+// asks downstream relays to retain their target sets as well.
+const broadcastFlagFixedNeighbours int32 = 2
+
 func planFastSyncRebroadcast(kind string, payloadLen int) rebroadcastPlan {
+	if kind == "tonNode.externalMessageBroadcast" {
+		if payloadLen <= ordinarySimpleBroadcastMaxSize {
+			return rebroadcastPlan{mode: rebroadcastModeSimple}
+		}
+		return rebroadcastPlan{
+			mode:  rebroadcastModeFEC,
+			flags: broadcastFlagFixedNeighbours | overlay.BroadcastFlagNoTwoStep,
+		}
+	}
 	if kind == "tonNode.newShardBlockBroadcast" {
 		if payloadLen <= ordinarySimpleBroadcastMaxSize {
 			return rebroadcastPlan{
@@ -386,7 +404,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 		return s.enqueueTwoStepRebroadcast(req)
 	}
 	if plan.mode == rebroadcastModeSimple && req.simple == nil {
-		msg, err := s.node.buildSimpleBroadcast(req.payload, plan.flags)
+		msg, err := s.node.buildSimpleBroadcast(req.payload, plan.flags&^overlay.BroadcastFlagNoTwoStep)
 		if err != nil {
 			s.node.chainNode().noteRebroadcastDropped(req)
 			s.log.Debug().
@@ -404,7 +422,7 @@ func (s *overlaySubscription) enqueueRebroadcast(req rebroadcastRequest) bool {
 			s.node.privKey,
 			req.certificate,
 			req.payload,
-			plan.flags,
+			plan.flags&^overlay.BroadcastFlagNoTwoStep,
 			overlay.WithBroadcastFECSymbolSize(rebroadcastFECSymbolSize),
 		)
 		if err != nil {
@@ -678,17 +696,44 @@ func (s *overlaySubscription) rebroadcastToPeer(ctx context.Context, peer *overl
 		return false
 	}
 
+	// An own broadcast waits for a missing QUIC connection, a relayed one never
+	// does. The wait comes first and has a budget of its own, as C++ waits for
+	// the connection before it sends (quic-sender.cpp wait_connection_ready):
+	// a dial that lands late cannot eat the send budget and turn a truncated
+	// burst into a peer fault, and no node-wide FEC backpressure slot is held
+	// while waiting. The wait holds only this peer's queue, like the C++
+	// per-connection waiting list.
+	target := peer.broadcastPeer
+	if req.local {
+		target = peer.localBroadcastPeer
+		if local, ok := target.(quicLocalBroadcastPeer); ok {
+			waitCtx, cancel := context.WithTimeout(ctx, peerRebroadcastTimeout)
+			_, err := local.connection(waitCtx)
+			cancel()
+			if err != nil {
+				s.noteLocalSendFailure(req.kind, peer.id[:], err)
+				return false
+			}
+		}
+	}
+
 	plan := s.rebroadcastPlan(req.kind, payloadLen)
 	if plan.mode == rebroadcastModeSimple {
-		return s.rebroadcastSimpleToPeer(ctx, peer, req, plan)
+		return s.rebroadcastSimpleToPeer(ctx, peer, target, req, plan)
 	}
-	return s.rebroadcastFECToPeer(ctx, peer, req, plan)
+	return s.rebroadcastFECToPeer(ctx, peer, target, req, plan)
 }
 
-func (s *overlaySubscription) rebroadcastSimpleToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest, plan rebroadcastPlan) bool {
+func (s *overlaySubscription) rebroadcastSimpleToPeer(
+	ctx context.Context,
+	peer *overlayPeer,
+	target overlay.BroadcastPeer,
+	req rebroadcastRequest,
+	plan rebroadcastPlan,
+) bool {
 	msg := req.simple
 	if msg == nil {
-		built, err := s.node.buildSimpleBroadcast(req.payload, plan.flags)
+		built, err := s.node.buildSimpleBroadcast(req.payload, plan.flags&^overlay.BroadcastFlagNoTwoStep)
 		if err != nil {
 			s.log.Debug().Err(err).Str("kind", req.kind).Msg("failed to build rebroadcast envelope")
 			return false
@@ -697,8 +742,11 @@ func (s *overlaySubscription) rebroadcastSimpleToPeer(ctx context.Context, peer 
 	}
 
 	sendCtx, cancel := context.WithTimeout(ctx, peerRebroadcastTimeout)
-	err := peer.broadcastPeer.SendCustomMessage(sendCtx, *msg)
+	err := target.SendCustomMessage(sendCtx, *msg)
 	cancel()
+	if req.local && err != nil {
+		s.noteLocalSendFailure(req.kind, peer.id[:], err)
+	}
 	if errors.Is(err, errQUICPeerOffline) {
 		// Offline peer: the send was a no-op, not a failure. Count it as a drop
 		// (false) but do not fault the peer — the ping path owns eviction.
@@ -718,7 +766,13 @@ func (s *overlaySubscription) rebroadcastSimpleToPeer(ctx context.Context, peer 
 	return true
 }
 
-func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *overlayPeer, req rebroadcastRequest, plan rebroadcastPlan) bool {
+func (s *overlaySubscription) rebroadcastFECToPeer(
+	ctx context.Context,
+	peer *overlayPeer,
+	target overlay.BroadcastPeer,
+	req rebroadcastRequest,
+	plan rebroadcastPlan,
+) bool {
 	releaseBackpressure, ok := s.node.chainNode().waitRebroadcastFECBackpressure(ctx, peer, req)
 	if !ok {
 		return false
@@ -735,7 +789,7 @@ func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *ov
 			s.node.privKey,
 			req.certificate,
 			req.payload,
-			plan.flags,
+			plan.flags&^overlay.BroadcastFlagNoTwoStep,
 			overlay.WithBroadcastFECSymbolSize(rebroadcastFECSymbolSize),
 		)
 		if err != nil {
@@ -751,14 +805,20 @@ func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *ov
 	err := sendFastFECToPeer(
 		ctx,
 		sender,
-		peer.broadcastPeer,
+		target,
 		peerRebroadcastTimeout,
 		pace,
 	)
+	if req.local && err != nil {
+		s.noteLocalSendFailure(req.kind, peer.id[:], err)
+	}
 	if errors.Is(err, errQUICPeerOffline) {
-		// Offline peer: sendFastFECToPeer stopped at the first part instead of
-		// pacing through the whole burst. Count the drop without faulting the
-		// peer — the ping path owns eviction.
+		// Offline peer: sendFastFECToPeer stopped at the part that found no
+		// outbound connection instead of pacing through the whole burst - at
+		// once for a relay; an own broadcast already waited for its connection
+		// in rebroadcastToPeer and comes here only when that connection was
+		// lost mid-burst and not brought back within the burst budget. Count
+		// the drop without faulting the peer — the ping path owns eviction.
 		return false
 	}
 	if err != nil {
@@ -773,6 +833,24 @@ func (s *overlaySubscription) rebroadcastFECToPeer(ctx context.Context, peer *ov
 		return false
 	}
 	return true
+}
+
+// noteLocalSendFailure accounts one recipient this node's own broadcast did not
+// reach. A relayed miss is redundancy loss, while an own miss can be the whole
+// delivery - in a two-member custom overlay nobody else forwards it - so it is
+// counted per recipient in p2p_broadcast_dropped_total under a local_send_*
+// reason and logged at Info, at most once per localSendDropLogPeriod per
+// overlay.
+func (s *overlaySubscription) noteLocalSendFailure(kind string, peerID []byte, err error) {
+	reason := localSendDropReasons[classifyTwoStepSendFault(err)]
+	s.node.chainNode().noteBroadcastDrop(s.spec.Name, kind, reason)
+
+	s.localSendDropLog.Info().
+		Err(err).
+		Str("kind", kind).
+		Hex("peer", peerID).
+		Str("reason", reason).
+		Msg("own broadcast did not reach peer")
 }
 
 func (n *Node) waitRebroadcastFECBackpressure(ctx context.Context, peer *overlayPeer, req rebroadcastRequest) (func(), bool) {

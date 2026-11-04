@@ -1,6 +1,7 @@
 package pebblestore
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -8,6 +9,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/vfs"
@@ -50,11 +52,21 @@ func TestUnsyncedWriteSurvivesAHardKillWhenALaterSyncedWriteFollows(t *testing.T
 	if err != nil {
 		t.Fatalf("locate the test binary: %v", err)
 	}
-	child := exec.Command(executable, "-test.run", "TestUnsyncedWriteSurvivesAHardKillWhenALaterSyncedWriteFollows")
+	childCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	child := exec.CommandContext(
+		childCtx,
+		executable,
+		"-test.run",
+		"TestUnsyncedWriteSurvivesAHardKillWhenALaterSyncedWriteFollows",
+	)
 	child.Env = append(os.Environ(), walChildEnv+"=1", walChildDir+"="+dir)
 	child.Stdout = os.Stderr
 	child.Stderr = os.Stderr
 	err = child.Run()
+	if childCtx.Err() != nil {
+		t.Fatalf("child did not terminate itself before the parent timeout: %v", childCtx.Err())
+	}
 
 	// The child SIGKILLs itself after its writes, so there is no Close, no flush and
 	// no clean shutdown of any kind — which is the point.
@@ -150,8 +162,11 @@ func walFlushChild(t *testing.T) {
 	if err = syscall.Kill(os.Getpid(), syscall.SIGKILL); err != nil {
 		t.Fatalf("child failed to kill itself: %v", err)
 	}
-	// Unreachable; SIGKILL is not deliverable-and-ignorable.
-	t.Fatal("child survived SIGKILL")
+	// Darwin can deliver this process-wide signal to another thread after Kill
+	// returns. Await signal termination without a clean exit; the parent bounds it.
+	for {
+		time.Sleep(time.Hour)
+	}
 }
 
 // offsetTrackingFS records, for each fsync of a file, how many bytes had been

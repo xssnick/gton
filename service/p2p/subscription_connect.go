@@ -372,16 +372,19 @@ func (s *overlaySubscription) newOverlayPeer(pooled *pooledPeer, announced *over
 			peer:     peer,
 			envelope: s.quicEnvelope,
 		}
-		peer.broadcastPeer = quicRouteBroadcastPeer{
+		route := quicRouteBroadcastPeer{
 			peer:     peer,
 			envelope: s.quicEnvelope,
 		}
+		peer.broadcastPeer = route
+		peer.localBroadcastPeer = quicLocalBroadcastPeer{route: route}
 	} else {
 		peer.queryTransport = rldpPeerQueryTransport{
 			overlay:   rldpOverlay,
 			overlayID: s.spec.ShortID,
 		}
 		peer.broadcastPeer = peer.overlay
+		peer.localBroadcastPeer = peer.overlay
 	}
 	return peer, nil
 }

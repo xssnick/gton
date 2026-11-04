@@ -71,7 +71,7 @@ func TestPublicRandomPeersV2PreservesSignedDescriptor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	node.Flags = overlayMemberDoNotReceiveBroadcasts
+	node.Flags = overlayMemberDoNotReceivePlumtreeBroadcasts
 	node.Certificate = overlay.MemberCertificate{
 		IssuedBy:  keys.PublicKeyED25519{Key: bytes.Repeat([]byte{0x82}, ed25519.PublicKeySize)},
 		Signature: bytes.Repeat([]byte{0x83}, ed25519.SignatureSize),
@@ -304,18 +304,18 @@ func TestPeerQueryDispatchServesPlumtreeRepair(t *testing.T) {
 	}
 }
 
-func TestPublicV2FlagsExcludeBroadcastReceiver(t *testing.T) {
+func TestPublicV2FlagsExcludeOnlyPlumtreeReceiver(t *testing.T) {
 	id := testPeerID("public nonreceiver")
 	peer := &overlayPeer{
 		id:          id,
 		fixedMember: true,
 		alive:       true,
 		route:       newTestPeerRoute("127.0.0.1:3000"),
-		announced:   &overlay.NodeV2{Flags: overlayMemberDoNotReceiveBroadcasts},
+		announced:   &overlay.NodeV2{Flags: overlayMemberDoNotReceivePlumtreeBroadcasts},
 	}
 	sub := testOverlaySubscription(&overlaySubscription{peers: map[PeerID]*overlayPeer{id: peer}})
-	if len(sub.buildBroadcastTargetsSnapshot().peers) != 0 || sub.PlumtreePeerReceivesBroadcasts(id) {
-		t.Fatal("public V2 peer that declined broadcasts was selected")
+	if len(sub.buildBroadcastTargetsSnapshot().peers) != 1 || sub.PlumtreePeerReceivesBroadcasts(id) {
+		t.Fatal("public V2 peer flag did not distinguish ordinary gossip and Plumtree")
 	}
 	result := []bool{true}
 	sub.PlumtreePeersReceiveBroadcasts([]PeerID{id}, result)

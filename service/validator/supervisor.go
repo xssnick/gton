@@ -102,6 +102,7 @@ type SessionIdentity struct {
 // prepared runtime.
 type SessionConfig struct {
 	SessionID        [32]byte
+	ExpectedStart    time.Time
 	Shard            groups.ShardID
 	CatchainSeqno    uint32
 	ValidatorSetHash uint32
@@ -844,6 +845,7 @@ func (s *sessionSupervisor) buildDesiredSession(
 	return desiredSession{
 		config: SessionConfig{
 			SessionID:            group.ID,
+			ExpectedStart:        group.ExpectedStart,
 			Shard:                group.Shard,
 			CatchainSeqno:        group.CatchainSeqno,
 			ValidatorSetHash:     group.ValidatorSetHash,

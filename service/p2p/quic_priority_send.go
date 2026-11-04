@@ -173,8 +173,9 @@ func (l *quicPrioritySendLatch) await(
 	}
 }
 
-// awaitPrioritySend is the relay side of the latch: called right before a
-// relay write opens its stream to this peer.
+// awaitPrioritySend is the deferring side of the latch: called right before a
+// relay write, or a write of this node's other own broadcasts
+// (quicLocalBroadcastPeer), opens its stream to this peer.
 func (p *overlayPeer) awaitPrioritySend(ctx context.Context) {
 	result, waited := p.prioritySend.await(ctx, quicPrioritySendWaitBound)
 	if result == prioritySendNotWaited {
@@ -194,7 +195,10 @@ func (p *overlayPeer) awaitPrioritySend(ctx context.Context) {
 // raises the peer's latch for the duration of the write - before the stream
 // is opened, until the write returns or fails - instead of honouring it.
 // Only PrivateOverlay.BroadcastTwoStep hands these out; every forwarding and
-// relay path keeps the plain type.
+// relay path keeps the plain type, and this node's other own broadcasts use
+// quicLocalBroadcastPeer. Unlike those, the candidate does not wait for a
+// missing connection: its fan-out is released at quorum, and the committee's
+// paths are kept up by the consensus messages' dialForMessage.
 type quicPriorityBroadcastPeer struct {
 	route quicRouteBroadcastPeer
 }

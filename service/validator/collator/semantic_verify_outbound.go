@@ -18,6 +18,13 @@ func (v *semanticQueueValidation) verifyOutQueueChange(key msgpool.QueueKey, ent
 
 	envelope := descriptor.envelope
 	if added {
+		expectedLT := v.replay.candidate.block.BlockInfo.StartLt
+		if descriptor.tag == semanticOutNew || descriptor.tag == semanticOutDeferredTransit {
+			expectedLT = entry.envelope.bound.lt
+		}
+		if entry.enqueued.EnqueuedLT != expectedLT {
+			return fmt.Errorf("%w: outbound queue enqueued lt %d differs from expected %d", ErrInvalidInput, entry.enqueued.EnqueuedLT, expectedLT)
+		}
 		switch descriptor.tag {
 		case semanticOutNew, semanticOutTransit, semanticOutTransitRequest, semanticOutDeferredTransit:
 		default:

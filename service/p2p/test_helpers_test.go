@@ -88,6 +88,9 @@ func testOverlaySubscription(sub *overlaySubscription) *overlaySubscription {
 		if peer.broadcastPeer == nil {
 			peer.broadcastPeer = peer.overlay
 		}
+		if peer.localBroadcastPeer == nil {
+			peer.localBroadcastPeer = peer.broadcastPeer
+		}
 		if peer.release == nil {
 			peer.release = func() {}
 		}

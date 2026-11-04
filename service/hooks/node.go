@@ -21,8 +21,10 @@ import (
 // Node exposes the node capabilities available to a statically linked
 // extension.
 type Node struct {
-	Network                Network
-	MasterchainHead        MasterchainHead
+	Network         Network
+	MasterchainHead MasterchainHead
+	// SyncLag measures the lag of the applied masterchain and shard-client masterchain frontiers.
+	SyncLag                func() (time.Duration, error)
 	PrivateOverlays        *p2p.PrivateOverlayRegistry
 	BlockBroadcasts        *p2p.BlockBroadcasts
 	Store                  Store

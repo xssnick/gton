@@ -493,7 +493,7 @@ func serializeCandidatePayload(candidate Candidate, blockBOC, collatedData []byt
 
 	collatedRoots, err := cell.FromBOCMultiRootWithOptions(
 		collatedData,
-		cell.BOCParseOptions{NoCopyPayload: true},
+		cell.BOCParseOptions{NoCopyPayload: true, AllowNonZeroLevelRoot: true},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("simplex: parse candidate collated data: %w", err)

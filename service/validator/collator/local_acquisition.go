@@ -27,10 +27,8 @@ const defaultLocalExternalLimit = 500
 // by local acquisition. msgpool.Pool implements it directly.
 type LocalMessageSource interface {
 	OpenExternalStream(msgpool.ShardIdent, int) (*msgpool.ExternalStream, error)
-	// OpenExternalStreamExcluding is OpenExternalStream with a set of messages
-	// the stream must never offer. A build started before its predecessor
-	// reported what it consumed has to be told directly, or it executes those
-	// messages a second time and its feedback for them is dropped as stale.
+	// OpenExternalStreamExcluding excludes normalized hashes already processed
+	// anywhere in the current leader window, including deleted pool entries.
 	OpenExternalStreamExcluding(msgpool.ShardIdent, int, [][32]byte) (*msgpool.ExternalStream, error)
 	OpenExternalSnapshot(msgpool.ShardIdent, int) (*msgpool.ExternalStream, error)
 	Complete([]msgpool.ExternalFeedback) error

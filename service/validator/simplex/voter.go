@@ -222,13 +222,17 @@ func (e *Engine) acceptCandidate(c *Candidate) {
 	if c.Leader == uint32(e.localIndex) {
 		e.noteOwnCandidate(c.ID)
 	}
-	if c.Leader != uint32(e.localIndex) {
+	if e.tracer != nil && (c.Leader != uint32(e.localIndex) || c.Delegation != nil) {
 		block := c.Block
 		var blockPtr *ton.BlockIDExt
 		if !c.Empty {
 			blockPtr = &block
 		}
-		e.trace(TraceCandidateReceived{ID: c.ID, Parent: c.Parent, Block: blockPtr})
+		var collatorNodeID [32]byte
+		if c.Delegation != nil {
+			collatorNodeID = KeyNodeIDShort(c.Delegation.CollatorKey)
+		}
+		e.trace(TraceCandidateReceived{ID: c.ID, Parent: c.Parent, Block: blockPtr, CollatorNodeID: collatorNodeID})
 	}
 	// The durable store starts the moment the candidate is accepted, so the
 	// write overlaps the parent wait and the validation gate. Both must finish

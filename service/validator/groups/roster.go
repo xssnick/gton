@@ -3,8 +3,6 @@ package groups
 import (
 	"bytes"
 	"errors"
-	"fmt"
-	"math"
 	"math/bits"
 	"sort"
 
@@ -21,15 +19,6 @@ type RosterInput struct {
 	Shard         uint64
 	CatchainSeqno uint32
 	Catchain      CatchainConfig
-}
-
-// TentativeValidatorSetInput contains the sets and checked block time used to
-// choose the set for the next catchain session.
-type TentativeValidatorSetInput struct {
-	Current          ValidatorSet
-	Next             *ValidatorSet
-	GenUTime         uint32
-	CatchainLifetime uint32
 }
 
 // ValidatorSetHashInput contains the exact ordered roster hashed into block
@@ -54,33 +43,6 @@ func selectRoster(input RosterInput) []Validator {
 	}
 
 	return selectShardRosterWithCumulativeWeights(input, input.Set.cumulativeWeights)
-}
-
-// SelectTentativeValidatorSet applies the next-session lifetime boundary.
-// Boundary arithmetic is checked instead of wrapping uint32.
-func SelectTentativeValidatorSet(input TentativeValidatorSetInput) (ValidatorSet, error) {
-	// Every reachable ValidatorSet comes from ParseConfig, whose parseValidatorSet
-	// already enforced main in 1..total, a non-empty roster, positive weights, no
-	// overflow, the 2^61 cap and a computed rather than trusted TotalWeight — and
-	// it is the only thing that populates the unexported cumulativeWeights the
-	// shard path below needs.
-	if input.Next == nil {
-		return input.Current, nil
-	}
-	if input.CatchainLifetime == 0 {
-		return ValidatorSet{}, errors.New("catchain lifetime must be positive")
-	}
-
-	lifetime := uint64(input.CatchainLifetime)
-	boundary := (uint64(input.GenUTime)/lifetime + 1) * lifetime
-	if boundary > math.MaxUint32 {
-		return ValidatorSet{}, fmt.Errorf("next catchain boundary %d overflows uint32", boundary)
-	}
-	if uint64(input.Next.Since) <= boundary {
-		return *input.Next, nil
-	}
-
-	return input.Current, nil
 }
 
 // ValidatorAddrs maps a selected roster onto the TL-B validator addresses

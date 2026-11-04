@@ -72,10 +72,7 @@ type validatorDebugExternalMessages struct {
 	InvalidDeleted      uint64 `json:"invalid_deleted"`
 	IncludedQuarantined uint64 `json:"included_quarantined"`
 	IncludedReleased    uint64 `json:"included_released"`
-	RejectedDelayed     uint64 `json:"rejected_delayed"`
-	RejectedRetried     uint64 `json:"rejected_retried"`
-	RejectedExhausted   uint64 `json:"rejected_exhausted"`
-	RejectedPressure    uint64 `json:"rejected_pressure"`
+	RejectedDeleted     uint64 `json:"rejected_deleted"`
 	StaleFeedback       uint64 `json:"stale_feedback"`
 	AppliedRequested    uint64 `json:"applied_requested"`
 	AppliedDeleted      uint64 `json:"applied_deleted"`
@@ -360,10 +357,7 @@ func makeValidatorDebugExternalMessages(status msgpool.Stats) validatorDebugExte
 		InvalidDeleted:      status.InvalidDeleted,
 		IncludedQuarantined: status.IncludedQuarantined,
 		IncludedReleased:    status.IncludedReleased,
-		RejectedDelayed:     status.RejectedDelayed,
-		RejectedRetried:     status.RejectedRetried,
-		RejectedExhausted:   status.RejectedExhausted,
-		RejectedPressure:    status.RejectedPressure,
+		RejectedDeleted:     status.RejectedDeleted,
 		StaleFeedback:       status.StaleFeedback,
 		AppliedRequested:    status.AppliedRequested,
 		AppliedDeleted:      status.AppliedDeleted,

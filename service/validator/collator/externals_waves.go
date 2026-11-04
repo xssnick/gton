@@ -50,7 +50,8 @@ type externalPlan struct {
 	// verdict is a planning outcome that needs no execution: an invalid
 	// message, one outside the shard, one held behind the queue brake. Zero
 	// means the message executes.
-	verdict msgpool.ExternalOutcome
+	verdict   msgpool.ExternalOutcome
+	duplicate bool
 	// executes marks a plan a worker emulates; the remaining fields are its.
 	executes bool
 	afterLT  uint64
@@ -79,6 +80,7 @@ type externalWaveState struct {
 	arena     []externalPlan
 	plans     []*externalPlan
 	seen      map[[32]byte]struct{}
+	seenNorm  map[[32]byte]struct{}
 	queue     chan *externalPlan
 	workers   sync.WaitGroup
 	abandoned atomic.Bool
@@ -190,21 +192,21 @@ func (c *collation) externalBatchStops(
 	c.updateCollatedEstimate()
 	if !c.limits.fits(LoadSoft) {
 		for _, skipped := range externals[at:] {
-			c.recordExternal(skipped.Ref, msgpool.ExternalSkippedLimit)
+			c.recordExternal(skipped, msgpool.ExternalSkippedLimit)
 		}
 
 		return true, externalBatchResult{stop: ExternalStopSoftLimit, consumed: at}
 	}
 	if !deadline.IsZero() && !time.Now().Before(deadline) {
 		for _, skipped := range externals[at:] {
-			c.recordExternal(skipped.Ref, msgpool.ExternalSkippedLimit)
+			c.recordExternal(skipped, msgpool.ExternalSkippedLimit)
 		}
 
 		return true, externalBatchResult{stop: ExternalStopDeadline, consumed: at}
 	}
 	if c.paceExpired() {
 		for _, skipped := range externals[at:] {
-			c.recordExternal(skipped.Ref, msgpool.ExternalSkippedLimit)
+			c.recordExternal(skipped, msgpool.ExternalSkippedLimit)
 		}
 
 		return true, externalBatchResult{stop: ExternalStopDeadline, consumed: at}
@@ -228,6 +230,10 @@ func (c *collation) planExternalWave(externals []ExternalInput) ([]*externalPlan
 	w := &c.externalWaves
 	w.plans = w.plans[:0]
 	clear(w.seen)
+	if w.seenNorm == nil {
+		w.seenNorm = make(map[[32]byte]struct{}, internalWaveLength)
+	}
+	clear(w.seenNorm)
 	lastProcLT := c.lastProcLT
 	limit := c.admission.waveLimit(c.internalWaveParallelism())
 	for i := range externals {
@@ -236,7 +242,10 @@ func (c *collation) planExternalWave(externals []ExternalInput) ([]*externalPlan
 		}
 		plan := w.take(externals[i])
 		c.planExternalInto(plan)
-		if plan.verdict == 0 {
+		if _, duplicate := w.seenNorm[plan.input.normalizedHash]; duplicate && plan.verdict != msgpool.ExternalSkippedLimit {
+			plan.duplicate = true
+		}
+		if plan.verdict == 0 && !plan.duplicate {
 			if _, repeated := w.seen[plan.key]; repeated {
 				break
 			}
@@ -263,6 +272,9 @@ func (c *collation) planExternalWave(externals []ExternalInput) ([]*externalPlan
 			}
 		}
 		w.plans = append(w.plans, plan)
+		if plan.verdict != msgpool.ExternalSkippedLimit {
+			w.seenNorm[plan.input.normalizedHash] = struct{}{}
+		}
 	}
 
 	return w.plans, lastProcLT
@@ -272,6 +284,15 @@ func (c *collation) planExternalWave(externals []ExternalInput) ([]*externalPlan
 // executes a message, in the same order. Everything here is a pure function of
 // the message and of collation state the wave does not move.
 func (c *collation) planExternalInto(plan *externalPlan) {
+	if c.externalIntakeClosed() {
+		plan.verdict = msgpool.ExternalSkippedLimit
+		return
+	}
+	if _, duplicate := c.processedExternalSet[plan.input.normalizedHash]; duplicate {
+		plan.duplicate = true
+		return
+	}
+
 	prepared := plan.input.message
 	root := prepared.Cell()
 	message := prepared.Message()
@@ -284,14 +305,6 @@ func (c *collation) planExternalInto(plan *externalPlan) {
 	destination, err := accountPrefixFromAddress(message.AsExternalIn().DstAddr)
 	if err != nil || !c.shard.ContainsPrefix(destination) {
 		plan.verdict = msgpool.ExternalInvalid
-
-		return
-	}
-	// Checked after the message is known to be well-formed and ours, so a
-	// message that would never be executable is still purged from the pool
-	// rather than held behind the brake.
-	if c.externalIntakeClosed() {
-		plan.verdict = msgpool.ExternalSkippedLimit
 
 		return
 	}
@@ -365,8 +378,20 @@ func (c *collation) runExternalWave(
 		if err = c.ctx.Err(); err != nil {
 			return externalBatchResult{}, false, err
 		}
+		if _, duplicate := c.processedExternalSet[plan.input.normalizedHash]; duplicate && plan.verdict != msgpool.ExternalSkippedLimit {
+			if plan.executes {
+				plan.wg.Wait()
+				c.stats.ExternalAttempts--
+				if plan.lane != nil {
+					plan.lane.tracer.discard()
+				}
+			}
+			c.stats.ExternalSkippedDuplicate++
+			retired++
+			continue
+		}
 		if plan.verdict != 0 {
-			c.recordExternal(plan.input.Ref, plan.verdict)
+			c.recordExternal(plan.input, plan.verdict)
 			retired++
 
 			continue
@@ -374,7 +399,7 @@ func (c *collation) runExternalWave(
 		if !plan.executes {
 			// The budget ran out at this message during planning.
 			for _, skipped := range externals[at:] {
-				c.recordExternal(skipped.Ref, msgpool.ExternalSkippedLimit)
+				c.recordExternal(skipped, msgpool.ExternalSkippedLimit)
 			}
 
 			return externalBatchResult{stop: ExternalStopAttemptLimit, consumed: at}, true, nil
@@ -435,7 +460,7 @@ func (c *collation) retireExternal(plan *externalPlan, lastProcLT uint64) error 
 	lane.tracer.replay()
 	result := plan.result
 	if !result.Accepted {
-		c.recordExternal(plan.input.Ref, msgpool.ExternalNotAccepted)
+		c.recordExternal(plan.input, msgpool.ExternalNotAccepted)
 
 		return nil
 	}
@@ -451,7 +476,7 @@ func (c *collation) retireExternal(plan *externalPlan, lastProcLT uint64) error 
 	if err = c.insert(c.inMessages.AugmentedDictionary, &c.inDescr, root, in); err != nil {
 		return err
 	}
-	c.recordExternal(plan.input.Ref, msgpool.ExternalIncluded)
+	c.recordExternal(plan.input, msgpool.ExternalIncluded)
 
 	return c.registerOutputs(result, lane, nil, true)
 }

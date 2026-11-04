@@ -15,18 +15,28 @@ type semanticDispatchOrder struct {
 }
 
 type semanticDispatchChange struct {
-	queue        *tlb.AccountDispatchQueue
-	hadOld       bool
-	oldMax       uint64
-	removed      bool
-	maxRemoved   uint64
-	added        bool
-	minimumAdded uint64
+	queue            *tlb.AccountDispatchQueue
+	hadOld           bool
+	oldMax           uint64
+	removed          bool
+	maxRemoved       uint64
+	added            bool
+	minimumAdded     uint64
+	oldCount         uint64
+	removedCount     uint64
+	candidateBalance *tlb.CurrencyCollection
+	balanceAdded     tlb.CurrencyCollection
+	balanceRemoved   tlb.CurrencyCollection
 }
 
 func (v *semanticQueueValidation) applyDispatchChanges() error {
 	orders := make(map[[32]byte][]semanticDispatchOrder)
 	changes := make(map[[32]byte]*semanticDispatchChange)
+	for _, accountID := range v.changedDispatchAccounts {
+		if _, err := v.dispatchChange(changes, accountID); err != nil {
+			return err
+		}
+	}
 	for _, entry := range v.inOrder {
 		hash, descriptor := entry.hash, entry.descriptor
 		if descriptor.tag != semanticInDeferredFinal && descriptor.tag != semanticInDeferredTransit {
@@ -86,6 +96,14 @@ func (v *semanticQueueValidation) applyDispatchChanges() error {
 			return fmt.Errorf("%w: deferred source %x count underflow", ErrInvalidInput, accountID)
 		}
 		accountQueue.Count--
+		change.removedCount++
+		if change.candidateBalance != nil {
+			balance := dispatchMessageBalance(&envelope.internal, v.replay.transition.Config.globalVersion)
+			change.balanceRemoved, err = change.balanceRemoved.Add(balance)
+			if err != nil {
+				return fmt.Errorf("%w: sum removed dispatch balance: %v", ErrInvalidInput, err)
+			}
+		}
 		change.removed = true
 		change.maxRemoved = max(change.maxRemoved, envelope.internal.CreatedLT)
 		// Persisting every removal previously checked this before the next
@@ -114,9 +132,6 @@ func (v *semanticQueueValidation) applyDispatchChanges() error {
 		if err != nil || !v.target.ContainsPrefix(envelope.source) {
 			return fmt.Errorf("%w: new deferred message %x source is outside this shard", ErrInvalidInput, hash)
 		}
-		if _, special := v.replay.specials.set[accountID]; special {
-			return fmt.Errorf("%w: special masterchain account %x defers an outbound message", ErrInvalidInput, accountID)
-		}
 		change, err := v.dispatchChange(changes, accountID)
 		if err != nil {
 			return err
@@ -143,6 +158,16 @@ func (v *semanticQueueValidation) applyDispatchChanges() error {
 			return fmt.Errorf("%w: deferred source %x count overflow", ErrInvalidInput, accountID)
 		}
 		accountQueue.Count++
+		if change.candidateBalance != nil {
+			if err = checkDispatchExtraCurrencies(envelope.internal.ExtraCurrencies, v.replay.transition.Config.maxMsgExtraCurrencies); err != nil {
+				return err
+			}
+			balance := dispatchMessageBalance(&envelope.internal, v.replay.transition.Config.globalVersion)
+			change.balanceAdded, err = change.balanceAdded.Add(balance)
+			if err != nil {
+				return fmt.Errorf("%w: sum added dispatch balance: %v", ErrInvalidInput, err)
+			}
+		}
 		change.added = true
 		change.minimumAdded = min(change.minimumAdded, envelope.internal.CreatedLT)
 	}
@@ -150,7 +175,11 @@ func (v *semanticQueueValidation) applyDispatchChanges() error {
 	// Each account owns one decoded working queue. Rebuild its outer path once,
 	// after all removals and additions, retaining the final root comparison.
 	for _, accountID := range sortedAccountKeys(changes) {
-		if err := storeAccountDispatchQueue(v.dispatch.AugmentedDictionary, accountID, changes[accountID].queue); err != nil {
+		change := changes[accountID]
+		if err := change.applyBalance(); err != nil {
+			return fmt.Errorf("%w: dispatch account %x balance: %v", ErrInvalidInput, accountID, err)
+		}
+		if err := storeAccountDispatchQueue(v.dispatch.AugmentedDictionary, accountID, change.queue); err != nil {
 			return fmt.Errorf("%w: store deferred source %x: %v", ErrInvalidInput, accountID, err)
 		}
 	}
@@ -195,12 +224,30 @@ func (v *semanticQueueValidation) dispatchChange(
 		// updating it does not mutate the predecessor or another validation.
 		change.queue = original
 		change.hadOld = true
+		change.oldCount = original.Count
 		change.oldMax, err = dispatchDictionaryBoundary(original.Messages, true)
 		if err != nil {
 			return nil, fmt.Errorf("%w: predecessor dispatch account %x maximum: %v", ErrInvalidInput, accountID, err)
 		}
 	} else {
 		change.queue = &tlb.AccountDispatchQueue{Messages: cell.NewDict(64)}
+	}
+	if v.candidate.Extra != nil {
+		next, loadErr := loadAccountDispatchQueue(v.candidate.Extra.DispatchQueue, accountID)
+		if loadErr != nil && !isMissingKey(loadErr) {
+			return nil, fmt.Errorf("%w: load candidate dispatch account %x: %v", ErrInvalidInput, accountID, loadErr)
+		}
+		if loadErr == nil {
+			change.candidateBalance = next.TotalBalance
+			oldHasBalance := original == nil || original.TotalBalance != nil
+			if v.replay.transition.Config.globalVersion >= 16 {
+				if next.TotalBalance == nil && oldHasBalance {
+					return nil, fmt.Errorf("%w: dispatch account %x omits required balance", ErrInvalidInput, accountID)
+				}
+			} else if next.TotalBalance != nil && (original == nil || original.TotalBalance == nil) {
+				return nil, fmt.Errorf("%w: dispatch account %x introduces balance before global version 16", ErrInvalidInput, accountID)
+			}
+		}
 	}
 	changes[accountID] = change
 
@@ -332,15 +379,22 @@ func (v *semanticQueueValidation) verifyDispatchOutputPolicy(
 		account := v.replay.accounts[accountID]
 		change := changes[accountID]
 		deferAll := false
+		hadOld := false
 		if change == nil {
 			oldQueue, err := v.oldDispatchAccount(accountID)
 			if err != nil {
 				return err
 			}
-			deferAll = oldQueue != nil
+			hadOld = oldQueue != nil
+			deferAll = hadOld
 		} else {
-			deferAll = change.hadOld && (!change.removed || change.maxRemoved != change.oldMax)
+			hadOld = change.hadOld
+			deferAll = hadOld && (!change.removed || change.maxRemoved != change.oldMax)
 		}
+
+		config := v.replay.transition.Config
+		allowDefer := hadOld || config.globalVersion >= 16 && v.old.Extra != nil &&
+			v.old.Extra.OutQueueSize != nil && *v.old.Extra.OutQueueSize > config.outQueueSoftLimit
 
 		for transactionIndex := range account.outputTags {
 			for outputIndex, tag := range account.outputTags[transactionIndex] {
@@ -365,12 +419,15 @@ func (v *semanticQueueValidation) verifyDispatchOutputPolicy(
 						accountID,
 					)
 				}
-				if outputIndex == 0 && !deferAll {
+				if outputIndex == 0 && !deferAll && !allowDefer {
 					return fmt.Errorf(
 						"%w: account %x defers the first output without an earlier pending message",
 						ErrInvalidInput,
 						accountID,
 					)
+				}
+				if _, special := v.replay.specials.set[accountID]; special && v.target.Workchain == masterchainWorkchainID && !deferAll && !allowDefer {
+					return fmt.Errorf("%w: special masterchain account %x defers an outbound message", ErrInvalidInput, accountID)
 				}
 				deferAll = true
 			}
@@ -431,4 +488,59 @@ func slicesSortDispatchOrder(order []semanticDispatchOrder) {
 		}
 		order[j] = value
 	}
+}
+
+func (change *semanticDispatchChange) applyBalance() error {
+	// An old queue may have no recorded balance. It can acquire one only after
+	// every old message has left; on downgrade an existing balance may be kept
+	// or dropped. Match the candidate format after validating that transition.
+	if change.candidateBalance == nil {
+		change.queue.TotalBalance = nil
+		return nil
+	}
+
+	var expected tlb.CurrencyCollection
+	if change.queue.Count != 0 {
+		expected = change.balanceAdded
+		if change.removedCount != change.oldCount {
+			if change.queue.TotalBalance == nil {
+				return fmt.Errorf("cannot introduce total balance while legacy messages remain")
+			}
+			var err error
+			expected, err = change.queue.TotalBalance.Add(change.balanceAdded)
+			if err != nil {
+				return err
+			}
+			expected, err = expected.Sub(change.balanceRemoved)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if !expected.Equals(*change.candidateBalance) {
+		return fmt.Errorf("total balance differs from added and removed messages")
+	}
+	change.queue.TotalBalance = &expected
+	return nil
+}
+
+func checkDispatchExtraCurrencies(currencies *cell.Dictionary, limit uint32) error {
+	if currencies == nil {
+		return nil
+	}
+	iterator, err := currencies.Iterator(false, false)
+	if err != nil {
+		return fmt.Errorf("%w: read dispatch extra currencies: %v", ErrInvalidInput, err)
+	}
+	var count uint64
+	for iterator.Next() {
+		count++
+		if count > uint64(limit) {
+			return fmt.Errorf("%w: deferred message has too many extra currencies", ErrInvalidInput)
+		}
+	}
+	if err = iterator.Err(); err != nil {
+		return fmt.Errorf("%w: read dispatch extra currencies: %v", ErrInvalidInput, err)
+	}
+	return nil
 }

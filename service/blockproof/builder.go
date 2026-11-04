@@ -587,11 +587,8 @@ func visitKeyBlockValidatorConfig(root *cell.Cell) error {
 	for _, id := range []uint32{
 		tlb.ConfigParamCatchainConfig,
 		tlb.ConfigParamPrevValidators,
-		tlb.ConfigParamPrevTempValidators,
 		tlb.ConfigParamCurrentValidators,
-		tlb.ConfigParamCurrentTempValidators,
 		tlb.ConfigParamNextValidators,
-		tlb.ConfigParamNextTempValidators,
 	} {
 		if err = visitConfigParam(cfg, id); err != nil {
 			return err

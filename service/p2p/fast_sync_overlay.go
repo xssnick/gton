@@ -30,14 +30,14 @@ type FastSyncState struct {
 }
 
 type fastSyncOverlaySpec struct {
-	roster            FastSyncValidatorRoster
-	rosterFingerprint [sha256.Size]byte
-	certificate       *overlay.MemberCertificate
-	certificateHash   [sha256.Size]byte
-	localValidator    bool
-	receiveBroadcasts bool
-	plumtreeEnabled   bool
-	permanentFlags    uint32
+	roster                    FastSyncValidatorRoster
+	rosterFingerprint         [sha256.Size]byte
+	certificate               *overlay.MemberCertificate
+	certificateHash           [sha256.Size]byte
+	localValidator            bool
+	receivePlumtreeBroadcasts bool
+	plumtreeEnabled           bool
+	permanentFlags            uint32
 }
 
 type fastSyncOverlayRuntime struct {
@@ -74,7 +74,7 @@ func newFastSyncOverlayRuntime(
 	peers, err := fastsync.NewPeerRuntime(
 		node.privKey,
 		overlayID,
-		fastSyncLocalMemberFlags(spec.receiveBroadcasts),
+		fastSyncLocalMemberFlags(spec.receivePlumtreeBroadcasts),
 		certificate,
 		membership,
 		time.Now(),
@@ -121,17 +121,17 @@ func fastSyncCertificateValue(
 	return *certificate
 }
 
-func fastSyncLocalMemberFlags(receiveBroadcasts bool) uint32 {
-	if receiveBroadcasts {
+func fastSyncLocalMemberFlags(receivePlumtreeBroadcasts bool) uint32 {
+	if receivePlumtreeBroadcasts {
 		return 0
 	}
-	return overlayMemberDoNotReceiveBroadcasts
+	return overlayMemberDoNotReceivePlumtreeBroadcasts
 }
 
 func (r *fastSyncOverlayRuntime) matches(spec fastSyncOverlaySpec) bool {
 	return r.spec.rosterFingerprint == spec.rosterFingerprint &&
 		r.spec.localValidator == spec.localValidator &&
-		r.spec.receiveBroadcasts == spec.receiveBroadcasts &&
+		r.spec.receivePlumtreeBroadcasts == spec.receivePlumtreeBroadcasts &&
 		r.spec.plumtreeEnabled == spec.plumtreeEnabled &&
 		r.spec.permanentFlags == spec.permanentFlags
 }
@@ -151,7 +151,7 @@ func (r *fastSyncOverlayRuntime) updateCertificate(
 		return err
 	}
 	if err := r.peers.UpdateLocal(
-		fastSyncLocalMemberFlags(r.spec.receiveBroadcasts),
+		fastSyncLocalMemberFlags(r.spec.receivePlumtreeBroadcasts),
 		fastSyncCertificateValue(certificate),
 		time.Now(),
 	); err != nil {
@@ -171,17 +171,15 @@ func (r *fastSyncOverlayRuntime) permanent(id PeerID) bool {
 	return r.membership.IsPermanent(fastsync.ID(id))
 }
 
-// declinesBroadcasts reports whether this overlay is send-only for us, i.e. we
-// published DoNotReceiveBroadcasts in our own member flags. Stated as the
-// conjunction rather than as !receiveBroadcasts so a zero-valued spec means
-// "receiving", which is what every overlay that is not a plumtree validator is.
-func (r *fastSyncOverlayRuntime) declinesBroadcasts() bool {
-	return r.spec.localValidator && !r.spec.receiveBroadcasts
+// declinesPlumtreeBroadcasts matches the local bit-1 member flag. Ordinary
+// simple/FEC and two-step broadcasts remain enabled for every overlay member.
+func (r *fastSyncOverlayRuntime) declinesPlumtreeBroadcasts() bool {
+	return r.spec.localValidator && !r.spec.receivePlumtreeBroadcasts
 }
 
-func (r *fastSyncOverlayRuntime) peerReceivesBroadcasts(id PeerID) bool {
+func (r *fastSyncOverlayRuntime) peerReceivesPlumtreeBroadcasts(id PeerID) bool {
 	flags, err := r.membership.PeerFlags(fastsync.ID(id))
-	return err == nil && flags&overlayMemberDoNotReceiveBroadcasts == 0
+	return err == nil && flags&overlayMemberDoNotReceivePlumtreeBroadcasts == 0
 }
 
 func (r *fastSyncOverlayRuntime) setValidatorAlive(
@@ -402,7 +400,7 @@ func (n *Node) fastSyncLocalCertificate(
 	}
 	// Not an error path, but the transition it precedes is invisible otherwise:
 	// once this node is in the roster, plumtree turns FastSync into a
-	// send-only overlay for it (receiveBroadcasts goes false), so a silent flip
+	// overlay that declines Plumtree for it, so a silent flip
 	// would look like FastSync simply stopped delivering.
 
 	skip := func(i int, err error) {
@@ -526,23 +524,23 @@ func (n *Node) buildFastSyncOverlaySpec(
 		authorizedKeys[string(id[:])] = maxOverlayPayloadSize
 	}
 
-	receiveBroadcasts := true
+	receivePlumtreeBroadcasts := true
 	if plumtreeEnabled {
-		receiveBroadcasts = !localValidator
+		receivePlumtreeBroadcasts = !localValidator
 	}
 	permanentFlags := uint32(0)
-	if plumtreeEnabled || shard.Workchain != -1 {
-		permanentFlags = overlayMemberDoNotReceiveBroadcasts
+	if plumtreeEnabled {
+		permanentFlags = overlayMemberDoNotReceivePlumtreeBroadcasts
 	}
 
 	fastSyncSpec := fastSyncOverlaySpec{
-		roster:            roster,
-		rosterFingerprint: roster.Fingerprint(),
-		certificate:       certificate,
-		localValidator:    localValidator,
-		receiveBroadcasts: receiveBroadcasts,
-		plumtreeEnabled:   plumtreeEnabled,
-		permanentFlags:    permanentFlags,
+		roster:                    roster,
+		rosterFingerprint:         roster.Fingerprint(),
+		certificate:               certificate,
+		localValidator:            localValidator,
+		receivePlumtreeBroadcasts: receivePlumtreeBroadcasts,
+		plumtreeEnabled:           plumtreeEnabled,
+		permanentFlags:            permanentFlags,
 	}
 	if certificate != nil {
 		encoded, err := tl.Serialize(*certificate, true)

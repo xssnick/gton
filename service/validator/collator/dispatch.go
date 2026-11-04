@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"math/big"
 	"slices"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -81,6 +82,10 @@ func (c *collation) processDispatchQueue() error {
 		var total uint64
 
 		for !current.IsEmpty() {
+			if c.config.globalVersion >= 16 && c.queueSize+c.pendingDispatchMessages >= c.config.outQueueHardLimit {
+				c.haveUnprocessedDispatchQueue = false
+				return nil
+			}
 			c.updateCollatedEstimate()
 			if !c.limits.fits(c.fullMark()) {
 				c.blockFull = true
@@ -300,11 +305,11 @@ func dispatchMinimumLT(extra *cell.Slice) (uint64, error) {
 	if extra == nil {
 		return 0, fmt.Errorf("augmentation is absent")
 	}
-	lt, err := extra.LoadUInt(64)
-	if err != nil || extra.BitsLeft() != 0 || extra.RefsNum() != 0 {
-		return 0, fmt.Errorf("expected exactly one uint64")
+	var augmentation tlb.DispatchQueueAugData
+	if err := loadExactSlice(&augmentation, extra); err != nil {
+		return 0, fmt.Errorf("invalid dispatch augmentation: %w", err)
 	}
-	return lt, nil
+	return augmentation.MinCreatedLT, nil
 }
 
 func loadAccountDispatchQueue(queue *tlb.DispatchQueueAugDict, accountID [32]byte) (*tlb.AccountDispatchQueue, error) {
@@ -469,6 +474,7 @@ func (c *collation) processDeferredMessage(
 	})
 	c.limits.extraOutMsgs++
 	c.unprocessedDeferred[source.AccountID]++
+	c.pendingDispatchMessages++
 	c.stats.DispatchedMessages++
 
 	return envelope.Metadata, nil
@@ -501,6 +507,23 @@ func (c *collation) removeDispatchEntry(
 	}
 
 	accountQueue.Count--
+	if c.config.globalVersion >= 16 && accountQueue.TotalBalance != nil {
+		var envelope tlb.MsgEnvelope
+		if err := parseExact(&envelope, removed.message.Msg); err != nil {
+			return dispatchRemoval{}, fmt.Errorf("%w: decode removed dispatch envelope: %v", ErrInvalidInput, err)
+		}
+		var message tlb.Message
+		if err := parseExact(&message, envelope.Msg); err != nil || message.MsgType != tlb.MsgTypeInternal {
+			return dispatchRemoval{}, fmt.Errorf("%w: invalid removed dispatch message: %v", ErrInvalidInput, err)
+		}
+		balance, err := accountQueue.TotalBalance.Sub(dispatchMessageBalance(message.AsInternal(), c.config.globalVersion))
+		if err != nil {
+			return dispatchRemoval{}, fmt.Errorf("%w: subtract dispatch balance: %v", ErrInvalidInput, err)
+		}
+		accountQueue.TotalBalance = &balance
+	} else {
+		accountQueue.TotalBalance = nil
+	}
 	if accountQueue.Count == 0 {
 		if !accountQueue.Messages.IsEmpty() {
 			return dispatchRemoval{}, fmt.Errorf("%w: dispatch account %x count reached zero with messages remaining", ErrInvalidInput, accountID)
@@ -646,7 +669,7 @@ func (c *collation) shouldDeferGenerated(
 	if !isMissingKey(err) {
 		return false, fmt.Errorf("%w: lookup dispatch account %x: %v", ErrInvalidInput, sourceID, err)
 	}
-	return false, nil
+	return c.config.globalVersion >= 16 && c.queueSize+c.pendingDispatchMessages >= c.config.outQueueHardLimit, nil
 }
 
 func (c *collation) deferGenerated(message *newMessage, sourceID [32]byte) error {
@@ -679,6 +702,9 @@ func (c *collation) deferGenerated(message *newMessage, sourceID [32]byte) error
 	accountQueue, err := loadAccountDispatchQueue(c.dispatchQueue, sourceID)
 	if isMissingKey(err) {
 		accountQueue = &tlb.AccountDispatchQueue{Messages: cell.NewDict(64)}
+		if c.config.globalVersion >= 16 {
+			accountQueue.TotalBalance = &tlb.CurrencyCollection{}
+		}
 	} else if err != nil {
 		return fmt.Errorf("%w: load dispatch account %x: %v", ErrInvalidInput, sourceID, err)
 	}
@@ -695,10 +721,29 @@ func (c *collation) deferGenerated(message *newMessage, sourceID [32]byte) error
 		return fmt.Errorf("%w: duplicate dispatch message lt %x:%d", ErrInvalidInput, sourceID, message.lt)
 	}
 	accountQueue.Count++
+	if c.config.globalVersion >= 16 && accountQueue.TotalBalance != nil {
+		balance, balanceErr := accountQueue.TotalBalance.Add(dispatchMessageBalance(internal, c.config.globalVersion))
+		if balanceErr != nil {
+			return fmt.Errorf("%w: add dispatch balance: %v", ErrInvalidInput, balanceErr)
+		}
+		accountQueue.TotalBalance = &balance
+	} else {
+		accountQueue.TotalBalance = nil
+	}
 	if err = storeAccountDispatchQueue(c.dispatchQueue.AugmentedDictionary, sourceID, accountQueue); err != nil {
 		return fmt.Errorf("store dispatch account %x: %w", sourceID, err)
 	}
 
 	c.stats.DeferredMessages++
 	return c.registerDispatchOp(false)
+}
+
+// Dispatch balances include the original message forwarding fee, not the
+// remaining fee in its envelope. Since GV12 the IHR field carries flags.
+func dispatchMessageBalance(message *tlb.InternalMessage, version uint32) tlb.CurrencyCollection {
+	grams := new(big.Int).Add(message.Amount.Nano(), message.FwdFee.Nano())
+	if version < 12 {
+		grams.Add(grams, message.IHRFee.Nano())
+	}
+	return tlb.CurrencyCollection{Coins: tlb.FromNanoTON(grams), ExtraCurrencies: message.ExtraCurrencies}
 }

@@ -41,6 +41,9 @@ type localBlockSource struct {
 	masterGenLT    uint64
 	masterRegistry *ShardRegistry
 	masterErr      error
+	balanceMu      sync.Mutex
+	balances       [2]*globalBalanceShard
+	balanceLoads   [2]*globalBalanceLoad
 
 	generation uint64
 }

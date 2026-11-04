@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 )
@@ -65,10 +66,15 @@ func (n *Node) newOverlaySubscriptionWithPrivate(
 		return nil, fmt.Errorf("create broadcast receiver for %s: %w", spec.Name, err)
 	}
 
+	subLog := n.log.With().Str("overlay", spec.Name).Logger()
 	sub := &overlaySubscription{
-		node:              n,
-		spec:              spec,
-		log:               n.log.With().Str("overlay", spec.Name).Logger(),
+		node: n,
+		spec: spec,
+		log:  subLog,
+		localSendDropLog: subLog.Sample(&zerolog.BurstSampler{
+			Burst:  1,
+			Period: localSendDropLogPeriod,
+		}),
 		peers:             map[PeerID]*overlayPeer{},
 		peerNotify:        make(chan struct{}, 1),
 		broadcastReceiver: receiver,

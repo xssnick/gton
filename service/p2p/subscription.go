@@ -17,6 +17,9 @@ type overlaySubscription struct {
 	node *Node
 	spec overlaySpec
 	log  zerolog.Logger
+	// localSendDropLog is log sampled to one entry per localSendDropLogPeriod,
+	// for own broadcasts that missed a recipient (noteLocalSendFailure).
+	localSendDropLog zerolog.Logger
 
 	mx                  sync.Mutex
 	cancel              context.CancelFunc
@@ -287,7 +290,12 @@ type overlayPeer struct {
 	rldpOverlay    *overlay.RLDPOverlayWrapper
 	queryTransport peerQueryTransport
 	broadcastPeer  overlay.BroadcastPeer
-	release        func()
+	// localBroadcastPeer carries this node's own queued broadcasts to the
+	// peer. Over QUIC it waits for a missing outbound connection
+	// (quicLocalBroadcastPeer) where broadcastPeer, the relay identity, never
+	// does; over ADNL the two are the same transport.
+	localBroadcastPeer overlay.BroadcastPeer
+	release            func()
 
 	// prioritySend is raised while this node's own candidate symbol is being
 	// written to the peer; relay writes to the peer defer to it. It is the

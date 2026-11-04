@@ -2,6 +2,7 @@ package simplex
 
 import (
 	"context"
+	"encoding/binary"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,24 @@ import (
 // runnerBatchSize bounds the time spent serving one wakeup. Returning to the
 // outer loop between batches keeps cancellation and consensus timers live
 // even when network ingress continuously replenishes the queue.
-const runnerBatchSize = 256
+const (
+	runnerBatchSize             = 256
+	runnerMaxQueuedMessages     = 4096
+	runnerMaxQueuedMessageBytes = 8 << 20
+	runnerMaxPeerMessages       = 256
+	runnerMaxPeerMessageBytes   = 1 << 20
+)
+
+type runnerMessage struct {
+	source    PeerID
+	validator int
+	data      []byte
+}
+
+type runnerMessageBudget struct {
+	count int
+	bytes int
+}
 
 // Runner is the production wrapper around Engine: it owns the event-loop
 // goroutine, serializes all inputs and drives the engine timers off the wall
@@ -27,6 +45,15 @@ type Runner struct {
 	wake     chan struct{}
 	done     chan struct{}
 	stopped  bool
+
+	// Network ingress has its own bounded queue. Internal completions must
+	// still reach the engine when a peer exhausts its message allowance.
+	// Budgets include a detached batch until verification releases its data.
+	messages     []runnerMessage
+	messageCount int
+	messageBytes int
+	messagePeers map[PeerID]runnerMessageBudget
+	messageDrops atomic.Uint64
 
 	// snapshot is the engine's own view, republished at the end of each loop
 	// turn so an off-goroutine reader never has to enter the loop.
@@ -44,9 +71,10 @@ type Runner struct {
 // goroutine once the engine is wrapped.
 func NewRunner(eng *Engine) *Runner {
 	r := &Runner{
-		eng:  eng,
-		wake: make(chan struct{}, 1),
-		done: make(chan struct{}),
+		eng:          eng,
+		wake:         make(chan struct{}, 1),
+		done:         make(chan struct{}),
+		messagePeers: make(map[PeerID]runnerMessageBudget),
 	}
 	eng.post = r.post
 	return r
@@ -85,6 +113,10 @@ func (r *Runner) run(ctx context.Context, startup chan<- error) (resultErr error
 		r.stopped = true
 		r.queue = nil
 		r.priority = nil
+		r.messages = nil
+		r.messagePeers = nil
+		r.messageCount = 0
+		r.messageBytes = 0
 		r.mu.Unlock()
 
 		close(r.done)
@@ -135,18 +167,23 @@ func (r *Runner) run(ctx context.Context, startup chan<- error) (resultErr error
 				return err
 			}
 		case <-r.wake:
-			q, stopped, more := r.takeBatch()
+			q, messages, stopped, more := r.takeBatch()
 			if stopped {
 				r.eng.Stop()
 				return r.eng.Err()
 			}
-			for _, f := range q {
+			for i, f := range q {
+				q[i] = nil
 				f()
+			}
+			for _, message := range messages {
+				r.eng.handleMessageBatched(message.source, message.validator, message.data)
 			}
 			// The batch admitted its votes without checking their signatures;
 			// verifying them together is what puts the arrival burst of one
 			// vote round on all cores instead of on this goroutine alone.
 			r.eng.FlushVerify()
+			r.releaseMessages(messages)
 			r.publishStats()
 			if more {
 				r.signal()
@@ -165,51 +202,85 @@ func (r *Runner) stopRequested() bool {
 	return stopped
 }
 
-func (r *Runner) takeBatch() (queue []func(), stopped, more bool) {
+func (r *Runner) takeBatch() (queue []func(), messages []runnerMessage, stopped, more bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.stopped {
 		r.queue = nil
 		r.priority = nil
-		return nil, true, false
+		r.messages = nil
+		r.messagePeers = nil
+		r.messageCount = 0
+		r.messageBytes = 0
+		return nil, nil, true, false
 	}
 
 	n := min(len(r.priority)+len(r.queue), runnerBatchSize)
-	if len(r.priority) == 0 {
+	switch {
+	case len(r.priority) == 0:
 		queue = r.queue[:n]
 		if n == len(r.queue) {
 			r.queue = nil
 		} else {
 			r.queue = r.queue[n:]
 		}
-
-		return queue, false, len(r.queue) != 0
-	}
-	if n <= len(r.priority) {
+	case n <= len(r.priority):
 		queue = r.priority[:n]
 		if n == len(r.priority) {
 			r.priority = nil
 		} else {
 			r.priority = r.priority[n:]
 		}
-		return queue, false, len(r.priority) != 0 || len(r.queue) != 0
+	default:
+		// Only mixed callback batches need a copy; the ordinary path keeps
+		// transferring ownership of its existing slice without allocating.
+		queue = make([]func(), 0, n)
+		queue = append(queue, r.priority...)
+		r.priority = nil
+		ordinary := n - len(queue)
+		queue = append(queue, r.queue[:ordinary]...)
+		if ordinary == len(r.queue) {
+			r.queue = nil
+		} else {
+			r.queue = r.queue[ordinary:]
+		}
 	}
 
-	// Candidate work reaches the queue beside ordinary direct-message work
-	// only during a leader window. Keep the normal message path allocation-free
-	// and copy only for this mixed, latency-sensitive batch.
-	queue = make([]func(), 0, n)
-	queue = append(queue, r.priority...)
-	r.priority = nil
-	ordinary := n - len(queue)
-	queue = append(queue, r.queue[:ordinary]...)
-	if ordinary == len(r.queue) {
-		r.queue = nil
+	n = min(len(r.messages), runnerBatchSize-len(queue))
+	messages = r.messages[:n]
+	if n == len(r.messages) {
+		r.messages = nil
 	} else {
-		r.queue = r.queue[ordinary:]
+		r.messages = r.messages[n:]
 	}
-	return queue, false, len(r.priority) != 0 || len(r.queue) != 0
+
+	return queue, messages, false, len(r.priority) != 0 || len(r.queue) != 0 || len(r.messages) != 0
+}
+
+// releaseMessages runs after FlushVerify: pending signatures can still refer
+// to the message buffers until that verification batch finishes.
+func (r *Runner) releaseMessages(messages []runnerMessage) {
+	if len(messages) == 0 {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for i, message := range messages {
+		budget := r.messagePeers[message.source]
+		budget.count--
+		budget.bytes -= len(message.data)
+		if budget.count == 0 {
+			delete(r.messagePeers, message.source)
+		} else {
+			r.messagePeers[message.source] = budget
+		}
+		r.messageCount--
+		r.messageBytes -= len(message.data)
+		messages[i] = runnerMessage{}
+	}
 }
 
 func (r *Runner) armTimer(timer *time.Timer) {
@@ -259,11 +330,50 @@ func (r *Runner) signal() {
 	}
 }
 
-// HandleMessage enqueues a protocol message for the engine.
+// HandleMessage admits network ingress without blocking the transport. Invalid
+// envelopes and messages beyond the global or per-peer budgets are dropped
+// before copying their payload. Authentication remains on the engine loop.
 func (r *Runner) HandleMessage(src PeerID, srcValidator int, data []byte) {
-	msg := make([]byte, len(data))
-	copy(msg, data)
-	r.post(func() { r.eng.handleMessageBatched(src, srcValidator, msg) })
+	valid := false
+	if len(data) >= 4 {
+		switch binary.LittleEndian.Uint32(data) {
+		case idSignedVote:
+			valid = len(data) <= signedVoteWireMax && srcValidator >= 0 && srcValidator < len(r.eng.validators())
+		case idCertificate:
+			valid = len(data) <= r.eng.maxCertWire
+		}
+	}
+	if !valid {
+		r.messageDrops.Add(1)
+		return
+	}
+
+	// A large roster must still be able to deliver one complete certificate.
+	peerByteLimit := max(runnerMaxPeerMessageBytes, r.eng.maxCertWire)
+	byteLimit := max(runnerMaxQueuedMessageBytes, peerByteLimit)
+
+	r.mu.Lock()
+	if r.stopped {
+		r.mu.Unlock()
+		return
+	}
+	budget := r.messagePeers[src]
+	if r.messageCount >= runnerMaxQueuedMessages || len(data) > byteLimit-r.messageBytes ||
+		budget.count >= runnerMaxPeerMessages || len(data) > peerByteLimit-budget.bytes {
+		r.mu.Unlock()
+		r.messageDrops.Add(1)
+		return
+	}
+
+	msg := append([]byte(nil), data...)
+	r.messages = append(r.messages, runnerMessage{source: src, validator: srcValidator, data: msg})
+	r.messageCount++
+	r.messageBytes += len(msg)
+	budget.count++
+	budget.bytes += len(msg)
+	r.messagePeers[src] = budget
+	r.mu.Unlock()
+	r.signal()
 }
 
 // SubmitCandidate synchronously admits a candidate proposal on the engine
@@ -340,7 +450,10 @@ func (r *Runner) doWithPost(post func(func()), f func()) bool {
 // condition it is being scraped to diagnose.
 func (r *Runner) Stats() Stats {
 	var s Stats
-	r.do(func() { s = r.eng.Stats() })
+	r.do(func() {
+		s = r.eng.Stats()
+		s.MessagesDropped += r.messageDrops.Load()
+	})
 	return s
 }
 
@@ -369,6 +482,7 @@ func (r *Runner) StatsSnapshot() Stats {
 // still holding the older snapshot.
 func (r *Runner) publishStats() {
 	stats := r.eng.statsAliased()
+	stats.MessagesDropped += r.messageDrops.Load()
 	if !slices.Equal(r.lastSigned, stats.LastSignedSlot) {
 		r.lastSigned = append([]uint32(nil), stats.LastSignedSlot...)
 	}

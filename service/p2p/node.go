@@ -67,12 +67,13 @@ type Node struct {
 	masterDecodeQueue        chan offloadedBroadcastDecode
 	decodeWorkersOnce        sync.Once
 
-	myExternalMessages        *eventdedupe.Cache
-	processedExternalMessages *eventdedupe.Cache
-	externalMessageLimiter    *extmsg.AddressLimiter
-	externalBroadcastPacer    *externalBroadcastPacer
-	allowDuplicateExternals   bool
-	localExternalFanout       int
+	myExternalMessages            *eventdedupe.Cache
+	processedExternalMessages     *eventdedupe.Cache
+	externalMessageLimiter        *extmsg.AddressLimiter
+	externalBroadcastPacer        *externalBroadcastPacer
+	allowDuplicateExternals       bool
+	disablePublicExternalMessages bool
+	localExternalFanout           int
 	// relayEgress meters the FEC parts this node forwards on public overlays;
 	// nil disables the metering. See relay_budget.go.
 	relayEgress *relayEgressBudget
@@ -354,6 +355,7 @@ func New(opts Options) (*Node, error) {
 		externalMessageLimiter:        extmsg.NewDefaultAddressLimiter(),
 		externalBroadcastPacer:        externalBroadcastPacer,
 		allowDuplicateExternals:       opts.AllowDuplicateExternals,
+		disablePublicExternalMessages: opts.DisablePublicExternalMessages,
 		localExternalFanout:           localExternalFanout,
 		relayEgress:                   newRelayEgressBudget(relayEgressBits, time.Now()),
 		runCtx:                        context.Background(),

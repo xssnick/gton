@@ -210,9 +210,7 @@ func (v *configParameterValidator) parameter(s *cell.Slice, id uint32) error {
 		}
 	case tlb.ConfigParamFundamentalSMCAddresses:
 		return v.hashmapE(s, 256, configSliceEnd)
-	case tlb.ConfigParamPrevValidators, tlb.ConfigParamPrevTempValidators,
-		tlb.ConfigParamCurrentValidators, tlb.ConfigParamCurrentTempValidators,
-		tlb.ConfigParamNextValidators, tlb.ConfigParamNextTempValidators:
+	case tlb.ConfigParamPrevValidators, tlb.ConfigParamCurrentValidators, tlb.ConfigParamNextValidators:
 		return v.validators(s)
 	case tlb.ConfigParamValidatorTempKeys:
 		return v.hashmapE(s, 256, v.signedTempKey)
@@ -225,6 +223,24 @@ func (v *configParameterValidator) parameter(s *cell.Slice, id uint32) error {
 		}
 		return s.SkipBits(32 + 9*16)
 	case tlb.ConfigParamSizeLimits:
+		prefix := *s
+		tag, err := prefix.LoadUInt(8)
+		if err != nil {
+			return err
+		}
+		if tag == 3 {
+			// The #03 governance schema requires both queue limits. The generic
+			// config reader also accepts the earlier experimental #03 prefix.
+			// That read compatibility must not admit a newly proposed config.
+			if err = tlb.LoadFromCell(new(tlb.SizeLimitsConfigV2), &prefix, true); err != nil {
+				return err
+			}
+			if err = prefix.SkipBits(4 * 32); err != nil {
+				return err
+			}
+			*s = prefix
+			return nil
+		}
 		return tlb.LoadFromCell(new(tlb.SizeLimitsConfig), s)
 	case tlb.ConfigParamSuspendedAddressList:
 		if err := configTag(s, 0, 8); err != nil {

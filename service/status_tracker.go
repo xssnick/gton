@@ -163,6 +163,38 @@ func (t *StatusTracker) SyncLagSeconds() (int64, error) {
 	return t.syncLagSeconds(time.Now())
 }
 
+// SyncLag measures collation readiness against both masterchain frontiers:
+// the newest applied masterchain block and the block whose shards are applied.
+func (t *StatusTracker) SyncLag() (time.Duration, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if t.current == nil {
+		return 0, fmt.Errorf("current state is missing for sync lag: %w", storage.ErrNotFound)
+	}
+	current := &t.current.Masterchain
+	if current.Block.Workchain != -1 || current.Block.Shard != topShard {
+		return 0, fmt.Errorf("current masterchain frontier is invalid for sync lag: %w", storage.ErrNotFound)
+	}
+	if current.Parsed == nil || current.Parsed.GenUTime == 0 {
+		return 0, fmt.Errorf("current masterchain utime is missing for sync lag: %w", storage.ErrNotFound)
+	}
+
+	applied := t.appliedMasterchain
+	if applied == nil {
+		return 0, fmt.Errorf("applied masterchain frontier is missing for sync lag: %w", storage.ErrNotFound)
+	}
+	if applied.Block.Workchain != -1 || applied.Block.Shard != topShard {
+		return 0, fmt.Errorf("applied masterchain frontier is invalid for sync lag: %w", storage.ErrNotFound)
+	}
+	if applied.Parsed == nil || applied.Parsed.GenUTime == 0 {
+		return 0, fmt.Errorf("applied masterchain utime is missing for sync lag: %w", storage.ErrNotFound)
+	}
+
+	oldest := min(current.Parsed.GenUTime, applied.Parsed.GenUTime)
+	return time.Since(time.Unix(int64(oldest), 0)), nil
+}
+
 func (t *StatusTracker) syncLagSeconds(now time.Time) (int64, error) {
 	nowUnix := now.Unix()
 	var maxLag int64

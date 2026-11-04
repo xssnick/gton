@@ -18,8 +18,9 @@ import (
 const maxShardTopChainLength = uint32(8)
 
 type masterCollation struct {
-	oldExtra tlb.McStateExtra
-	oldInfo  tlb.McStateExtraBlockInfo
+	previousGlobalBalance *big.Int
+	oldExtra              tlb.McStateExtra
+	oldInfo               tlb.McStateExtraBlockInfo
 	// oldCreatorStats is the predecessor's BlockCreateStats as parsed with
 	// oldInfo, so the update pass does not walk that dictionary a second time.
 	oldCreatorStats blockCreateStats
@@ -67,6 +68,16 @@ func (b *Builder) BuildMaster(ctx context.Context, req MasterRequest) (*Candidat
 	common := masterCollationRequest(req)
 	if err := validateCollationRequest(&common); err != nil {
 		return nil, err
+	}
+	if req.Config.globalVersion >= 17 {
+		if req.GlobalBalance == nil {
+			return nil, fmt.Errorf("%w: GV17 requires a global balance calculator", ErrInvalidInput)
+		}
+		var err error
+		req.previousGlobalBalance, err = req.GlobalBalance.CalculateGlobalBalance(ctx, req.Previous, req.Config.globalVersion)
+		if err != nil {
+			return nil, fmt.Errorf("calculate previous global balance: %w", err)
+		}
 	}
 	candidate, err := retryUnderSizeLimit(ctx, func(attempt collationAttempt) (*Candidate, error) {
 		return b.buildMasterAttempt(ctx, req, attempt)
@@ -138,13 +149,13 @@ func (b *Builder) prepareMasterPhases(
 	timer.stop()
 
 	timer = c.req.assembly.start(CollationStageExecuteInternalMessages)
-	if err = c.processDispatchQueue(); err != nil {
-		return nil, err
-	}
 	if err = c.processMasterTickTock(false); err != nil {
 		return nil, err
 	}
 	if err = c.processMasterSpecials(); err != nil {
+		return nil, err
+	}
+	if err = c.processDispatchQueue(); err != nil {
 		return nil, err
 	}
 	if err = c.processInternals(); err != nil {
@@ -359,13 +370,14 @@ func (b *Builder) prepareMaster(ctx context.Context, req MasterRequest) (*collat
 	}
 
 	master := &masterCollation{
-		oldExtra:        oldExtra,
-		oldInfo:         oldInfo,
-		oldCreatorStats: oldCreatorStats,
-		previousGroups:  req.Groups.Config,
-		registry:        registry,
-		shardFees:       shardFees,
-		shardTops:       shardTops,
+		previousGlobalBalance: req.previousGlobalBalance,
+		oldExtra:              oldExtra,
+		oldInfo:               oldInfo,
+		oldCreatorStats:       oldCreatorStats,
+		previousGroups:        req.Groups.Config,
+		registry:              registry,
+		shardFees:             shardFees,
+		shardTops:             shardTops,
 	}
 	if err = master.initValueFlow(req.Config, &oldStats); err != nil {
 		return nil, err

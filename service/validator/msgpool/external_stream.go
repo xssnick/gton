@@ -45,21 +45,9 @@ func (p *Pool) OpenExternalStream(shard ShardIdent, capacity int) (*ExternalStre
 	return p.OpenExternalStreamExcluding(shard, capacity, nil)
 }
 
-// OpenExternalStreamExcluding opens a stream that will never offer the named
-// messages or known normalized variants, neither in its first fill nor in
-// anything admitted afterwards.
-//
-// It exists for a collation that starts before its predecessor has reported what
-// it consumed. The pool learns that at the predecessor's commit; a successor
-// opened ahead of it would be offered those messages again, execute them a
-// second time, and have its feedback dropped as stale — which leaves them
-// without a retry stamp, so the same messages come back on every remaining slot
-// of the window.
-//
-// The exclusion is seeded before the first fill: seeding after it would let the
-// very first batch through, which is the batch a successor takes. Known raw
-// hashes also seed a normalized-hash set so equivalent variants admitted later
-// stay excluded.
+// OpenExternalStreamExcluding opens a stream excluding the normalized hashes
+// already attempted in this leader window. The hashes remain authoritative
+// after pool deletion, so newly admitted equivalent messages stay excluded.
 func (p *Pool) OpenExternalStreamExcluding(
 	shard ShardIdent,
 	capacity int,
@@ -91,16 +79,9 @@ func (p *Pool) OpenExternalStreamExcluding(
 		stream.excludeNorm = make(map[[32]byte]struct{}, len(exclude))
 	}
 	for _, hash := range exclude {
-		stream.seen[hash] = struct{}{}
-		entry := p.byHash[hash]
-		if entry == nil {
-			continue
-		}
-		stream.excludeNorm[entry.msg.HashNorm] = struct{}{}
-		for _, variant := range p.byNorm[entry.msg.HashNorm] {
-			stream.seen[variant.msg.Hash] = struct{}{}
-		}
+		stream.excludeNorm[hash] = struct{}{}
 	}
+
 	p.streams[stream.id] = stream
 	p.refillExternalStreamLocked(stream)
 

@@ -518,16 +518,8 @@ func TestTrackerReusedActiveSessionsMatchFreshDerivation(t *testing.T) {
 	}
 }
 
-// TestTrackerFutureSessionsFollowTentativeSetBoundary pins the one input that
-// moves a tentative roster while the configuration cell is byte-identical:
-// SelectTentativeValidatorSet flips the current set for the next one purely on
-// gen_utime crossing (gen_utime/lifetime+1)*lifetime. Any future-session reuse
-// keyed on the config pointer, the shard and the catchain seqno would serve a
-// stale session id right here, which is a consensus hazard.
-func TestTrackerFutureSessionsFollowTentativeSetBoundary(t *testing.T) {
-	// The default catchain lifetime is 200 seconds, so the boundary for
-	// gen_utime 1_699_999_999 is 1_700_000_000 and the next set is not eligible
-	// yet, while for 1_700_000_001 it is 1_700_000_200 and the set is.
+// Explicit future catchain selection keeps the current roster until config 34 rotates.
+func TestTrackerFutureSessionsKeepCurrentRosterAcrossTimeBoundary(t *testing.T) {
 	const nextSetSince = uint32(1_700_000_200)
 
 	current := buildTestValidatorSet(t, []testValidatorWire{{
@@ -604,22 +596,16 @@ func TestTrackerFutureSessionsFollowTentativeSetBoundary(t *testing.T) {
 		t.Fatalf("tentative roster before the boundary = %x, want the current set", got)
 	}
 
-	var promoted *Session
-	for i := range afterSessions {
-		if afterSessions[i].Validators[0].PublicKey == groupTestBytes(2) {
-			promoted = &afterSessions[i]
-		}
+	if len(afterSessions) != 1 || afterSessions[0].Validators[0].PublicKey != groupTestBytes(1) {
+		t.Fatalf("future roster after boundary = %+v, want current set", afterSessions)
 	}
-	if promoted == nil {
-		t.Fatal("tentative roster did not move to the next set across the boundary")
+	if afterSessions[0].ID != beforeSessions[0].ID {
+		t.Fatal("future session changed without a roster or catchain rotation")
 	}
-	if promoted.CatchainSeqno != beforeSessions[0].CatchainSeqno {
-		t.Fatalf("tentative catchain seqno changed: %d then %d",
-			beforeSessions[0].CatchainSeqno, promoted.CatchainSeqno)
+	if !afterSessions[0].ExpectedStart.Equal(beforeSessions[0].ExpectedStart) {
+		t.Fatal("existing prepared session lost its original expected start")
 	}
-	if promoted.ID == beforeSessions[0].ID {
-		t.Fatal("tentative session id survived a validator set change")
-	}
+
 }
 
 func TestTrackerStartGroupsFromSeqnoGatesLifecycle(t *testing.T) {

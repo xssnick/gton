@@ -18,13 +18,8 @@ const (
 	configParamNewConsensus         = uint32(30)
 	configParamFundamentalContracts = uint32(31)
 	configParamPreviousValidators   = uint32(32)
-	// configParamPreviousTemporary is named for completeness of the 32..37
-	// block. It is never parsed: see ParseConfig.
-	configParamPreviousTemporary    = uint32(33)
 	configParamCurrentValidators    = uint32(34)
-	configParamCurrentTemporary     = uint32(35)
 	configParamNextValidators       = uint32(36)
-	configParamNextTemporary        = uint32(37)
 	configParamValidatorRegistry    = uint32(46)
 	maxTotalValidatorWeight         = uint64(1) << 61
 	ed25519PublicKeyConstructor     = uint64(0x8e81278a)
@@ -104,8 +99,8 @@ type NewConsensusConfig struct {
 }
 
 // Config contains the validator-group configuration needed by the tracker.
-// ActiveValidators selects parameter 35 over 34. NextValidators selects 37
-// over 36 and is nil when neither next set is present. AllCurrentValidators is
+// ActiveValidators selects parameter 34. NextValidators selects parameter 36
+// and is nil when the next set is absent. AllCurrentValidators is
 // the ADNL roster of persistent parameter 34, matching the reference private
 // overlay's all_current_validators set. Parsed values are immutable and may
 // share their backing storage.
@@ -165,20 +160,12 @@ func ParseConfig(root *cell.Cell) (*Config, error) {
 		return nil, fmt.Errorf("config parameter %d: %w", configParamConsensus, err)
 	}
 
-	// Only the sets something downstream reads are parsed. Parameter 33 is
-	// deliberately absent: no consumer here selects it and the C++ node never
-	// looks it up either (get_config_param(35, 34), (37, 36), 34 and 36 are its
-	// only validator-set lookups). Parsing it strictly would let an odd value
-	// nobody uses fail ParseConfig, which fails masterchain apply and — worse —
-	// refuses collation and validation through master_state.go. Parameter 32
-	// keeps its strict parse because persistentOverlayMembers is built from it.
-	validatorSets := make(map[uint32]ValidatorSet, 5)
+	// Temporary validator sets 33/35/37 are no longer part of roster selection.
+	validatorSets := make(map[uint32]ValidatorSet, 3)
 	for _, parameter := range [...]uint32{
 		configParamPreviousValidators,
 		configParamCurrentValidators,
-		configParamCurrentTemporary,
 		configParamNextValidators,
-		configParamNextTemporary,
 	} {
 		parameterCell, exists := params[parameter]
 		if !exists {
@@ -197,15 +184,8 @@ func ParseConfig(root *cell.Cell) (*Config, error) {
 		return nil, fmt.Errorf("config parameter %d: %w", configParamCurrentValidators, ErrNotFound)
 	}
 
-	active := current
-	if temporary, exists := validatorSets[configParamCurrentTemporary]; exists {
-		active = temporary
-	}
-
 	var next *ValidatorSet
-	if temporary, exists := validatorSets[configParamNextTemporary]; exists {
-		next = &temporary
-	} else if persistent, exists := validatorSets[configParamNextValidators]; exists {
+	if persistent, exists := validatorSets[configParamNextValidators]; exists {
 		next = &persistent
 	}
 
@@ -225,7 +205,7 @@ func ParseConfig(root *cell.Cell) (*Config, error) {
 		NewConsensus:             newConsensus,
 		MaxBlockSize:             maxBlockSize,
 		MaxCollatedDataSize:      maxCollatedDataSize,
-		ActiveValidators:         active,
+		ActiveValidators:         current,
 		NextValidators:           next,
 		AllCurrentValidators:     validatorADNLIDs(current.Validators),
 		persistentOverlayMembers: buildPersistentOverlayMembers(persistentValidatorSets),
@@ -953,6 +933,10 @@ func (c SimplexConfig) SimplexParams() simplex.Params {
 			params.CertificateGossipNeighbors = item.Value
 		case 16:
 			params.StandstillMinEgressBytesPerS = item.Value
+		case 17:
+			params.CollatorMaxFutureWindow = item.Value
+		case 18:
+			params.CollatorMaxSyncDelay = consensusMilliseconds(item.Value)
 		}
 	}
 

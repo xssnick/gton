@@ -30,8 +30,8 @@ func TestSemanticOutQueueDeltaRejectParity(t *testing.T) {
 	key := msgpool.MakeQueueKey(envelope.next, envelope.message.HashKey())
 	otherKey := msgpool.MakeQueueKey(other.next, other.message.HashKey())
 	incomingKey := msgpool.MakeQueueKey(incoming.next, incoming.message.HashKey())
-	old := map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 6_000)}
-	added := map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 11_000)}
+	old := map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 4_000)}
+	added := map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 5_000)}
 	newDescriptor := outQueueDeltaDescriptor(semanticOutNew, envelope)
 	dequeueDescriptor := outQueueDeltaDescriptor(semanticOutDequeue, envelope)
 	shortDescriptor := outQueueDeltaDescriptor(semanticOutDequeueShort, envelope)
@@ -58,10 +58,10 @@ func TestSemanticOutQueueDeltaRejectParity(t *testing.T) {
 		{name: "wrong full dequeue envelope", old: old, out: []semanticOutDescriptorEntry{outQueueDeltaDescriptor(semanticOutDequeue, changed)}, reject: true},
 		{name: "wrong short dequeue next hop", capabilities: capShortDequeue, old: old, out: []semanticOutDescriptorEntry{wrongShort}, reject: true},
 		{name: "wrong short dequeue envelope", capabilities: capShortDequeue, old: old, out: []semanticOutDescriptorEntry{wrongEnvelopeShort}, reject: true},
-		{name: "new envelope differs from descriptor", next: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, changed, 11_000)}, out: []semanticOutDescriptorEntry{newDescriptor}, reject: true},
+		{name: "new envelope differs from descriptor", next: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, changed, 5_000)}, out: []semanticOutDescriptorEntry{newDescriptor}, reject: true},
 		{name: "queue key differs from envelope", next: map[msgpool.QueueKey]*cell.Cell{otherKey: added[key]}, out: []semanticOutDescriptorEntry{newDescriptor}, reject: true},
-		{name: "same message added at two hops", next: map[msgpool.QueueKey]*cell.Cell{key: added[key], incomingKey: outQueueDeltaValue(t, incoming, 11_000)}, out: []semanticOutDescriptorEntry{newDescriptor}, reject: true},
-		{name: "same message deleted at two hops", capabilities: capShortDequeue, old: map[msgpool.QueueKey]*cell.Cell{key: old[key], incomingKey: outQueueDeltaValue(t, incoming, 6_000)}, out: []semanticOutDescriptorEntry{shortDescriptor}, reject: true},
+		{name: "same message added at two hops", next: map[msgpool.QueueKey]*cell.Cell{key: added[key], incomingKey: outQueueDeltaValue(t, incoming, 5_000)}, out: []semanticOutDescriptorEntry{newDescriptor}, reject: true},
+		{name: "same message deleted at two hops", capabilities: capShortDequeue, old: map[msgpool.QueueKey]*cell.Cell{key: old[key], incomingKey: outQueueDeltaValue(t, incoming, 4_000)}, out: []semanticOutDescriptorEntry{shortDescriptor}, reject: true},
 		{name: "new descriptor cannot remove", old: old, out: []semanticOutDescriptorEntry{newDescriptor}, reject: true},
 		{name: "dequeue descriptor cannot add", capabilities: capShortDequeue, next: added, out: []semanticOutDescriptorEntry{shortDescriptor}, reject: true},
 		{name: "external descriptor cannot add", next: added, out: []semanticOutDescriptorEntry{outQueueDeltaDescriptor(semanticOutExternal, envelope)}, reject: true},
@@ -71,11 +71,11 @@ func TestSemanticOutQueueDeltaRejectParity(t *testing.T) {
 		{name: "queue size mismatch", next: added, out: []semanticOutDescriptorEntry{newDescriptor}, candidateSize: &wrongSize, reject: true},
 		{name: "queue size overflow", next: added, out: []semanticOutDescriptorEntry{newDescriptor}, initialSize: &maximum, reject: true},
 		{name: "queue size underflow", old: old, out: []semanticOutDescriptorEntry{dequeueDescriptor}, initialSize: &zero, reject: true},
-		{name: "dequeued lt reaches block start", old: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 10_000)}, out: []semanticOutDescriptorEntry{dequeueDescriptor}, reject: true},
+		{name: "dequeued lt reaches block start", old: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 5_000)}, out: []semanticOutDescriptorEntry{dequeueDescriptor}, reject: true},
 		{name: "enqueued lt precedes block", next: old, out: []semanticOutDescriptorEntry{newDescriptor}, reject: true},
 		{name: "enqueued lt reaches block end", next: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 20_000)}, out: []semanticOutDescriptorEntry{newDescriptor}, reject: true},
-		{name: "new while keeping an unrelated old entry", old: map[msgpool.QueueKey]*cell.Cell{otherKey: outQueueDeltaValue(t, other, 6_000)}, next: map[msgpool.QueueKey]*cell.Cell{otherKey: outQueueDeltaValue(t, other, 6_000), key: added[key]}, out: []semanticOutDescriptorEntry{newDescriptor}},
-		{name: "add and remove different messages", capabilities: capShortDequeue, old: map[msgpool.QueueKey]*cell.Cell{otherKey: outQueueDeltaValue(t, other, 6_000)}, next: added, out: []semanticOutDescriptorEntry{newDescriptor, outQueueDeltaDescriptor(semanticOutDequeueShort, other)}},
+		{name: "new while keeping an unrelated old entry", old: map[msgpool.QueueKey]*cell.Cell{otherKey: outQueueDeltaValue(t, other, 4_000)}, next: map[msgpool.QueueKey]*cell.Cell{otherKey: outQueueDeltaValue(t, other, 4_000), key: added[key]}, out: []semanticOutDescriptorEntry{newDescriptor}},
+		{name: "add and remove different messages", capabilities: capShortDequeue, old: map[msgpool.QueueKey]*cell.Cell{otherKey: outQueueDeltaValue(t, other, 4_000)}, next: added, out: []semanticOutDescriptorEntry{newDescriptor, outQueueDeltaDescriptor(semanticOutDequeueShort, other)}},
 	}
 
 	for _, test := range tests {
@@ -124,13 +124,13 @@ func TestSemanticOutQueueTransitAndMerge(t *testing.T) {
 	dequeueImmediate.descriptor.reimport = final.root
 
 	tests := []semanticOutQueueDeltaCase{
-		{name: "transit insertion", next: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 11_000)}, out: []semanticOutDescriptorEntry{transit}, in: inbound},
-		{name: "merge transit requeue", old: map[msgpool.QueueKey]*cell.Cell{incomingKey: outQueueDeltaValue(t, incoming, 6_000)}, next: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 11_000)}, out: []semanticOutDescriptorEntry{transitRequest}, in: inbound},
-		{name: "transit request missing removal", next: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 11_000)}, out: []semanticOutDescriptorEntry{transitRequest}, in: inbound, reject: true},
-		{name: "transit request missing insertion", old: map[msgpool.QueueKey]*cell.Cell{incomingKey: outQueueDeltaValue(t, incoming, 6_000)}, out: []semanticOutDescriptorEntry{transitRequest}, in: inbound, reject: true},
-		{name: "transit request keeps imported entry", old: map[msgpool.QueueKey]*cell.Cell{incomingKey: outQueueDeltaValue(t, incoming, 6_000)}, next: map[msgpool.QueueKey]*cell.Cell{incomingKey: outQueueDeltaValue(t, incoming, 6_000), key: outQueueDeltaValue(t, envelope, 11_000)}, out: []semanticOutDescriptorEntry{transitRequest}, in: inbound, reject: true},
-		{name: "transit request missing reimport", old: map[msgpool.QueueKey]*cell.Cell{incomingKey: outQueueDeltaValue(t, incoming, 6_000)}, next: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 11_000)}, out: []semanticOutDescriptorEntry{transitRequest}, reject: true},
-		{name: "merge immediate dequeue", old: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 6_000)}, out: []semanticOutDescriptorEntry{dequeueImmediate}, in: final},
+		{name: "transit insertion", next: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 5_000)}, out: []semanticOutDescriptorEntry{transit}, in: inbound},
+		{name: "merge transit requeue", old: map[msgpool.QueueKey]*cell.Cell{incomingKey: outQueueDeltaValue(t, incoming, 4_000)}, next: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 5_000)}, out: []semanticOutDescriptorEntry{transitRequest}, in: inbound},
+		{name: "transit request missing removal", next: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 5_000)}, out: []semanticOutDescriptorEntry{transitRequest}, in: inbound, reject: true},
+		{name: "transit request missing insertion", old: map[msgpool.QueueKey]*cell.Cell{incomingKey: outQueueDeltaValue(t, incoming, 4_000)}, out: []semanticOutDescriptorEntry{transitRequest}, in: inbound, reject: true},
+		{name: "transit request keeps imported entry", old: map[msgpool.QueueKey]*cell.Cell{incomingKey: outQueueDeltaValue(t, incoming, 4_000)}, next: map[msgpool.QueueKey]*cell.Cell{incomingKey: outQueueDeltaValue(t, incoming, 4_000), key: outQueueDeltaValue(t, envelope, 5_000)}, out: []semanticOutDescriptorEntry{transitRequest}, in: inbound, reject: true},
+		{name: "transit request missing reimport", old: map[msgpool.QueueKey]*cell.Cell{incomingKey: outQueueDeltaValue(t, incoming, 4_000)}, next: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 5_000)}, out: []semanticOutDescriptorEntry{transitRequest}, reject: true},
+		{name: "merge immediate dequeue", old: map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 4_000)}, out: []semanticOutDescriptorEntry{dequeueImmediate}, in: final},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -145,7 +145,7 @@ func TestSemanticOutQueueTransitAndMerge(t *testing.T) {
 	}
 
 	t.Run("delivered merged entry must be removed", func(t *testing.T) {
-		old := map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 6_000)}
+		old := map[msgpool.QueueKey]*cell.Cell{key: outQueueDeltaValue(t, envelope, 4_000)}
 		validation := newOutQueueDeltaValidation(t, semanticOutQueueDeltaCase{old: old, next: old})
 		if err := verifyOutQueueDelta(validation); err != nil {
 			t.Fatal(err)
@@ -166,7 +166,7 @@ func TestSemanticOutQueueTransitAndMerge(t *testing.T) {
 func TestSemanticOutQueueDiffChecksAugmentationAndPrunedChanges(t *testing.T) {
 	envelope := routeFixtureEnvelope(t, address.NewAddress(0, 0, bytes.Repeat([]byte{0x11}, 32)), address.NewAddress(0, 0, bytes.Repeat([]byte{0x22}, 32)), 96)
 	key := msgpool.MakeQueueKey(envelope.next, envelope.message.HashKey())
-	value := outQueueDeltaValue(t, envelope, 11_000)
+	value := outQueueDeltaValue(t, envelope, 5_000)
 	test := semanticOutQueueDeltaCase{next: map[msgpool.QueueKey]*cell.Cell{key: value}, out: []semanticOutDescriptorEntry{outQueueDeltaDescriptor(semanticOutNew, envelope)}}
 	validation := newOutQueueDeltaValidation(t, test)
 	if err := verifyOutQueueDelta(validation); err != nil {
@@ -191,7 +191,7 @@ func TestSemanticOutQueueDiffChecksAugmentationAndPrunedChanges(t *testing.T) {
 		other := routeFixtureEnvelope(t, envelope.internal.SrcAddr, address.NewAddress(0, 0, bytes.Repeat([]byte{0x33}, 32)), 96)
 		otherKey := msgpool.MakeQueueKey(other.next, other.message.HashKey())
 		validation := newOutQueueDeltaValidation(t, semanticOutQueueDeltaCase{
-			next: map[msgpool.QueueKey]*cell.Cell{key: value, otherKey: outQueueDeltaValue(t, other, 11_000)},
+			next: map[msgpool.QueueKey]*cell.Cell{key: value, otherKey: outQueueDeltaValue(t, other, 5_000)},
 			out:  []semanticOutDescriptorEntry{outQueueDeltaDescriptor(semanticOutNew, envelope), outQueueDeltaDescriptor(semanticOutNew, other)},
 		})
 		if err := verifyOutQueueDelta(validation); err != nil {
@@ -242,14 +242,12 @@ func TestSemanticOutQueueDiffChecksAugmentationAndPrunedChanges(t *testing.T) {
 	})
 }
 
-// C++ accepts both hml_short and hml_long (dict.cpp:283), then compares leaf
-// contents after skipping the labels (dict.cpp:2404-2420). Re-encoding a label
-// changes the authenticated root, but does not create a message-queue delta.
-// The former reconstructed-root comparison rejected these valid encodings.
-func TestSemanticOutQueueAcceptsEquivalentLabelEncoding(t *testing.T) {
+// New OutMsgQueue nodes must use canonical labels, including a label-only
+// change whose decoded message value is otherwise unchanged.
+func TestSemanticOutQueueRejectsNonCanonicalEquivalentLabelEncoding(t *testing.T) {
 	envelope := routeFixtureEnvelope(t, address.NewAddress(0, 0, bytes.Repeat([]byte{0x11}, 32)), address.NewAddress(0, 0, bytes.Repeat([]byte{0x22}, 32)), 96)
 	key := msgpool.MakeQueueKey(envelope.next, envelope.message.HashKey())
-	value := outQueueDeltaValue(t, envelope, 11_000)
+	value := outQueueDeltaValue(t, envelope, 5_000)
 	root := cell.BeginCell().MustStoreUInt(0, 1).MustStoreSlice(bytes.Repeat([]byte{0xff}, 44), 352).
 		MustStoreUInt(0, 1).MustStoreSlice(key[:], 352).MustStoreUInt(envelope.bound.lt, 64).
 		MustStoreBuilder(value.ToBuilder()).EndCell()
@@ -276,8 +274,8 @@ func TestSemanticOutQueueAcceptsEquivalentLabelEncoding(t *testing.T) {
 			if err := reconstructOutQueueDelta(validation); err == nil {
 				t.Fatal("former root comparison unexpectedly accepted another encoding")
 			}
-			if err := verifyOutQueueDelta(validation); err != nil {
-				t.Fatalf("reference-compatible label encoding = %v", err)
+			if err := verifyOutQueueDelta(validation); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("noncanonical label error = %v, want invalid input", err)
 			}
 		})
 	}
@@ -308,7 +306,7 @@ func newOutQueueDeltaValidation(t *testing.T, test semanticOutQueueDeltaCase) *s
 		candidateSize = *test.candidateSize
 	}
 	candidate := &verifiedCandidate{}
-	candidate.block.BlockInfo.StartLt, candidate.block.BlockInfo.EndLt = 10_000, 20_000
+	candidate.block.BlockInfo.StartLt, candidate.block.BlockInfo.EndLt = 5_000, 20_000
 	target := msgpool.ShardIdent{Workchain: 0, Shard: msgpool.ShardAll}
 	validation := &semanticQueueValidation{
 		replay:    &semanticReplay{ctx: context.Background(), candidate: candidate, transition: CandidateTransition{Config: &Config{capabilities: test.capabilities}}},
@@ -382,7 +380,7 @@ func reconstructOutQueueDelta(v *semanticQueueValidation) error {
 		if err != nil {
 			return err
 		}
-		if !equalCell(entry.envelope.root, envelope.root) || entry.enqueued.EnqueuedLT < 10_000 || entry.enqueued.EnqueuedLT >= 20_000 || entry.enqueued.EnqueuedLT < entry.envelope.bound.lt || size == maxOutMsgQueueSize {
+		if !equalCell(entry.envelope.root, envelope.root) || entry.enqueued.EnqueuedLT < 5_000 || entry.enqueued.EnqueuedLT >= 20_000 || entry.enqueued.EnqueuedLT < entry.envelope.bound.lt || size == maxOutMsgQueueSize {
 			return ErrInvalidInput
 		}
 		value, err := entry.enqueued.ToCell()
@@ -406,7 +404,7 @@ func reconstructOutQueueDelta(v *semanticQueueValidation) error {
 		if err != nil {
 			return err
 		}
-		if entry.enqueued.EnqueuedLT >= 10_000 || entry.enqueued.Msg.HashKey() != envelopeHash || size == 0 {
+		if entry.enqueued.EnqueuedLT >= 5_000 || entry.enqueued.Msg.HashKey() != envelopeHash || size == 0 {
 			return ErrInvalidInput
 		}
 		size--

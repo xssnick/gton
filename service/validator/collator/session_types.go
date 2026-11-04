@@ -83,8 +83,12 @@ type SessionActivation struct {
 // made available to the acquisition pipeline. HasFinalizedBlock keeps the
 // persisted form explicit.
 type SessionUpdate struct {
-	SessionID                 [32]byte
-	TargetRate                time.Duration
+	SessionID  [32]byte
+	TargetRate time.Duration
+	// Delegation admission limits are refreshed from authenticated config; they
+	// are intentionally not persisted in the session WAL.
+	CollatorMaxFutureWindow   uint32
+	CollatorMaxSyncDelay      time.Duration
 	NoEmptyBlocksOnErrTimeout time.Duration
 	MasterchainBlock          ton.BlockIDExt
 	HasFinalizedBlock         bool

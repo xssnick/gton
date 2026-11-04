@@ -1200,7 +1200,11 @@ func (c *Controller) reconcileBackendDescriptor(
 	if err != nil {
 		return err
 	}
-	if shouldUpdate {
+	if shouldUpdate || next.update.MasterchainBlock.SeqNo == record.Update.MasterchainBlock.SeqNo {
+		// Admission limits are ephemeral, so refresh them even when the recovered
+		// durable chain view already matches this authenticated projection.
+		update.CollatorMaxFutureWindow = next.update.CollatorMaxFutureWindow
+		update.CollatorMaxSyncDelay = next.update.CollatorMaxSyncDelay
 		if err = c.backend.UpdateSession(ctx, update); err != nil {
 			return fmt.Errorf("update backend session: %w", err)
 		}

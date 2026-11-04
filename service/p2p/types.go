@@ -213,7 +213,9 @@ type Options struct {
 	LiveBlockCache            *storage.LiveBlockCache
 	ExternalBroadcastCapacity ExternalBroadcastCapacityOptions
 	AllowDuplicateExternals   bool
-	LocalExternalFanout       int
+	// DisablePublicExternalMessages isolates configured validators and collators.
+	DisablePublicExternalMessages bool
+	LocalExternalFanout           int
 	// RelayEgressBitsPerSecond bounds the FEC parts this node forwards on the
 	// public overlays; zero takes the default, a negative value disables the
 	// bound. See relay_budget.go.

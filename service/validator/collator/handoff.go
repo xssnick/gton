@@ -205,9 +205,8 @@ type SuccessorOffer struct {
 	// in front of the commit that is about to need it.
 	Policy CandidateState
 
-	// Exclude are the external messages this block consumed. The successor opens
-	// its stream before that consumption is reported to the pool, so it has to
-	// be told directly or it re-executes them.
+	// Exclude contains all normalized external hashes tried in this window,
+	// including ancestors before the immediately preceding candidate.
 	Exclude [][32]byte
 
 	predecessorSlot uint32

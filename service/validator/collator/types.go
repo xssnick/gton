@@ -3,6 +3,7 @@ package collator
 import (
 	"context"
 	"errors"
+	"math/big"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -237,7 +238,8 @@ type ShardRequest struct {
 	RandSeed  [32]byte
 	CreatedBy [32]byte
 
-	Externals []ExternalInput
+	Externals          []ExternalInput
+	processedExternals [][32]byte
 	// MaxExternalAttempts is the local work budget for TVM admission attempts.
 	// It must be positive when Externals is non-empty. Messages past the budget
 	// are reported as msgpool.ExternalSkippedLimit and remain retryable.
@@ -320,15 +322,18 @@ type ShardRequest struct {
 // TopBlockDescr selected by the acquisition pipeline to the transition that
 // the builder validates and applies atomically.
 type MasterRequest struct {
-	Previous PreviousBlock
-	Config   *Config
-	Groups   *groups.Snapshot
-	Header   HeaderParams
+	Previous              PreviousBlock
+	Config                *Config
+	Groups                *groups.Snapshot
+	Header                HeaderParams
+	GlobalBalance         GlobalBalanceCalculator
+	previousGlobalBalance *big.Int
 
 	RandSeed  [32]byte
 	CreatedBy [32]byte
 
 	Externals           []ExternalInput
+	processedExternals  [][32]byte
 	MaxExternalAttempts int
 	StorageStats        AccountStorageStats
 	Dispatch            DispatchPolicy
@@ -433,9 +438,10 @@ type ShardVerificationRequest struct {
 // acquisition pipeline has verified their proof chains and signatures; this
 // core binds those exact descriptors and creator lists to the candidate.
 type MasterVerificationRequest struct {
-	Previous PreviousBlock
-	Config   *Config
-	Groups   *groups.Snapshot
+	Previous      PreviousBlock
+	Config        *Config
+	Groups        *groups.Snapshot
+	GlobalBalance GlobalBalanceCalculator
 
 	ShardTops []ShardTop
 	Neighbors []Neighbor
@@ -472,6 +478,7 @@ type collationRequest struct {
 	createdBy [32]byte
 
 	externals           []ExternalInput
+	processedExternals  [][32]byte
 	maxExternalAttempts int
 	storageStats        AccountStorageStats
 	dispatch            DispatchPolicy
@@ -511,6 +518,7 @@ func shardCollationRequest(req ShardRequest) collationRequest {
 		randSeed:            req.RandSeed,
 		createdBy:           req.CreatedBy,
 		externals:           req.Externals,
+		processedExternals:  req.processedExternals,
 		maxExternalAttempts: req.MaxExternalAttempts,
 		storageStats:        req.StorageStats,
 		dispatch:            req.Dispatch,
@@ -535,6 +543,7 @@ func masterCollationRequest(req MasterRequest) collationRequest {
 		randSeed:            req.RandSeed,
 		createdBy:           req.CreatedBy,
 		externals:           req.Externals,
+		processedExternals:  req.processedExternals,
 		maxExternalAttempts: req.MaxExternalAttempts,
 		storageStats:        req.StorageStats,
 		dispatch:            req.Dispatch,
@@ -564,8 +573,9 @@ func (r *collationRequest) internalsIncomplete() bool {
 // selected it. Candidate.Externals can therefore be passed directly to
 // msgpool.Pool.Complete without a hash-based reconciliation step.
 type ExternalInput struct {
-	Ref     msgpool.ExternalRef
-	message *tvm.PreparedMessage
+	Ref            msgpool.ExternalRef
+	message        *tvm.PreparedMessage
+	normalizedHash [32]byte
 }
 
 // NewExternalInput prepares one immutable pool snapshot for collation.
@@ -575,7 +585,7 @@ func NewExternalInput(snapshot msgpool.ExternalSnapshot) (ExternalInput, error) 
 		return ExternalInput{}, err
 	}
 
-	return ExternalInput{Ref: snapshot.Reference(), message: prepared}, nil
+	return ExternalInput{Ref: snapshot.Reference(), message: prepared, normalizedHash: snapshot.NormalizedHash()}, nil
 }
 
 type LoadClass uint8
@@ -594,20 +604,21 @@ type Stats struct {
 	// admission closes (before speculative workers join), or at finalization
 	// for a build which did not hit its pace budget. These are local timings,
 	// not protocol data. Zero means pacing was disabled.
-	PaceElapsed          time.Duration
-	PaceTail             time.Duration
-	PaceLimited          bool
-	Transactions         uint32
-	ExternalAttempts     uint32
-	ExternalIncluded     uint32
-	ExternalInvalid      uint32
-	ExternalNotAccepted  uint32
-	ExternalSkippedLimit uint32
-	ExternalBatches      uint32
-	ExternalWait         time.Duration
-	ExternalStop         ExternalStopReason
-	InternalsImported    uint32
-	InternalsSkipped     uint32
+	PaceElapsed              time.Duration
+	PaceTail                 time.Duration
+	PaceLimited              bool
+	Transactions             uint32
+	ExternalAttempts         uint32
+	ExternalIncluded         uint32
+	ExternalInvalid          uint32
+	ExternalNotAccepted      uint32
+	ExternalSkippedLimit     uint32
+	ExternalSkippedDuplicate uint32
+	ExternalBatches          uint32
+	ExternalWait             time.Duration
+	ExternalStop             ExternalStopReason
+	InternalsImported        uint32
+	InternalsSkipped         uint32
 	// ImmediateMessages counts msg_import_imm: a message this block generated
 	// and delivered inside itself, because its destination is in this shard.
 	// It is neither an external nor an imported internal, so both of those
@@ -783,8 +794,9 @@ type Candidate struct {
 	StateUpdate      *cell.Cell
 	StorageStats     AccountStorageStats
 
-	Externals []msgpool.ExternalFeedback
-	Stats     Stats
+	Externals          []msgpool.ExternalFeedback
+	processedExternals [][32]byte
+	Stats              Stats
 
 	// prepared is the broadcast payload of this candidate, compressed in the
 	// background from the roots the build produced. It is set only by the

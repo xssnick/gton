@@ -337,10 +337,7 @@ func (c *ShardTopValidatorContext) baseCatchainSeqno(block ton.BlockIDExt) (uint
 func (c *ShardTopValidatorContext) loadTentativeShardTopValidatorSet(
 	current tlb.ValidatorSetAny,
 ) (tlb.ValidatorSetAny, error) {
-	next, err := loadShardTopValidatorSetParam(c.config, tlb.ConfigParamNextTempValidators)
-	if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
-		next, err = loadShardTopValidatorSetParam(c.config, tlb.ConfigParamNextValidators)
-	}
+	next, err := loadShardTopValidatorSetParam(c.config, tlb.ConfigParamNextValidators)
 	if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
 		return current, nil
 	}
@@ -385,10 +382,7 @@ func shardTopValidatorRosterNotReady(name string, err error) error {
 }
 
 func loadCurrentShardTopValidatorSet(config tlb.BlockchainConfig) (tlb.ValidatorSetAny, error) {
-	validators, err := loadShardTopValidatorSetParam(config, tlb.ConfigParamCurrentTempValidators)
-	if errors.Is(err, tlb.ErrBlockchainConfigParamAbsent) {
-		validators, err = loadShardTopValidatorSetParam(config, tlb.ConfigParamCurrentValidators)
-	}
+	validators, err := loadShardTopValidatorSetParam(config, tlb.ConfigParamCurrentValidators)
 	if err != nil {
 		return tlb.ValidatorSetAny{}, fmt.Errorf("load current validators: %w", err)
 	}

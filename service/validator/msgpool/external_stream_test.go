@@ -287,7 +287,7 @@ func TestExternalStreamNeverOffersAnExcludedMessage(t *testing.T) {
 	requireEqual(t, consumed.HashNorm, variant.HashNorm, "normalized variants match")
 	kept := env.mustAdd(buildExtMsg(t, 0, testAddr(0x22), bodyWithTag(2), msgOpts{}), ExternalPriorityBroadcast)
 
-	stream, err := env.pool.OpenExternalStreamExcluding(allShard, 500, [][32]byte{consumed.Hash})
+	stream, err := env.pool.OpenExternalStreamExcluding(allShard, 500, [][32]byte{consumed.HashNorm})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,6 +335,26 @@ func TestExternalStreamNeverOffersAnExcludedMessage(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("the stream never woke")
 	}
+}
+
+func TestExternalStreamExcludesNormalizedHashAfterOriginalWasDeleted(t *testing.T) {
+	env := newPoolEnv(t)
+	addr := testAddr(0x31)
+	body := bodyWithTag(71)
+	original := env.mustAdd(buildExtMsg(t, 0, addr, body, msgOpts{}), ExternalPriorityBroadcast)
+	env.pool.EraseApplied([][32]byte{original.HashNorm})
+
+	stream, err := env.pool.OpenExternalStreamExcluding(allShard, 2, [][32]byte{original.HashNorm})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stream.Close() })
+	variant := env.mustAdd(buildExtMsg(t, 0, addr, body, msgOpts{importFee: 777}), ExternalPriorityBroadcast)
+	requireEqual(t, variant.HashNorm, original.HashNorm, "normalized hash after re-admission")
+	kept := env.mustAdd(buildExtMsg(t, 0, testAddr(0x32), bodyWithTag(72), msgOpts{}), ExternalPriorityBroadcast)
+	batch := stream.TakeReady(2)
+	requireEqual(t, len(batch), 1, "ready messages excluding the deleted predecessor input")
+	requireEqual(t, batch[0].Hash, kept.Hash, "unrelated message remains eligible")
 }
 
 // The plain opener must keep offering everything, or the exclusion becomes a

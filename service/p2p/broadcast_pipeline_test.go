@@ -193,7 +193,7 @@ func TestFastSyncOutMsgQueueProofBroadcastIsRelayOnly(t *testing.T) {
 		msg,
 		newKnownBroadcastPayload([]byte{0x01}),
 		DeliverySimple,
-		false,
+		true,
 		testPeerID("peer"),
 	)
 	if err != nil {
@@ -1720,15 +1720,13 @@ func TestBlockOverlayFanoutKeyIsPerRouteClassAndChainPosition(t *testing.T) {
 	}
 }
 
-// TestFastSyncDeclinedBroadcastsAreDropped covers the send-only case: when this
-// node publishes DoNotReceiveBroadcasts in its member flags, a peer that
-// ignores the flag must not make us spend decode work on the payload.
-func TestFastSyncDeclinedBroadcastsAreDropped(t *testing.T) {
+// The Plumtree-only flag must reject a payload before parsing or hashing it.
+func TestFastSyncDeclinedPlumtreeBroadcastsAreDropped(t *testing.T) {
 	node := newTestNode(t)
 
-	// receiveBroadcasts is false only for a validator under plumtree, which is
-	// exactly when the member flags say DoNotReceiveBroadcasts.
-	newSub := func(receiveBroadcasts bool) *overlaySubscription {
+	// receivePlumtreeBroadcasts is false only for a validator under plumtree, which is
+	// exactly when the member flags say DoNotReceivePlumtreeBroadcasts.
+	newSub := func(receivePlumtreeBroadcasts bool) *overlaySubscription {
 		return testOverlaySubscription(&overlaySubscription{
 			node: node,
 			spec: overlaySpec{
@@ -1738,8 +1736,8 @@ func TestFastSyncDeclinedBroadcastsAreDropped(t *testing.T) {
 			},
 			fastSync: &fastSyncOverlayRuntime{
 				spec: fastSyncOverlaySpec{
-					localValidator:    true,
-					receiveBroadcasts: receiveBroadcasts,
+					localValidator:            true,
+					receivePlumtreeBroadcasts: receivePlumtreeBroadcasts,
 				},
 			},
 			log: discardLogger(),
@@ -1750,7 +1748,7 @@ func TestFastSyncDeclinedBroadcastsAreDropped(t *testing.T) {
 	payload := newSerializedBroadcastPayload(make(chan struct{}))
 
 	declined := newSub(false)
-	result, err := declined.classifyBroadcastPayload(nil, msg, payload, DeliveryFEC, false, testPeerID("peer"))
+	result, err := declined.classifyBroadcastPayload(nil, msg, payload, DeliveryPlumtree, true, testPeerID("peer"))
 	if err != nil {
 		t.Fatalf("classify declined broadcast: %v", err)
 	}
@@ -1764,14 +1762,14 @@ func TestFastSyncDeclinedBroadcastsAreDropped(t *testing.T) {
 	// The gate is narrow: it asks the runtime, and a receiving overlay — which
 	// is every overlay that is not a plumtree validator, including one built
 	// from a zero-valued spec — never answers yes.
-	if !declined.fastSync.declinesBroadcasts() {
+	if !declined.fastSync.declinesPlumtreeBroadcasts() {
 		t.Fatal("a validator under plumtree must decline broadcasts")
 	}
-	if newSub(true).fastSync.declinesBroadcasts() {
+	if newSub(true).fastSync.declinesPlumtreeBroadcasts() {
 		t.Fatal("a receiving overlay must not decline broadcasts")
 	}
 	zeroValued := &fastSyncOverlayRuntime{}
-	if zeroValued.declinesBroadcasts() {
+	if zeroValued.declinesPlumtreeBroadcasts() {
 		t.Fatal("a zero-valued runtime must read as receiving, not declining")
 	}
 }

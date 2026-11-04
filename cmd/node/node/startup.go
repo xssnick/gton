@@ -476,6 +476,8 @@ func runConfiguredNode(startOpts startupOptions, cfg nodeconfig.Config, extensio
 	}
 
 	if localValidator != nil || standaloneCollator != nil {
+		runOpts.RetainMasterchainHistory = true
+		runOpts.P2P.DisablePublicExternalMessages = true
 		extensionFactories = append(extensionFactories, newValidatorStackFactory(validatorStackComposition{
 			localValidator:     localValidator,
 			standaloneCollator: standaloneCollator,

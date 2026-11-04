@@ -24,6 +24,7 @@ var errFinalizedLineageAhead = errors.New("validator runtime: finalized lineage 
 var errStateBelowFinalization = fmt.Errorf("%w: uncertified candidate is below finalization", ErrBlockNotReady)
 
 const consensusExtraDataTag = uint64(0x638eb292)
+const collatedDataSeparatorTag = uint64(0xfa8b2b92)
 
 // ResolvedState is one cached candidate-parent state. GenUtime is zero for
 // consensus genesis and exact to the millisecond for ordinary candidates.
@@ -1214,7 +1215,7 @@ func (r *stateResolver) loadFinalizedChainState(
 func candidateGenUtime(collatedData []byte) (time.Time, error) {
 	roots, err := cell.FromBOCMultiRootWithOptions(
 		collatedData,
-		cell.BOCParseOptions{NoCopyPayload: true},
+		cell.BOCParseOptions{NoCopyPayload: true, AllowNonZeroLevelRoot: true},
 	)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("validator runtime: decode collated data time: %w", err)
@@ -1229,12 +1230,18 @@ func candidateGenUtime(collatedData []byte) (time.Time, error) {
 
 func candidateGenUtimeMSFromRoots(roots []*cell.Cell) (uint64, error) {
 	for _, root := range roots {
+		if root.Level() != 0 {
+			return 0, errors.New("validator runtime: collated root before separator has non-zero level")
+		}
 		var loader cell.Slice
 		loadErr := root.BeginParseInto(&loader)
-		if loadErr != nil || loader.BitsLeft() < 128 {
+		if loadErr != nil || loader.BitsLeft() < 32 {
 			continue
 		}
 		tag, tagErr := loader.LoadUInt(32)
+		if tagErr == nil && tag == collatedDataSeparatorTag {
+			break
+		}
 		if tagErr != nil || tag != consensusExtraDataTag {
 			continue
 		}

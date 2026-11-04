@@ -303,77 +303,94 @@ func (s *State) CurrentTargets() ([]Target, error) {
 	return append(targets, basechainTargets...), nil
 }
 
-// FutureShards returns masterchain and basechain shards whose tentative groups
-// must be prepared at the explicit observation time and horizon.
-func (s *State) FutureShards(asOf time.Time, horizon time.Duration) ([]ShardID, error) {
-	deadline, err := futureDeadline(asOf, horizon)
+// FutureShard describes a tentative session and the chain time at which it may start.
+type FutureShard struct {
+	Shard         ShardID
+	CatchainSeqno uint32
+	ExpectedStart time.Time
+}
+
+// FutureShards plans tentative groups against the next catchain rotation.
+func (s *State) FutureShards(config CatchainConfig) ([]FutureShard, error) {
+	mcRotation, err := nextCatchainRotation(s.GenUTime, config.MasterchainLifetime)
 	if err != nil {
 		return nil, err
 	}
-	masterchain := masterchainShardID()
-	if s.Block.SeqNo == 0 {
-		return []ShardID{masterchain}, nil
+	shardRotation, err := nextCatchainRotation(s.GenUTime, config.ShardLifetime)
+	if err != nil {
+		return nil, err
 	}
-
-	result := []ShardID{masterchain}
-	resultSet := make(map[ShardID]struct{}, len(s.Shards)+1)
-	resultSet[masterchain] = struct{}{}
-	merged := make(map[ShardID]struct{})
+	if s.CatchainSeqno == math.MaxUint32 {
+		return nil, errors.New("future masterchain catchain seqno overflows uint32")
+	}
+	result := []FutureShard{{Shard: masterchainShardID(), CatchainSeqno: s.CatchainSeqno + 1, ExpectedStart: mcRotation}}
+	seen := make(map[ShardID]struct{}, len(s.Shards))
+	add := func(shard ShardID, seqno uint32, start time.Time) {
+		if _, exists := seen[shard]; !exists {
+			seen[shard] = struct{}{}
+			result = append(result, FutureShard{Shard: shard, CatchainSeqno: seqno, ExpectedStart: start})
+		}
+	}
 	for i := range s.Shards {
 		description := &s.Shards[i]
-		if description.Shard.Workchain != basechainWorkchain {
+		if description.Shard.Workchain != basechainWorkchain || description.BeforeSplit || description.BeforeMerge {
 			continue
 		}
-
-		due := shardFSMDue(description.FSM, deadline)
-		switch {
-		case description.FSM.Kind == ShardFSMSplit && due:
+		seqno := description.NextCatchainSeqno
+		due := time.Unix(int64(description.FSM.UTime), 0).Before(shardRotation)
+		if description.FSM.Kind == ShardFSMSplit && due {
 			left, right, err := shardChildren(description.Shard)
 			if err != nil {
 				return nil, fmt.Errorf("future split %v: %w", description.Shard, err)
 			}
-			if err = appendShard(&result, resultSet, left); err != nil {
-				return nil, err
-			}
-			if err = appendShard(&result, resultSet, right); err != nil {
-				return nil, err
-			}
-		case description.FSM.Kind == ShardFSMMerge && due:
+			start := time.Unix(int64(description.FSM.UTime), 0)
+			add(left, seqno, start)
+			add(right, seqno, start)
+			continue
+		}
+		if seqno == math.MaxUint32 {
+			return nil, fmt.Errorf("future catchain seqno for %v overflows uint32", description.Shard)
+		}
+		if description.FSM.Kind == ShardFSMMerge && due {
 			parent, err := shardParent(description.Shard)
 			if err != nil {
 				return nil, fmt.Errorf("future merge %v: %w", description.Shard, err)
 			}
-			if _, done := merged[parent]; done {
-				continue
-			}
-
 			left, right, err := shardChildren(parent)
 			if err != nil {
-				return nil, fmt.Errorf("future merge %v: %w", description.Shard, err)
-			}
-			leftIndex, leftFound := s.shardIndex[left]
-			rightIndex, rightFound := s.shardIndex[right]
-			leftDue := leftFound && s.Shards[leftIndex].FSM.Kind == ShardFSMMerge && shardFSMDue(s.Shards[leftIndex].FSM, deadline)
-			rightDue := rightFound && s.Shards[rightIndex].FSM.Kind == ShardFSMMerge && shardFSMDue(s.Shards[rightIndex].FSM, deadline)
-			if !leftDue || !rightDue {
-				return nil, fmt.Errorf("future merge %v has incomplete sibling pair", parent)
-			}
-
-			if err = appendShard(&result, resultSet, parent); err != nil {
 				return nil, err
 			}
-			merged[parent] = struct{}{}
-		default:
-			if err = appendShard(&result, resultSet, description.Shard); err != nil {
-				return nil, err
+			sibling := left
+			if sibling == description.Shard {
+				sibling = right
 			}
+			if index, exists := s.shardIndex[sibling]; exists {
+				other := s.Shards[index]
+				if other.FSM.Kind == ShardFSMMerge && time.Unix(int64(other.FSM.UTime), 0).Before(shardRotation) {
+					mergeSeqno := max(seqno, other.NextCatchainSeqno)
+					if mergeSeqno == math.MaxUint32 {
+						return nil, fmt.Errorf("future merge catchain seqno for %v overflows uint32", parent)
+					}
+					add(parent, mergeSeqno+1, time.Unix(int64(max(description.FSM.UTime, other.FSM.UTime)), 0))
+				}
+			}
+			// A scheduled merge is not guaranteed, so retain the sibling rotations.
 		}
+		add(description.Shard, seqno+1, shardRotation)
 	}
-
-	sort.Slice(result, func(i, j int) bool {
-		return shardLess(result[i], result[j])
-	})
+	sort.Slice(result, func(i, j int) bool { return shardLess(result[i].Shard, result[j].Shard) })
 	return result, nil
+}
+
+func nextCatchainRotation(now, lifetime uint32) (time.Time, error) {
+	if lifetime == 0 {
+		return time.Time{}, errors.New("catchain lifetime must be positive")
+	}
+	next := (uint64(now)/uint64(lifetime) + 1) * uint64(lifetime)
+	if next > math.MaxUint32 {
+		return time.Time{}, errors.New("next catchain rotation overflows uint32")
+	}
+	return time.Unix(int64(next), 0), nil
 }
 
 // CatchainSeqnoFor returns the catchain sequence number for a current or
@@ -704,15 +721,6 @@ func appendTarget(targets *[]Target, seen map[ShardID]struct{}, target Target) e
 	return nil
 }
 
-func appendShard(shards *[]ShardID, seen map[ShardID]struct{}, shard ShardID) error {
-	if _, duplicate := seen[shard]; duplicate {
-		return fmt.Errorf("duplicate future shard %v", shard)
-	}
-	seen[shard] = struct{}{}
-	*shards = append(*shards, shard)
-	return nil
-}
-
 func masterchainShardID() ShardID {
 	return ShardID{Workchain: masterchainWorkchain, Shard: masterchainShard}
 }
@@ -752,28 +760,4 @@ func shardLess(left, right ShardID) bool {
 		return left.Workchain < right.Workchain
 	}
 	return uint64(left.Shard) < uint64(right.Shard)
-}
-
-func futureDeadline(asOf time.Time, horizon time.Duration) (time.Time, error) {
-	if asOf.IsZero() {
-		return time.Time{}, errors.New("future shard observation time is required")
-	}
-	if horizon < 0 {
-		return time.Time{}, fmt.Errorf("future shard horizon is negative: %s", horizon)
-	}
-
-	deadline := asOf.Add(horizon)
-	asOfUnix := asOf.Unix()
-	deadlineUnix := deadline.Unix()
-	if asOfUnix < 0 || asOfUnix > math.MaxUint32 || deadlineUnix < 0 || deadlineUnix > math.MaxUint32 {
-		return time.Time{}, errors.New("future shard time is outside uint32 Unix range")
-	}
-	if deadline.Before(asOf) {
-		return time.Time{}, errors.New("future shard deadline overflow")
-	}
-	return deadline, nil
-}
-
-func shardFSMDue(fsm ShardFSM, deadline time.Time) bool {
-	return time.Unix(int64(fsm.UTime), 0).Before(deadline)
 }

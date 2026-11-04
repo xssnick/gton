@@ -37,6 +37,9 @@ type StateLifecycleOptions struct {
 	NextBlockCheckpointBlocks          uint32
 	CheckpointBytes                    uint64
 	SyncBackpressureWindows            uint32
+	// RetainMasterchainHistory protects ProcessedUpto references used by local
+	// validation and collation when rotating cell generations.
+	RetainMasterchainHistory bool
 }
 
 // stateBlockTransitions is owned by StateLifecycle and exposes only the chain
@@ -123,6 +126,7 @@ type StateLifecycle struct {
 	stateSerializer *stateSerializer
 
 	stateTTL                           time.Duration
+	retainMasterchainHistory           bool
 	syncDiskSpacePath                  string
 	minStateSerializationDiskFreeBytes uint64
 	nextBlockCheckpointBlocks          uint32
@@ -184,6 +188,7 @@ func NewStateLifecycle(logger zerolog.Logger, store stateLifecycleStore, status 
 		artifactPrewrite:                   artifactPrewrite,
 		stateCellLoaders:                   make(map[uint64]cell.LazyCellLoader),
 		stateTTL:                           opts.StateTTL,
+		retainMasterchainHistory:           opts.RetainMasterchainHistory,
 		syncDiskSpacePath:                  opts.StorageDir,
 		minStateSerializationDiskFreeBytes: opts.MinStateSerializationDiskFreeBytes,
 		nextBlockCheckpointBlocks:          opts.NextBlockCheckpointBlocks,

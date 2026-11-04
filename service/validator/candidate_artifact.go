@@ -561,7 +561,8 @@ func (c *candidateCodec) decodePayload(data []byte) (decodedCandidatePayload, er
 		// slices keep that backing array alive through validationRoots, while
 		// avoiding a second copy of every payload byte before canonical rebuild.
 		roots, err = cell.FromBOCMultiRootWithOptions(decompressed, cell.BOCParseOptions{
-			NoCopyPayload: true,
+			NoCopyPayload:         true,
+			AllowNonZeroLevelRoot: true,
 		})
 		if err == nil {
 			combinedRootBytes = candidateDecodedBOCBytes(decompressed)
@@ -644,6 +645,9 @@ func (c *candidateCodec) finishPayload(
 	}
 	if len(roots) == 0 {
 		return decodedCandidatePayload{}, errors.New("validator runtime: candidate boc is empty")
+	}
+	if roots[0].Level() != 0 {
+		return decodedCandidatePayload{}, errors.New("validator runtime: candidate block root has non-zero level")
 	}
 	if !cellHashEquals(roots[0], rootHash) {
 		return decodedCandidatePayload{}, errors.New("validator runtime: candidate root hash mismatch")

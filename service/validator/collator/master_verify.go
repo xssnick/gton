@@ -3,6 +3,7 @@ package collator
 import (
 	"bytes"
 	"fmt"
+	"math/big"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -13,11 +14,12 @@ import (
 )
 
 type masterCandidateState struct {
-	previousStats tlb.ShardStateStats
-	previousExtra tlb.McStateExtra
-	previousInfo  tlb.McStateExtraBlockInfo
-	nextExtra     tlb.McStateExtra
-	nextInfo      tlb.McStateExtraBlockInfo
+	previousGlobalBalance *big.Int
+	previousStats         tlb.ShardStateStats
+	previousExtra         tlb.McStateExtra
+	previousInfo          tlb.McStateExtraBlockInfo
+	nextExtra             tlb.McStateExtra
+	nextInfo              tlb.McStateExtraBlockInfo
 	// The creator statistics decoded together with previousInfo/nextInfo, so
 	// verifyBlockCreateStatsUpdate does not walk either dictionary again.
 	previousCreators blockCreateStats

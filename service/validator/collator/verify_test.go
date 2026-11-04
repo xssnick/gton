@@ -569,7 +569,7 @@ func TestVerifyLoadHistory(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := verifyLoadHistory(&test.previous, &test.next, &test.header, test.topologyChanged)
+			err := verifyLoadHistory(&test.previous, &test.next, &test.header, test.topologyChanged, true)
 			if test.wantErr == "" && err != nil {
 				t.Fatal(err)
 			}

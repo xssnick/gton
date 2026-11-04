@@ -6,7 +6,6 @@ import (
 	"math"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -313,11 +312,11 @@ func TestParseStateAllowsEmptyShardHashesOnlyAtZeroState(t *testing.T) {
 	if len(state.Shards) != 0 {
 		t.Fatalf("zero state shards = %d, want 0", len(state.Shards))
 	}
-	future, err := state.FutureShards(time.Unix(1_000, 0), time.Minute)
+	future, err := state.FutureShards(CatchainConfig{MasterchainLifetime: 100, ShardLifetime: 100})
 	if err != nil {
 		t.Fatalf("zero state FutureShards: %v", err)
 	}
-	if len(future) != 1 || future[0] != masterchainShardID() {
+	if len(future) != 1 || future[0].Shard != masterchainShardID() {
 		t.Fatalf("zero state future shards = %+v, want masterchain", future)
 	}
 
@@ -518,82 +517,101 @@ func TestStateGroupLifecycleIgnoresCustomWorkchains(t *testing.T) {
 		t.Fatalf("active targets = %+v, want masterchain and basechain", targets)
 	}
 
-	future, err := state.FutureShards(time.Unix(1_000, 0), time.Minute)
+	future, err := state.FutureShards(CatchainConfig{MasterchainLifetime: 100, ShardLifetime: 100})
 	if err != nil {
 		t.Fatalf("FutureShards: %v", err)
 	}
-	if len(future) != 2 || future[0] != masterchainShardID() || future[1] != basechain.Shard {
+	if len(future) != 2 || future[0].Shard != masterchainShardID() || future[1].Shard != basechain.Shard {
 		t.Fatalf("future shards = %+v, want masterchain and basechain", future)
 	}
 }
 
-func TestStateFutureShardsUsesStrictBoundary(t *testing.T) {
+func TestStateFutureShardsUsesRotationBoundary(t *testing.T) {
 	t.Parallel()
-
 	root := ShardID{Workchain: 0, Shard: masterchainShard}
 	left, right := mustShardChildren(t, root)
-	asOf := time.Unix(1_000, 0)
-
 	description := testTopologyDescription(root, 1)
-	description.FSM = ShardFSM{Kind: ShardFSMSplit, UTime: 1_060}
-	shards, err := testTopologyState(description).FutureShards(asOf, time.Minute)
+	description.NextCatchainSeqno = 7
+	description.FSM = ShardFSM{Kind: ShardFSMSplit, UTime: 1_100}
+	state := testTopologyState(description)
+	state.GenUTime = 1_000
+	config := CatchainConfig{MasterchainLifetime: 100, ShardLifetime: 100}
+	shards, err := state.FutureShards(config)
 	if err != nil {
-		t.Fatalf("FutureShards at boundary: %v", err)
+		t.Fatal(err)
 	}
-	if len(shards) != 2 || shards[0] != masterchainShardID() || shards[1] != root {
-		t.Fatalf("FSM at strict boundary activated: %+v", shards)
+	if len(shards) != 2 || shards[1].Shard != root || shards[1].CatchainSeqno != 8 || shards[1].ExpectedStart.Unix() != 1_100 {
+		t.Fatalf("rotation at strict split boundary: %+v", shards)
 	}
-
-	description.FSM.UTime--
-	shards, err = testTopologyState(description).FutureShards(asOf, time.Minute)
+	state.Shards[0].FSM.UTime = 1_099
+	shards, err = state.FutureShards(config)
 	if err != nil {
-		t.Fatalf("FutureShards before boundary: %v", err)
+		t.Fatal(err)
 	}
-	if len(shards) != 3 || shards[0] != masterchainShardID() || shards[1] != left || shards[2] != right {
-		t.Fatalf("due split shards = %+v, want left/right", shards)
+	if len(shards) != 3 || shards[1].Shard != left || shards[2].Shard != right {
+		t.Fatalf("due split: %+v", shards)
 	}
-
-	// The deadline retains sub-second precision, so integer second 1060 is
-	// already due when the deadline is 1060.5.
-	description.FSM.UTime = 1_060
-	shards, err = testTopologyState(description).FutureShards(asOf.Add(500*time.Millisecond), time.Minute)
-	if err != nil {
-		t.Fatalf("FutureShards fractional boundary: %v", err)
+	for _, shard := range shards[1:] {
+		if shard.CatchainSeqno != 7 || shard.ExpectedStart.Unix() != 1_099 {
+			t.Fatalf("split session: %+v", shard)
+		}
 	}
-	if len(shards) != 3 {
-		t.Fatalf("fractional deadline did not activate split: %+v", shards)
+	state.Shards[0].BeforeSplit = true
+	shards, err = state.FutureShards(config)
+	if err != nil || len(shards) != 1 {
+		t.Fatalf("before-split futures: %+v, %v", shards, err)
 	}
 }
 
-func TestStateFutureShardsMergeAndTimeValidation(t *testing.T) {
+func TestStateFutureShardsMergeKeepsSiblingRotations(t *testing.T) {
 	t.Parallel()
-
 	root := ShardID{Workchain: 0, Shard: masterchainShard}
 	left, right := mustShardChildren(t, root)
-	leftDescription := testTopologyDescription(left, 1)
-	leftDescription.FSM = ShardFSM{Kind: ShardFSMMerge, UTime: 1_001}
-	rightDescription := testTopologyDescription(right, 2)
-	rightDescription.FSM = ShardFSM{Kind: ShardFSMMerge, UTime: 1_002}
-
-	shards, err := testTopologyState(rightDescription, leftDescription).FutureShards(time.Unix(1_000, 0), time.Minute)
+	l := testTopologyDescription(left, 1)
+	l.NextCatchainSeqno = 7
+	l.FSM = ShardFSM{Kind: ShardFSMMerge, UTime: 1_001}
+	r := testTopologyDescription(right, 2)
+	r.NextCatchainSeqno = 9
+	r.FSM = ShardFSM{Kind: ShardFSMMerge, UTime: 1_002}
+	state := testTopologyState(l, r)
+	state.GenUTime = 1_000
+	config := CatchainConfig{MasterchainLifetime: 100, ShardLifetime: 100}
+	shards, err := state.FutureShards(config)
 	if err != nil {
-		t.Fatalf("FutureShards merge: %v", err)
+		t.Fatal(err)
 	}
-	if len(shards) != 2 || shards[0] != masterchainShardID() || shards[1] != root {
-		t.Fatalf("future merge shards = %+v, want root", shards)
+	if len(shards) != 4 {
+		t.Fatalf("future merge shards = %+v", shards)
 	}
-
-	if _, err = testTopologyState(leftDescription).FutureShards(time.Unix(1_000, 0), time.Minute); err == nil {
-		t.Fatal("FutureShards accepted incomplete merge pair")
+	for _, shard := range shards[1:] {
+		switch shard.Shard {
+		case root:
+			if shard.CatchainSeqno != 10 || shard.ExpectedStart.Unix() != 1_002 {
+				t.Fatalf("merge: %+v", shard)
+			}
+		case left:
+			if shard.CatchainSeqno != 8 || shard.ExpectedStart.Unix() != 1_100 {
+				t.Fatalf("left: %+v", shard)
+			}
+		case right:
+			if shard.CatchainSeqno != 10 || shard.ExpectedStart.Unix() != 1_100 {
+				t.Fatalf("right: %+v", shard)
+			}
+		}
 	}
-	if _, err = testTopologyState(leftDescription).FutureShards(time.Time{}, time.Minute); err == nil {
-		t.Fatal("FutureShards accepted zero observation time")
+	incomplete := testTopologyState(l)
+	incomplete.GenUTime = 1_000
+	shards, err = incomplete.FutureShards(config)
+	if err != nil || len(shards) != 2 || shards[1].Shard != left {
+		t.Fatalf("incomplete merge: %+v, %v", shards, err)
 	}
-	if _, err = testTopologyState(leftDescription).FutureShards(time.Unix(1_000, 0), -time.Second); err == nil {
-		t.Fatal("FutureShards accepted negative horizon")
+	state.GenUTime = math.MaxUint32
+	if _, err := state.FutureShards(config); err == nil {
+		t.Fatal("accepted rotation overflow")
 	}
-	if _, err = testTopologyState(leftDescription).FutureShards(time.Unix(math.MaxUint32, 0), time.Second); err == nil {
-		t.Fatal("FutureShards accepted uint32 time overflow")
+	state.GenUTime = 1_000
+	if _, err := state.FutureShards(CatchainConfig{}); err == nil {
+		t.Fatal("accepted zero lifetime")
 	}
 }
 

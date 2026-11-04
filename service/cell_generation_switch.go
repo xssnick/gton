@@ -41,6 +41,10 @@ func (s *StateLifecycle) cellGenerationSwitchPreserveStateMeta(ctx context.Conte
 }
 
 func (s *StateLifecycle) prepareCellGenerationSwitchCandidate(ctx context.Context, store cellGenerationStore, candidate *cellGenerationCandidate, origin ton.BlockIDExt) error {
+	if err := s.checkCellGenerationHistory(candidate.current, origin); err != nil {
+		return err
+	}
+
 	preserveStateMeta, err := s.cellGenerationSwitchPreserveStateMeta(ctx, store, candidate.generation, origin)
 	if err != nil {
 		return err
@@ -77,6 +81,10 @@ func (s *StateLifecycle) prepareCellGenerationSwitchCandidate(ctx context.Contex
 }
 
 func (s *StateLifecycle) trySwitchCellGenerationCandidate(ctx context.Context, store cellGenerationStore, candidate *cellGenerationCandidate, origin ton.BlockIDExt) (uint64, error) {
+	if err := s.checkCellGenerationHistory(candidate.current, origin); err != nil {
+		return 0, err
+	}
+
 	s.stateMu.Lock()
 	s.currentStatePersistMu.Lock()
 
@@ -141,6 +149,28 @@ func (s *StateLifecycle) trySwitchCellGenerationCandidate(ctx context.Context, s
 		Dur("elapsed", time.Since(switchStarted)).
 		Msg("cell generation switch completed")
 	return oldGeneration, nil
+}
+
+// A generation imported at origin only contains masterchain states from origin
+// onward. The canonical state's minimum includes every registered shard's
+// ProcessedUpto references. Keeping the old generation until that floor reaches
+// origin preserves the historical shard end-LTs required for message processing
+// and global-balance validation, including after a cold restart.
+func (s *StateLifecycle) checkCellGenerationHistory(current *storage.CurrentState, origin ton.BlockIDExt) error {
+	if !s.retainMasterchainHistory {
+		return nil
+	}
+
+	master, err := parsedCellGenerationProgressState(&current.Masterchain)
+	if err != nil {
+		return fmt.Errorf("parse masterchain history retention floor: %w", err)
+	}
+	if master.Parsed.MinRefMCSeqno < origin.SeqNo {
+		return fmt.Errorf("%w: minimum %d, origin %d, current %d", errCellGenerationHistoryReferenced,
+			master.Parsed.MinRefMCSeqno, origin.SeqNo, current.Masterchain.Block.SeqNo)
+	}
+
+	return nil
 }
 
 func loadActiveCurrentState(ctx context.Context, store cellGenerationStore, current *storage.CurrentState) (*storage.CurrentState, error) {

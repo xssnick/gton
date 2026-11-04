@@ -19,6 +19,7 @@ var (
 	errCellGenerationMigrationAborted  = errors.New("cell generation migration aborted")
 	errCellGenerationPersistentMissing = errors.New("serialized persistent state for cell generation migration is missing")
 	errPendingCellGenerationCompaction = errors.New("pending cell generation is waiting for compaction")
+	errCellGenerationHistoryReferenced = errors.New("cell generation still references masterchain history before its origin")
 )
 
 const (

@@ -791,6 +791,7 @@ func (a *LocalAcquisition) validateMasterCandidate(
 	prepared.masterPredecessor = previousState
 
 	return verifyPreparedMasterCandidate(ctx, MasterVerificationRequest{
+		GlobalBalance:      localGlobalBalanceCalculator{acquisition: a, mode: mode, baseline: previous},
 		Previous:           previous,
 		Config:             master.context.Config,
 		Groups:             master.context.Groups,

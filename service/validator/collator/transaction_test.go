@@ -259,12 +259,12 @@ func TestPoolSelectionCandidateFeedbackRoundTrip(t *testing.T) {
 	if next := pool.SelectForBlock(msgpool.ShardIdent{Workchain: 0, Shard: msgpool.ShardAll}, 1); len(next) != 0 {
 		t.Fatal("account-rejected external was immediately selected again")
 	}
-	if stats := pool.Stats(); stats.RejectedDelayed != 1 || stats.Pooled != 1 {
+	if stats := pool.Stats(); stats.RejectedDeleted != 1 || stats.Pooled != 0 {
 		t.Fatalf("pool stats after feedback = %+v", stats)
 	}
 }
 
-func TestBuildCandidateRejectsDuplicateExternal(t *testing.T) {
+func TestBuildCandidateSkipsDuplicateExternal(t *testing.T) {
 	req := emptyCandidateRequest(t)
 	addr := address.NewAddress(0, 0, bytes.Repeat([]byte{0x54}, 32))
 	req.Previous.State = stateWithAccounts(t, req.Previous.State,
@@ -280,8 +280,12 @@ func TestBuildCandidateRejectsDuplicateExternal(t *testing.T) {
 	input := externalInput(t, message)
 	req.Externals = []ExternalInput{input, input}
 
-	if _, err = testBuilder().BuildShard(context.Background(), req); !errors.Is(err, ErrInvalidInput) {
-		t.Fatalf("error = %v, want ErrInvalidInput", err)
+	candidate, err := testBuilder().BuildShard(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Stats.ExternalIncluded != 1 || candidate.Stats.ExternalSkippedDuplicate != 1 {
+		t.Fatalf("stats=%+v", candidate.Stats)
 	}
 }
 
@@ -586,9 +590,15 @@ func prepareExternal(tb testing.TB, root *cell.Cell) *tvm.PreparedMessage {
 func externalInput(tb testing.TB, root *cell.Cell) ExternalInput {
 	tb.Helper()
 
+	prepared := prepareExternal(tb, root)
+	var normalized [32]byte
+	if prepared.Message().MsgType == tlb.MsgTypeExternalIn {
+		copy(normalized[:], prepared.Message().AsExternalIn().NormalizedHash())
+	}
 	return ExternalInput{
-		Ref:     msgpool.ExternalRef{Hash: root.HashKey(), Generation: 1},
-		message: prepareExternal(tb, root),
+		Ref:            msgpool.ExternalRef{Hash: root.HashKey(), Generation: 1},
+		message:        prepared,
+		normalizedHash: normalized,
 	}
 }
 

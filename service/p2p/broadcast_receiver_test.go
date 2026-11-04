@@ -553,12 +553,7 @@ func BenchmarkResolvePublicBroadcastReceiver(b *testing.B) {
 	}
 }
 
-// A FastSync overlay carries only its validator roster's traffic, so a sender
-// outside the authorized keys must be refused at any size - the reference node
-// builds it with OverlayPrivacyRules{0, 0, keys}. Every other overlay kind keeps
-// accepting unauthorized broadcasts up to the payload limit, because that is how
-// a public shard overlay learns blocks at all.
-func TestUnauthorizedBroadcastLimitIsZeroOnlyForFastSync(t *testing.T) {
+func TestUnauthorizedBroadcastLimitRemainsBounded(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -566,7 +561,7 @@ func TestUnauthorizedBroadcastLimitIsZeroOnlyForFastSync(t *testing.T) {
 		kind overlayKind
 		want uint32
 	}{
-		{name: "fast sync", kind: overlayKindFastSync, want: 0},
+		{name: "fast sync", kind: overlayKindFastSync, want: maxOverlayPayloadSize},
 		{name: "public shard", kind: overlayKindPublicShard, want: maxOverlayPayloadSize},
 		{name: "custom fixed", kind: overlayKindCustomFixed, want: maxOverlayPayloadSize},
 	}
@@ -575,7 +570,8 @@ func TestUnauthorizedBroadcastLimitIsZeroOnlyForFastSync(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := unauthorizedBroadcastLimit(test.kind); got != test.want {
+			spec := overlaySpec{Kind: test.kind}
+			if got := spec.unauthorizedBroadcastLimit(); got != test.want {
 				t.Fatalf("unauthorized broadcast limit = %d, want %d", got, test.want)
 			}
 		})

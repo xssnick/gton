@@ -127,6 +127,9 @@ type NodeOptions struct {
 	CheckpointBytes           uint64
 	SyncBackpressureWindows   uint32
 	DisableStateSerialization bool
+	// RetainMasterchainHistory preserves ProcessedUpto history across cell
+	// generation switches for validator and collator roles.
+	RetainMasterchainHistory bool
 
 	LiveView *liveview.Options
 
@@ -408,6 +411,7 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 		StateTTL:                         stateTTL,
 		StorageDir:                       storageDir,
 		DisableStateSerialization:        runOpts.DisableStateSerialization,
+		RetainMasterchainHistory:         runOpts.RetainMasterchainHistory,
 		PersistentStateLargeBOCBatchSize: persistentStateLargeBOCBatchSize,
 		StateSerializeOnePass:            storageOpts.StateSerializeOnePass,
 		NextBlockCheckpointBlocks:        nextCheckpointBlocks,
@@ -435,6 +439,7 @@ func RunNode(parentCtx context.Context, runOpts NodeOptions) (returnErr error) {
 		metricsCapability = runtimeMetrics
 	}
 	extensionNode := hooks.Node{
+		SyncLag:                statusTracker.SyncLag,
 		Network:                externalMessages,
 		MasterchainHead:        node,
 		PrivateOverlays:        node.PrivateOverlays(),

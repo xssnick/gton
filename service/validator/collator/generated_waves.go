@@ -365,6 +365,9 @@ func (c *collation) planGeneratedImmediate(plan *generatedPlan, state *generated
 			}
 		}
 	}
+	if c.config.globalVersion >= 16 && state.queueSize+c.pendingDispatchMessages >= c.config.outQueueHardLimit {
+		return false, nil
+	}
 	if c.unprocessedDeferred[sourceID] != 0 {
 		return false, nil
 	}
@@ -505,6 +508,7 @@ func (c *collation) retireGeneratedPlan(plan *generatedPlan, enqueueOnly *bool) 
 		if pending == 0 {
 			return fmt.Errorf("%w: dispatch message %x has no pending source entry", ErrInvalidInput, plan.item.hash)
 		}
+		c.pendingDispatchMessages--
 		if pending == 1 {
 			delete(c.unprocessedDeferred, plan.sourceID)
 		} else {

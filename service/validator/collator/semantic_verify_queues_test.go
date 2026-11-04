@@ -70,14 +70,13 @@ func TestSemanticDispatchOutputPolicy(t *testing.T) {
 			wantError:  "non-deferred message",
 		},
 		{
-			name:         "fully drained queue cannot defer first output",
+			name:         "fully drained old queue permits first output deferral",
 			capabilities: capDeferMessages,
 			old:          tlb.OutMsgQueueInfo{Extra: &tlb.OutMsgQueueExtra{DispatchQueue: pending}},
 			changes: map[[32]byte]*semanticDispatchChange{
 				accountID: {hadOld: true, oldMax: 11, removed: true, maxRemoved: 11},
 			},
 			outputTags: [][]uint8{{semanticOutNewDeferred}},
-			wantError:  "first output",
 		},
 		{
 			name:       "capability gates new deferral",

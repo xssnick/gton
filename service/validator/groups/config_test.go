@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
@@ -207,7 +208,7 @@ func buildTestConsensusLimits(constructor uint64, maxBlockSize, maxCollatedDataS
 	return b.EndCell()
 }
 
-func TestParseConfigPrefersTemporaryValidatorSets(t *testing.T) {
+func TestParseConfigIgnoresTemporaryValidatorSets(t *testing.T) {
 	validatorSet := func(seed byte) *cell.Cell {
 		return buildTestValidatorSet(t, []testValidatorWire{{
 			index: 0, key: groupTestBytes(seed), adnl: groupTestBytes(seed + 40), weight: 1, withADNL: true,
@@ -216,21 +217,21 @@ func TestParseConfigPrefersTemporaryValidatorSets(t *testing.T) {
 
 	config, err := ParseConfig(buildTestConfig(t, map[uint32]*cell.Cell{
 		configParamPreviousValidators: validatorSet(5),
-		configParamPreviousTemporary:  validatorSet(6),
+		uint32(33):                    validatorSet(6),
 		configParamCurrentValidators:  validatorSet(1),
-		configParamCurrentTemporary:   validatorSet(2),
+		uint32(35):                    validatorSet(2),
 		configParamNextValidators:     validatorSet(3),
-		configParamNextTemporary:      validatorSet(4),
+		uint32(37):                    validatorSet(4),
 	}))
 	if err != nil {
 		t.Fatalf("parse config: %v", err)
 	}
 
-	if got := config.ActiveValidators.Validators[0].PublicKey; got != groupTestBytes(2) {
-		t.Fatalf("active set key = %x, want temporary current", got)
+	if got := config.ActiveValidators.Validators[0].PublicKey; got != groupTestBytes(1) {
+		t.Fatalf("active set key = %x, want current", got)
 	}
-	if got := config.NextValidators.Validators[0].PublicKey; got != groupTestBytes(4) {
-		t.Fatalf("next set key = %x, want temporary next", got)
+	if got := config.NextValidators.Validators[0].PublicKey; got != groupTestBytes(3) {
+		t.Fatalf("next set key = %x, want next", got)
 	}
 	if !slices.Equal(config.AllCurrentValidators, [][32]byte{groupTestBytes(1 + 40)}) {
 		t.Fatalf(
@@ -268,7 +269,7 @@ func TestParseConfigRequiresCurrentValidatorSet(t *testing.T) {
 	}
 }
 
-func TestParseConfigUsesPersistentNextFallback(t *testing.T) {
+func TestParseConfigUsesNextValidators(t *testing.T) {
 	current := buildTestValidatorSet(t, []testValidatorWire{{index: 0, key: groupTestBytes(1), weight: 1}}, false, 0)
 	next := buildTestValidatorSet(t, []testValidatorWire{{index: 0, key: groupTestBytes(2), weight: 1}}, false, 0)
 
@@ -280,7 +281,7 @@ func TestParseConfigUsesPersistentNextFallback(t *testing.T) {
 		t.Fatalf("parse config: %v", err)
 	}
 	if got := config.NextValidators.Validators[0].PublicKey; got != groupTestBytes(2) {
-		t.Fatalf("persistent next fallback = %x", got)
+		t.Fatalf("next validators = %x", got)
 	}
 }
 
@@ -352,9 +353,7 @@ func TestParseConfigRejectsMalformedOptionalValidatorSet(t *testing.T) {
 
 	for _, parameter := range []uint32{
 		configParamPreviousValidators,
-		configParamCurrentTemporary,
 		configParamNextValidators,
-		configParamNextTemporary,
 	} {
 		t.Run(strconv.FormatUint(uint64(parameter), 10), func(t *testing.T) {
 			_, err := ParseConfig(buildTestConfig(t, map[uint32]*cell.Cell{
@@ -377,10 +376,10 @@ func TestParseConfigIgnoresPreviousTemporaryValidatorSet(t *testing.T) {
 	// validating masterchain blocks.
 	config, err := ParseConfig(buildTestConfig(t, map[uint32]*cell.Cell{
 		configParamCurrentValidators: current,
-		configParamPreviousTemporary: malformed,
+		uint32(33):                   malformed,
 	}))
 	if err != nil {
-		t.Fatalf("parse config with malformed parameter %d: %v", configParamPreviousTemporary, err)
+		t.Fatalf("parse config with malformed parameter %d: %v", uint32(33), err)
 	}
 	if got := config.ActiveValidators.Validators[0].PublicKey; got != groupTestBytes(1) {
 		t.Fatalf("active set key = %x, want current", got)
@@ -797,5 +796,22 @@ func TestSimplexProtocolFeatureMatrix(t *testing.T) {
 			t.Fatalf("EnablePlumtree(v%d, protocol %d) = %v, want %v",
 				test.version, test.protocolVersion, got, test.plumtree)
 		}
+	}
+}
+
+func TestSimplexCollatorAdmissionParams(t *testing.T) {
+	defaults := (SimplexConfig{}).SimplexParams()
+	if defaults.CollatorMaxFutureWindow != 4 || defaults.CollatorMaxSyncDelay != 10*time.Second {
+		t.Fatalf("collator defaults = %d/%s", defaults.CollatorMaxFutureWindow, defaults.CollatorMaxSyncDelay)
+	}
+	config := SimplexConfig{NoncriticalParams: []NoncriticalParam{{ID: 17, Value: 7}, {ID: 18, Value: 1234}}}
+	params := config.SimplexParams()
+	if params.CollatorMaxFutureWindow != 7 || params.CollatorMaxSyncDelay != 1234*time.Millisecond {
+		t.Fatalf("collator overrides = %d/%s", params.CollatorMaxFutureWindow, params.CollatorMaxSyncDelay)
+	}
+	config.NoncriticalParams = []NoncriticalParam{{ID: 17}, {ID: 18}}
+	params = config.SimplexParams()
+	if params.CollatorMaxFutureWindow != 0 || params.CollatorMaxSyncDelay != 0 {
+		t.Fatal("explicit zero admission limits replaced with defaults")
 	}
 }

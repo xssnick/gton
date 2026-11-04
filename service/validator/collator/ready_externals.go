@@ -436,7 +436,7 @@ func (b *Builder) buildShardReadyAttempt(
 		// counted as a consumed batch either — nothing of it entered the block.
 		if c.externalIntakeClosed() {
 			for i := range snapshots {
-				c.recordExternal(snapshots[i].Reference(), msgpool.ExternalSkippedLimit)
+				c.recordExternal(ExternalInput{Ref: snapshots[i].Reference()}, msgpool.ExternalSkippedLimit)
 			}
 			continue
 		}

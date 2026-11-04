@@ -316,6 +316,9 @@ func (c *collation) loadHistory() (uint64, uint64, bool, bool) {
 
 	wantSplit := historyWeight(overload) >= 0
 	wantMerge := !wantSplit && historyWeight(underload) >= 0
+	if c.config.globalVersion >= 16 && c.queueSize > c.config.outQueueHardLimit/2 {
+		wantMerge = false
+	}
 	return overload, underload, wantSplit, wantMerge
 }
 
@@ -323,4 +326,9 @@ func historyWeight(history uint64) int {
 	return bits.OnesCount64(history&0xffff)*3 +
 		bits.OnesCount64(history&0xffff0000)*2 +
 		bits.OnesCount64(history&0xffff00000000) - 64
+}
+
+func queueAllowsMerge(config *Config, queue *tlb.OutMsgQueueInfo) bool {
+	return config.globalVersion < 16 || queue.Extra == nil || queue.Extra.OutQueueSize == nil ||
+		*queue.Extra.OutQueueSize <= config.outQueueHardLimit/2
 }

@@ -9,7 +9,7 @@ import (
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
-func TestCurrentValidatorsForBlockPrefersTemporaryValidators(t *testing.T) {
+func TestCurrentValidatorsForBlockIgnoresTemporaryValidators(t *testing.T) {
 	currentSet := testValidatorSetConfigCell(t, 0x11, 100)
 	temporarySet := testValidatorSetConfigCell(t, 0x22, 200)
 	cfg := testValidatorBlockchainConfig(t, map[uint32]*cell.Cell{
@@ -24,10 +24,10 @@ func TestCurrentValidatorsForBlockPrefersTemporaryValidators(t *testing.T) {
 		t.Fatalf("current validators: %v", err)
 	}
 
-	testRequireValidator(t, validators, 0x22, 200)
+	testRequireValidator(t, validators, 0x11, 100)
 }
 
-func TestCurrentValidatorsForBlockFallsBackToCurrentValidators(t *testing.T) {
+func TestCurrentValidatorsForBlockLoadsCurrentValidators(t *testing.T) {
 	currentSet := testValidatorSetConfigCell(t, 0x11, 100)
 	cfg := testValidatorBlockchainConfig(t, map[uint32]*cell.Cell{
 		tlb.ConfigParamCatchainConfig:    testCatchainConfigCell(),
@@ -59,7 +59,7 @@ func TestCurrentValidatorsForBlockLoadsLegacyValidatorSet(t *testing.T) {
 	testRequireValidator(t, validators, 0x33, 300)
 }
 
-func TestPrevValidatorsForBlockPrefersTemporaryValidators(t *testing.T) {
+func TestPrevValidatorsForBlockIgnoresTemporaryValidators(t *testing.T) {
 	prevSet := testValidatorSetConfigCell(t, 0x11, 100)
 	temporarySet := testValidatorSetConfigCell(t, 0x22, 200)
 	cfg := testValidatorBlockchainConfig(t, map[uint32]*cell.Cell{
@@ -74,10 +74,10 @@ func TestPrevValidatorsForBlockPrefersTemporaryValidators(t *testing.T) {
 		t.Fatalf("previous validators: %v", err)
 	}
 
-	testRequireValidator(t, validators, 0x22, 200)
+	testRequireValidator(t, validators, 0x11, 100)
 }
 
-func TestPrevValidatorsForBlockFallsBackToPreviousValidators(t *testing.T) {
+func TestPrevValidatorsForBlockLoadsPreviousValidators(t *testing.T) {
 	prevSet := testValidatorSetConfigCell(t, 0x11, 100)
 	cfg := testValidatorBlockchainConfig(t, map[uint32]*cell.Cell{
 		tlb.ConfigParamCatchainConfig: testCatchainConfigCell(),
@@ -93,7 +93,7 @@ func TestPrevValidatorsForBlockFallsBackToPreviousValidators(t *testing.T) {
 	testRequireValidator(t, validators, 0x11, 100)
 }
 
-func TestNextValidatorsForBlockPrefersTemporaryValidators(t *testing.T) {
+func TestNextValidatorsForBlockIgnoresTemporaryValidators(t *testing.T) {
 	nextSet := testValidatorSetConfigCell(t, 0x11, 100)
 	temporarySet := testValidatorSetConfigCell(t, 0x22, 200)
 	cfg := testValidatorBlockchainConfig(t, map[uint32]*cell.Cell{
@@ -108,10 +108,10 @@ func TestNextValidatorsForBlockPrefersTemporaryValidators(t *testing.T) {
 		t.Fatalf("next validators: %v", err)
 	}
 
-	testRequireValidator(t, validators, 0x22, 200)
+	testRequireValidator(t, validators, 0x11, 100)
 }
 
-func TestNextValidatorsForBlockFallsBackToNextValidators(t *testing.T) {
+func TestNextValidatorsForBlockLoadsNextValidators(t *testing.T) {
 	nextSet := testValidatorSetConfigCell(t, 0x11, 100)
 	cfg := testValidatorBlockchainConfig(t, map[uint32]*cell.Cell{
 		tlb.ConfigParamCatchainConfig: testCatchainConfigCell(),

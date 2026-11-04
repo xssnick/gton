@@ -33,6 +33,10 @@ type Route struct {
 	retryState       atomic.Int64
 	retryMu          sync.Mutex
 	dialFailures     uint32
+	// reopenedAt is dialFailures when ReopenFailingQUICDial last reopened the
+	// route, 0 when it has not since the last successful dial. While the two
+	// are equal no dial has reached a verdict since the reopen.
+	reopenedAt       uint32
 	dialDone         chan struct{}
 	backgroundDial   atomic.Bool
 	lastUsedUnixNano atomic.Int64
@@ -113,8 +117,44 @@ func (r *Route) BeginQUICDial(now time.Time) bool {
 	return true
 }
 
+// QUICDialFailing reports that the route's last dial that reached a verdict
+// failed and none has succeeded since, unless ReopenFailingQUICDial reopened
+// the route after that verdict. A dial in flight leaves it unchanged until it
+// finishes, and an abandoned one (FinishQUICDial) leaves it unchanged for good.
+func (r *Route) QUICDialFailing() bool {
+	r.retryMu.Lock()
+	defer r.retryMu.Unlock()
+
+	return r.dialFailures > 0 && r.dialFailures != r.reopenedAt
+}
+
 func (r *Route) QUICDialInFlight() bool {
 	return r.retryState.Load() < 0
+}
+
+// ReopenFailingQUICDial lifts the failure verdict and the retry gate of a
+// failing route for a caller holding fresh proof that the peer is alive: the
+// next dial is permitted at once, and QUICDialFailing stays false until a dial
+// reaches a verdict. It reports whether the route was reopened.
+//
+// It reopens once per failing streak: after a reopen it refuses until a dial
+// succeeds. The failure count stays too, so a failed dial after the reopen
+// backs off from where the streak was. A peer that is alive but not dialable
+// from here therefore costs one extra attempt per streak, however often it
+// proves that it is alive. A dial in flight is left alone, since it owns the
+// gate until its verdict. The stale-address flag stays, because proof of life
+// does not say where the peer listens.
+func (r *Route) ReopenFailingQUICDial() bool {
+	r.retryMu.Lock()
+	defer r.retryMu.Unlock()
+
+	if r.dialFailures == 0 || r.reopenedAt != 0 || r.retryState.Load() < 0 {
+		return false
+	}
+
+	r.reopenedAt = r.dialFailures
+	r.retryState.Store(0)
+	return true
 }
 
 // WaitQUICDial waits for the current route owner, if any. Completion is
@@ -137,10 +177,14 @@ func (r *Route) WaitQUICDial(ctx context.Context) error {
 	}
 }
 
+// FinishQUICDial releases a claimed dial that ended without a reachability
+// verdict - its owner gave up waiting for a dial slot or was cancelled. The
+// gate reopens and the failure history stays: an abandoned attempt says
+// nothing about the peer, so it must neither shorten the next backoff nor
+// clear QUICDialFailing for a peer that is still unreachable.
 func (r *Route) FinishQUICDial() {
 	r.retryMu.Lock()
 	if r.retryState.CompareAndSwap(-1, 0) {
-		r.dialFailures = 0
 		r.finishQUICDialLocked()
 	}
 	r.retryMu.Unlock()
@@ -168,6 +212,7 @@ func (r *Route) SucceedQUICDial(claimed bool) {
 	}
 
 	r.dialFailures = 0
+	r.reopenedAt = 0
 	r.quicAddressStale.Store(false)
 }
 

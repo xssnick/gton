@@ -47,6 +47,9 @@ type Config struct {
 	maxBlockBytes          uint32
 	maxCollatedBytes       uint32
 	deferOutQueueSizeLimit uint64
+	outQueueHardLimit      uint64
+	outQueueSoftLimit      uint64
+	maxMsgExtraCurrencies  uint32
 	// gas is the semantic gas allowance of config parameters 20/21 folded with
 	// the epoch block limits, indexed like tvm's masterchain index: 0 basechain,
 	// 1 masterchain. It is epoch data because blockLimitsAtTime rewrites only
@@ -220,7 +223,7 @@ func PrepareConfig(execution *tvm.PreparedBlockchainConfig, configAddress [32]by
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
-	deferOutQueueSizeLimit, err := configDeferOutQueueSizeLimit(raw)
+	queueLimits, err := configMessageQueueLimits(raw)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
@@ -255,7 +258,10 @@ func PrepareConfig(execution *tvm.PreparedBlockchainConfig, configAddress [32]by
 		burning:                burning,
 		maxBlockBytes:          maxBlockBytes,
 		maxCollatedBytes:       maxCollatedBytes,
-		deferOutQueueSizeLimit: deferOutQueueSizeLimit,
+		deferOutQueueSizeLimit: queueLimits.deferThreshold,
+		outQueueHardLimit:      queueLimits.hard,
+		outQueueSoftLimit:      queueLimits.soft,
+		maxMsgExtraCurrencies:  queueLimits.maxExtraCurrencies,
 		gas: [2]gasAccounting{
 			deriveGasAccounting(execution, basechainLimits.limits, false),
 			deriveGasAccounting(execution, masterchainLimits.limits, true),
@@ -361,22 +367,41 @@ func feeDestinationOf(addr []byte, err error) feeDestination {
 	return feeDestination{addr: [32]byte(addr), ok: true}
 }
 
-func configDeferOutQueueSizeLimit(raw tlb.BlockchainConfig) (uint64, error) {
+type messageQueueLimits struct {
+	deferThreshold     uint64
+	hard               uint64
+	soft               uint64
+	maxExtraCurrencies uint32
+}
+
+func configMessageQueueLimits(raw tlb.BlockchainConfig) (messageQueueLimits, error) {
 	limits, err := raw.GetSizeLimitsConfig()
 	if err != nil {
-		return 0, fmt.Errorf("load size limits: %v", err)
+		return messageQueueLimits{}, fmt.Errorf("load size limits: %v", err)
 	}
 
+	// Older constructors inherit the protocol defaults for fields they omit.
+	result := messageQueueLimits{
+		deferThreshold:     legacyDeferOutQueueSizeLimit,
+		hard:               18000,
+		soft:               12000,
+		maxExtraCurrencies: 2,
+	}
 	switch value := limits.Config.(type) {
 	case tlb.SizeLimitsConfigV1:
-		return legacyDeferOutQueueSizeLimit, nil
 	case tlb.SizeLimitsConfigV2:
-		return uint64(value.DeferOutQueueSizeLimit), nil
+		result.deferThreshold = uint64(value.DeferOutQueueSizeLimit)
+		result.maxExtraCurrencies = value.MaxMsgExtraCurrencies
 	case tlb.SizeLimitsConfigV3:
-		return uint64(value.DeferOutQueueSizeLimit), nil
+		result.deferThreshold = uint64(value.DeferOutQueueSizeLimit)
+		result.hard = uint64(value.OutMsgQueueSizeHardLimit)
+		result.soft = uint64(value.OutMsgQueueSizeSoftLimit)
+		result.maxExtraCurrencies = value.MaxMsgExtraCurrencies
 	default:
-		return 0, fmt.Errorf("unsupported size limits config %T", value)
+		return messageQueueLimits{}, fmt.Errorf("unsupported size limits config %T", value)
 	}
+
+	return result, nil
 }
 
 func prepareChainConfig(raw tlb.BlockchainConfig, masterchain bool) (chainConfig, error) {

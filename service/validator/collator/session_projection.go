@@ -177,6 +177,8 @@ func projectCollatorSession(
 	update := SessionUpdate{
 		SessionID:                 group.ID,
 		TargetRate:                params.TargetRate,
+		CollatorMaxFutureWindow:   params.CollatorMaxFutureWindow,
+		CollatorMaxSyncDelay:      params.CollatorMaxSyncDelay,
 		NoEmptyBlocksOnErrTimeout: params.NoEmptyBlocksOnErrTimeout,
 		MasterchainBlock:          cloneBlockID(snapshot.MasterchainBlock),
 		Registered:                append([]groups.ShardDescription(nil), group.Registered...),

@@ -22,25 +22,13 @@ const (
 	ExternalPriorityLocal     = 1
 )
 
-const accountRejectRetrySoftLimit = 1024
-
-type retryReason uint8
-
-const (
-	retryNone retryReason = iota
-	retryIncluded
-	retryAccountRejected
-)
-
 // entry is one pooled message.
 type entry struct {
 	msg         *ExternalMessage
 	priority    int
 	deleteAt    time.Time
 	retryAt     time.Time
-	retryReason retryReason
 	generation  uint64
-	retryCount  uint32
 	expiryIndex int
 	normIndex   int
 	removed     bool
@@ -129,9 +117,7 @@ type statCounters struct {
 	added, overflowMempool, overflowBytes     uint64
 	overflowAddress, expired                  uint64
 	invalidDeleted, includedQuarantined       uint64
-	includedReleased, rejectedDelayed         uint64
-	rejectedRetried, rejectedExhausted        uint64
-	rejectedPressure                          uint64
+	includedReleased, rejectedDeleted         uint64
 	staleFeedback, appliedReq, appliedDeleted uint64
 }
 
@@ -544,10 +530,9 @@ func (p *Pool) eraseLocked(e *entry) {
 // ---- collation feedback and cleanup ----
 
 // Complete applies collation outcomes to the selection generation that
-// produced them. Invalid messages are removed, account-rejected messages are
-// delayed for a bounded number of retry generations, included messages are
-// quarantined, and skipped messages stay ready. Feedback for an older
-// generation is ignored.
+// produced them. Invalid and account-rejected messages remove every normalized
+// variant, included messages are quarantined, and skipped messages stay ready.
+// Feedback for an older generation is ignored.
 func (p *Pool) Complete(feedback []ExternalFeedback) error {
 	for i, result := range feedback {
 		switch result.Outcome {
@@ -574,26 +559,16 @@ func (p *Pool) Complete(feedback []ExternalFeedback) error {
 		switch result.Outcome {
 		case ExternalIncluded:
 			p.quarantineIncludedLocked(e, now)
-		case ExternalInvalid:
-			p.eraseLocked(e)
-			p.stats.invalidDeleted++
-		case ExternalNotAccepted:
-			if e.retryCount >= p.cfg.AccountRejectRetryLimit {
-				p.eraseLocked(e)
-				p.stats.rejectedExhausted++
-				continue
+		case ExternalInvalid, ExternalNotAccepted:
+			// eraseLocked swap-removes normalized siblings, so drain from the tail.
+			for norm := p.byNorm[e.msg.HashNorm]; len(norm) > 0; norm = p.byNorm[e.msg.HashNorm] {
+				p.eraseLocked(norm[len(norm)-1])
+				if result.Outcome == ExternalInvalid {
+					p.stats.invalidDeleted++
+				} else {
+					p.stats.rejectedDeleted++
+				}
 			}
-			softLimit := min(accountRejectRetrySoftLimit, p.cfg.MempoolLimit)
-			if softLimit > 0 && len(p.slabs[e.priority].entries) >= softLimit {
-				p.eraseLocked(e)
-				p.stats.rejectedPressure++
-				continue
-			}
-			e.generation++
-			e.retryCount++
-			e.retryAt = now.Add(p.cfg.AccountRejectRetryDelay)
-			e.retryReason = retryAccountRejected
-			p.stats.rejectedDelayed++
 		case ExternalSkippedLimit:
 			// No TVM attempt happened, so this feedback must not consume the
 			// generation shared with another concurrent collation.
@@ -607,7 +582,6 @@ func (p *Pool) quarantineIncludedLocked(included *entry, now time.Time) {
 	for _, e := range p.byNorm[included.msg.HashNorm] {
 		e.generation++
 		e.retryAt = retryAt
-		e.retryReason = retryIncluded
 		p.stats.includedQuarantined++
 	}
 }
@@ -632,13 +606,7 @@ func (p *Pool) reactivateDueLocked(e *entry, now time.Time) {
 		return
 	}
 	e.retryAt = time.Time{}
-	switch e.retryReason {
-	case retryIncluded:
-		p.stats.includedReleased++
-	case retryAccountRejected:
-		p.stats.rejectedRetried++
-	}
-	e.retryReason = retryNone
+	p.stats.includedReleased++
 }
 
 // expireLocked drains every due live entry. Indexed removals keep the heap in
@@ -708,10 +676,7 @@ func (p *Pool) Stats() Stats {
 		InvalidDeleted:      p.stats.invalidDeleted,
 		IncludedQuarantined: p.stats.includedQuarantined,
 		IncludedReleased:    p.stats.includedReleased,
-		RejectedDelayed:     p.stats.rejectedDelayed,
-		RejectedRetried:     p.stats.rejectedRetried,
-		RejectedExhausted:   p.stats.rejectedExhausted,
-		RejectedPressure:    p.stats.rejectedPressure,
+		RejectedDeleted:     p.stats.rejectedDeleted,
 		StaleFeedback:       p.stats.staleFeedback,
 		AppliedRequested:    p.stats.appliedReq,
 		AppliedDeleted:      p.stats.appliedDeleted,

@@ -754,6 +754,7 @@ func newStandaloneCollatorFactory(
 		}
 		backend, err := core.NewService(core.ServiceOptions{
 			ProductionMode:     core.ProductionModeDelegated,
+			SyncLag:            node.SyncLag,
 			Storage:            composition.collatorStorage,
 			Pipeline:           acquisition,
 			Keys:               composition.keys,

@@ -637,7 +637,7 @@ sync queues.
 | `gton_p2p_queue_max_bytes` | gauge | `queue` | Configured byte limit for a P2P queue. |
 | `gton_p2p_queue_dropped_total` | counter | `queue` | Number of rejected pushes into a P2P queue. |
 | `gton_p2p_broadcasts_total` | counter | `direction`, `overlay`, `kind`, `delivery` | Number of P2P broadcasts received, accepted, or successfully sent through the app-level rebroadcast queue by type and delivery mode. |
-| `gton_p2p_broadcast_dropped_total` | counter | `overlay`, `kind`, `reason` | Number of inbound P2P broadcasts dropped before acceptance by type and reason; duplicate payload rebroadcasts rejected by existing seen/dedupe guards use `reason="seen"`. |
+| `gton_p2p_broadcast_dropped_total` | counter | `overlay`, `kind`, `reason` | Number of inbound P2P broadcasts dropped before acceptance by type and reason; duplicate payload rebroadcasts rejected by existing seen/dedupe guards use `reason="seen"`. `local_send_*` reasons instead count recipients this node's own broadcasts did not reach. |
 | `gton_p2p_broadcast_pipeline_stage_duration_seconds` | histogram | `stage`, `kind`, `delivery`, `result` | Inbound broadcast hot-path stage latency. Stages include `fec_decode`, `classify`, `candidate_decode`, `shard_desc_validate`, `block_broadcast_signature_check`, `hot_cache_notify`, `exact_pop`, `decode_async` (block decode on the bounded decode pool), and `decode_inline` (block decode on the transport receive goroutine). `block_broadcast_signature_check` is the validator-signature pass over a full block broadcast, run on the transport thread *before* the payload decode is enqueued (the reference ordering: `validate_block_broadcast_signatures` gates `obtain_state_for_decompression`), so an unverified payload never buys a decode worker. It is measured separately but is contained in `classify`, which the relay/trust decision keeps on that thread anyway. `decode_inline` covers two cases: payload kinds that cannot be offloaded because their validator signatures are only verifiable after the decode (`tonNode.blockBroadcastCompressed`, i.e. v1 — the only kind whose signature check is sampled after its decode), and payloads the decode pool refused. Compare it against `decode_async` per `kind`: a rising `decode_inline` rate on `tonNode.blockBroadcastCompressedV2` or `tonNode.blockBroadcast` is the pool-undersized signal, while v1 traffic is expected there. |
 | `gton_p2p_rebroadcast_sent_total` | counter | `queue` | Number of successful app-level P2P rebroadcast queue sends. |
 | `gton_p2p_rebroadcast_dropped_total` | counter | `queue` | Number of app-level P2P rebroadcast queue messages dropped before a successful send. |
@@ -680,6 +680,21 @@ applied seqno of their chain use `already_applied` — the masterchain seqno for
 masterchain blocks, and the applied top block of that exact shard for shard
 blocks (a shard whose prefix has just changed through a split or a merge is not
 gated until the next committed masterchain state names it).
+
+The `local_send_*` reasons of `gton_p2p_broadcast_dropped_total` are not
+inbound drops: each counts one recipient a broadcast this node originated
+through the rebroadcast queues of any overlay did not reach, by `overlay` and
+`kind`. Over QUIC (custom and FastSync overlays) an own broadcast waits for a
+missing outbound connection unless the recipient's route is failing, and the
+reason says how that ended. `local_send_peer_offline` means the route was
+failing, so the part was dropped at once with a background redial requested;
+`local_send_context_deadline` an expired send budget, including a wait for the
+shared dial that held its queue for the whole budget; `local_send_canceled` a
+send or wait cancelled by shutdown; `local_send_dial_deferred` a dial that could
+not start because the route had just entered its retry window;
+`local_send_write_deadline` an expired transport write; `local_send_error` any
+other transport error. `gton_p2p_rebroadcast_dropped_total` stays a count of
+queue outcomes, not of recipients.
 
 `gton_p2p_broadcast_pipeline_stage_duration_seconds` intentionally has no block
 id, root hash, file hash, or peer label. `stage="fec_decode"` is measured inside

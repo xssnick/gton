@@ -114,6 +114,12 @@ func TestMetricsHandlerExposesSyncAndStatusMetrics(t *testing.T) {
 						Reason:  "signature_check_failed",
 						Count:   2,
 					},
+					{
+						Overlay: "custom.node-conn",
+						Kind:    "tonNode.externalMessageBroadcast",
+						Reason:  "local_send_peer_offline",
+						Count:   3,
+					},
 				},
 				FECReceivers: []p2p.FECReceiverStatusSnapshot{
 					{
@@ -237,6 +243,7 @@ func TestMetricsHandlerExposesSyncAndStatusMetrics(t *testing.T) {
 		namespace + `_p2p_broadcasts_total{delivery="plumtree",direction="accepted",kind="tonNode.blockBroadcastCompressedV2",overlay="masterchain"} 3`,
 		namespace + `_p2p_broadcasts_total{delivery="fec",direction="queue_rebroadcasted",kind="tonNode.externalMessageBroadcast",overlay="masterchain"} 4`,
 		namespace + `_p2p_broadcast_dropped_total{kind="tonNode.blockBroadcastCompressedV2",overlay="masterchain",reason="signature_check_failed"} 2`,
+		namespace + `_p2p_broadcast_dropped_total{kind="tonNode.externalMessageBroadcast",overlay="custom.node-conn",reason="local_send_peer_offline"} 3`,
 		namespace + `_p2p_fec_receiver_active_streams{overlay="masterchain"} 2`,
 		namespace + `_p2p_fec_receiver_active_bytes{overlay="masterchain"} 4096`,
 		namespace + `_p2p_fec_receiver_delivered_cache_items{overlay="masterchain"} 7`,

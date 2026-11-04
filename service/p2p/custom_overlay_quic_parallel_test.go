@@ -38,7 +38,7 @@ func TestQUICDialContenderHonorsContextDuringPrewarm(t *testing.T) {
 		node.wg.Wait()
 	})
 
-	peer.requestBackgroundQUICDial()
+	peer.quicPath().requestBackgroundQUICDial()
 	select {
 	case <-dht.started:
 	case <-time.After(2 * time.Second):
@@ -73,9 +73,11 @@ func TestQUICDialContenderHonorsContextDuringPrewarm(t *testing.T) {
 	}
 }
 
-// The source fan-out must never dial: a peer without an established
-// connection fails immediately with a background dial requested, so one cold
-// peer costs its own part and nothing else. See quicRouteBroadcastPeer.
+// The relay contract: a fan-out through the plain route-bound peers never
+// dials, so a peer without an established connection fails immediately with a
+// background dial requested and one cold peer costs its own part and nothing
+// else. See quicRouteBroadcastPeer; this node's own broadcasts wait through
+// quicLocalBroadcastPeer instead (TestLocalTwoStepQUICSendWaitsForColdPeerDial).
 func TestTwoStepQUICSendSkipsUnconnectedPeerWithoutDialing(t *testing.T) {
 	fastGateway, err := adnlquic.NewGateway(quicOutboundTestKey(t))
 	if err != nil {
@@ -127,7 +129,7 @@ func TestTwoStepQUICSendSkipsUnconnectedPeerWithoutDialing(t *testing.T) {
 		pub:   fastGateway.PublicKey(),
 		route: newTestPeerRoute(fastAddr),
 	}
-	slowPeer.requestBackgroundQUICDial()
+	slowPeer.quicPath().requestBackgroundQUICDial()
 	select {
 	case <-dht.started:
 	case <-time.After(2 * time.Second):
@@ -167,7 +169,7 @@ func TestTwoStepQUICSendSkipsUnconnectedPeerWithoutDialing(t *testing.T) {
 		t.Fatalf("resolved peers = %d, want two", len(peerSet))
 	}
 
-	// No peer send budget at all, exactly as the source path sends: if the
+	// No peer send budget at all, exactly as a relay fan-out sends: if the
 	// fan-out waited for the cold peer it would hang on the blocked DHT until
 	// this context expires.
 	sendCtx, cancelSend := context.WithTimeout(context.Background(), 3*time.Second)

@@ -495,20 +495,25 @@ func TestTraceEvents(t *testing.T) {
 }
 
 // TestTraceCandidateReceivedWire checks the candidateReceived payload against
-// a hand-decoded layout: bare candidateId, boxed parent, boxed block, Bool.
+// a hand-decoded layout: bare candidateId, boxed parent, boxed block, Bool,
+// and the delegated collator's int256 node id.
 func TestTraceCandidateReceivedWire(t *testing.T) {
 	block := ton.BlockIDExt{
 		Workchain: 0, Shard: -0x8000000000000000, SeqNo: 5,
 		RootHash: bytes.Repeat([]byte{1}, 32), FileHash: bytes.Repeat([]byte{2}, 32),
 	}
 	ev := TraceCandidateReceived{
-		ID:     candID(3, 0x44),
-		Parent: Parent(candID(2, 0x33)),
-		Block:  &block,
+		ID:             candID(3, 0x44),
+		Parent:         Parent(candID(2, 0x33)),
+		Block:          &block,
+		CollatorNodeID: [32]byte{0xa7, 0x39},
 	}
 	wire := ev.Serialize()
 	if got := binary.LittleEndian.Uint32(wire[:4]); got != tl.CRC(schemeStatsCandidateReceived) {
 		t.Fatalf("wrong ctor %#08x", got)
+	}
+	if !bytes.Equal(wire[len(wire)-32:], ev.CollatorNodeID[:]) {
+		t.Fatal("collator node id missing from candidateReceived wire tail")
 	}
 	// id: slot(4) + hash(32) bare, then the boxed parent constructor.
 	requireEqual(t, binary.LittleEndian.Uint32(wire[4:8]), uint32(3), "slot")
@@ -526,5 +531,8 @@ func TestTraceCandidateReceivedWire(t *testing.T) {
 	}
 	if got := binary.LittleEndian.Uint32(wire[44:48]); got != tl.CRC(schemeStatsCandidateEmpty) {
 		t.Fatalf("wrong empty block ctor %#08x", got)
+	}
+	if len(wire) != 84 || !bytes.Equal(wire[52:], ev.CollatorNodeID[:]) {
+		t.Fatalf("wrong empty candidateReceived wire layout: %x", wire)
 	}
 }

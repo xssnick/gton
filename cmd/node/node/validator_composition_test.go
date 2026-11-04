@@ -570,6 +570,7 @@ func TestStandaloneCollatorCompositionBuildsCompleteExtension(t *testing.T) {
 		keyID:              identity.keyID,
 		allowAllValidators: true,
 	}, network, nil)(hooks.Node{
+		SyncLag: func() (time.Duration, error) { return 0, nil },
 		Store:   compositionLiveView(),
 		Network: network,
 		TVM:     tvm.NewTVM(),

@@ -149,6 +149,7 @@ func TestLoadHistoryLongCollation(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := collation{
+				config:    &Config{},
 				oldStats:  tlb.ShardStateStats{OverloadHistory: 1 << 4, UnderloadHistory: 1 << 5},
 				limits:    idleLimitStatus(),
 				peakLoad:  tc.load,

@@ -16,6 +16,9 @@ import (
 
 const accountStorageDictProofTag = uint64(0x37c1e3fc)
 const blockTag = uint64(0x11ef55aa)
+const collatedRootStateTag = uint64(0x4b2f36ec)
+const collatedRootStorageTag = uint64(0x796eaeb6)
+const collatedSeparatorTag = uint64(0xfa8b2b92)
 
 type verifiedCollatedData struct {
 	roots          []*cell.Cell
@@ -81,10 +84,21 @@ func verifyCollatedRoots(roots []*cell.Cell, genUtime uint32) (verifiedCollatedD
 	}
 	consensusFound := false
 	topBlockDescrFound := false
+	separatorFound := false
+	var stateHashes, storageHashes []cell.Hash
+	var rawRoots map[cell.Hash]*cell.Cell
 
 	for i, root := range roots {
 		if root == nil {
 			return verifiedCollatedData{}, fmt.Errorf("%w: collated root %d is nil", ErrInvalidInput, i)
+		}
+		if separatorFound {
+			virtual := root.Virtualize(0)
+			rawRoots[virtual.HashKey()] = virtual
+			continue
+		}
+		if root.Level() != 0 {
+			return verifiedCollatedData{}, fmt.Errorf("%w: collated root %d before separator has non-zero level", ErrInvalidInput, i)
 		}
 		if root.IsSpecial() {
 			virtualRoot, err := unwrapCollatedProof(root)
@@ -114,6 +128,29 @@ func verifyCollatedRoots(roots []*cell.Cell, genUtime uint32) (verifiedCollatedD
 			continue
 		}
 		switch tag {
+		case collatedRootStateTag, collatedRootStorageTag:
+			if loader.BitsLeft() != 256 || loader.RefsNum() != 0 {
+				return verifiedCollatedData{}, fmt.Errorf("%w: malformed collated root declaration %d", ErrInvalidInput, i)
+			}
+			bits, hashErr := loader.LoadSlice(256)
+			if hashErr != nil {
+				return verifiedCollatedData{}, fmt.Errorf("%w: load collated root hash %d: %v", ErrInvalidInput, i, hashErr)
+			}
+			hash := cell.Hash(bits)
+			if tag == collatedRootStateTag {
+				stateHashes = append(stateHashes, hash)
+			} else {
+				storageHashes = append(storageHashes, hash)
+			}
+			verified.full = true
+
+		case collatedSeparatorTag:
+			if loader.BitsLeft() != 0 || loader.RefsNum() != 0 {
+				return verifiedCollatedData{}, fmt.Errorf("%w: malformed collated separator %d", ErrInvalidInput, i)
+			}
+			separatorFound = true
+			rawRoots = make(map[cell.Hash]*cell.Cell, len(roots)-i-1)
+
 		case masterTopBlockDescrSetTag:
 			if topBlockDescrFound {
 				return verifiedCollatedData{}, fmt.Errorf("%w: duplicate top block descriptor set", ErrInvalidInput)
@@ -162,6 +199,26 @@ func verifyCollatedRoots(roots []*cell.Cell, genUtime uint32) (verifiedCollatedD
 			verified.genUtimeMS = genUtimeMS
 			consensusFound = true
 		}
+	}
+	for _, hash := range stateHashes {
+		root := rawRoots[hash]
+		if root == nil {
+			return verifiedCollatedData{}, fmt.Errorf("%w: declared collated state root %x is absent", ErrInvalidInput, hash)
+		}
+		if _, duplicate := verified.virtualRoots[hash]; duplicate {
+			return verifiedCollatedData{}, fmt.Errorf("%w: duplicate collated proof virtual root %x", ErrInvalidInput, hash)
+		}
+		verified.virtualRoots[hash] = root
+	}
+	for _, hash := range storageHashes {
+		root := rawRoots[hash]
+		if root == nil {
+			return verifiedCollatedData{}, fmt.Errorf("%w: declared collated storage root %x is absent", ErrInvalidInput, hash)
+		}
+		if _, duplicate := verified.accountStorage[hash]; duplicate {
+			return verifiedCollatedData{}, fmt.Errorf("%w: duplicate account storage proof virtual root %x", ErrInvalidInput, hash)
+		}
+		verified.accountStorage[hash] = root
 	}
 	if !consensusFound {
 		return verifiedCollatedData{}, fmt.Errorf("%w: candidate collated data has no consensus root", ErrInvalidInput)

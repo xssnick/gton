@@ -476,14 +476,15 @@ func (o *PrivateOverlay) BroadcastTwoStep(
 	return o.sub.twoStepSendOutcome(result), err
 }
 
-// twoStepPeerSet is the fan-out of this node's own broadcast, and the only
+// twoStepPeerSet is the fan-out of this node's own candidate, and the only
 // place priority-marked peers are handed out: the private overlay is the
 // candidate transport, and its BroadcastTwoStep has exactly one caller, the
 // collator's candidate sender. Stand, 2026-09-03: the candidate's ~200 kB
 // symbol queued behind up to 14 relayed symbols on the same per-peer
 // connection, p90 1.84 s against a p50 of 0.10 s (see quicPrioritySendLatch).
-// Forwarding of received symbols and queued rebroadcasts resolve the plain set
-// and defer to these writes.
+// Forwarding of received symbols and queued relayed rebroadcasts resolve the
+// plain set, queued own rebroadcasts the local set (localTwoStepPeerSet), and
+// both defer to these writes.
 func (o *PrivateOverlay) twoStepPeerSet() overlay.StaticBroadcastPeerSet {
 	return prioritizeTwoStepPeerSet(o.sub.resolveTwoStepPeerSet(PeerID{}))
 }

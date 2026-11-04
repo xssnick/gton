@@ -188,7 +188,11 @@ func TestTheExclusionSetIsWhatThePredecessorConsumed(t *testing.T) {
 		{Ref: msgpool.ExternalRef{Hash: hash(4)}, Outcome: msgpool.ExternalSkippedLimit},
 	}
 
-	consumed := consumedExternals(feedback)
+	var c collation
+	for _, entry := range feedback {
+		c.recordExternal(ExternalInput{Ref: entry.Ref, normalizedHash: entry.Ref.Hash}, entry.Outcome)
+	}
+	consumed := c.processedExternals
 	got := map[[32]byte]bool{}
 	for _, entry := range consumed {
 		got[entry] = true
@@ -206,7 +210,7 @@ func TestTheExclusionSetIsWhatThePredecessorConsumed(t *testing.T) {
 	if len(consumed) != 3 {
 		t.Errorf("the exclusion set holds %d entries, want 3", len(consumed))
 	}
-	if consumedExternals(nil) != nil {
+	if (collation{}).processedExternals != nil {
 		t.Error("an empty feedback set produced a non-nil exclusion set")
 	}
 }

@@ -260,6 +260,8 @@ func (n *Node) handleInboundQUICPeer(peer *adnlquic.Peer) error {
 				Msg("rejected QUIC overlay message")
 		}
 	})
+
+	authenticated.reopenFailingRoute()
 	return nil
 }
 

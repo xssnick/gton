@@ -37,7 +37,7 @@ const (
 	consensusExtraDataTag   = uint64(0x638eb292)
 )
 
-const supportedSoftwareVersion = uint32(15)
+const supportedSoftwareVersion = uint32(17)
 
 // SupportedSoftware reports the block software version and capabilities this
 // builder emits. The list is part of the protocol contract: a capability
@@ -147,6 +147,7 @@ type collation struct {
 	senderGenerated              map[[32]byte]uint32
 	lastDispatchEmitted          map[[32]byte]uint64
 	unprocessedDeferred          map[[32]byte]uint32
+	pendingDispatchMessages      uint64
 	haveUnprocessedDispatchQueue bool
 
 	// lastProcLT and lastProcHash track the newest processed inbound internal
@@ -198,11 +199,13 @@ type collation struct {
 	processedRecords []tlb.ProcessedUptoRecord
 	processedParsed  bool
 
-	maxLT        uint64
-	stats        Stats
-	externals    []msgpool.ExternalFeedback
-	storageStats AccountStorageStats
-	burned       tlb.CurrencyCollection
+	maxLT                uint64
+	stats                Stats
+	externals            []msgpool.ExternalFeedback
+	processedExternals   [][32]byte
+	processedExternalSet map[[32]byte]struct{}
+	storageStats         AccountStorageStats
+	burned               tlb.CurrencyCollection
 
 	// fullCollated is capFullCollatedData as it stood when this collation was
 	// prepared. It is a field rather than a config read because it also has to
@@ -344,6 +347,13 @@ func newCollation(init *collationInit) (*collation, error) {
 		externals:             make([]msgpool.ExternalFeedback, 0, len(init.request.externals)),
 		fullCollated:          init.fullCollated,
 		collatedProofEstimate: init.collatedProofEstimate,
+	}
+	if len(init.request.processedExternals) != 0 {
+		c.processedExternals = append([][32]byte(nil), init.request.processedExternals...)
+		c.processedExternalSet = make(map[[32]byte]struct{}, len(c.processedExternals))
+		for _, hash := range c.processedExternals {
+			c.processedExternalSet[hash] = struct{}{}
+		}
 	}
 	c.prepareAccountPathRecorder()
 
@@ -755,7 +765,6 @@ func (b *Builder) prepare(ctx context.Context, req ShardRequest) (*collation, er
 }
 
 func validateExternalInputs(inputs []ExternalInput) error {
-	seen := make(map[[32]byte]struct{}, len(inputs))
 	for i := range inputs {
 		input := &inputs[i]
 		if input.message == nil {
@@ -769,10 +778,6 @@ func validateExternalInputs(inputs []ExternalInput) error {
 		if input.Ref.Hash != hash {
 			return fmt.Errorf("%w: external %d reference does not match its message", ErrInvalidInput, i)
 		}
-		if _, exists := seen[hash]; exists {
-			return fmt.Errorf("%w: duplicate external %x", ErrInvalidInput, hash)
-		}
-		seen[hash] = struct{}{}
 	}
 
 	return nil
@@ -1309,16 +1314,17 @@ func (c *collation) finish() (*Candidate, error) {
 			RootHash:  rootHash[:],
 			FileHash:  fileHash[:],
 		},
-		CreatedBy:        c.req.createdBy,
-		BlockBOC:         boc,
-		CollatedData:     collatedData,
-		CollatedFileHash: collatedFileHash,
-		State:            parts.state,
-		StateUpdate:      parts.stateUpdate,
-		StorageStats:     c.storageStats,
-		Externals:        c.externals,
-		Stats:            c.stats,
-		prepared:         prepared,
+		CreatedBy:          c.req.createdBy,
+		BlockBOC:           boc,
+		CollatedData:       collatedData,
+		CollatedFileHash:   collatedFileHash,
+		State:              parts.state,
+		StateUpdate:        parts.stateUpdate,
+		StorageStats:       c.storageStats,
+		Externals:          c.externals,
+		processedExternals: c.processedExternals,
+		Stats:              c.stats,
+		prepared:           prepared,
 		// ID.FileHash and CollatedFileHash above are fileHash and
 		// collatedFileHash, taken from these very buffers a few statements ago.
 		// signArtifact used to re-derive both to compare them against
@@ -1705,6 +1711,13 @@ func (c *collation) buildCollatedRoots(consensusExtra, stateUpdate *cell.Cell) (
 	for _, hash := range hashes {
 		roots = append(roots, storageProofs[hash])
 	}
+	if c.config.globalVersion >= 16 {
+		var err error
+		roots, err = encodeCollatedProofTrees(roots)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	verified, err := verifyCollatedRoots(roots, c.header.GenUtime)
 	if err != nil {
@@ -1749,6 +1762,13 @@ func (c *collation) buildDeferredCollatedProofs() error {
 	}
 	roots := make([]*cell.Cell, 0, len(c.fullCollatedProofs))
 	roots = append(roots, c.fullCollatedProofs...)
+	if c.config.globalVersion >= 16 {
+		var err error
+		roots, err = encodeCollatedProofTrees(roots)
+		if err != nil {
+			return err
+		}
+	}
 	size, err := collatedBOCSize(roots)
 	if err != nil {
 		return fmt.Errorf("estimate neighbor collated proofs: %w", err)
@@ -1971,6 +1991,21 @@ func (c *collation) updateCollatedEstimate() {
 		return
 	}
 	proofBytes := c.collatedProofEstimate.size()
+	if c.config.globalVersion >= 16 {
+		// A GV16 declaration occupies 38 bytes plus its four-byte root index;
+		// the separator occupies another six bytes plus its index. Neighbor
+		// declarations are included in their measured proofs, and storage
+		// declarations fit within the existing standalone storage-proof bound.
+		declarations := uint64(10)
+		if c.master == nil {
+			declarations += uint64(c.previousCount()) * 42
+		}
+		if math.MaxUint64-proofBytes < declarations {
+			c.limits.collatedData = math.MaxUint64
+			return
+		}
+		proofBytes += declarations
+	}
 	if math.MaxUint64-c.collatedFixedEstimate < proofBytes {
 		c.limits.collatedData = math.MaxUint64
 		return
@@ -1988,32 +2023,6 @@ func consensusExtraRoot(genUtimeMS uint64) *cell.Cell {
 
 func isMissingKey(err error) bool {
 	return errors.Is(err, cell.ErrNoSuchKeyInDict)
-}
-
-// consumedExternals is the set a successor must not be offered: the messages
-// this block took out of the pool's reach. Only the three outcomes that end a
-// message's life in this window count.
-//
-// ExternalSkippedLimit is deliberately absent. A message skipped for a limit was
-// never executed and its generation is untouched, so it is exactly the kind of
-// message the next slot should pick up — excluding it would strand it for the
-// rest of the window for no reason.
-func consumedExternals(feedback []msgpool.ExternalFeedback) [][32]byte {
-	if len(feedback) == 0 {
-		return nil
-	}
-	consumed := make([][32]byte, 0, len(feedback))
-	for i := range feedback {
-		switch feedback[i].Outcome {
-		case msgpool.ExternalIncluded, msgpool.ExternalInvalid, msgpool.ExternalNotAccepted:
-			consumed = append(consumed, feedback[i].Ref.Hash)
-		}
-	}
-	if len(consumed) == 0 {
-		return nil
-	}
-
-	return consumed
 }
 
 // handOffSuccessor gives the next slot everything it needs to start building on
@@ -2078,7 +2087,7 @@ func (c *collation) handOffSuccessor(fileHash [32]byte, blockRoot *cell.Cell, pa
 			NextSeqno:   parts.header.SeqNo + 1,
 			BeforeSplit: port.policy.BeforeSplit,
 		},
-		Exclude:         consumedExternals(c.externals),
+		Exclude:         c.processedExternals,
 		predecessorSlot: port.slot,
 		handoffAt:       time.Now(),
 		externalWaitEnd: port.externalWaitEnd,

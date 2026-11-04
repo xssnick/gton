@@ -233,6 +233,7 @@ type localBackendTestCollator struct {
 	record           *collator.SessionRecord
 	sessionErr       error
 	probeErr         error
+	probe            func(context.Context, collator.WindowPreparation) error
 	commitErr        error
 	commit           func(context.Context, collator.WindowRequest) error
 	selfErr          error
@@ -371,13 +372,18 @@ func (c *localBackendTestCollator) RetireSession(_ context.Context, id [32]byte)
 }
 
 func (c *localBackendTestCollator) Probe(
-	_ context.Context,
+	ctx context.Context,
 	window collator.WindowPreparation,
 ) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.probeCalls = append(c.probeCalls, window)
-	return c.probeErr
+	probe, err := c.probe, c.probeErr
+	c.mu.Unlock()
+	if probe != nil {
+		return probe(ctx, window)
+	}
+
+	return err
 }
 
 func (c *localBackendTestCollator) CommitDelegation(
@@ -599,6 +605,12 @@ func newLocalBackendProductionTestFixture(
 	if mode == collator.ProductionModeSelf {
 		backend.self = producer
 	}
+
+	t.Cleanup(func() {
+		if err := backend.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 
 	return &localBackendProductionTestFixture{
 		backend:    backend,

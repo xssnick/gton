@@ -6873,14 +6873,15 @@ func testShardHashLeaf(t *testing.T, block ton.BlockIDExt, nextValidatorShard in
 }
 
 type testDispatchQueueAccount struct {
-	addr []byte
-	lts  []uint64
+	addr    []byte
+	lts     []uint64
+	balance *tlb.CurrencyCollection
 }
 
 func testDispatchQueue(t *testing.T, accounts ...testDispatchQueueAccount) *cell.AugmentedDictionary {
 	t.Helper()
 
-	dispatchQueue, err := cell.NewAugDict(256, testUint64BoundaryAugmentation{})
+	dispatchQueue, err := tlb.NewDispatchQueueAugDict()
 	if err != nil {
 		t.Fatalf("create dispatch queue dict: %v", err)
 	}
@@ -6899,15 +6900,19 @@ func testDispatchQueue(t *testing.T, accounts ...testDispatchQueueAccount) *cell
 			}
 		}
 
-		accountQueue := cell.BeginCell().
-			MustStoreDict(messages).
-			MustStoreUInt(uint64(len(account.lts)), 48).
-			EndCell()
+		accountQueue, err := (tlb.AccountDispatchQueue{
+			Messages:     messages,
+			Count:        uint64(len(account.lts)),
+			TotalBalance: account.balance,
+		}).ToCell()
+		if err != nil {
+			t.Fatalf("build account dispatch queue: %v", err)
+		}
 		if err = dispatchQueue.Set(blockproof.AccountKey(account.addr), accountQueue); err != nil {
 			t.Fatalf("set dispatch queue account: %v", err)
 		}
 	}
-	return dispatchQueue
+	return dispatchQueue.AugmentedDictionary
 }
 
 func testShardStateWithOutMsgQueueSize(t *testing.T, block ton.BlockIDExt, size uint64) *cell.Cell {
